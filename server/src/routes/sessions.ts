@@ -1,6 +1,10 @@
 import { Router } from "express";
-import { listSessionIds, readSession, readManifestRaw } from "../lib/sessions";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { sessionsDir } from "../config";
+import { listSessionIds, readSession, readManifestRaw, isValidSessionId } from "../lib/sessions";
 import { gitDiff, gitRevertFile } from "../lib/git";
+import { parseLogToEvents } from "../lib/events";
 
 export const sessionsRouter = Router();
 
@@ -20,6 +24,18 @@ sessionsRouter.get("/sessions/:id/manifest", async (req, res) => {
   const raw = await readManifestRaw(req.params.id);
   if (!raw) return res.status(404).json({ error: "not found" });
   res.json(raw);
+});
+
+sessionsRouter.get("/sessions/:id/events", async (req, res) => {
+  if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
+  const logPath = path.join(sessionsDir(), req.params.id, "engineer-00.log");
+  try {
+    const text = await fs.readFile(logPath, "utf-8");
+    res.json(parseLogToEvents(req.params.id, text));
+  } catch (err: any) {
+    if (err.code === "ENOENT") return res.json([]);
+    throw err;
+  }
 });
 
 sessionsRouter.get("/sessions/:id/diff", async (req, res) => {
