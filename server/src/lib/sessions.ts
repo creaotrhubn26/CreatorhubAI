@@ -70,7 +70,10 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
 const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/;
 
 export function isValidSessionId(id: string): boolean {
-  return SAFE_SESSION_ID.test(id);
+  if (!SAFE_SESSION_ID.test(id)) return false;
+  const resolved = path.resolve(sessionsDir(), id);
+  const root = path.resolve(sessionsDir()) + path.sep;
+  return resolved.startsWith(root);
 }
 
 export async function listSessionIds(): Promise<string[]> {

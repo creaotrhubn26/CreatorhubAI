@@ -89,6 +89,11 @@ describe("isValidSessionId", () => {
     expect(isValidSessionId("a/b")).toBe(false);
     expect(isValidSessionId("/etc/passwd")).toBe(false);
   });
+
+  it("rejects bare '..' and '.' even though every character is individually allowed", () => {
+    expect(isValidSessionId("..")).toBe(false);
+    expect(isValidSessionId(".")).toBe(false);
+  });
 });
 
 describe("readManifestRaw / readSession path-traversal guard", () => {
