@@ -1,22 +1,33 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { NewTaskScreen } from "./NewTaskScreen";
+import * as client from "../../api/client";
 
 // NewTaskScreen calls useNavigate() (per the task-12 brief's exact implementation),
 // which requires a Router context to render. MemoryRouter is added here (matching
 // the pattern already used in AppShell.test.tsx) purely as test scaffolding — it
 // does not change what is asserted.
 function withQuery(ui: React.ReactElement) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider client={qc}>
       <MemoryRouter>{ui}</MemoryRouter>
     </QueryClientProvider>
   );
 }
 
 describe("NewTaskScreen", () => {
+  beforeEach(() => {
+    // NewTaskScreen now renders TaskIntelligencePanel, which fetches on mount.
+    // Stub it so these tests exercise the composer form, not the network.
+    vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
+      likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: null, provenance: "deterministic-backend",
+    });
+  });
+
+
   it("renders commit/push/deploy/install as permanently disabled and unchecked", () => {
     render(withQuery(<NewTaskScreen />));
     for (const label of ["Commit", "Push", "Deploy", "Install dependencies"]) {

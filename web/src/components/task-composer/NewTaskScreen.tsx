@@ -3,6 +3,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
+import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
   objective: "", scopePackage: "repository", scopeArea: "", mode: "implement",
@@ -56,6 +57,8 @@ export function NewTaskScreen() {
           ))}
         </select>
       </fieldset>
+
+      <TaskIntelligencePanel scopePackage={form.scopePackage} scopeArea={form.scopeArea || undefined} />
 
       <fieldset>
         <legend>Verification</legend>

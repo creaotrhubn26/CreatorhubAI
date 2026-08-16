@@ -27,4 +27,16 @@ describe("glimmerApi", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 500 }));
     await expect(glimmerApi.getStatus()).rejects.toThrow();
   });
+
+  it("getTaskIntelligence calls GET /api/task-intelligence with query params", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ likelyArea: "frontend", likelyPackage: "x", suggestedVerification: [], estimatedRisk: null, provenance: "git-derived" }), { status: 200 })
+    );
+    const result = await glimmerApi.getTaskIntelligence("frontend", "frontend/client/src/dialog");
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/task-intelligence?scopePackage=frontend&scopeArea=${encodeURIComponent("frontend/client/src/dialog")}`,
+      expect.anything()
+    );
+    expect(result.likelyArea).toBe("frontend");
+  });
 });
