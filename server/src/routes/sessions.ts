@@ -10,7 +10,9 @@ import {
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { parseLogToEvents } from "../lib/events.js";
 import { runGlimmer, buildArgs } from "../lib/runner.js";
-import type { TaskContract, GlimmerSession } from "@glimmer/shared";
+import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
+import { findRepoMap } from "./repository.js";
+import type { TaskContract, GlimmerSession, SessionAnalysis } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
 
@@ -131,6 +133,22 @@ sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
   run.cancel();
   activeRuns.delete(req.params.id);
   res.json({ cancelled: true });
+});
+
+sessionsRouter.get("/sessions/:id/analysis", async (req, res) => {
+  try {
+    const session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    const repoMap = await findRepoMap();
+    const riskScore = computeRiskScore(session.changedFiles, repoMap);
+    const scopeGuard = session.taskContract
+      ? computeScopeGuard(session.taskContract.scope, session.changedFiles, repoMap)
+      : null;
+    const body: SessionAnalysis = { riskScore, scopeGuard };
+    res.json(body);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 sessionsRouter.get("/sessions/:id/diff", async (req, res) => {

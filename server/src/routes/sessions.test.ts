@@ -147,3 +147,44 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     expect(written).toEqual(validContract);
   });
 });
+
+describe("GET /api/sessions/:id/analysis", () => {
+  it("computes risk score and scope guard from real session data", async () => {
+    const id = "20260817-000010-glimmer-analysis-test";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+      finalChangedFiles: ["frontend/client/src/dialog/Dialog.tsx", "backend/src/unrelated.ts"],
+    }));
+    await fs.writeFile(path.join(dir, "gateway-contract.json"), JSON.stringify({
+      objective: "x", scope: { package: "directory", area: "frontend/client/src/dialog" }, mode: "implement",
+      constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+      verification: [], repairBudget: 0,
+    }));
+
+    const res = await request(app).get(`/api/sessions/${id}/analysis`);
+    expect(res.status).toBe(200);
+    expect(res.body.scopeGuard.inScope).toBe(false);
+    expect(res.body.scopeGuard.expandedFiles).toEqual(["backend/src/unrelated.ts"]);
+    expect(["LOW", "MEDIUM", "HIGH", "CRITICAL"]).toContain(res.body.riskScore);
+  });
+
+  it("returns scopeGuard: null when no contract was ever persisted", async () => {
+    const id = "20260817-000011-glimmer-nocontract-analysis";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+    }));
+
+    const res = await request(app).get(`/api/sessions/${id}/analysis`);
+    expect(res.status).toBe(200);
+    expect(res.body.scopeGuard).toBeNull();
+  });
+
+  it("returns 404 for an unknown session id instead of crashing", async () => {
+    const res = await request(app).get("/api/sessions/does-not-exist/analysis");
+    expect(res.status).toBe(404);
+  });
+});
