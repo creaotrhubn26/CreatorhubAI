@@ -231,3 +231,30 @@ export interface DashboardStatus {
   recentSessions: Array<Pick<GlimmerSession, "id" | "task" | "status" | "changedFiles" | "completedAt">>;
   verification: VerificationSummary | null;
 }
+
+export interface TaskIntelligence {
+  likelyArea: string | null;
+  likelyPackage: string | null;
+  suggestedVerification: string[];
+  estimatedRisk: RiskLevel | null;
+  provenance: DataProvenance;
+}
+
+export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export interface ScopeGuardResult {
+  inScope: boolean;
+  expected: string[];
+  actual: string[];
+  expandedFiles: string[];
+}
+
+export interface SessionAnalysis {
+  riskScore: RiskLevel;
+  scopeGuard: ScopeGuardResult | null;
+}
+
+export interface SessionAssistantAnswer {
+  answer: string;
+  provenance: "model-output";
+}
