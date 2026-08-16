@@ -3,6 +3,7 @@ import cors from "cors";
 import { statusRouter } from "./routes/status";
 import { sessionsRouter } from "./routes/sessions";
 import { workspacesRouter } from "./routes/workspaces";
+import { modelRouter } from "./routes/model";
 
 export function createApp(): Express {
   const app = express();
@@ -11,5 +12,6 @@ export function createApp(): Express {
   app.use("/api", statusRouter);
   app.use("/api", sessionsRouter);
   app.use("/api", workspacesRouter);
+  app.use("/api", modelRouter);
   return app;
 }
