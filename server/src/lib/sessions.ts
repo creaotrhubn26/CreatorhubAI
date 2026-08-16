@@ -67,6 +67,12 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   };
 }
 
+const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/;
+
+export function isValidSessionId(id: string): boolean {
+  return SAFE_SESSION_ID.test(id);
+}
+
 export async function listSessionIds(): Promise<string[]> {
   try {
     const entries = await fs.readdir(sessionsDir(), { withFileTypes: true });
@@ -78,6 +84,7 @@ export async function listSessionIds(): Promise<string[]> {
 }
 
 export async function readManifestRaw(id: string): Promise<unknown | null> {
+  if (!isValidSessionId(id)) return null; // reject path traversal as not-found, never resolve it
   try {
     const raw = await fs.readFile(path.join(sessionsDir(), id, "manifest.json"), "utf-8");
     return JSON.parse(raw);

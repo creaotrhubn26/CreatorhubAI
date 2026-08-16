@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseManifest } from "./sessions";
+import { parseManifest, isValidSessionId, readManifestRaw, readSession } from "./sessions";
 
 const REAL_MANIFEST = {
   version: "2.1",
@@ -74,5 +74,26 @@ describe("parseManifest", () => {
       "sid-3"
     );
     expect(session.verification.overall).toBe("FAILED");
+  });
+});
+
+describe("isValidSessionId", () => {
+  it("accepts real session id shapes", () => {
+    expect(isValidSessionId("20260816-181928-glimmer-x")).toBe(true);
+    expect(isValidSessionId("20260816-181928")).toBe(true);
+  });
+
+  it("rejects path-traversal and path-separator ids", () => {
+    expect(isValidSessionId("../x")).toBe(false);
+    expect(isValidSessionId("../../evil")).toBe(false);
+    expect(isValidSessionId("a/b")).toBe(false);
+    expect(isValidSessionId("/etc/passwd")).toBe(false);
+  });
+});
+
+describe("readManifestRaw / readSession path-traversal guard", () => {
+  it("resolves an invalid session id to null instead of reading outside sessionsDir", async () => {
+    expect(await readManifestRaw("../../evil")).toBeNull();
+    expect(await readSession("../../evil")).toBeNull();
   });
 });
