@@ -1,0 +1,14 @@
+{
+  "name": "glimmer-control-center",
+  "private": true,
+  "workspaces": ["shared", "server", "web"],
+  "scripts": {
+    "build": "npm run build -ws --if-present",
+    "test": "npm run test -ws --if-present",
+    "dev:server": "npm run dev -w server",
+    "dev:web": "npm run dev -w web"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}
