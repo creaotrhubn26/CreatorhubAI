@@ -69,4 +69,53 @@ describe("parseLogToEvents", () => {
       expect(typeof e.id).toBe("string");
     }
   });
+
+  it("parses the real PEG retry attempt number out of the payload filename, not a running event count", () => {
+    const recoveries = events.filter((e) => e.type === "parser_recovery");
+    // all three fixture lines reference a "...-attempt-1.json" payload, so the
+    // parsed attempt must be 1 for each — a running sequence counter would
+    // instead grow (e.g. 1, 4, 6) as other events are emitted in between.
+    for (const r of recoveries) {
+      expect(r.attempt).toBe(1);
+    }
+  });
+});
+
+// Ordinary (debug-off) runs never emit [PEG DEBUG] lines — GLIMMER_DEBUG_PEG_PAYLOAD
+// is opt-in and unset in normal operation. In that mode, glimmer-engineer.py can still
+// print a "GLIMMER:" banner followed by the model's free-form prose directly to stdout,
+// between a "← RESULT:" block and the next "→ TOOL:" line. The parser must stop scanning
+// before that banner, never folding raw model reasoning into resultSummary.
+const NO_DEBUG_LOG = `→ TOOL: read_file
+{
+  "path": "/ws/a.ts"
+}
+← RESULT:
+some file content here
+
+GLIMMER:
+Here is my internal reasoning about why this fix works — a secret
+chain-of-thought explanation spanning multiple lines that must never reach the UI.
+
+→ TOOL: write_file
+{
+  "path": "/ws/a.ts"
+}
+← RESULT:
+ok
+`;
+
+describe("parseLogToEvents (no PEG DEBUG lines — default, debug-off run)", () => {
+  const events = parseLogToEvents("sid-2", NO_DEBUG_LOG);
+
+  it("stops the RESULT scan at a GLIMMER: banner instead of consuming the model's prose", () => {
+    const completed = events.filter((e) => e.type === "tool_completed");
+    expect(completed).toHaveLength(2);
+    expect(completed[0].resultSummary).toBe("some file content here");
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("GLIMMER");
+    expect(serialized).not.toContain("reasoning");
+    expect(serialized).not.toContain("chain-of-thought");
+  });
 });

@@ -34,7 +34,7 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
     res.json(parseLogToEvents(req.params.id, text));
   } catch (err: any) {
     if (err.code === "ENOENT") return res.json([]);
-    throw err;
+    res.status(500).json({ error: err.message });
   }
 });
 

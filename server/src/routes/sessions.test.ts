@@ -52,6 +52,21 @@ describe("GET /api/sessions/:id/diff", () => {
   });
 });
 
+describe("GET /api/sessions/:id/events", () => {
+  it("returns a clean 500 instead of crashing when the session id resolves to a non-directory", async () => {
+    // isValidSessionId only checks the id's character shape / path resolution,
+    // not that the entry is actually a directory — a plain file at that path
+    // makes path.join(..., id, "engineer-00.log") + fs.readFile fail with
+    // ENOTDIR, which must not propagate as an unhandled rejection.
+    const fileId = "not-a-directory";
+    await fs.writeFile(path.join(stateRoot, "sessions", fileId), "not a session dir");
+
+    const res = await request(app).get(`/api/sessions/${fileId}/events`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
 describe("POST /api/sessions/:id/revert-file", () => {
   it("returns 404 for a path-traversal session id instead of touching the filesystem", async () => {
     const res = await request(app)
