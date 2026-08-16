@@ -31,7 +31,7 @@ describe("DashboardScreen", () => {
     render(withQuery(<DashboardScreen />));
     await waitFor(() => expect(screen.getByText("OFFLINE")).toBeInTheDocument());
     // activeSession, latestSession, and verification are all null here, so
-    // "Unavailable" renders three times (never a fabricated value in any of them).
-    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
+    // "Unavailable" must render exactly three times (never a fabricated value in any of them).
+    expect(screen.getAllByText("Unavailable")).toHaveLength(3);
   });
 });
