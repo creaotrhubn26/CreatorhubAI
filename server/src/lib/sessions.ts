@@ -38,7 +38,7 @@ function overallFromManifest(manifest: any): VerificationOverall {
   const last = attempts[attempts.length - 1];
   const results: VerificationCheckResult[] = (last.verificationResults ?? []).map(toVerificationCheck);
   if (results.length === 0) return "NOT_RUN";
-  if (results.some((r) => !r.ok && r.status === "CODE_FAIL" && r.newErrorSignatures.length > 0)) return "FAILED";
+  if (results.some((r) => !r.ok && (r.status === "FAIL" || r.status === "ERROR" || (r.status === "CODE_FAIL" && r.newErrorSignatures.length > 0)))) return "FAILED";
   if (results.every((r) => r.ok)) return manifest.status === "verified" ? "VERIFIED" : "PARTIAL";
   return "PARTIAL";
 }

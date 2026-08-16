@@ -57,4 +57,22 @@ describe("parseManifest", () => {
     expect(session.status).toBe("preflight");
     expect(session.verification.overall).toBe("NOT_RUN");
   });
+
+  it("classifies a hard FAIL/ERROR check (not baseline-related) as FAILED overall", () => {
+    const session = parseManifest(
+      {
+        ...REAL_MANIFEST,
+        attempts: [
+          {
+            ...REAL_MANIFEST.attempts[0],
+            verificationResults: [
+              { command: "npm test", returncode: 1, status: "FAIL", ok: false, elapsedSeconds: 1.1, outputTail: "", newErrorSignatures: [] },
+            ],
+          },
+        ],
+      },
+      "sid-3"
+    );
+    expect(session.verification.overall).toBe("FAILED");
+  });
 });
