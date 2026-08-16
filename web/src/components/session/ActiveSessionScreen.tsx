@@ -6,6 +6,7 @@ import { deriveSessionState } from "../../state/deriveSessionState";
 import { AgentStateStepper } from "./AgentStateStepper";
 import { AgentTimeline } from "./AgentTimeline";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
+import { SessionAssistant } from "./SessionAssistant";
 
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
@@ -38,6 +39,7 @@ export function ActiveSessionScreen() {
       </dl>
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       <AgentTimeline events={events} />
+      {id && <SessionAssistant sessionId={id} />}
     </div>
   );
 }

@@ -48,4 +48,14 @@ describe("glimmerApi", () => {
     expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/analysis`, expect.anything());
     expect(result.riskScore).toBe("HIGH");
   });
+
+  it("askSession POSTs the question and returns the model's answer", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ answer: "It owns the parser state.", provenance: "model-output" }), { status: 200 })
+    );
+    const result = await glimmerApi.askSession("s1", "Why was this file chosen?");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/ask`, expect.objectContaining({ method: "POST" }));
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({ question: "Why was this file chosen?" });
+    expect(result.answer).toBe("It owns the parser state.");
+  });
 });
