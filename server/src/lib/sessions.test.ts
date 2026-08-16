@@ -1,11 +1,10 @@
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus,
-  writeGatewayContract, readGatewayContract,
 } from "./sessions.js";
-import { sessionsDir } from "../config.js";
 import type { TaskContract } from "@glimmer/shared";
 
 const REAL_MANIFEST = {
@@ -158,45 +157,50 @@ const REAL_CONTRACT: TaskContract = {
   repairBudget: 2,
 };
 
-const GATEWAY_CONTRACT_TEST_DIRS = [
-  "20260817-000000-glimmer-test",
-  "20260817-000001-glimmer-nocontract",
-  "20260817-000002-glimmer-withcontract",
-];
+// Isolate these fs-touching tests from the real ~/.muse-glimmer: reset the
+// module registry and re-import sessions.js under a temp GLIMMER_STATE_ROOT,
+// mirroring sessionAdoption.test.ts's setup. The statically-imported
+// functions above (used by the pure/in-memory tests) keep referencing the
+// original module instance and are unaffected.
+let contractStateRoot: string;
+let sessionsIsolated: typeof import("./sessions.js");
+
+beforeAll(async () => {
+  contractStateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-contract-root-"));
+  process.env.GLIMMER_STATE_ROOT = contractStateRoot;
+  await fs.mkdir(path.join(contractStateRoot, "sessions"), { recursive: true });
+  vi.resetModules();
+  sessionsIsolated = await import("./sessions.js");
+});
 
 afterAll(async () => {
-  // ponytail: these tests write into the real sessionsDir() (no
-  // GLIMMER_STATE_ROOT override in this file) — clean up after ourselves so
-  // repeated runs don't litter ~/.muse-glimmer/sessions.
-  await Promise.all(
-    GATEWAY_CONTRACT_TEST_DIRS.map((id) => fs.rm(path.join(sessionsDir(), id), { recursive: true, force: true }))
-  );
+  await fs.rm(contractStateRoot, { recursive: true, force: true });
 });
 
 describe("gateway contract persistence", () => {
   it("round-trips a written contract", async () => {
-    const dir = path.join(sessionsDir(), "20260817-000000-glimmer-test");
+    const dir = path.join(contractStateRoot, "sessions", "20260817-000000-glimmer-test");
     await fs.mkdir(dir, { recursive: true });
-    await writeGatewayContract(dir, REAL_CONTRACT);
-    const read = await readGatewayContract("20260817-000000-glimmer-test");
+    await sessionsIsolated.writeGatewayContract(dir, REAL_CONTRACT);
+    const read = await sessionsIsolated.readGatewayContract("20260817-000000-glimmer-test");
     expect(read).toEqual(REAL_CONTRACT);
   });
 
   it("returns null when no contract was ever written for a session", async () => {
-    const dir = path.join(sessionsDir(), "20260817-000001-glimmer-nocontract");
+    const dir = path.join(contractStateRoot, "sessions", "20260817-000001-glimmer-nocontract");
     await fs.mkdir(dir, { recursive: true });
-    expect(await readGatewayContract("20260817-000001-glimmer-nocontract")).toBeNull();
+    expect(await sessionsIsolated.readGatewayContract("20260817-000001-glimmer-nocontract")).toBeNull();
   });
 });
 
 describe("readSession populates taskContract", () => {
   it("attaches the persisted contract to the returned GlimmerSession", async () => {
     const id = "20260817-000002-glimmer-withcontract";
-    const dir = path.join(sessionsDir(), id);
+    const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
-    await writeGatewayContract(dir, REAL_CONTRACT);
-    const session = await readSession(id);
+    await sessionsIsolated.writeGatewayContract(dir, REAL_CONTRACT);
+    const session = await sessionsIsolated.readSession(id);
     expect(session?.taskContract).toEqual(REAL_CONTRACT);
   });
 });
