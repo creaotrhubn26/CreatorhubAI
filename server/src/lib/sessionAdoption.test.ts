@@ -55,6 +55,41 @@ describe("pending -> real session adoption", () => {
     expect(await sessions.adoptRealSessionDir(pendingId, before, 300, 50)).toBeNull();
     expect(sessions.resolveSessionId(pendingId)).toBe(pendingId);
   });
+
+  it("aliases two concurrent adoptions to two different real directories, never the same one", async () => {
+    // Simulates two sessions starting within the same poll window (or one
+    // adoption racing a human running glimmer-v2.py directly): both pending
+    // ids share the same pre-spawn snapshot, and their real directories
+    // appear close together while both polling loops are in flight.
+    const pendingA = "pending-aaaaaaaa-0000-0000-0000-000000000001";
+    const pendingB = "pending-bbbbbbbb-0000-0000-0000-000000000002";
+    await fs.mkdir(path.join(stateRoot, "sessions", pendingA), { recursive: true });
+    await fs.mkdir(path.join(stateRoot, "sessions", pendingB), { recursive: true });
+    const before = new Set(await sessions.listSessionIds());
+
+    const realA = "20260816-190001-glimmer-concurrent-a";
+    const realB = "20260816-190002-glimmer-concurrent-b";
+
+    const adoptionA = sessions.adoptRealSessionDir(pendingA, before, 3000, 20);
+    const adoptionB = sessions.adoptRealSessionDir(pendingB, before, 3000, 20);
+
+    // Stagger creation so both polling loops race for realA first (the exact
+    // window the old, unclaimed-tracking-free code mis-attributed), then
+    // realB appears once one adoption has already claimed realA.
+    await new Promise((r) => setTimeout(r, 50));
+    await fs.mkdir(path.join(stateRoot, "sessions", realA), { recursive: true });
+    await new Promise((r) => setTimeout(r, 100));
+    await fs.mkdir(path.join(stateRoot, "sessions", realB), { recursive: true });
+
+    const [adoptedA, adoptedB] = await Promise.all([adoptionA, adoptionB]);
+
+    expect(adoptedA).not.toBeNull();
+    expect(adoptedB).not.toBeNull();
+    expect(new Set([adoptedA, adoptedB])).toEqual(new Set([realA, realB]));
+    expect(adoptedA).not.toBe(adoptedB);
+    expect(sessions.resolveSessionId(pendingA)).toBe(adoptedA);
+    expect(sessions.resolveSessionId(pendingB)).toBe(adoptedB);
+  });
 });
 
 describe("torn manifest.json", () => {

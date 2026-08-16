@@ -81,7 +81,7 @@ describe("mapManifestStatus", () => {
   // Ground truth: glimmer-v2.py's manifest["status"] assignment sites.
   it.each([
     ["initialized", "preflight"],
-    ["repo-map-only", "preflight"],
+    ["repo-map-only", "cancelled"],
     ["verified", "verified"],
     ["no-change-verified", "verified"],
     ["no-change-unverified", "needs_review"],
@@ -90,7 +90,7 @@ describe("mapManifestStatus", () => {
     ["blocked-no-changes", "blocked"],
     ["failed-verifier-mutated-repo", "failed"],
     ["failed-repair-budget-exhausted", "failed"],
-    ["something-nobody-has-seen", "preflight"],
+    ["something-nobody-has-seen", "needs_review"],
   ])("maps %s -> %s", (raw, expected) => {
     expect(mapManifestStatus(raw)).toBe(expected);
   });
@@ -99,6 +99,20 @@ describe("mapManifestStatus", () => {
     const session = parseManifest({ ...REAL_MANIFEST, status: "blocked-timeout" }, "sid-blocked");
     expect(session.status).toBe("blocked");
     expect(session.completedAt).toBe(REAL_MANIFEST.updatedAt);
+  });
+
+  it("maps repo-map-only and unknown statuses to a status that is NOT in-flight, and sets completedAt", () => {
+    const IN_FLIGHT = new Set([
+      "preflight", "understanding", "discovery", "candidate_selection",
+      "implementing", "verifying", "repairing", "waiting_for_approval",
+    ]);
+    const repoMapOnly = parseManifest({ ...REAL_MANIFEST, status: "repo-map-only", attempts: [] }, "sid-repo-map-only");
+    expect(IN_FLIGHT.has(repoMapOnly.status)).toBe(false);
+    expect(repoMapOnly.completedAt).toBe(REAL_MANIFEST.updatedAt);
+
+    const unknown = parseManifest({ ...REAL_MANIFEST, status: "some-future-status", attempts: [] }, "sid-unknown");
+    expect(IN_FLIGHT.has(unknown.status)).toBe(false);
+    expect(unknown.completedAt).toBe(REAL_MANIFEST.updatedAt);
   });
 });
 

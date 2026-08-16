@@ -13,13 +13,18 @@ let stateRoot: string;
 
 const blockedId = "20260816-120000-glimmer-blocked";
 const verifiedId = "20260815-120000-glimmer-verified";
+const repoMapOnlyId = "20260816-130000-glimmer-repo-map-only";
 
 beforeAll(async () => {
   stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-routes-root-"));
   process.env.GLIMMER_STATE_ROOT = stateRoot;
   process.env.GLIMMER_MODEL_URL = "http://127.0.0.1:1"; // nothing listens here
 
-  for (const [id, status] of [[blockedId, "blocked-timeout"], [verifiedId, "verified"]] as const) {
+  for (const [id, status] of [
+    [blockedId, "blocked-timeout"],
+    [verifiedId, "verified"],
+    [repoMapOnlyId, "repo-map-only"],
+  ] as const) {
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
@@ -49,5 +54,14 @@ describe("GET /api/status", () => {
     expect(res.status).toBe(200);
     expect(res.body.recentSessions.map((s: { id: string }) => s.id)).toContain(blockedId);
     expect(res.body.activeSession).toBeNull();
+  });
+
+  it("never presents a repo-map-only session (terminal, finished immediately) as the live active session", async () => {
+    const res = await request(app).get("/api/status");
+    expect(res.status).toBe(200);
+    expect(res.body.recentSessions.map((s: { id: string }) => s.id)).toContain(repoMapOnlyId);
+    expect(res.body.activeSession).toBeNull();
+    const repoMapOnlySession = res.body.recentSessions.find((s: { id: string }) => s.id === repoMapOnlyId);
+    expect(repoMapOnlySession.status).not.toBe("preflight");
   });
 });

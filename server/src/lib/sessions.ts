@@ -14,11 +14,19 @@ const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
 // no-change-verified, no-change-unverified, verified, blocked-<reason>,
 // failed-verifier-mutated-repo, failed-repair-budget-exhausted.
 export function mapManifestStatus(raw: string): GlimmerSessionStatus {
+  if (raw === "initialized") return "preflight";
   if (raw === "verified" || raw === "no-change-verified") return "verified";
   if (raw === "no-change-unverified") return "needs_review";
   if (raw.startsWith("blocked-")) return "blocked";
   if (raw.startsWith("failed-")) return "failed";
-  return "preflight"; // initialized, repo-map-only, and any unknown status
+  // repo-map-only is TERMINAL (glimmer-v2.py writes it and exits immediately,
+  // no engineering work attempted) — must not map to an IN_FLIGHT_STATUSES
+  // member or the session shows as the live "Active session" forever.
+  if (raw === "repo-map-only") return "cancelled";
+  // Any status this map doesn't recognize: never default to in-flight — an
+  // unknown terminal status from a future orchestrator version would be
+  // misreported as live. Surface it for a human to look at instead.
+  return "needs_review";
 }
 
 function toChangedFiles(paths: string[] | undefined): ChangedFile[] {
@@ -140,11 +148,25 @@ export async function adoptRealSessionDir(
 ): Promise<string | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    for (const id of await listSessionIds()) {
-      if (before.has(id) || id.startsWith("pending-")) continue;
-      sessionAliases.set(pendingId, id);
-      return id;
+    const ids = await listSessionIds();
+    // Computed AFTER the await, synchronously with the filter below: JS
+    // callbacks run to completion, so this whole block is atomic relative to
+    // any other concurrent adoptRealSessionDir call's own claim-and-set —
+    // a claim made while we were awaiting listSessionIds() is visible here.
+    const claimed = new Set(sessionAliases.values());
+    const candidates = ids.filter(
+      (id) => !before.has(id) && !id.startsWith("pending-") && !claimed.has(id)
+    );
+    if (candidates.length === 1) {
+      sessionAliases.set(pendingId, candidates[0]);
+      return candidates[0];
     }
+    // 0 candidates: nothing new yet that isn't already claimed by another
+    // pending adoption — keep polling.
+    // >1 candidates: genuinely ambiguous this tick (e.g. two orchestrators
+    // started around the same time) — don't guess which is ours. Bail
+    // without aliasing; the next tick re-evaluates once the other adoption
+    // claims its directory.
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   return null;
