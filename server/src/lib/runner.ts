@@ -4,7 +4,7 @@ import path from "node:path";
 import type { TaskContract } from "@glimmer/shared";
 
 export function buildArgs(contract: TaskContract, workspace: string): string[] {
-  const args = [contract.objective, "--workspace", workspace];
+  const args = ["--workspace", workspace];
   args.push("--max-repairs", String(contract.repairBudget));
   if (contract.verification.length === 0) {
     args.push("--verification-level", "minimal");
@@ -14,6 +14,9 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
   }
   if (contract.maxTurns) args.push("--max-turns", String(contract.maxTurns));
   // Deliberately closed set: no --auto-approve, no flag path can request commit/push/deploy/install.
+  // "--" forces argparse to treat the objective as the positional `task`, never as a flag,
+  // even if a client submits an objective like "--auto-approve" or "--engineer=...".
+  args.push("--", contract.objective);
   return args;
 }
 

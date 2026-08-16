@@ -3,7 +3,10 @@ import request from "supertest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Express } from "express";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Isolate this file's sessionsDir from the real ~/.muse-glimmer state by
 // pointing GLIMMER_STATE_ROOT at a throwaway temp dir before importing
@@ -16,6 +19,9 @@ const sessionId = "diff-error-session";
 beforeAll(async () => {
   stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-state-root-"));
   process.env.GLIMMER_STATE_ROOT = stateRoot;
+  // Point the "real orchestrator" path at the fake fixture so run/replay tests
+  // never spawn python3 or the actual glimmer-v2.py.
+  process.env.GLIMMER_V2_PATH = path.join(__dirname, "..", "lib", "__fixtures__", "fake-glimmer-v2.mjs");
 
   const { createApp } = await import("../app");
   app = createApp();
@@ -73,5 +79,60 @@ describe("POST /api/sessions/:id/revert-file", () => {
       .post("/api/sessions/..%2F..%2Fevil/revert-file")
       .send({ path: "a.txt" });
     expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/sessions", () => {
+  it("rejects a taskContract missing verification/repairBudget instead of accepting it", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: { objective: "x" }, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+  });
+
+  it("accepts a well-formed taskContract", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({
+        taskContract: {
+          objective: "Fix a thing",
+          scope: { package: "frontend" },
+          mode: "implement",
+          constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+          verification: [],
+          repairBudget: 1,
+        },
+        workspace: "/tmp/ws",
+      });
+    expect(res.status).toBe(201);
+    expect(res.body).toHaveProperty("id");
+  });
+});
+
+describe("POST /api/sessions/:id/run replay protection", () => {
+  const validContract = {
+    objective: "Fix a thing",
+    scope: { package: "frontend" },
+    mode: "implement",
+    constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+    verification: [],
+    repairBudget: 1,
+  };
+
+  it("a second /run call for the same id does not spawn a second process", async () => {
+    const createRes = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: validContract, workspace: "/tmp/ws" });
+    const id = createRes.body.id as string;
+
+    const firstRun = await request(app).post(`/api/sessions/${id}/run`);
+    expect(firstRun.status).toBe(200);
+
+    // Called immediately, before the fake fixture's process has necessarily
+    // exited: activeRuns should still hold the first handle, so this must be
+    // rejected rather than spawning a second child process.
+    const secondRun = await request(app).post(`/api/sessions/${id}/run`);
+    expect([404, 409]).toContain(secondRun.status);
   });
 });

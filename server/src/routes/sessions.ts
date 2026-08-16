@@ -69,7 +69,14 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
 sessionsRouter.post("/sessions", async (req, res) => {
   const contract = req.body?.taskContract as TaskContract | undefined;
   const workspace = req.body?.workspace as string | undefined;
-  if (!contract || !workspace) return res.status(400).json({ error: "taskContract and workspace required" });
+  if (
+    !contract || typeof contract.objective !== "string" || !contract.objective ||
+    !Array.isArray(contract.verification) ||
+    typeof contract.repairBudget !== "number" ||
+    typeof workspace !== "string" || !workspace
+  ) {
+    return res.status(400).json({ error: "invalid taskContract or workspace" });
+  }
 
   const id = `pending-${randomUUID()}`;
   pendingContracts.set(id, { contract, workspace });
@@ -83,6 +90,7 @@ sessionsRouter.post("/sessions", async (req, res) => {
 
 sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
+  if (activeRuns.has(req.params.id)) return res.status(409).json({ error: "already running" });
   const pending = pendingContracts.get(req.params.id);
   if (!pending) return res.status(404).json({ error: "no pending task contract for this session id" });
 
@@ -94,10 +102,12 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
     activeRuns.delete(req.params.id);
   });
   activeRuns.set(req.params.id, handle);
+  pendingContracts.delete(req.params.id); // consumed: a second /run 404s instead of re-spawning
   res.json({ started: true, pid: handle.pid });
 });
 
 sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
+  if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
   const run = activeRuns.get(req.params.id);
   if (!run) return res.status(404).json({ error: "no active run for this session id" });
   run.cancel();

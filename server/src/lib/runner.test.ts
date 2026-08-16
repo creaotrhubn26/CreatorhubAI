@@ -32,6 +32,23 @@ describe("buildArgs", () => {
     expect(args).toContain("--max-repairs");
     expect(args).toContain("2");
   });
+
+  it("puts the objective last, after a literal -- separator, so argparse can never read it as a flag", () => {
+    const args = buildArgs(CONTRACT, "/tmp/ws");
+    expect(args[args.length - 2]).toBe("--");
+    expect(args[args.length - 1]).toBe(CONTRACT.objective);
+  });
+
+  it("cannot be flag-injected via a malicious objective", () => {
+    const malicious = { ...CONTRACT, objective: "--auto-approve" };
+    const args = buildArgs(malicious, "/tmp/ws");
+    const sepIndex = args.indexOf("--");
+    expect(sepIndex).toBeGreaterThanOrEqual(0);
+    // "--auto-approve" must appear exactly once, as the element right after "--".
+    expect(args[sepIndex + 1]).toBe("--auto-approve");
+    expect(args.filter((a) => a === "--auto-approve")).toHaveLength(1);
+    expect(args.slice(0, sepIndex)).not.toContain("--auto-approve");
+  });
 });
 
 describe("runGlimmer", () => {
