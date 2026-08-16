@@ -58,6 +58,40 @@ export function NewTaskScreen() {
       </fieldset>
 
       <fieldset>
+        <legend>Verification</legend>
+        <label>
+          <input
+            type="checkbox"
+            checked={form.verification.includes("frontend-typecheck")}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                verification: e.target.checked
+                  ? [...form.verification, "frontend-typecheck"]
+                  : form.verification.filter((v) => v !== "frontend-typecheck"),
+              })
+            }
+          />
+          Frontend typecheck
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={form.verification.includes("targeted-test")}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                verification: e.target.checked
+                  ? [...form.verification, "targeted-test"]
+                  : form.verification.filter((v) => v !== "targeted-test"),
+              })
+            }
+          />
+          Targeted test
+        </label>
+      </fieldset>
+
+      <fieldset>
         <legend>Repair budget</legend>
         <input
           type="range" min={0} max={5} value={form.repairBudget}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { NewTaskScreen } from "./NewTaskScreen";
@@ -37,5 +37,13 @@ describe("NewTaskScreen", () => {
   it("shows the RUN GLIMMER primary action", () => {
     render(withQuery(<NewTaskScreen />));
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
+  });
+
+  it("lets the user toggle a verification checkbox on", () => {
+    render(withQuery(<NewTaskScreen />));
+    const box = screen.getByLabelText("Frontend typecheck") as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+    expect(box.checked).toBe(true);
   });
 });
