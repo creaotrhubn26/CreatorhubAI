@@ -39,4 +39,13 @@ describe("glimmerApi", () => {
     );
     expect(result.likelyArea).toBe("frontend");
   });
+
+  it("getSessionAnalysis calls GET /api/sessions/:id/analysis", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ riskScore: "HIGH", scopeGuard: null }), { status: 200 })
+    );
+    const result = await glimmerApi.getSessionAnalysis("s1");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/analysis`, expect.anything());
+    expect(result.riskScore).toBe("HIGH");
+  });
 });

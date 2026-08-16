@@ -27,4 +27,25 @@ describe("ActiveSessionScreen", () => {
     await waitFor(() => expect(screen.getByText(/Changed files/)).toBeInTheDocument());
     expect(screen.getByText("1")).toBeInTheDocument();
   });
+
+  it("renders the risk/scope summary once analysis data loads", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [{ path: "a.ts", status: "modified" }],
+      verification: { overall: "PARTIAL", checks: [] }, repairsUsed: 0, repairBudget: 2,
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+    vi.spyOn(client.glimmerApi, "getSessionAnalysis").mockResolvedValue({ riskScore: "LOW", scopeGuard: null });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText("LOW")).toBeInTheDocument());
+  });
 });

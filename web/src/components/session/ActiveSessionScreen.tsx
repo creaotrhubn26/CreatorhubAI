@@ -5,6 +5,7 @@ import { useSessionEvents } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
 import { AgentStateStepper } from "./AgentStateStepper";
 import { AgentTimeline } from "./AgentTimeline";
+import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
@@ -13,6 +14,11 @@ export function ActiveSessionScreen() {
     queryFn: () => glimmerApi.getSession(id!),
     enabled: !!id,
     refetchInterval: 4000,
+  });
+  const { data: analysis } = useQuery({
+    queryKey: ["session-analysis", id],
+    queryFn: () => glimmerApi.getSessionAnalysis(id!),
+    enabled: !!id,
   });
   const events = useSessionEvents(id ?? "");
 
@@ -30,6 +36,7 @@ export function ActiveSessionScreen() {
         <dt>Repair budget</dt>
         <dd>{session.repairsUsed} / {session.repairBudget}</dd>
       </dl>
+      {analysis && <RiskAndScopeSummary analysis={analysis} />}
       <AgentTimeline events={events} />
     </div>
   );

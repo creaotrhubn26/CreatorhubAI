@@ -1,5 +1,5 @@
 import type {
-  DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence,
+  DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -19,6 +19,7 @@ export const glimmerApi = {
   listSessions: () => request<GlimmerSession[]>("/api/sessions"),
   getSession: (id: string) => request<GlimmerSession>(`/api/sessions/${id}`),
   getSessionDiff: (id: string) => request<{ diff: string }>(`/api/sessions/${id}/diff`),
+  getSessionAnalysis: (id: string) => request<SessionAnalysis>(`/api/sessions/${id}/analysis`),
   getRepositoryMap: () => request<RepoMap>("/api/repository/map"),
   listWorkspaces: () => request<WorkspaceInfo[]>("/api/workspaces"),
   createSession: (taskContract: TaskContract, workspace: string) =>
