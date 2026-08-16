@@ -1,5 +1,5 @@
-import { useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useParams, Link } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { useSessionEvents } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
@@ -10,6 +10,11 @@ import { SessionAssistant } from "./SessionAssistant";
 
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
+  const cancelMutation = useMutation({
+    mutationFn: () => glimmerApi.cancelSession(id!),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", id] }),
+  });
   const { data: session } = useQuery({
     queryKey: ["session", id],
     queryFn: () => glimmerApi.getSession(id!),
@@ -30,6 +35,11 @@ export function ActiveSessionScreen() {
   return (
     <div>
       <h1>{session.task}</h1>
+      <Link to={`/sessions/${id}/diff`}>View diff</Link>{" "}
+      <button onClick={() => cancelMutation.mutate()} disabled={cancelMutation.isPending}>
+        Cancel
+      </button>
+      {cancelMutation.isError && <div>Unavailable — could not cancel this session.</div>}
       <AgentStateStepper current={state} />
       <dl>
         <dt>Changed files</dt>
