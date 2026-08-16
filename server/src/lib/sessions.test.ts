@@ -1,5 +1,12 @@
-import { describe, it, expect } from "vitest";
-import { parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus } from "./sessions.js";
+import { describe, it, expect, afterAll } from "vitest";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import {
+  parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus,
+  writeGatewayContract, readGatewayContract,
+} from "./sessions.js";
+import { sessionsDir } from "../config.js";
+import type { TaskContract } from "@glimmer/shared";
 
 const REAL_MANIFEST = {
   version: "2.1",
@@ -139,5 +146,57 @@ describe("readManifestRaw / readSession path-traversal guard", () => {
   it("resolves an invalid session id to null instead of reading outside sessionsDir", async () => {
     expect(await readManifestRaw("../../evil")).toBeNull();
     expect(await readSession("../../evil")).toBeNull();
+  });
+});
+
+const REAL_CONTRACT: TaskContract = {
+  objective: "Fix dialog state restoration",
+  scope: { package: "frontend", area: "frontend/client/src/dialog" },
+  mode: "implement",
+  constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+  verification: ["frontend-typecheck"],
+  repairBudget: 2,
+};
+
+const GATEWAY_CONTRACT_TEST_DIRS = [
+  "20260817-000000-glimmer-test",
+  "20260817-000001-glimmer-nocontract",
+  "20260817-000002-glimmer-withcontract",
+];
+
+afterAll(async () => {
+  // ponytail: these tests write into the real sessionsDir() (no
+  // GLIMMER_STATE_ROOT override in this file) — clean up after ourselves so
+  // repeated runs don't litter ~/.muse-glimmer/sessions.
+  await Promise.all(
+    GATEWAY_CONTRACT_TEST_DIRS.map((id) => fs.rm(path.join(sessionsDir(), id), { recursive: true, force: true }))
+  );
+});
+
+describe("gateway contract persistence", () => {
+  it("round-trips a written contract", async () => {
+    const dir = path.join(sessionsDir(), "20260817-000000-glimmer-test");
+    await fs.mkdir(dir, { recursive: true });
+    await writeGatewayContract(dir, REAL_CONTRACT);
+    const read = await readGatewayContract("20260817-000000-glimmer-test");
+    expect(read).toEqual(REAL_CONTRACT);
+  });
+
+  it("returns null when no contract was ever written for a session", async () => {
+    const dir = path.join(sessionsDir(), "20260817-000001-glimmer-nocontract");
+    await fs.mkdir(dir, { recursive: true });
+    expect(await readGatewayContract("20260817-000001-glimmer-nocontract")).toBeNull();
+  });
+});
+
+describe("readSession populates taskContract", () => {
+  it("attaches the persisted contract to the returned GlimmerSession", async () => {
+    const id = "20260817-000002-glimmer-withcontract";
+    const dir = path.join(sessionsDir(), id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await writeGatewayContract(dir, REAL_CONTRACT);
+    const session = await readSession(id);
+    expect(session?.taskContract).toEqual(REAL_CONTRACT);
   });
 });

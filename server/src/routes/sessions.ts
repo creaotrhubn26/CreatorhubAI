@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { CONFIG, sessionsDir } from "../config.js";
 import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
-  resolveSessionId, adoptRealSessionDir,
+  resolveSessionId, adoptRealSessionDir, writeGatewayContract,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { parseLogToEvents } from "../lib/events.js";
@@ -108,6 +108,7 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
 
   const dir = path.join(sessionsDir(), req.params.id);
   await fs.mkdir(dir, { recursive: true });
+  await writeGatewayContract(dir, pending.contract);
 
   // Snapshot before spawning: glimmer-v2.py creates its own session directory
   // early in main(), and whichever directory appears next is this run's.

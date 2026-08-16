@@ -135,4 +135,15 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     const secondRun = await request(app).post(`/api/sessions/${id}/run`);
     expect([404, 409]).toContain(secondRun.status);
   });
+
+  it("POST /run persists the task contract so it survives pendingContracts being cleared", async () => {
+    const created = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: validContract, workspace: "/tmp/ws" });
+    const id = created.body.id;
+    await request(app).post(`/api/sessions/${id}/run`);
+    const contractPath = path.join(stateRoot, "sessions", id, "gateway-contract.json");
+    const written = JSON.parse(await fs.readFile(contractPath, "utf-8"));
+    expect(written).toEqual(validContract);
+  });
 });
