@@ -12,12 +12,24 @@ import { parseLogToEvents } from "../lib/events.js";
 import { runGlimmer, buildArgs } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
-import type { TaskContract, GlimmerSession, SessionAnalysis } from "@glimmer/shared";
+import { askSessionAssistant } from "../lib/sessionAssistant.js";
+import type { TaskContract, GlimmerSession, SessionAnalysis, GlimmerEvent } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
 
 const activeRuns = new Map<string, { cancel(): void }>();
 const pendingContracts = new Map<string, { contract: TaskContract; workspace: string }>();
+
+export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]> {
+  const logPath = path.join(sessionsDir(), resolveSessionId(id), "engineer-00.log");
+  try {
+    const text = await fs.readFile(logPath, "utf-8");
+    return parseLogToEvents(id, text);
+  } catch (err: any) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+}
 
 sessionsRouter.get("/sessions", async (_req, res) => {
   const ids = await listSessionIds();
@@ -72,11 +84,25 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
   }
 
   try {
-    const text = await fs.readFile(logPathNow(), "utf-8");
-    res.json(parseLogToEvents(req.params.id, text));
+    res.json(await readSessionEventsBatch(req.params.id));
   } catch (err: any) {
-    if (err.code === "ENOENT") return res.json([]);
     res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.post("/sessions/:id/ask", async (req, res) => {
+  const question = req.body?.question;
+  if (typeof question !== "string" || !question.trim()) {
+    return res.status(400).json({ error: "question is required" });
+  }
+  try {
+    const session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    const events = await readSessionEventsBatch(req.params.id);
+    const answer = await askSessionAssistant(CONFIG.modelBaseUrl, session, events, question);
+    res.json(answer);
+  } catch (err: any) {
+    res.status(502).json({ error: err.message });
   }
 });
 

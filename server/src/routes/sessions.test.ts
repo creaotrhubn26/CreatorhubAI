@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import request from "supertest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -186,5 +186,37 @@ describe("GET /api/sessions/:id/analysis", () => {
   it("returns 404 for an unknown session id instead of crashing", async () => {
     const res = await request(app).get("/api/sessions/does-not-exist/analysis");
     expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/sessions/:id/ask", () => {
+  it("returns 400 without a question", async () => {
+    const res = await request(app).post("/api/sessions/some-id/ask").send({});
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 404 for an unknown session", async () => {
+    const res = await request(app).post("/api/sessions/does-not-exist/ask").send({ question: "why?" });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 502, not a crash, when the model is unreachable", async () => {
+    const id = "20260817-000020-glimmer-ask-test";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+    }));
+    // Isolate this test's CONFIG.modelBaseUrl from the rest of the file:
+    // CONFIG is a module-level const read at import time, so mutating the env
+    // var alone would not affect the already-imported `app`. Reset the module
+    // registry and re-import app.js under the new env var, mirroring
+    // sessions.test.ts (lib)'s contractStateRoot isolation pattern.
+    process.env.GLIMMER_MODEL_URL = "http://127.0.0.1:1"; // nothing listens here
+    vi.resetModules();
+    const { createApp: createAppFresh } = await import("../app.js");
+    const appFresh = createAppFresh();
+    const res = await request(appFresh).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
+    expect(res.status).toBe(502);
   });
 });
