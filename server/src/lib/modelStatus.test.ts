@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
-import { probeModel } from "./modelStatus";
+import { probeModel } from "./modelStatus.js";
 
 let server: http.Server | undefined;
 afterEach(() => { server?.close(); server = undefined; });

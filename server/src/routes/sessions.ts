@@ -2,11 +2,14 @@ import { Router } from "express";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { CONFIG, sessionsDir } from "../config";
-import { listSessionIds, readSession, readManifestRaw, isValidSessionId } from "../lib/sessions";
-import { gitDiff, gitRevertFile } from "../lib/git";
-import { parseLogToEvents } from "../lib/events";
-import { runGlimmer, buildArgs } from "../lib/runner";
+import { CONFIG, sessionsDir } from "../config.js";
+import {
+  listSessionIds, readSession, readManifestRaw, isValidSessionId,
+  resolveSessionId, adoptRealSessionDir,
+} from "../lib/sessions.js";
+import { gitDiff, gitRevertFile } from "../lib/git.js";
+import { parseLogToEvents } from "../lib/events.js";
+import { runGlimmer, buildArgs } from "../lib/runner.js";
 import type { TaskContract, GlimmerSession } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
@@ -33,8 +36,9 @@ sessionsRouter.get("/sessions/:id/manifest", async (req, res) => {
 });
 
 sessionsRouter.get("/sessions/:id/events", async (req, res) => {
-  if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
-  const logPath = path.join(sessionsDir(), req.params.id, "engineer-00.log");
+  if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
+  const logPathNow = () =>
+    path.join(sessionsDir(), resolveSessionId(req.params.id), "engineer-00.log");
 
   if (req.query.stream === "1") {
     res.writeHead(200, {
@@ -43,8 +47,16 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
       Connection: "keep-alive",
     });
     let lastCount = 0;
+    let lastPath = logPathNow();
     const interval = setInterval(async () => {
       try {
+        // Re-resolve each tick: the pending -> real session alias can land
+        // mid-stream, at which point the real engineer transcript takes over.
+        const logPath = logPathNow();
+        if (logPath !== lastPath) {
+          lastPath = logPath;
+          lastCount = 0;
+        }
         const text = await fs.readFile(logPath, "utf-8");
         const events = parseLogToEvents(req.params.id, text);
         for (const evt of events.slice(lastCount)) {
@@ -58,7 +70,7 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
   }
 
   try {
-    const text = await fs.readFile(logPath, "utf-8");
+    const text = await fs.readFile(logPathNow(), "utf-8");
     res.json(parseLogToEvents(req.params.id, text));
   } catch (err: any) {
     if (err.code === "ENOENT") return res.json([]);
@@ -97,17 +109,22 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   const dir = path.join(sessionsDir(), req.params.id);
   await fs.mkdir(dir, { recursive: true });
 
+  // Snapshot before spawning: glimmer-v2.py creates its own session directory
+  // early in main(), and whichever directory appears next is this run's.
+  const before = new Set(await listSessionIds());
+
   const args = buildArgs(pending.contract, pending.workspace);
   const handle = runGlimmer(dir, CONFIG.glimmerV2Path, ["--engineer", CONFIG.engineerPath, ...args], () => {
     activeRuns.delete(req.params.id);
   });
+  void adoptRealSessionDir(req.params.id, before);
   activeRuns.set(req.params.id, handle);
   pendingContracts.delete(req.params.id); // consumed: a second /run 404s instead of re-spawning
   res.json({ started: true, pid: handle.pid });
 });
 
 sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
-  if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
+  if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
   const run = activeRuns.get(req.params.id);
   if (!run) return res.status(404).json({ error: "no active run for this session id" });
   run.cancel();

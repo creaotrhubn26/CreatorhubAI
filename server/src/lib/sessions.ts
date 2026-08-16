@@ -1,19 +1,25 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { sessionsDir } from "../config";
+import { sessionsDir } from "../config.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall,
 } from "@glimmer/shared";
 
-const MANIFEST_TO_SESSION_STATUS: Record<string, GlimmerSessionStatus> = {
-  initialized: "preflight",
-  "repo-map-only": "preflight",
-  verified: "verified",
-  failed: "failed",
-  "needs-review": "needs_review",
-  cancelled: "cancelled",
-};
+const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
+  "verified", "failed", "blocked", "needs_review", "cancelled",
+]);
+
+// glimmer-v2.py's real manifest["status"] values: initialized, repo-map-only,
+// no-change-verified, no-change-unverified, verified, blocked-<reason>,
+// failed-verifier-mutated-repo, failed-repair-budget-exhausted.
+export function mapManifestStatus(raw: string): GlimmerSessionStatus {
+  if (raw === "verified" || raw === "no-change-verified") return "verified";
+  if (raw === "no-change-unverified") return "needs_review";
+  if (raw.startsWith("blocked-")) return "blocked";
+  if (raw.startsWith("failed-")) return "failed";
+  return "preflight"; // initialized, repo-map-only, and any unknown status
+}
 
 function toChangedFiles(paths: string[] | undefined): ChangedFile[] {
   return (paths ?? []).map((p) => ({ path: p, status: "modified" as const }));
@@ -49,17 +55,18 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   const lastAttempt = attempts[attempts.length - 1];
   const checks: VerificationCheckResult[] = (lastAttempt?.verificationResults ?? []).map(toVerificationCheck);
   const verification: VerificationSummary = { overall: overallFromManifest(m), checks };
+  const status = mapManifestStatus(String(m.status ?? ""));
 
   return {
     id: sessionId,
     task: m.task,
-    status: MANIFEST_TO_SESSION_STATUS[m.status as string] ?? "preflight",
+    status,
     workspace: m.workspace,
     branch: m.branch,
     baselineSha: m.baseline,
     headSha: m.finalHead ?? lastAttempt?.diffHashAfterVerify,
     startedAt: undefined,
-    completedAt: m.status === "verified" || m.status === "failed" ? m.updatedAt : undefined,
+    completedAt: TERMINAL_STATUSES.has(status) ? m.updatedAt : undefined,
     changedFiles: toChangedFiles(m.finalChangedFiles ?? lastAttempt?.changedFiles),
     verification,
     repairsUsed: Math.max(0, attempts.length - 1),
@@ -87,18 +94,58 @@ export async function listSessionIds(): Promise<string[]> {
 }
 
 export async function readManifestRaw(id: string): Promise<unknown | null> {
-  if (!isValidSessionId(id)) return null; // reject path traversal as not-found, never resolve it
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) return null; // reject path traversal as not-found, never resolve it
   try {
-    const raw = await fs.readFile(path.join(sessionsDir(), id, "manifest.json"), "utf-8");
+    const raw = await fs.readFile(path.join(sessionsDir(), real, "manifest.json"), "utf-8");
     return JSON.parse(raw);
   } catch (err: any) {
-    if (err.code === "ENOENT") return null;
-    throw err;
+    // glimmer-v2.py rewrites manifest.json non-atomically, so a poll can read a
+    // torn file and JSON.parse throws a SyntaxError with no .code. Any failure
+    // here means "no readable manifest" — never let it escape into a route.
+    if (err?.code !== "ENOENT") {
+      console.warn(`[sessions] unreadable manifest for ${real}: ${err?.message ?? err}`);
+    }
+    return null;
   }
 }
 
 export async function readSession(id: string): Promise<GlimmerSession | null> {
-  const raw = await readManifestRaw(id);
+  const real = resolveSessionId(id);
+  const raw = await readManifestRaw(real);
   if (!raw) return null;
-  return parseManifest(raw, id);
+  return parseManifest(raw, real);
+}
+
+// --- pending-id -> real-session-id aliasing -------------------------------
+// The gateway creates `pending-<uuid>` and hands it to the client, but
+// glimmer-v2.py creates its OWN `<timestamp>-<branch>` session directory and
+// writes manifest.json there. Without an alias the client's id never resolves.
+const sessionAliases = new Map<string, string>();
+
+export function resolveSessionId(id: string): string {
+  return sessionAliases.get(id) ?? id;
+}
+
+/**
+ * Poll sessionsDir() for a directory that did not exist at spawn time and
+ * alias `pendingId` to it. Resolves to the real id, or null on timeout (which
+ * honestly means glimmer-v2.py never got as far as creating its session dir).
+ */
+export async function adoptRealSessionDir(
+  pendingId: string,
+  before: Set<string>,
+  timeoutMs = 10_000,
+  intervalMs = 250
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const id of await listSessionIds()) {
+      if (before.has(id) || id.startsWith("pending-")) continue;
+      sessionAliases.set(pendingId, id);
+      return id;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return null;
 }

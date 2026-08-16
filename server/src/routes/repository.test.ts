@@ -16,7 +16,7 @@ beforeAll(async () => {
   stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-state-root-"));
   process.env.GLIMMER_STATE_ROOT = stateRoot;
 
-  const { createApp } = await import("../app");
+  const { createApp } = await import("../app.js");
   app = createApp();
 
   const sessionPath = path.join(stateRoot, "sessions", sessionId);

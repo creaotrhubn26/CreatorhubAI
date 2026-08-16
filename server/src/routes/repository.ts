@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { sessionsDir } from "../config";
-import { listSessionIds, isValidSessionId } from "../lib/sessions";
+import { sessionsDir } from "../config.js";
+import { listSessionIds, isValidSessionId } from "../lib/sessions.js";
 import type { RepoMap } from "@glimmer/shared";
 
 export const repositoryRouter = Router();

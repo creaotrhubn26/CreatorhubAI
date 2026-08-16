@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { probeModel } from "../lib/modelStatus";
-import { CONFIG } from "../config";
+import { probeModel } from "../lib/modelStatus.js";
+import { CONFIG } from "../config.js";
 
 export const modelRouter = Router();
 

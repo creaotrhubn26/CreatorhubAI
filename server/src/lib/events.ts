@@ -10,6 +10,14 @@ const ATTEMPT_RE = /-attempt-(\d+)\.json$/;
 // prose; upgrade path is the same --json-events flag noted above.
 const RESULT_STOP_RE = /^(GLIMMER:?$|═{5,}$|┌─|└─|↻ |⚠ |LOCAL POST-FLIGHT$|git (status|diff))/;
 
+// Tool args are model-authored JSON: drop any key that could carry
+// chain-of-thought prose before the event reaches any consumer.
+const REASONING_KEY_RE = /thought|reason|rationale|analysis|plan/i;
+
+function stripReasoningKeys(args: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(args).filter(([k]) => !REASONING_KEY_RE.test(k)));
+}
+
 function summarize(text: string, maxLen = 200): string {
   const oneLine = text.trim().replace(/\s+/g, " ");
   return oneLine.length > maxLen ? oneLine.slice(0, maxLen) + "…" : oneLine;
@@ -58,7 +66,10 @@ export function parseLogToEvents(sessionId: string, logText: string): GlimmerEve
         j++;
       }
       let args: Record<string, unknown> = {};
-      try { args = JSON.parse(argLines.join("\n")); } catch { /* non-JSON args: leave empty */ }
+      try {
+        const parsed = JSON.parse(argLines.join("\n"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = stripReasoningKeys(parsed);
+      } catch { /* non-JSON args: leave empty */ }
       events.push({ id: nextId(), sessionId, timestamp: timestamp(), type: "tool_started", tool, args });
 
       if (RESULT_RE.test(lines[j])) {

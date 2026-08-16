@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseManifest, isValidSessionId, readManifestRaw, readSession } from "./sessions";
+import { parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus } from "./sessions.js";
 
 const REAL_MANIFEST = {
   version: "2.1",
@@ -74,6 +74,31 @@ describe("parseManifest", () => {
       "sid-3"
     );
     expect(session.verification.overall).toBe("FAILED");
+  });
+});
+
+describe("mapManifestStatus", () => {
+  // Ground truth: glimmer-v2.py's manifest["status"] assignment sites.
+  it.each([
+    ["initialized", "preflight"],
+    ["repo-map-only", "preflight"],
+    ["verified", "verified"],
+    ["no-change-verified", "verified"],
+    ["no-change-unverified", "needs_review"],
+    ["blocked-infra_blocked", "blocked"],
+    ["blocked-timeout", "blocked"],
+    ["blocked-no-changes", "blocked"],
+    ["failed-verifier-mutated-repo", "failed"],
+    ["failed-repair-budget-exhausted", "failed"],
+    ["something-nobody-has-seen", "preflight"],
+  ])("maps %s -> %s", (raw, expected) => {
+    expect(mapManifestStatus(raw)).toBe(expected);
+  });
+
+  it("carries the mapped status through parseManifest and marks blocked sessions complete", () => {
+    const session = parseManifest({ ...REAL_MANIFEST, status: "blocked-timeout" }, "sid-blocked");
+    expect(session.status).toBe("blocked");
+    expect(session.completedAt).toBe(REAL_MANIFEST.updatedAt);
   });
 });
 

@@ -1,11 +1,16 @@
 import type { GlimmerSessionStatus } from "@glimmer/shared";
 import { StatusBadge } from "../common/StatusBadge";
 
+// The in-flight flow only. Terminal states (verified/failed/blocked/
+// needs_review/cancelled) are not steps — they replace the stepper, so a
+// finished session never renders as if it were mid-flow.
 const STATES: GlimmerSessionStatus[] = [
-  "understanding", "discovery", "candidate_selection", "implementing", "verifying", "repairing", "verified",
+  "created", "preflight", "understanding", "discovery", "candidate_selection",
+  "implementing", "verifying", "repairing", "waiting_for_approval",
 ];
 
 export function AgentStateStepper({ current }: { current: GlimmerSessionStatus }) {
+  if (!STATES.includes(current)) return <StatusBadge status={current} />;
   return (
     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
       {STATES.map((s) => (

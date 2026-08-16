@@ -23,7 +23,7 @@ beforeAll(async () => {
   // never spawn python3 or the actual glimmer-v2.py.
   process.env.GLIMMER_V2_PATH = path.join(__dirname, "..", "lib", "__fixtures__", "fake-glimmer-v2.mjs");
 
-  const { createApp } = await import("../app");
+  const { createApp } = await import("../app.js");
   app = createApp();
 
   // A workspace directory that exists but is not a git repo — `git diff`

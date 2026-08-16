@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { listSessionIds, readSession } from "../lib/sessions";
-import { gitStatus } from "../lib/git";
+import { listSessionIds, readSession } from "../lib/sessions.js";
+import { gitStatus } from "../lib/git.js";
 import type { WorkspaceInfo } from "@glimmer/shared";
 
 export const workspacesRouter = Router();

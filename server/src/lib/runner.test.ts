@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { buildArgs, runGlimmer } from "./runner";
+import { buildArgs, runGlimmer } from "./runner.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -48,6 +48,25 @@ describe("buildArgs", () => {
     expect(args[sepIndex + 1]).toBe("--auto-approve");
     expect(args.filter((a) => a === "--auto-approve")).toHaveLength(1);
     expect(args.slice(0, sepIndex)).not.toContain("--auto-approve");
+  });
+
+  it("maps symbolic verification names to the real allowlisted commands", () => {
+    const args = buildArgs({ ...CONTRACT, verification: ["frontend-typecheck", "targeted-test"] }, "/tmp/ws");
+    expect(args).toContain("--verify");
+    expect(args).toContain("npm --prefix frontend run typecheck");
+    expect(args).toContain("npm --prefix frontend run test:unit");
+    expect(args.filter((a) => a === "--verify")).toHaveLength(2);
+  });
+
+  it("drops unrecognized verification values instead of forwarding them to shlex.split", () => {
+    const evil = "git push origin main";
+    const args = buildArgs({ ...CONTRACT, verification: [evil, "rm -rf /", "frontend-typecheck"] }, "/tmp/ws");
+    // glimmer-v2.py executes every --verify value verbatim: nothing outside the
+    // allowlist may appear anywhere in argv.
+    expect(args.some((a) => a.includes(evil))).toBe(false);
+    expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
+    expect(args.filter((a) => a === "--verify")).toHaveLength(1);
+    expect(args).toContain("npm --prefix frontend run typecheck");
   });
 });
 

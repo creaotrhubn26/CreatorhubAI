@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gitStatus, gitDiff, gitRevertFile } from "./git";
+import { gitStatus, gitDiff, gitRevertFile } from "./git.js";
 
 const exec = promisify(execFile);
 let repo: string;

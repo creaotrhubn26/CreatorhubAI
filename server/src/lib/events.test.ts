@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseLogToEvents } from "./events";
+import { parseLogToEvents } from "./events.js";
 
 const REAL_LOG = `[PEG DEBUG] payload: /Users/x/.muse-glimmer/debug/peg-payload-1-attempt-1.json
 
@@ -117,5 +117,36 @@ describe("parseLogToEvents (no PEG DEBUG lines — default, debug-off run)", () 
     expect(serialized).not.toContain("GLIMMER");
     expect(serialized).not.toContain("reasoning");
     expect(serialized).not.toContain("chain-of-thought");
+  });
+});
+
+describe("tool_started args are stripped of model-authored reasoning keys", () => {
+  const LOG = `→ TOOL: edit_file
+{
+  "path": "a.ts",
+  "rationale": "because the parser needs it",
+  "thought": "first I will…",
+  "reasoning": "…",
+  "analysis": "…",
+  "plan": "…",
+  "edits": 1
+}
+← RESULT:
+ok
+`;
+  const events = parseLogToEvents("sid-3", LOG);
+  const started = events.find((e) => e.type === "tool_started") as Extract<
+    ReturnType<typeof parseLogToEvents>[number], { type: "tool_started" }
+  >;
+
+  it("keeps legitimate operational args", () => {
+    expect(started.args).toEqual({ path: "a.ts", edits: 1 });
+  });
+
+  it("drops every chain-of-thought-shaped key before the event is constructed", () => {
+    const serialized = JSON.stringify(started);
+    for (const forbidden of ["rationale", "thought", "reasoning", "analysis", "plan", "because the parser"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
   });
 });
