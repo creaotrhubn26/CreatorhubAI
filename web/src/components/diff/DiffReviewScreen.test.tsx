@@ -41,4 +41,22 @@ describe("DiffReviewScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: /revert/i }));
     await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
   });
+
+  it("invalidates session-analysis on a successful revert, so a stale risk/scope score isn't left behind", async () => {
+    vi.spyOn(client.glimmerApi, "revertFile").mockResolvedValue({ reverted: "a.ts" });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateSpy = vi.spyOn(qc, "invalidateQueries");
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1/diff"]}>
+          <Routes><Route path="/sessions/:id/diff" element={<DiffReviewScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => screen.getByRole("button", { name: /revert/i }));
+    fireEvent.click(screen.getByRole("button", { name: /revert/i }));
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session-analysis", "s1"] })
+    );
+  });
 });

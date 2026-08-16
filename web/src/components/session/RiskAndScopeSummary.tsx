@@ -12,7 +12,9 @@ export function RiskAndScopeSummary({ analysis }: { analysis: SessionAnalysis })
   return (
     <fieldset>
       <legend>Risk &amp; Scope</legend>
-      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Live — computed from this session's actual changed files</p>
+      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        Live — computed from this session's actual changed files ({analysis.provenance})
+      </p>
       <dl>
         <dt>Risk level</dt>
         <dd>
@@ -30,6 +32,9 @@ export function RiskAndScopeSummary({ analysis }: { analysis: SessionAnalysis })
           </span>
         </dd>
       </dl>
+      {analysis.scopeGuard === null && (
+        <p>Scope guard: Unavailable — no task contract on record for this session.</p>
+      )}
       {analysis.scopeGuard && !analysis.scopeGuard.inScope && (
         <div style={{ border: "1px solid var(--red)", borderRadius: "var(--radius)", padding: 8, marginTop: 8 }}>
           <strong style={{ color: "var(--red)" }}>SCOPE EXPANSION</strong>

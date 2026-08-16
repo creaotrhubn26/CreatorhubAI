@@ -187,6 +187,67 @@ describe("GET /api/sessions/:id/analysis", () => {
     const res = await request(app).get("/api/sessions/does-not-exist/analysis");
     expect(res.status).toBe(404);
   });
+
+  it("scores against THIS session's own repo-map.json, not the newest session's", async () => {
+    const repoPackage = (dir: string) => ({
+      path: dir, dir, name: dir, scripts: {}, frameworks: [], engines: {}, workspaces: {},
+    });
+
+    // Older id, analyzed by this test — its own repo-map says its backend
+    // package lives at "backend-a", matching where its changed file lives.
+    const olderId = "20260817-000012-glimmer-own-repo-map-a";
+    const olderDir = path.join(stateRoot, "sessions", olderId);
+    await fs.mkdir(olderDir, { recursive: true });
+    await fs.writeFile(path.join(olderDir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+      finalChangedFiles: ["backend-a/file.ts"],
+    }));
+    await fs.writeFile(path.join(olderDir, "gateway-contract.json"), JSON.stringify({
+      objective: "x", scope: { package: "backend" }, mode: "implement",
+      constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+      verification: [], repairBudget: 0,
+    }));
+    await fs.writeFile(path.join(olderDir, "repo-map.json"), JSON.stringify({
+      generatedAt: "x", workspace: "/tmp/ws", branch: "main", head: "x", upstream: null,
+      packages: [repoPackage("backend-a")],
+    }));
+
+    // Newer id (lexicographically later => listSessionIds() sorts it first),
+    // with a DIFFERENT repo-map. Before the fix, findRepoMap() would return
+    // this one for both sessions.
+    const newerId = "20260817-000013-glimmer-own-repo-map-b";
+    const newerDir = path.join(stateRoot, "sessions", newerId);
+    await fs.mkdir(newerDir, { recursive: true });
+    await fs.writeFile(path.join(newerDir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+      finalChangedFiles: ["backend-b/file.ts"],
+    }));
+    await fs.writeFile(path.join(newerDir, "repo-map.json"), JSON.stringify({
+      generatedAt: "x", workspace: "/tmp/ws", branch: "main", head: "x", upstream: null,
+      packages: [repoPackage("backend-b")],
+    }));
+
+    const res = await request(app).get(`/api/sessions/${olderId}/analysis`);
+    expect(res.status).toBe(200);
+    // If this were scored against the newer session's repo-map (dir
+    // "backend-b"), expected would be ["backend-b"] and "backend-a/file.ts"
+    // would wrongly read as a scope expansion.
+    expect(res.body.scopeGuard.expected).toEqual(["backend-a"]);
+    expect(res.body.scopeGuard.inScope).toBe(true);
+  });
+
+  it("includes a provenance field on the response body", async () => {
+    const id = "20260817-000014-glimmer-provenance-test";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+    }));
+
+    const res = await request(app).get(`/api/sessions/${id}/analysis`);
+    expect(res.status).toBe(200);
+    expect(res.body.provenance).toBe("git-derived");
+  });
 });
 
 describe("POST /api/sessions/:id/ask", () => {
@@ -218,5 +279,21 @@ describe("POST /api/sessions/:id/ask", () => {
     const appFresh = createAppFresh();
     const res = await request(appFresh).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
     expect(res.status).toBe(502);
+  });
+
+  it("returns 500, not 502, when reading the session's own event log fails (a gateway fault, not the model's)", async () => {
+    const id = "20260817-000021-glimmer-ask-fs-fault";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+    }));
+    // A directory named engineer-00.log, not a file: fs.readFile on it fails
+    // with EISDIR before askSessionAssistant (and therefore the model) is
+    // ever reached — this must not be reported as "model unreachable" (502).
+    await fs.mkdir(path.join(dir, "engineer-00.log"));
+
+    const res = await request(app).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
+    expect(res.status).toBe(500);
   });
 });

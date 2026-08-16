@@ -12,7 +12,9 @@ export function TaskIntelligencePanel({ scopePackage, scopeArea }: { scopePackag
   return (
     <fieldset>
       <legend>Task Intelligence</legend>
-      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Deterministic — repository-derived, not a model guess</p>
+      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        Deterministic — repository-derived, not a model guess ({data.provenance})
+      </p>
       <dl>
         <dt>Likely area</dt>
         <dd>{data.likelyArea ?? "Unavailable"}</dd>

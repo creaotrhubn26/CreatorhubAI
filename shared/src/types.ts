@@ -252,6 +252,7 @@ export interface ScopeGuardResult {
 export interface SessionAnalysis {
   riskScore: RiskLevel;
   scopeGuard: ScopeGuardResult | null;
+  provenance: DataProvenance;
 }
 
 export interface SessionAssistantAnswer {

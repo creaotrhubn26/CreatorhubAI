@@ -13,7 +13,10 @@ export function ActiveSessionScreen() {
   const queryClient = useQueryClient();
   const cancelMutation = useMutation({
     mutationFn: () => glimmerApi.cancelSession(id!),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["session", id] });
+      queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
+    },
   });
   const { data: session } = useQuery({
     queryKey: ["session", id],
@@ -25,6 +28,7 @@ export function ActiveSessionScreen() {
     queryKey: ["session-analysis", id],
     queryFn: () => glimmerApi.getSessionAnalysis(id!),
     enabled: !!id,
+    refetchInterval: 4000,
   });
   const events = useSessionEvents(id ?? "");
 

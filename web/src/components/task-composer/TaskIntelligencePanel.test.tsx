@@ -29,4 +29,13 @@ describe("TaskIntelligencePanel", () => {
     render(withQuery(<TaskIntelligencePanel scopePackage="repository" scopeArea={undefined} />));
     await waitFor(() => expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0));
   });
+
+  it("reads the provenance field into the caption instead of a fully static string", async () => {
+    vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
+      likelyArea: "frontend", likelyPackage: "creatorhub-frontend",
+      suggestedVerification: ["frontend-typecheck"], estimatedRisk: null, provenance: "git-derived",
+    });
+    render(withQuery(<TaskIntelligencePanel scopePackage="frontend" scopeArea={undefined} />));
+    await waitFor(() => expect(screen.getByText(/git-derived/)).toBeInTheDocument());
+  });
 });

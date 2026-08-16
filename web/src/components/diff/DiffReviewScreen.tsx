@@ -12,6 +12,7 @@ export function DiffReviewScreen() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["session", id] });
       queryClient.invalidateQueries({ queryKey: ["diff", id] });
+      queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
     },
   });
 
