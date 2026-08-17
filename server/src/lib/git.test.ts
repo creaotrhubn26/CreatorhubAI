@@ -39,6 +39,28 @@ describe("gitDiff", () => {
   });
 });
 
+describe("gitDiff with an untracked (new) file", () => {
+  it("renders the new file's content as an addition-only patch, not empty output", async () => {
+    await fs.writeFile(path.join(repo, "new-file.txt"), "brand new content\nsecond line\n");
+
+    const diff = await gitDiff(repo, ["new-file.txt"]);
+
+    expect(diff).toContain("new-file.txt");
+    expect(diff).toContain("+brand new content");
+    expect(diff).toContain("+second line");
+  });
+
+  it("still diffs a modified tracked path normally when mixed with an untracked one", async () => {
+    await fs.writeFile(path.join(repo, "mixed-new.txt"), "untracked content\n");
+
+    const diff = await gitDiff(repo, ["a.txt", "mixed-new.txt"]);
+
+    expect(diff).toContain("-one"); // a.txt tracked modification (set up in beforeAll)
+    expect(diff).toContain("+two");
+    expect(diff).toContain("+untracked content");
+  });
+});
+
 describe("gitRevertFile", () => {
   it("restores an allowed file", async () => {
     await gitRevertFile(repo, ["a.txt"], "a.txt");

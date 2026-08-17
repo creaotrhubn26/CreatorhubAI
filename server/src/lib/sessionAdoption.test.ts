@@ -90,6 +90,43 @@ describe("pending -> real session adoption", () => {
     expect(sessions.resolveSessionId(pendingA)).toBe(adoptedA);
     expect(sessions.resolveSessionId(pendingB)).toBe(adoptedB);
   });
+
+  it("F2: resolves both pending ids by spawn order when both real directories appear before either poll runs", async () => {
+    // This is the exact deadlock scenario: two real session directories are
+    // already on disk before EITHER polling loop has run its first tick, so
+    // both loops see 2 unclaimed candidates on every tick. Pre-fix, neither
+    // side ever saw exactly 1 candidate, so both pending ids timed out
+    // unaliased even though both real sessions had genuinely started.
+    const pendingA = "pending-f2-order-aaaa";
+    const pendingB = "pending-f2-order-bbbb";
+    await fs.mkdir(path.join(stateRoot, "sessions", pendingA), { recursive: true });
+    await fs.mkdir(path.join(stateRoot, "sessions", pendingB), { recursive: true });
+    const before = new Set(await sessions.listSessionIds());
+
+    const realEarly = "20260817-100001-glimmer-f2-early";
+    const realLate = "20260817-100002-glimmer-f2-late";
+
+    // Both directories land on disk before either adoptRealSessionDir call
+    // below even starts polling.
+    await fs.mkdir(path.join(stateRoot, "sessions", realEarly), { recursive: true });
+    await new Promise((r) => setTimeout(r, 50)); // determinable birthtime gap
+    await fs.mkdir(path.join(stateRoot, "sessions", realLate), { recursive: true });
+
+    // pendingA is spawned (queued) strictly before pendingB, matching the
+    // order glimmer's /run route calls adoptRealSessionDir for back-to-back
+    // session creations.
+    const adoptionA = sessions.adoptRealSessionDir(pendingA, before, 3000, 20);
+    const adoptionB = sessions.adoptRealSessionDir(pendingB, before, 3000, 20);
+
+    const [adoptedA, adoptedB] = await Promise.all([adoptionA, adoptionB]);
+
+    // Both resolve (no deadlock) and the earliest-spawned pending id gets
+    // the earliest-created directory.
+    expect(adoptedA).toBe(realEarly);
+    expect(adoptedB).toBe(realLate);
+    expect(sessions.resolveSessionId(pendingA)).toBe(realEarly);
+    expect(sessions.resolveSessionId(pendingB)).toBe(realLate);
+  });
 });
 
 describe("torn manifest.json", () => {
