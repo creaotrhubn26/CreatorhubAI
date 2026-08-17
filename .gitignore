@@ -1,0 +1,16 @@
+# Vendored / built
+llama.cpp/
+Muse-Glimmer-30B-GGUF/
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets
+config/api-key.txt
+
+# Evolution backups (kept on disk, not versioned — git history replaces this going forward)
+backups/
+*.bak-*
+
+# Already its own independent git repo (github.com/creaotrhubn26/CreatorhubAI) — do not nest
+control-center/

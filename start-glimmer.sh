@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$HOME/AI/muse-glimmer"
+BIN="$ROOT/llama.cpp/build/bin/llama-server"
+
+MODEL="$ROOT/Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf"
+MMPROJ="$ROOT/Muse-Glimmer-30B-GGUF/mmproj-Muse-Glimmer-30B-Q4_K_M.gguf"
+DFLASH="$ROOT/Muse-Glimmer-30B-GGUF/dflash-Muse-Glimmer-30B-Q4_K_M.gguf"
+
+API_KEY_FILE="$ROOT/config/api-key.txt"
+
+PORT="${GLIMMER_PORT:-8080}"
+CTX="${GLIMMER_CTX:-65536}"
+
+if lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "Port $PORT er allerede i bruk."
+    echo "Kjør: $ROOT/stop-glimmer.sh"
+    exit 1
+fi
+
+echo "Starting Muse Glimmer 30B"
+echo "Context: $CTX"
+echo "Port:    $PORT"
+echo "Mode:    standard"
+echo
+
+exec "$BIN" \
+  -m "$MODEL" \
+  --mmproj "$MMPROJ" \
+  -ngl all \
+  -c "$CTX" \
+  -np 1 \
+  --jinja \
+  -fa on \
+  --spec-type draft-dflash \
+  -md "$DFLASH" \
+  -ngld all \
+  --spec-draft-n-max 3 \
+  --host 127.0.0.1 \
+  --port "$PORT" \
+  --cors-origins localhost \
+  --api-key-file "$API_KEY_FILE" \
+  -a muse-glimmer \
+  --reasoning-format deepseek \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 64

@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import urllib.error
+import urllib.request
+
+ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
+STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
+NODE_OPTIONS_DEFAULT = "--max-old-space-size=12288"
+READINESS_URL_DEFAULT = os.environ.get("GLIMMER_TOOLS_URL", "http://127.0.0.1:8080/tools")
+
+IGNORE_DIRS = {
+    ".git", "node_modules", ".next", ".turbo", ".cache", "coverage",
+    "dist", "build", "out", ".output", ".venv", "venv", "__pycache__",
+}
+
+SCRIPT_GROUPS = {
+    "typecheck": ("typecheck", "type-check", "check:types", "check-types", "tsc"),
+    "lint": ("lint", "eslint"),
+    "test": ("test:ci", "test", "vitest"),
+    "build": ("build", "build:ci"),
+}
+
+FRAMEWORK_DEPS = {
+    "react": "React", "vite": "Vite", "next": "Next.js",
+    "express": "Express", "fastify": "Fastify", "@nestjs/core": "NestJS",
+    "hono": "Hono", "drizzle-orm": "Drizzle ORM", "prisma": "Prisma",
+    "@prisma/client": "Prisma", "pg": "PostgreSQL client",
+    "postgres": "Postgres.js", "vitest": "Vitest", "jest": "Jest",
+    "@playwright/test": "Playwright", "cypress": "Cypress",
+    "typescript": "TypeScript",
+}
+
+CONFIG_NAMES = {
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml", "netlify.toml",
+    "vercel.json", "render.yaml", "render.yml", "drizzle.config.ts",
+    "drizzle.config.js", "vite.config.ts", "vite.config.js", "vitest.config.ts",
+    "vitest.config.js", "playwright.config.ts", "playwright.config.js",
+    "eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "tsconfig.json",
+    "turbo.json", "nx.json",
+}
+
+PASS_STATUSES = {"PASS", "PASS_BASELINE"}
+
+
+class V2Error(RuntimeError):
+    pass
+
+
+class V2Interrupted(RuntimeError):
+    pass
+
+
+def run(argv, cwd, *, check=True, timeout=None, env=None):
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    try:
+        p = subprocess.run(argv, cwd=str(cwd), text=True, capture_output=True,
+                           timeout=timeout, env=merged)
+    except FileNotFoundError as exc:
+        if check:
+            raise V2Error(f"Executable not found: {argv[0]}") from exc
+        return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: command not found\n")
+    if check and p.returncode != 0:
+        out = (p.stdout or "") + (p.stderr or "")
+        raise V2Error(f"Command failed ({p.returncode}): {shlex.join(argv)}\n{out[-8000:]}")
+    return p
+
+
+def git(ws, *args, check=True):
+    return (run(["git", *args], ws, check=check).stdout or "").strip()
+
+
+def lines(text):
+    return [x for x in text.splitlines() if x.strip()]
+
+
+def status(ws):
+    return lines(git(ws, "status", "--porcelain=v1", "--untracked-files=all"))
+
+
+def branch(ws):
+    return git(ws, "branch", "--show-current")
+
+
+def head(ws):
+    return git(ws, "rev-parse", "HEAD")
+
+
+def upstream(ws):
+    p = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], ws, check=False)
+    return (p.stdout or "").strip() if p.returncode == 0 else None
+
+
+def commit_subject(ws, rev="HEAD"):
+    return git(ws, "show", "-s", "--format=%s", rev)
+
+
+def changed_files(ws, baseline):
+    tracked = lines(git(ws, "diff", "--name-only", baseline, "--"))
+    untracked = lines(git(ws, "ls-files", "--others", "--exclude-standard"))
+    return sorted(set(tracked + untracked))
+
+
+def diff_hash(ws, baseline):
+    h = hashlib.sha256()
+    h.update((run(["git", "diff", "--binary", baseline, "--"], ws).stdout or "").encode())
+    for rel in lines(git(ws, "ls-files", "--others", "--exclude-standard")):
+        h.update(rel.encode() + b"\0")
+        p = ws / rel
+        try:
+            h.update(p.read_bytes())
+        except OSError:
+            pass
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def walk_files(ws, max_depth=5):
+    base_depth = len(ws.parts)
+    for current, dirs, files in os.walk(ws):
+        cp = Path(current)
+        depth = len(cp.parts) - base_depth
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        if depth >= max_depth:
+            dirs[:] = []
+        for name in files:
+            yield cp / name
+
+
+def safe_json(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def build_repo_map(ws):
+    packages, configs, workflows, locks = [], [], [], []
+    for path in walk_files(ws):
+        rel = path.relative_to(ws).as_posix()
+        if path.name == "package.json":
+            data = safe_json(path)
+            if data:
+                deps = set()
+                for key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                    value = data.get(key)
+                    if isinstance(value, dict):
+                        deps.update(value.keys())
+                scripts = data.get("scripts") if isinstance(data.get("scripts"), dict) else {}
+                parent = Path(rel).parent.as_posix()
+                packages.append({
+                    "path": rel,
+                    "dir": "." if parent == "." else parent,
+                    "name": data.get("name"),
+                    "scripts": scripts,
+                    "frameworks": sorted({label for dep, label in FRAMEWORK_DEPS.items() if dep in deps}),
+                    "engines": data.get("engines"),
+                    "workspaces": data.get("workspaces"),
+                })
+        if path.name in CONFIG_NAMES:
+            configs.append(rel)
+        if rel.startswith(".github/workflows/") and path.suffix in {".yml", ".yaml"}:
+            workflows.append(rel)
+        if path.name in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"}:
+            locks.append(rel)
+    return {
+        "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "workspace": str(ws), "branch": branch(ws), "head": head(ws),
+        "upstream": upstream(ws),
+        "packages": sorted(packages, key=lambda x: x["path"]),
+        "configs": sorted(set(configs)),
+        "workflows": sorted(set(workflows)),
+        "lockfiles": sorted(set(locks)),
+    }
+
+
+def repo_summary(m):
+    out = [f"branch={m['branch']}", f"head={m['head']}", f"upstream={m['upstream'] or 'none'}", "", "PACKAGES:"]
+    for p in m["packages"]:
+        useful = []
+        scripts = p.get("scripts") or {}
+        for group in SCRIPT_GROUPS.values():
+            useful.extend(name for name in group if name in scripts)
+        out.append(
+            f"- {p['path']} name={p.get('name')} frameworks={','.join(p['frameworks']) or 'none'} "
+            f"validation_scripts={','.join(dict.fromkeys(useful)) or 'none'}"
+        )
+    out += ["", "CONFIGS:"] + [f"- {x}" for x in m["configs"][:80]]
+    out += ["", "WORKFLOWS:"] + [f"- {x}" for x in m["workflows"][:80]]
+    out += ["", "LOCKFILES:"] + [f"- {x}" for x in m["lockfiles"][:40]]
+    return "\n".join(out)[:12000]
+
+
+def best_package(m, rel):
+    best = None
+    for pkg in m["packages"]:
+        d = pkg["dir"]
+        if d == "." or rel == d or rel.startswith(d.rstrip("/") + "/"):
+            score = len(d)
+            if best is None or score > best[0]:
+                best = (score, pkg)
+    return best[1] if best else None
+
+
+def choose_script(pkg, group):
+    scripts = pkg.get("scripts") or {}
+    for name in SCRIPT_GROUPS[group]:
+        if name in scripts:
+            return name
+    return None
+
+
+def npm_cmd(pkg, script):
+    return ["npm", "run", script] if pkg["dir"] == "." else ["npm", "--prefix", pkg["dir"], "run", script]
+
+
+def verifier_commands(m, files, level):
+    commands = [["git", "diff", "--check"]]
+    affected = {}
+    for f in files:
+        pkg = best_package(m, f)
+        if pkg:
+            affected[pkg["path"]] = pkg
+    for pkg in affected.values():
+        tc = choose_script(pkg, "typecheck")
+        lint = choose_script(pkg, "lint")
+        test = choose_script(pkg, "test")
+        build = choose_script(pkg, "build")
+        if tc:
+            commands.append(npm_cmd(pkg, tc))
+        if level in {"standard", "full"} and lint:
+            commands.append(npm_cmd(pkg, lint))
+        if level == "full" and test:
+            commands.append(npm_cmd(pkg, test))
+        if level == "full" and build:
+            commands.append(npm_cmd(pkg, build))
+    result, seen = [], set()
+    for c in commands:
+        key = tuple(c)
+        if key not in seen:
+            seen.add(key)
+            result.append(c)
+    return result
+
+
+def common_repo_root(ws):
+    raw = git(ws, "rev-parse", "--git-common-dir")
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (ws / p).resolve()
+    else:
+        p = p.resolve()
+    return p.parent if p.name == ".git" else p.parent
+
+
+def is_ignored(ws, rel):
+    p = run(["git", "check-ignore", "-q", "--", rel], ws, check=False)
+    return p.returncode == 0
+
+
+def prepare_toolchain_bridges(ws, repo_map):
+    source_root = common_repo_root(ws)
+    created = []
+    if source_root.resolve() == ws.resolve():
+        return source_root, created
+
+    candidates = [(Path("node_modules"), source_root / "node_modules")]
+    for pkg in repo_map.get("packages", []):
+        d = pkg.get("dir")
+        if d and d != ".":
+            rel = Path(d) / "node_modules"
+            candidates.append((rel, source_root / rel))
+
+    for rel, src in candidates:
+        dst = ws / rel
+        if os.path.lexists(dst):
+            continue
+        if not src.is_dir():
+            continue
+        rel_text = rel.as_posix()
+        if not is_ignored(ws, rel_text):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(src, dst, target_is_directory=True)
+        created.append({"path": str(dst), "source": str(src)})
+    return source_root, created
+
+
+def cleanup_toolchain_bridges(created):
+    for item in reversed(created):
+        p = Path(item["path"])
+        try:
+            if p.is_symlink() and str(p.resolve()) == str(Path(item["source"]).resolve()):
+                p.unlink()
+        except OSError:
+            pass
+
+
+def verifier_env(ws, repo_map, source_root, toolchain_mode="path"):
+    env = {"NODE_OPTIONS": os.environ.get("NODE_OPTIONS", NODE_OPTIONS_DEFAULT)}
+    bins = []
+    modules = []
+    roots = [ws]
+    if toolchain_mode != "none" and source_root.resolve() != ws.resolve():
+        roots.append(source_root)
+    for root in roots:
+        nm = root / "node_modules"
+        if nm.is_dir():
+            modules.append(str(nm))
+            b = nm / ".bin"
+            if b.is_dir():
+                bins.append(str(b))
+        for pkg in repo_map.get("packages", []):
+            d = pkg.get("dir")
+            if not d or d == ".":
+                continue
+            pnm = root / d / "node_modules"
+            if pnm.is_dir():
+                modules.append(str(pnm))
+                b = pnm / ".bin"
+                if b.is_dir():
+                    bins.append(str(b))
+    current_path = os.environ.get("PATH", "")
+    if bins:
+        env["PATH"] = os.pathsep.join(dict.fromkeys(bins)) + os.pathsep + current_path
+    if modules:
+        prior = os.environ.get("NODE_PATH", "")
+        env["NODE_PATH"] = os.pathsep.join(dict.fromkeys(modules + ([prior] if prior else [])))
+    return env
+
+
+def readiness_probe(url, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    print(f"[V2 preflight] Model readiness: {url}")
+    while True:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                code = getattr(resp, "status", 200)
+                if 200 <= code < 300:
+                    print("[V2 preflight] Model: READY")
+                    return {"status": "READY", "httpStatus": code}
+                last = f"HTTP {code}"
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                print(f"[V2 preflight] Model endpoint reachable (HTTP {exc.code}); auth delegated to engineer")
+                return {"status": "REACHABLE_AUTH", "httpStatus": exc.code}
+            last = f"HTTP {exc.code}"
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        if time.monotonic() >= deadline:
+            raise V2Error(f"Model readiness failed after {timeout_seconds}s: {last}")
+        time.sleep(2)
+
+
+def classify_raw_result(returncode, output, timed_out=False):
+    if timed_out:
+        return "TIMEOUT"
+    if returncode == 0:
+        return "PASS"
+    low = output.lower()
+    infra_markers = (
+        "command not found", "executable not found", "no such file or directory",
+        "npm err! enoent", "could not determine executable to run",
+    )
+    if returncode == 127 or any(x in low for x in infra_markers):
+        return "INFRA_BLOCKED"
+    return "CODE_FAIL"
+
+
+def normalize_output(text, workspace=None):
+    text = text.replace("\r\n", "\n")
+    if workspace:
+        text = text.replace(str(workspace), "<WS>")
+    text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds)\b", "<TIME>", text, flags=re.I)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b", "<TIMESTAMP>", text)
+    return "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
+
+
+def error_signatures(text, workspace=None):
+    norm = normalize_output(text, workspace)
+    sigs = set()
+    for raw in norm.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        interesting = (
+            "error ts" in low or re.search(r"\berror\b", low) or
+            low.startswith("fail ") or low.startswith("failed ") or
+            "assertionerror" in low or "typeerror" in low
+        )
+        if not interesting:
+            continue
+        line = re.sub(r":\d+:\d+", ":<LOC>", line)
+        line = re.sub(r"\(\d+,\d+\)", "(<LOC>)", line)
+        line = re.sub(r"\s+", " ", line)
+        sigs.add(line)
+    return sigs
+
+
+def run_verifier_command(ws, cmd, timeout, env):
+    label = shlex.join(cmd)
+    started = time.monotonic()
+    try:
+        p = run(cmd, ws, check=False, timeout=timeout, env=env)
+        output = ((p.stdout or "") + (p.stderr or ""))[-24000:]
+        status_name = classify_raw_result(p.returncode, output)
+        low = output.lower()
+        if (status_name == "CODE_FAIL" and not (ws / "node_modules").exists() and
+                ("cannot find module" in low or "error ts2307" in low or "module_not_found" in low)):
+            status_name = "INFRA_BLOCKED"
+        return {
+            "command": label,
+            "returncode": p.returncode,
+            "status": status_name,
+            "ok": status_name == "PASS",
+            "elapsedSeconds": round(time.monotonic() - started, 2),
+            "outputTail": output,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "command": label, "returncode": None, "status": "TIMEOUT", "ok": False,
+            "timeout": True, "elapsedSeconds": round(time.monotonic() - started, 2),
+            "outputTail": "",
+        }
+
+
+def baseline_accepts(current, baseline, current_ws, baseline_ws):
+    if current["status"] != "CODE_FAIL":
+        return False, set(), set()
+    if baseline["status"] in {"INFRA_BLOCKED", "TIMEOUT"}:
+        return False, set(), set()
+    if baseline["status"] == "PASS":
+        return False, set(), set()
+    cur_sigs = error_signatures(current.get("outputTail", ""), current_ws)
+    base_sigs = error_signatures(baseline.get("outputTail", ""), baseline_ws)
+    if cur_sigs and base_sigs and cur_sigs.issubset(base_sigs):
+        return True, cur_sigs, base_sigs
+    cur_norm = normalize_output(current.get("outputTail", ""), current_ws)
+    base_norm = normalize_output(baseline.get("outputTail", ""), baseline_ws)
+    if cur_norm and cur_norm == base_norm:
+        return True, cur_sigs, base_sigs
+    return False, cur_sigs, base_sigs
+
+
+def add_baseline_worktree(ws, baseline, session):
+    target = session / "baseline-worktree"
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    run(["git", "worktree", "add", "--detach", str(target), baseline], ws)
+    return target
+
+
+def remove_baseline_worktree(ws, target):
+    if not target:
+        return
+    run(["git", "worktree", "remove", "--force", str(target)], ws, check=False)
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def verify(ws, commands, timeout, session, iteration, repo_map, source_root, baseline, toolchain_mode="path"):
+    current_bridges = []
+    if toolchain_mode == "linked":
+        _, current_bridges = prepare_toolchain_bridges(ws, repo_map)
+    env = verifier_env(ws, repo_map, source_root, toolchain_mode)
+    results = []
+    baseline_ws = None
+    baseline_bridges = []
+    baseline_env = None
+    try:
+        for i, cmd in enumerate(commands, 1):
+            label = shlex.join(cmd)
+            print(f"\n[V2 verify {iteration}.{i}] {label}")
+            result = run_verifier_command(ws, cmd, timeout, env)
+
+            if result["status"] == "CODE_FAIL":
+                if baseline_ws is None:
+                    baseline_ws = add_baseline_worktree(ws, baseline, session)
+                    baseline_map = build_repo_map(baseline_ws)
+                    baseline_source = common_repo_root(baseline_ws)
+                    if toolchain_mode == "linked":
+                        _, baseline_bridges = prepare_toolchain_bridges(baseline_ws, baseline_map)
+                    baseline_env = verifier_env(baseline_ws, baseline_map, baseline_source, toolchain_mode)
+                baseline_result = run_verifier_command(baseline_ws, cmd, timeout, baseline_env)
+                accepted, cur_sigs, base_sigs = baseline_accepts(result, baseline_result, ws, baseline_ws)
+                result["baseline"] = {
+                    "returncode": baseline_result.get("returncode"),
+                    "status": baseline_result.get("status"),
+                    "outputTail": baseline_result.get("outputTail", "")[-16000:],
+                }
+                if accepted:
+                    result["status"] = "PASS_BASELINE"
+                    result["ok"] = True
+                    result["baselineAccepted"] = True
+                    result["currentErrorSignatures"] = sorted(cur_sigs)
+                    result["baselineErrorSignatures"] = sorted(base_sigs)
+                    result["newErrorSignatures"] = []
+                else:
+                    result["newErrorSignatures"] = sorted(cur_sigs - base_sigs) if cur_sigs else []
+
+            results.append(result)
+            (session / f"verify-{iteration:02d}-{i:02d}.json").write_text(
+                json.dumps(result, indent=2), encoding="utf-8"
+            )
+            if result["status"] == "PASS":
+                print("PASS")
+            elif result["status"] == "PASS_BASELINE":
+                print("PASS (baseline-aware: no new failures)")
+            else:
+                print(result["status"])
+
+            if not result.get("ok"):
+                if result.get("outputTail"):
+                    print(result["outputTail"][-5000:])
+                return False, results
+        return True, results
+    finally:
+        cleanup_toolchain_bridges(current_bridges)
+        cleanup_toolchain_bridges(baseline_bridges)
+        remove_baseline_worktree(ws, baseline_ws)
+
+
+def failure_text(results):
+    for r in results:
+        if not r.get("ok"):
+            extra = ""
+            if r.get("newErrorSignatures"):
+                extra = "\nNew error signatures:\n" + "\n".join(r["newErrorSignatures"][:50])
+            return (
+                f"Command: {r['command']}\nStatus: {r.get('status')}\n"
+                f"Return code: {r.get('returncode')}\nTimeout: {r.get('timeout', False)}\n"
+                f"Output:\n{r.get('outputTail', '')[-12000:]}{extra}"
+            )
+    return "Unknown verification failure"
+
+
+def checkpoint(ws, n):
+    run(["git", "add", "-A"], ws)
+    p = run([
+        "git", "-c", "user.name=Muse Glimmer v2.1", "-c", "user.email=glimmer-v2@localhost",
+        "commit", "--no-gpg-sign", "-m", f"glimmer-v2 checkpoint {n}"
+    ], ws, check=False)
+    if p.returncode != 0:
+        raise V2Error(((p.stdout or "") + (p.stderr or ""))[-8000:])
+    return head(ws)
+
+
+def collapse(ws, baseline):
+    if head(ws) != baseline:
+        run(["git", "reset", "--mixed", baseline], ws)
+
+
+def recover_interrupted_checkpoint(ws):
+    if not commit_subject(ws).startswith("glimmer-v2 checkpoint "):
+        return None
+    if status(ws):
+        raise V2Error("Interrupted Glimmer checkpoint detected, but worktree is dirty; refusing automatic recovery")
+    checkpoint_head = head(ws)
+    candidate = checkpoint_head
+    depth = 0
+    while commit_subject(ws, candidate).startswith("glimmer-v2 checkpoint "):
+        parent = git(ws, "rev-parse", f"{candidate}^")
+        candidate = parent
+        depth += 1
+        if depth > 10:
+            raise V2Error("Checkpoint recovery exceeded 10 ancestors; refusing")
+    run(["git", "reset", "--mixed", candidate], ws)
+    return {
+        "checkpointHead": checkpoint_head,
+        "recoveredBaseline": candidate,
+        "preservedChangedFiles": changed_files(ws, candidate),
+    }
+
+
+def make_prompt(task, summary, iteration, failure=None, checkpoint_sha=None):
+    repair = ""
+    if iteration:
+        repair = f"""
+AUTHORITATIVE V2 VERIFICATION FAILURE:
+{failure}
+
+PREVIOUS LOCAL-ONLY CHECKPOINT:
+{checkpoint_sha}
+
+Repair only failures introduced by this task. Preserve correct prior work and pre-existing baseline failures.
+"""
+    return textwrap.dedent(f"""
+    MUSE GLIMMER ENGINEERING MODE V2.1 — {'IMPLEMENT' if iteration == 0 else f'REPAIR {iteration}'}
+
+    USER TASK:
+    {task}
+
+    TRUSTED REPOSITORY MAP:
+    {summary}
+
+    {repair}
+
+    OPERATING CONTRACT:
+    - Work only inside this isolated Glimmer worktree.
+    - Inspect only files/symbols needed for this task.
+    - Reuse existing architecture only when it is genuinely applicable.
+    - Make the smallest complete implementation.
+    - Do not commit, push, deploy, install packages, change Git configuration, or modify unrelated files.
+    - Do NOT run broad/full typecheck, lint, full test suite, or full build.
+      The trusted v2.1 wrapper runs authoritative post-edit verification.
+    - Narrow diagnostic commands are allowed when needed.
+    - Inspect the exact diff before finishing.
+    - If the task cannot safely be completed, do not make speculative changes.
+    """).strip()
+
+
+def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path):
+    cmd = [str(engineer), "--workspace", str(ws)]
+    if max_turns is not None:
+        cmd += ["--max-turns", str(max_turns)]
+    if auto_approve:
+        cmd.append("--yes")
+    cmd.append(prompt)
+    print("\n[V2] Launching existing glimmer-engineer.py...")
+    with log_path.open("w", encoding="utf-8") as log:
+        p = subprocess.Popen(cmd, cwd=str(ws), text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, env=os.environ.copy(), bufsize=1)
+        assert p.stdout is not None
+        for line in p.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+        return p.wait()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
+    ap.add_argument("task", nargs="+")
+    ap.add_argument("--workspace", required=True)
+    ap.add_argument("--engineer", default=str(ENGINEER_DEFAULT))
+    ap.add_argument("--max-repairs", type=int, default=2)
+    ap.add_argument("--verification-level", choices=("minimal", "standard", "full"), default="standard")
+    ap.add_argument("--verify", action="append", default=[])
+    ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument("--max-turns", type=int)
+    ap.add_argument("--auto-approve", action="store_true")
+    ap.add_argument("--repo-map-only", action="store_true")
+    ap.add_argument("--allow-non-glimmer-branch", action="store_true")
+    ap.add_argument("--allow-upstream", action="store_true")
+    ap.add_argument("--skip-model-readiness", action="store_true")
+    ap.add_argument("--model-readiness-url", default=READINESS_URL_DEFAULT)
+    ap.add_argument("--readiness-timeout", type=int, default=180)
+    ap.add_argument("--toolchain-mode", choices=("path", "linked", "none"), default="path",
+                    help="path=reuse source tool binaries via env (safe default); linked=temporary ignored node_modules symlinks during trusted verification only; none=no source toolchain reuse")
+    args = ap.parse_args()
+
+    ws = Path(args.workspace).expanduser().resolve()
+    engineer = Path(args.engineer).expanduser().resolve()
+    task = " ".join(args.task).strip()
+
+    if not ws.is_dir():
+        raise V2Error(f"Workspace missing: {ws}")
+    if git(ws, "rev-parse", "--is-inside-work-tree", check=False) != "true":
+        raise V2Error(f"Not a Git worktree: {ws}")
+    if not args.repo_map_only and not engineer.is_file():
+        raise V2Error(f"Existing engineer missing: {engineer}")
+    if args.max_repairs < 0 or args.max_repairs > 5:
+        raise V2Error("--max-repairs must be 0..5")
+
+    recovery = recover_interrupted_checkpoint(ws)
+    if recovery:
+        print("=" * 72)
+        print(" GLIMMER V2.1: INTERRUPTED CHECKPOINT RECOVERED")
+        print("=" * 72)
+        print(f"Checkpoint HEAD:    {recovery['checkpointHead']}")
+        print(f"Recovered baseline: {recovery['recoveredBaseline']}")
+        print("Changes preserved as UNCOMMITTED diff for review.")
+        for f in recovery["preservedChangedFiles"]:
+            print(f"  - {f}")
+        raise V2Error("Recovery completed safely. Review/reset the preserved diff, then rerun v2.1")
+
+    b, baseline, up, dirty = branch(ws), head(ws), upstream(ws), status(ws)
+    if dirty:
+        raise V2Error("V2.1 requires clean start:\n" + "\n".join(dirty[:100]))
+    if not args.allow_non_glimmer_branch and not b.startswith("glimmer/"):
+        raise V2Error(f"Refusing non-glimmer branch: {b}")
+    if up and not args.allow_upstream:
+        raise V2Error(f"Refusing branch with upstream: {up}")
+
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    session = STATE_ROOT / f"{sid}-{b.replace('/', '-')}"
+    session.mkdir()
+
+    repo = build_repo_map(ws)
+    (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
+    summary = repo_summary(repo)
+    manifest = {
+        "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
+        "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
+        "verificationLevel": args.verification_level, "attempts": [], "status": "initialized"
+    }
+    manifest_path = session / "manifest.json"
+
+    def save():
+        manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    save()
+
+    print("=" * 72)
+    print(" MUSE GLIMMER ENGINEERING MODE V2.1")
+    print("=" * 72)
+    print(f"Workspace:     {ws}")
+    print(f"Branch:        {b}")
+    print(f"Baseline:      {baseline}")
+    print(f"Repair budget: {args.max_repairs}")
+    print(f"Repo map:      {session / 'repo-map.json'}")
+    print("Push:          BLOCKED BY DESIGN")
+    print("Deploy:        BLOCKED BY DESIGN")
+
+    if args.repo_map_only:
+        print("\n" + summary)
+        manifest["status"] = "repo-map-only"
+        save()
+        return 0
+
+    source_root = common_repo_root(ws)
+    manifest["toolchain"] = {
+        "sourceRepository": str(source_root),
+        "mode": args.toolchain_mode,
+        "note": "linked mode creates temporary ignored node_modules symlinks only while trusted verifier commands run" if args.toolchain_mode == "linked" else None,
+    }
+    print(f"[V2 preflight] Toolchain source: {source_root}")
+    print(f"[V2 preflight] Toolchain mode:   {args.toolchain_mode}")
+    save()
+
+    success, failure, checkpoint_sha = False, None, None
+    final_label = "NOT VERIFIED"
+    try:
+        if not args.skip_model_readiness:
+            manifest["modelReadiness"] = readiness_probe(args.model_readiness_url, args.readiness_timeout)
+            save()
+        else:
+            manifest["modelReadiness"] = {"status": "SKIPPED"}
+            save()
+
+        for iteration in range(args.max_repairs + 1):
+            prompt = make_prompt(task, summary, iteration, failure, checkpoint_sha)
+            (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
+            rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
+                                 session / f"engineer-{iteration:02d}.log")
+            files = changed_files(ws, baseline)
+            attempt = {"iteration": iteration, "engineerReturnCode": rc,
+                       "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
+
+            if not files:
+                commands = [["git", "diff", "--check"]]
+                for raw in args.verify:
+                    cmd = shlex.split(raw)
+                    if cmd and cmd not in commands:
+                        commands.append(cmd)
+                if args.verify:
+                    ok, results = verify(ws, commands, args.timeout, session, iteration,
+                                         repo, source_root, baseline, args.toolchain_mode)
+                    attempt["verificationCommands"] = [shlex.join(c) for c in commands]
+                    attempt["verificationResults"] = results
+                    if ok:
+                        attempt["status"] = "no-change-verified"
+                        manifest["attempts"].append(attempt)
+                        manifest["status"] = "no-change-verified"
+                        success = True
+                        final_label = "NO CHANGE REQUIRED — VERIFIED"
+                        save()
+                        break
+                attempt["status"] = "no-change-unverified"
+                manifest["attempts"].append(attempt)
+                manifest["status"] = "no-change-unverified"
+                save()
+                break
+
+            print("\n[V2] Changed files:")
+            for f in files:
+                print(f"  - {f}")
+
+            commands = verifier_commands(repo, files, args.verification_level)
+            for raw in args.verify:
+                cmd = shlex.split(raw)
+                if cmd and cmd not in commands:
+                    commands.append(cmd)
+            attempt["verificationCommands"] = [shlex.join(c) for c in commands]
+
+            before = diff_hash(ws, baseline)
+            ok, results = verify(ws, commands, args.timeout, session, iteration,
+                                 repo, source_root, baseline, args.toolchain_mode)
+            after = diff_hash(ws, baseline)
+            attempt["verificationResults"] = results
+            attempt["diffHashAfterVerify"] = after
+            if before != after:
+                attempt["status"] = "verifier-mutated-repo"
+                manifest["attempts"].append(attempt)
+                manifest["status"] = "failed-verifier-mutated-repo"
+                save()
+                raise V2Error("Verifier changed repository content; refusing to continue")
+
+            if ok:
+                attempt["status"] = "verified"
+                manifest["attempts"].append(attempt)
+                manifest["status"] = "verified"
+                save()
+                success = True
+                final_label = "VERIFIED"
+                break
+
+            attempt["status"] = "verification-failed"
+            manifest["attempts"].append(attempt)
+            failure = failure_text(results)
+            save()
+
+            failed_status = next((r.get("status") for r in results if not r.get("ok")), "CODE_FAIL")
+            if failed_status in {"INFRA_BLOCKED", "TIMEOUT"}:
+                manifest["status"] = f"blocked-{failed_status.lower()}"
+                save()
+                print(f"\n[V2] {failed_status}: repair budget will NOT be consumed.")
+                break
+
+            if iteration >= args.max_repairs:
+                manifest["status"] = "failed-repair-budget-exhausted"
+                save()
+                break
+
+            print("\n[V2] New code failure detected. Creating LOCAL-ONLY checkpoint...")
+            checkpoint_sha = checkpoint(ws, iteration + 1)
+            manifest["attempts"][-1]["checkpoint"] = checkpoint_sha
+            save()
+            print(f"[V2] checkpoint={checkpoint_sha}")
+            print("[V2] No push. Starting controlled repair round.")
+    finally:
+        collapse(ws, baseline)
+        manifest["finalHead"] = head(ws)
+        manifest["finalChangedFiles"] = changed_files(ws, baseline)
+        manifest["checkpointsCollapsed"] = head(ws) == baseline
+        manifest["finalDiffHash"] = diff_hash(ws, baseline)
+        save()
+
+    print("\n" + "=" * 72)
+    print(f" GLIMMER V2.1: {final_label}")
+    print("=" * 72)
+    print(f"HEAD restored to baseline: {head(ws) == baseline}")
+    print(f"Manifest: {manifest_path}")
+    print("Final changes are UNCOMMITTED for human review.")
+    print("No push. No deploy.")
+    final_check = run(["git", "diff", "--check"], ws, check=False)
+    print(f"git diff --check: {'PASS' if final_check.returncode == 0 else 'FAIL'}")
+    return 0 if success and final_check.returncode == 0 else 2
+
+
+def _sigterm_handler(signum, frame):
+    raise V2Interrupted(f"Received signal {signum}")
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    try:
+        raise SystemExit(main())
+    except (KeyboardInterrupt, V2Interrupted):
+        print("\nStopped. Cleanup attempted.", file=sys.stderr)
+        raise SystemExit(130)
+    except V2Error as exc:
+        print(f"\nGLIMMER V2.1 ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

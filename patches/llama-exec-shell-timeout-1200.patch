@@ -1,0 +1,13 @@
+diff --git a/tools/server/server-tools.cpp b/tools/server/server-tools.cpp
+index fd0ff8ddd..884b7abe1 100644
+--- a/tools/server/server-tools.cpp
++++ b/tools/server/server-tools.cpp
+@@ -1241,7 +1241,7 @@ struct server_tool_grep_search : server_tool {
+ //
+ 
+ static constexpr size_t SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_OUTPUT_SIZE = 16 * 1024; // 16 KB
+-static constexpr int    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT     = 60;        // seconds
++static constexpr int    SERVER_TOOL_EXEC_SHELL_COMMAND_MAX_TIMEOUT     = 1200;      // seconds
+ 
+ struct server_tool_exec_shell_command : server_tool {
+     server_tool_exec_shell_command() {
