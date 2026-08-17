@@ -56,10 +56,11 @@ cross-process:
 
 - `engineer_state` starts at `"preflight"` for every session.
 - It becomes `"verified"` — and stays there for the rest of the process,
-  monotonically — the first time a post-write validation command (`npm
-  run <script>`, `cargo check`/`test`, or `python -m py_compile`) is
-  *attempted* after a successful `edit_file`/`write_file` call. Pass,
-  fail, or timeout all count as terminal evidence, exactly as before.
+  monotonically — the first time a post-write validation command (any
+  command starting with `npm ` — not just `npm run <script>` — plus
+  `cargo check`/`test`, or `python -m py_compile`) is *attempted* after a
+  successful `edit_file`/`write_file` call. Pass, fail, or timeout all
+  count as terminal evidence, exactly as before.
 - `repository_write_guard_decision(tool_name, engineer_state)` blocks
   `edit_file`/`write_file` once `engineer_state == "verified"`.
 

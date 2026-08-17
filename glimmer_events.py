@@ -5,9 +5,13 @@ Two processes append to the same file (v2 is the parent, engineer is a
 subprocess it spawns) — every write is a single O_APPEND write() of one
 complete JSON line, so concurrent appends interleave at line granularity,
 never mid-line. This is the only correctness property that matters here;
-there is no lock, because O_APPEND on a local filesystem already makes each
-write() atomic up to PIPE_BUF (POSIX), which comfortably covers one JSON
-event line.
+there is no lock, because POSIX guarantees that a single write() to a
+regular local file opened with O_APPEND is atomic with respect to the file
+offset even under concurrent writers (the implicit seek-to-end-of-file and
+the write happen as one indivisible operation, so concurrent writers can
+never interleave mid-write or clobber each other's bytes) — a property of
+O_APPEND on regular files, distinct from (and not to be confused with)
+PIPE_BUF, which is a separate POSIX guarantee about atomic writes to pipes.
 """
 import json
 import os
@@ -38,7 +42,7 @@ def emit(events_path: str, event_type: str, session_id: str, **fields) -> None:
             **fields,
         }
         line = json.dumps(record, ensure_ascii=False) + "\n"
-        # O_APPEND is the atomicity guarantee described in the module docstring.
+        # O_APPEND write() atomicity is the guarantee described in the module docstring.
         fd = os.open(events_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
         try:
             os.write(fd, line.encode("utf-8"))

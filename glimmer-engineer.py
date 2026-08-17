@@ -24,6 +24,31 @@ def _emit(event_type: str, **fields) -> None:
     emit_event(GLIMMER_EVENTS_PATH, event_type, GLIMMER_SESSION_ID, **fields)
 
 
+# R3/I1 (glimmer-v7): engineer_phase is a local, engineer-loop-scoped concept
+# (see the R3 comment near its first assignment below) and its raw values
+# (discovering / narrowed_to_read_edit / narrowed_to_edit_only / writing) are
+# NOT members of @glimmer/shared's GlimmerSessionStatus union. Emitting them
+# verbatim as agent_state_changed.state would render as unrecognized strings
+# on the dashboard, and worse, any name that happened to collide with a real
+# union member (e.g. "verified") would be misread as an authoritative session
+# status. Map each local phase to the closest real GlimmerSessionStatus member
+# before emitting, so observability into the loop's internal phase never
+# masquerades as (or collides with) a real session-level status.
+ENGINEER_PHASE_TO_SESSION_STATUS = {
+    "discovering": "discovery",
+    "narrowed_to_read_edit": "candidate_selection",
+    "narrowed_to_edit_only": "candidate_selection",
+    "writing": "implementing",
+}
+
+
+def _emit_engineer_phase(phase: str) -> None:
+    _emit(
+        "agent_state_changed",
+        state=ENGINEER_PHASE_TO_SESSION_STATUS[phase],
+    )
+
+
 API_BASE = os.environ.get(
     "GLIMMER_URL",
     "http://127.0.0.1:8080",
@@ -37,6 +62,12 @@ API_KEY_FILE = (
 MAX_TOOL_RESULT = 28000
 MAX_EVIDENCE_RESULT = 7000
 MAX_EVIDENCE_TOTAL = 50000
+
+# Matches Task 3's existing tool_completed.resultSummary cap (1800, inline
+# below at its own reviewed call site — left untouched). tool_started.args
+# and tool_blocked.command carry unbounded model-controlled strings with no
+# cap at all; reuse the same limit for consistency across event fields.
+MAX_EVENT_FIELD = 1800
 
 
 # ============================================================
@@ -336,7 +367,14 @@ def load_validation_script_allowlist():
             ):
                 names.add(name)
 
-    return names or None
+    # A repo map that read/parsed successfully but has zero matching
+    # scripts must return an empty set here, NOT None — None is reserved
+    # for "no repo map available at all" (the two early returns above),
+    # where callers fall back to the shape-only match. Falling back to
+    # `names or None` would collapse "repo map says nothing matches" into
+    # that same fallback, which is wider than an empty allowlist and
+    # violates ADR-0002's "always a subset, narrows, never widens".
+    return names
 
 
 def shell_policy(
@@ -771,6 +809,23 @@ def result_text(result):
     return text
 
 
+def _capped_display_args(args, limit=MAX_EVENT_FIELD):
+    """Cap each top-level string value in an args dict before it's emitted
+    as tool_started.args. Must run on top of (i.e. AFTER) the caller's
+    WRITE_TOOLS redaction into display_args — this only bounds length of
+    already-safe values, it must never be used in place of that redaction
+    or run on raw, unredacted arguments."""
+    if not isinstance(args, dict):
+        return args
+    out = {}
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > limit:
+            out[key] = value[:limit] + "...(truncated)"
+        else:
+            out[key] = value
+    return out
+
+
 def add_evidence(
     ledger,
     tool_name,
@@ -1041,7 +1096,7 @@ def execute_tool(
 
             _emit(
                 "tool_blocked",
-                command=command,
+                command=command[:MAX_EVENT_FIELD],
                 reason=reason,
             )
 
@@ -1099,7 +1154,10 @@ def execute_tool(
     _emit(
         "tool_started",
         tool=tool_name,
-        args=display_args,
+        # Redaction (display_args, above) happens first; this only caps
+        # length on top of it (Minor finding: tool_started.args was
+        # previously unbounded).
+        args=_capped_display_args(display_args),
     )
 
     result = http_json(
@@ -1776,7 +1834,7 @@ def run_engineer(
     # write, because its whole purpose is to freeze writes permanently once
     # reached (see repository_write_guard_decision).
     engineer_phase = "discovering"
-    _emit("agent_state_changed", state=engineer_phase)
+    _emit_engineer_phase(engineer_phase)
 
     discovery_tools = {
         "file_glob_search",
@@ -2112,19 +2170,20 @@ def run_engineer(
                             )
 
                             if execution_was_attempted:
+                                # I1: engineer_state is a local write-freeze
+                                # marker (see R5 comment above), not a
+                                # session-level verification claim. It must
+                                # NOT be emitted as agent_state_changed — v2
+                                # owns the real "verified" GlimmerSessionStatus
+                                # and emits it only once its own verification
+                                # actually runs (see readiness_probe /
+                                # verification_started in glimmer-v2.py).
                                 engineer_state = "verified"
-                                _emit(
-                                    "agent_state_changed",
-                                    state=engineer_state,
-                                )
 
                     if changed:
                         if engineer_phase != "writing":
                             engineer_phase = "writing"
-                            _emit(
-                                "agent_state_changed",
-                                state=engineer_phase,
-                            )
+                            _emit_engineer_phase(engineer_phase)
                         diff_checked = False
                         validation_checked = False
 
@@ -2238,7 +2297,7 @@ def run_engineer(
             and discovery_calls >= discovery_tool_budget
         ):
             engineer_phase = "narrowed_to_read_edit"
-            _emit("agent_state_changed", state=engineer_phase)
+            _emit_engineer_phase(engineer_phase)
 
             messages.append(
                 {
@@ -2271,7 +2330,7 @@ def run_engineer(
                 >= post_gate_inspection_budget
         ):
             engineer_phase = "narrowed_to_edit_only"
-            _emit("agent_state_changed", state=engineer_phase)
+            _emit_engineer_phase(engineer_phase)
 
             messages.append(
                 {

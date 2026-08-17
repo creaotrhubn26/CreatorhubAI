@@ -163,6 +163,12 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "CODE_FAIL", "detail": "repair budget exhausted with failing checks remaining", "evidenceIds": []}
     if raw == "failed-verifier-mutated-repo":
         return {"class": "POLICY_BLOCK", "detail": "verifier command mutated the repository", "evidenceIds": []}
+    if raw == "failed-aborted":
+        return {"class": "ORCHESTRATION_ABORTED",
+                "detail": "orchestration raised an error before completing any attempt "
+                           "(e.g. model server unreachable at readiness_probe, or another "
+                           "run()/setup failure) — no repair loop iteration ever started",
+                "evidenceIds": []}
     if raw.startswith("cancelled"):
         return {"class": "USER_CANCELLED", "detail": "session terminated by SIGTERM/interrupt before reaching a terminal state", "evidenceIds": []}
 
@@ -964,13 +970,19 @@ def main():
     # manifest.json and the prompt built below, instead of separately-maintained
     # prose. noCommit/noPush/noDeploy/noDependencyInstall are project-wide hard
     # constraints, never configurable via CLI flags.
+    # scope.area/scope.paths/maxTurns are `?:` (optional), not nullable, in
+    # @glimmer/shared's real TaskContract shape — omit the keys entirely
+    # when unset instead of writing an explicit null, to stay assignable
+    # under strictNullChecks.
+    scope = {"package": args.scope_package}
+    if args.scope_area is not None:
+        scope["area"] = args.scope_area
+    if args.scope_paths is not None:
+        scope["paths"] = args.scope_paths
+
     contract = {
         "objective": task,
-        "scope": {
-            "package": args.scope_package,
-            "area": args.scope_area,
-            "paths": args.scope_paths,
-        },
+        "scope": scope,
         "mode": args.mode,
         "constraints": {
             "minimalChange": True,
@@ -981,8 +993,9 @@ def main():
         },
         "verification": args.verify,
         "repairBudget": args.max_repairs,
-        "maxTurns": args.max_turns,
     }
+    if args.max_turns is not None:
+        contract["maxTurns"] = args.max_turns
 
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
@@ -1179,6 +1192,20 @@ def main():
         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         raise
     finally:
+        # I2: every exit path routes through this finally, including the
+        # already-handled SIGTERM/KeyboardInterrupt path above (which sets a
+        # real terminal status before falling through here) and the sibling
+        # V2Error path — e.g. readiness_probe's `raise V2Error` when the
+        # model server isn't reachable, or any other run()/orchestration
+        # failure inside the try block above — which has no except clause of
+        # its own and previously fell straight through with manifest["status"]
+        # still stuck at its initial "initialized" value forever. If nothing
+        # else set a real terminal status by the time we get here, record one
+        # now, before state is recomputed/saved below.
+        if manifest["status"] == "initialized":
+            manifest["status"] = "failed-aborted"
+            manifest["state"] = canonical_session_state(manifest["status"])
+            emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         collapse(ws, baseline)
         manifest["finalHead"] = head(ws)
         manifest["finalChangedFiles"] = changed_files(ws, baseline)
@@ -1221,6 +1248,12 @@ def _r6_selfcheck() -> None:
     assert classify_failure({"status": "failed-repair-budget-exhausted"}, [])["class"] == "CODE_FAIL"
     assert classify_failure({"status": "failed-verifier-mutated-repo"}, [])["class"] == "POLICY_BLOCK"
     assert classify_failure({"status": "cancelled-sigterm"}, [])["class"] == "USER_CANCELLED"
+    # I2: the finally-block guard's terminal status for a V2Error (or any
+    # other) exit that never got past "initialized" (e.g. readiness_probe
+    # raising V2Error before any repair iteration) — must classify as
+    # something more useful than UNKNOWN, and must NOT be swallowed by the
+    # generic "failed-" prefix branches above it.
+    assert classify_failure({"status": "failed-aborted"}, [])["class"] == "ORCHESTRATION_ABORTED"
 
     # A real, verified archived session can still carry tool_blocked events
     # (20260817-183716-glimmer-smoke-test-r1 has 2) — success must win
@@ -1252,6 +1285,9 @@ def _r6_selfcheck() -> None:
     # R6's new raw status maps to the same "cancelled" canonical bucket
     # repo-map-only already uses.
     assert canonical_session_state("cancelled-sigterm") == "cancelled"
+    # I2: "failed-aborted" rides the existing generic "failed-" prefix match
+    # in canonical_session_state (no new branch needed there).
+    assert canonical_session_state("failed-aborted") == "failed"
 
     print("R6 classify_failure self-check: PASS")
 
