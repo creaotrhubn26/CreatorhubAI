@@ -14,6 +14,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let app: Express;
 let workspace: string;
 let stateRoot: string;
+let readSessionEventsBatch: typeof import("./sessions.js").readSessionEventsBatch;
 const sessionId = "diff-error-session";
 
 beforeAll(async () => {
@@ -25,6 +26,7 @@ beforeAll(async () => {
 
   const { createApp } = await import("../app.js");
   app = createApp();
+  ({ readSessionEventsBatch } = await import("./sessions.js"));
 
   // A workspace directory that exists but is not a git repo — `git diff`
   // inside it fails, which is what we want gitDiff to reject with.
@@ -62,7 +64,7 @@ describe("GET /api/sessions/:id/events", () => {
   it("returns a clean 500 instead of crashing when the session id resolves to a non-directory", async () => {
     // isValidSessionId only checks the id's character shape / path resolution,
     // not that the entry is actually a directory — a plain file at that path
-    // makes path.join(..., id, "engineer-00.log") + fs.readFile fail with
+    // makes path.join(..., id, "events.jsonl") + fs.readFile fail with
     // ENOTDIR, which must not propagate as an unhandled rejection.
     const fileId = "not-a-directory";
     await fs.writeFile(path.join(stateRoot, "sessions", fileId), "not a session dir");
@@ -70,6 +72,38 @@ describe("GET /api/sessions/:id/events", () => {
     const res = await request(app).get(`/api/sessions/${fileId}/events`);
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("readSessionEventsBatch", () => {
+  it("reads events.jsonl, validates each line with isGlimmerEvent, and silently skips a malformed line", async () => {
+    const id = "20260817-000040-glimmer-events-jsonl-test";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const lines = [
+      JSON.stringify({
+        id: "evt_1", sessionId: id, timestamp: "2026-08-17T00:00:00.000Z",
+        type: "tool_started", tool: "read_file", args: { path: "a.ts" },
+      }),
+      "not valid json at all {{{", // torn/malformed line — must be skipped, not crash the batch
+      JSON.stringify({
+        id: "evt_2", sessionId: id, timestamp: "2026-08-17T00:00:01.000Z",
+        type: "tool_completed", tool: "read_file", resultSummary: "ok",
+      }),
+    ];
+    await fs.writeFile(path.join(dir, "events.jsonl"), lines.join("\n") + "\n");
+
+    const events = await readSessionEventsBatch(id);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ id: "evt_1", type: "tool_started" });
+    expect(events[1]).toMatchObject({ id: "evt_2", type: "tool_completed" });
+  });
+
+  it("returns [] when events.jsonl does not exist yet", async () => {
+    const id = "20260817-000041-glimmer-events-jsonl-missing";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    expect(await readSessionEventsBatch(id)).toEqual([]);
   });
 });
 
@@ -288,10 +322,10 @@ describe("POST /api/sessions/:id/ask", () => {
     await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
       task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
     }));
-    // A directory named engineer-00.log, not a file: fs.readFile on it fails
+    // A directory named events.jsonl, not a file: fs.readFile on it fails
     // with EISDIR before askSessionAssistant (and therefore the model) is
     // ever reached — this must not be reported as "model unreachable" (502).
-    await fs.mkdir(path.join(dir, "engineer-00.log"));
+    await fs.mkdir(path.join(dir, "events.jsonl"));
 
     const res = await request(app).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
     expect(res.status).toBe(500);

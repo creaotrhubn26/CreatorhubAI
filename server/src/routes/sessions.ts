@@ -8,12 +8,11 @@ import {
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
-import { parseLogToEvents } from "../lib/events.js";
 import { runGlimmer, buildArgs } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
 import { askSessionAssistant } from "../lib/sessionAssistant.js";
-import type { TaskContract, GlimmerSession, SessionAnalysis, GlimmerEvent, RepoMap } from "@glimmer/shared";
+import { isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
 
@@ -35,14 +34,27 @@ async function findOwnRepoMap(id: string): Promise<RepoMap | null> {
 }
 
 export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]> {
-  const logPath = path.join(sessionsDir(), resolveSessionId(id), "engineer-00.log");
+  const eventsPath = path.join(sessionsDir(), resolveSessionId(id), "events.jsonl");
+  let text: string;
   try {
-    const text = await fs.readFile(logPath, "utf-8");
-    return parseLogToEvents(id, text);
+    text = await fs.readFile(eventsPath, "utf-8");
   } catch (err: any) {
     if (err.code === "ENOENT") return [];
     throw err;
   }
+  const events: GlimmerEvent[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (isGlimmerEvent(parsed)) events.push(parsed);
+      // else: silently skip — a malformed or partially-written line (a
+      // concurrent writer's in-flight append) is not a server error.
+    } catch {
+      // Torn/partial JSON line — same treatment as above, not an error.
+    }
+  }
+  return events;
 }
 
 sessionsRouter.get("/sessions", async (_req, res) => {
@@ -65,8 +77,6 @@ sessionsRouter.get("/sessions/:id/manifest", async (req, res) => {
 
 sessionsRouter.get("/sessions/:id/events", async (req, res) => {
   if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
-  const logPathNow = () =>
-    path.join(sessionsDir(), resolveSessionId(req.params.id), "engineer-00.log");
 
   if (req.query.stream === "1") {
     res.writeHead(200, {
@@ -75,23 +85,17 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
       Connection: "keep-alive",
     });
     let lastCount = 0;
-    let lastPath = logPathNow();
     const interval = setInterval(async () => {
       try {
-        // Re-resolve each tick: the pending -> real session alias can land
-        // mid-stream, at which point the real engineer transcript takes over.
-        const logPath = logPathNow();
-        if (logPath !== lastPath) {
-          lastPath = logPath;
-          lastCount = 0;
-        }
-        const text = await fs.readFile(logPath, "utf-8");
-        const events = parseLogToEvents(req.params.id, text);
+        // readSessionEventsBatch re-resolves the pending -> real session alias
+        // and re-reads events.jsonl (append-only) on every tick, so a stale
+        // lastCount never outruns the file — it only ever grows.
+        const events = await readSessionEventsBatch(req.params.id);
         for (const evt of events.slice(lastCount)) {
           res.write(`data: ${JSON.stringify(evt)}\n\n`);
         }
         lastCount = events.length;
-      } catch { /* log not written yet */ }
+      } catch { /* events.jsonl not written yet */ }
     }, 1000);
     req.on("close", () => clearInterval(interval));
     return;
