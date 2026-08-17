@@ -131,6 +131,11 @@ export async function readSession(id: string): Promise<GlimmerSession | null> {
 // writes manifest.json there. Without an alias the client's id never resolves.
 const sessionAliases = new Map<string, string>();
 
+// FIFO of pendingIds currently waiting on adoption, in the order /run spawned
+// them. Used only to break ties when multiple real directories show up
+// unclaimed at once (see adoptRealSessionDir below).
+const pendingSpawnQueue: string[] = [];
+
 export function resolveSessionId(id: string): string {
   return sessionAliases.get(id) ?? id;
 }
@@ -146,28 +151,70 @@ export async function adoptRealSessionDir(
   timeoutMs = 10_000,
   intervalMs = 250
 ): Promise<string | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const ids = await listSessionIds();
-    // Computed AFTER the await, synchronously with the filter below: JS
-    // callbacks run to completion, so this whole block is atomic relative to
-    // any other concurrent adoptRealSessionDir call's own claim-and-set —
-    // a claim made while we were awaiting listSessionIds() is visible here.
-    const claimed = new Set(sessionAliases.values());
-    const candidates = ids.filter(
-      (id) => !before.has(id) && !id.startsWith("pending-") && !claimed.has(id)
-    );
-    if (candidates.length === 1) {
-      sessionAliases.set(pendingId, candidates[0]);
-      return candidates[0];
+  if (!pendingSpawnQueue.includes(pendingId)) pendingSpawnQueue.push(pendingId);
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const ids = await listSessionIds();
+      // Computed AFTER the await, synchronously with the filter below: JS
+      // callbacks run to completion, so this whole block is atomic relative to
+      // any other concurrent adoptRealSessionDir call's own claim-and-set —
+      // a claim made while we were awaiting listSessionIds() is visible here.
+      const claimed = new Set(sessionAliases.values());
+      const candidates = ids.filter(
+        (id) => !before.has(id) && !id.startsWith("pending-") && !claimed.has(id)
+      );
+      if (candidates.length === 1) {
+        sessionAliases.set(pendingId, candidates[0]);
+        return candidates[0];
+      }
+      if (candidates.length > 1) {
+        // F2: two (or more) sessions started back-to-back can both create
+        // their real directory before either poll loop runs, so neither side
+        // ever sees exactly one candidate and both pending ids would spin
+        // forever. Break the tie by spawn order: if the number of unclaimed
+        // candidates matches the number of pending ids still waiting, pair
+        // the earliest-created directory with the earliest-spawned pending id
+        // (and so on). This is a heuristic, not a true fix — it relies on
+        // orchestrator startup order roughly matching directory-creation
+        // order. A deterministic fix needs glimmer-v2.py to hand back an
+        // explicit session tag (future work, out of scope here).
+        const waiting = pendingSpawnQueue.filter((id) => !sessionAliases.has(id));
+        if (candidates.length === waiting.length) {
+          const stamped = await Promise.all(
+            candidates.map(async (id) => ({
+              id,
+              birth: (await fs.stat(path.join(sessionsDir(), id))).birthtime.getTime(),
+            }))
+          );
+          stamped.sort((a, b) => a.birth - b.birth);
+          // Re-check: nothing may be claimed and the queue may not have
+          // changed while we were stat()-ing (no other await point between
+          // here and the alias write below, so this recheck is authoritative).
+          const stillClaimed = new Set(sessionAliases.values());
+          const stillCandidates = stamped.filter((c) => !stillClaimed.has(c.id));
+          const stillWaiting = pendingSpawnQueue.filter((id) => !sessionAliases.has(id));
+          if (stillCandidates.length === stillWaiting.length) {
+            const myIndex = stillWaiting.indexOf(pendingId);
+            const match = myIndex === -1 ? undefined : stillCandidates[myIndex]?.id;
+            if (match && !stillClaimed.has(match)) {
+              sessionAliases.set(pendingId, match);
+              return match;
+            }
+          }
+        }
+      }
+      // 0 candidates: nothing new yet that isn't already claimed by another
+      // pending adoption — keep polling.
+      // count mismatch: genuinely ambiguous this tick — don't guess which is
+      // ours. Bail without aliasing; the next tick re-evaluates once counts
+      // line up (another adoption claims its directory, or another candidate
+      // appears).
+      await new Promise((r) => setTimeout(r, intervalMs));
     }
-    // 0 candidates: nothing new yet that isn't already claimed by another
-    // pending adoption — keep polling.
-    // >1 candidates: genuinely ambiguous this tick (e.g. two orchestrators
-    // started around the same time) — don't guess which is ours. Bail
-    // without aliasing; the next tick re-evaluates once the other adoption
-    // claims its directory.
-    await new Promise((r) => setTimeout(r, intervalMs));
+    return null;
+  } finally {
+    const idx = pendingSpawnQueue.indexOf(pendingId);
+    if (idx !== -1) pendingSpawnQueue.splice(idx, 1);
   }
-  return null;
 }
