@@ -12,5 +12,8 @@ config/api-key.txt
 backups/
 *.bak-*
 
+# Disposable throwaway repos used for live smoke-test checkpoints
+.smoke-test-repo/
+
 # Already its own independent git repo (github.com/creaotrhubn26/CreatorhubAI) — do not nest
 control-center/
