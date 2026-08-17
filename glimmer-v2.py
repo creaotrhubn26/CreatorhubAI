@@ -275,17 +275,17 @@ def _expected_prefixes(scope: dict) -> list:
 def compute_scope_guard(changed: list, contract: dict) -> dict:
     """Python port of control-center's computeScopeGuard/expectedPrefixes
     (control-center/server/src/lib/repoAnalysis.ts, read in full for this
-    port). Mirrors that TS logic exactly as it stands today, INCLUDING a
-    known gap: the TS prefix match is a plain `p.startsWith(prefix)`, not
-    boundary-safe (`frontend/src/dialog` would match `frontend/src/dialog-old`).
-    An earlier draft of this task's brief believed that had already been
-    hardened; re-reading repoAnalysis.ts and its test file (repoAnalysis.test.ts)
-    for this task confirmed it has NOT — no boundary-safe test exists, and the
-    implementation is plain startsWith. Per this task's own instructions, the
-    real TS is the source of truth over the brief's aspirational snippet, so
-    this port intentionally preserves the TS's real (imperfect) behavior
-    rather than silently diverging from the reference it's ported from. See
-    task-6a-report.md for the follow-up recommendation."""
+    port).
+
+    Follow-up fix (Fix 2, fix-followups-a-c): the original port faithfully
+    copied a bug in the TS reference — a plain `p.startsWith(prefix)` match,
+    which is not boundary-safe (`frontend/src/dialog` would wrongly match
+    `frontend/src/dialog-old/file.ts`, a sibling-path collision rather than a
+    real path-boundary match). A companion fix is landing the boundary-safe
+    match in repoAnalysis.ts independently; this port now applies the
+    equivalent fix directly rather than waiting on that diff — a path is in
+    scope only if it equals a declared prefix exactly, or starts with
+    `prefix + "/"` (after stripping any trailing slash from the prefix)."""
     scope = contract.get("scope") or {}
     expected = _expected_prefixes(scope)
     actual = list(changed)
@@ -300,8 +300,42 @@ def compute_scope_guard(changed: list, contract: dict) -> dict:
             return {"inScope": False, "expected": expected, "actual": actual,
                      "expandedFiles": [], "unbounded": True}
         return {"inScope": True, "expected": expected, "actual": actual, "expandedFiles": []}
-    expanded = [p for p in actual if not any(p.startswith(prefix) for prefix in expected)]
+    expanded = [f for f in actual if not any(
+        f == p.rstrip("/") or f.startswith(p.rstrip("/") + "/")
+        for p in expected
+    )]
     return {"inScope": len(expanded) == 0, "expected": expected, "actual": actual, "expandedFiles": expanded}
+
+
+def _scope_guard_selfcheck() -> None:
+    """Fix 2 (fix-followups-a-c): boundary-safe prefix match for
+    compute_scope_guard. Run with: python3 glimmer-v2.py --scope-guard-selfcheck
+    """
+    # Exact-prefix match still in scope.
+    r = compute_scope_guard(["src/dialog/file.ts"], {"scope": {"paths": ["src/dialog"]}})
+    assert r["inScope"] is True and r["expandedFiles"] == []
+
+    # A file that IS the declared prefix path exactly is in scope.
+    r = compute_scope_guard(["src/dialog"], {"scope": {"paths": ["src/dialog"]}})
+    assert r["inScope"] is True and r["expandedFiles"] == []
+
+    # Boundary fix: a sibling path that merely shares the prefix as a string
+    # (src/dialog-old/...) must NOT be treated as in scope.
+    r = compute_scope_guard(["src/dialog-old/file.ts"], {"scope": {"paths": ["src/dialog"]}})
+    assert r["inScope"] is False and r["expandedFiles"] == ["src/dialog-old/file.ts"]
+
+    # Trailing slash on the declared prefix is normalized the same way.
+    r = compute_scope_guard(["src/dialog-old/file.ts"], {"scope": {"paths": ["src/dialog/"]}})
+    assert r["inScope"] is False and r["expandedFiles"] == ["src/dialog-old/file.ts"]
+
+    # Mixed set: in-scope file passes, sibling-collision file is flagged.
+    r = compute_scope_guard(
+        ["src/dialog/a.ts", "src/dialog-old/b.ts"],
+        {"scope": {"paths": ["src/dialog"]}},
+    )
+    assert r["inScope"] is False and r["expandedFiles"] == ["src/dialog-old/b.ts"]
+
+    print("scope guard boundary-match self-check: PASS")
 
 
 def file_change_types(ws, baseline):
@@ -1295,6 +1329,9 @@ def _r6_selfcheck() -> None:
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--scope-guard-selfcheck"]:
+        _scope_guard_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:

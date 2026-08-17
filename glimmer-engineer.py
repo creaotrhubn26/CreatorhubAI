@@ -1102,6 +1102,40 @@ def execute_tool(
 
             return message, False
 
+        # ----------------------------------------------------
+        # REPEAT-COMMAND GUARD (Fix 1, fix-followups-a-c)
+        # ----------------------------------------------------
+        #
+        # Every command that reaches here already passed shell_policy's
+        # allowlist (read-only git, npm run <validation script>,
+        # python -m py_compile, cargo check/test) — a real, executed
+        # command, not just any model utterance. Re-running the EXACT SAME
+        # command string with no intervening file edit can only reproduce
+        # the same result (e.g. a model looping `npm run typecheck` over
+        # and over), so short-circuit from the same generic tool-result
+        # cache read_file/glob/grep already use above — it's already
+        # cleared on every write (see cache.clear() in run_engineer), which
+        # is exactly the invalidation this guard needs too.
+        cache_key = json.dumps(
+            [
+                "exec_shell_command",
+                command,
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        if cache_key in cache:
+            print(
+                f"\n↻ CACHE: exec_shell_command "
+                "(already ran this exact command — reusing prior result)"
+            )
+
+            return (
+                cache[cache_key],
+                False,
+            )
+
 
     # --------------------------------------------------------
     # HUMAN APPROVAL
@@ -1204,6 +1238,88 @@ def execute_tool(
     )
 
     return content, changed
+
+
+def _repeat_guard_selfcheck() -> None:
+    """Fix 1 (fix-followups-a-c): repeat-validation-command guard on
+    exec_shell_command in execute_tool, reusing the same generic
+    tool-result cache read_file/glob/grep already use (cleared on every
+    write). Monkeypatches http_json so no live llama-server/tool endpoint
+    is needed. Run with:
+    python3 glimmer-engineer.py --repeat-guard-selfcheck
+    """
+    global http_json
+
+    calls = []
+
+    def fake_http_json(method, endpoint, payload=None, extra_headers=None):
+        calls.append(payload["params"]["command"])
+        return {"plain_text_response": f"result #{len(calls)}"}
+
+    real_http_json = http_json
+    http_json = fake_http_json
+
+    try:
+        cache = {}
+        ledger = []
+        approval_state = {"approve_all": True}
+        workspace = Path(".")
+
+        # First run of a validation-shaped command: actually executes.
+        result1, changed1 = execute_tool(
+            "exec_shell_command",
+            {"command": "git status"},
+            workspace,
+            approval_state,
+            cache,
+            ledger,
+        )
+        assert changed1 is False
+        assert len(calls) == 1, "first run must actually execute"
+
+        # Same command again, no intervening write: short-circuited from
+        # the cache — no second execution, same result returned.
+        result2, changed2 = execute_tool(
+            "exec_shell_command",
+            {"command": "git status"},
+            workspace,
+            approval_state,
+            cache,
+            ledger,
+        )
+        assert result2 == result1
+        assert changed2 is False
+        assert len(calls) == 1, (
+            "repeat command without an intervening write must be "
+            "short-circuited from cache, not re-executed"
+        )
+
+        # A write invalidates prior validation results — same mechanism
+        # run_engineer's loop already applies (cache.clear() on any
+        # WRITE_TOOLS success). Simulate that here.
+        cache.clear()
+
+        # Same command again, AFTER a write: guard must NOT block it —
+        # cache correctly invalidated, so it actually re-executes.
+        result3, changed3 = execute_tool(
+            "exec_shell_command",
+            {"command": "git status"},
+            workspace,
+            approval_state,
+            cache,
+            ledger,
+        )
+        assert changed3 is False
+        assert len(calls) == 2, (
+            "repeat command AFTER a write must re-execute, not be "
+            "blocked by a stale cache entry"
+        )
+        assert result3 != result1
+
+    finally:
+        http_json = real_http_json
+
+    print("repeat-validation-command guard self-check: PASS")
 
 
 # ============================================================
@@ -2419,6 +2535,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--repeat-guard-selfcheck"]:
+        _repeat_guard_selfcheck()
+        sys.exit(0)
+
     try:
         main()
 
