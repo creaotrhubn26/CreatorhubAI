@@ -84,9 +84,109 @@ def canonical_session_state(raw_status: str) -> str:
     # engineering work attempted) — must not map to an in-flight state.
     if raw_status == "repo-map-only":
         return "cancelled"
+    # R6: SIGTERM/Ctrl-C now write "cancelled-sigterm" (see _sigterm_handler's
+    # call site in main()) instead of silently leaving whatever status was
+    # last saved before the interrupt. Not yet mirrored in control-center's
+    # mapManifestStatus (out of this task's file scope) — that function's own
+    # unrecognized-status fallback ("needs_review", never in-flight) is a safe
+    # degrade until it is.
+    if raw_status.startswith("cancelled"):
+        return "cancelled"
     # Unrecognized raw status: never default to in-flight — surface it for a
     # human to look at instead of misreporting a live session.
     return "needs_review"
+
+
+def read_session_events(events_path: Path) -> list:
+    """R6: read a session's own events.jsonl back at session end, so
+    classify_failure has real event evidence (tool_blocked/scope_expanded/
+    parser_recovery) to cite. Python-side equivalent of a
+    readSessionEventsBatch-style reader: one process, one run, so the file is
+    always small — a single full read is enough, no streaming/pagination
+    needed. Tolerates a missing file (archived sessions predating Task 1's
+    emitter have none) and malformed/partial lines (glimmer_events.emit's own
+    docstring notes O_APPEND is only atomic up to PIPE_BUF; never raise on a
+    torn last line)."""
+    try:
+        raw = events_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+PARSER_FAILURE_THRESHOLD = 2  # R6: one recovered parse is transient; repeated recoveries in one terminal session point at a structural parser problem
+
+
+def classify_failure(manifest: dict, events: list) -> dict | None:
+    """R6: classify a session's real terminal state into
+    {class, detail, evidenceIds}, or None for genuine success.
+
+    Reads manifest["status"] (the RAW string), not manifest["state"] — the
+    canonical GlimmerSessionStatus value collapses blocked-infra_blocked/
+    blocked-timeout (and any future blocked-*/failed-* variant) into one
+    generic "blocked"/"failed" bucket via canonical_session_state's prefix
+    match, which is exactly the distinction a failure taxonomy needs to keep.
+    Archived sessions from before R3 (Task 6) never got a "state" field at
+    all, so "status" is also the only field guaranteed to exist.
+
+    Precedence: manifest["status"] is the orchestrator's own authoritative
+    terminal signal and is checked first. Per-tool/per-file events
+    (tool_blocked, scope_expanded, parser_recovery) are advisory during the
+    run — e.g. a real archived "verified" session
+    (20260817-183716-glimmer-smoke-test-r1) has 2 tool_blocked events from a
+    denied command the engineer recovered from and still finished clean — so
+    they are only consulted for terminal states this function doesn't
+    otherwise recognize, never allowed to override a genuine success/no-op
+    status.
+    """
+    raw = manifest.get("status") or ""
+
+    if raw in ("verified", "no-change-verified"):
+        return None
+    if raw == "repo-map-only":
+        return None  # deliberate --repo-map-only early exit, not a failure
+
+    if raw == "blocked-infra_blocked":
+        return {"class": "INFRA_BLOCKED", "detail": "verifier infrastructure failure (missing binary/module)", "evidenceIds": []}
+    if raw == "blocked-timeout":
+        return {"class": "TIMEOUT", "detail": "verifier or engineer step timed out", "evidenceIds": []}
+    if raw == "failed-repair-budget-exhausted":
+        return {"class": "CODE_FAIL", "detail": "repair budget exhausted with failing checks remaining", "evidenceIds": []}
+    if raw == "failed-verifier-mutated-repo":
+        return {"class": "POLICY_BLOCK", "detail": "verifier command mutated the repository", "evidenceIds": []}
+    if raw.startswith("cancelled"):
+        return {"class": "USER_CANCELLED", "detail": "session terminated by SIGTERM/interrupt before reaching a terminal state", "evidenceIds": []}
+
+    blocked = [e for e in events if e.get("type") == "tool_blocked"]
+    if blocked:
+        return {"class": "POLICY_BLOCK", "detail": blocked[-1].get("reason") or "shell command blocked by policy",
+                "evidenceIds": [e["id"] for e in blocked if "id" in e]}
+
+    scope_events = [e for e in events if e.get("type") == "scope_expanded"]
+    if scope_events:
+        return {"class": "SCOPE_FAILURE", "detail": "changed files exceeded the task contract's declared scope",
+                "evidenceIds": [e["id"] for e in scope_events if "id" in e]}
+
+    parser_events = [e for e in events if e.get("type") == "parser_recovery"]
+    if len(parser_events) >= PARSER_FAILURE_THRESHOLD:
+        return {"class": "PARSER_FAILURE", "detail": f"model response parser recovered {len(parser_events)} times this session",
+                "evidenceIds": [e["id"] for e in parser_events if "id" in e]}
+
+    # Anything else reaching here is a real terminal status this function
+    # doesn't specifically recognize — e.g. "no-change-unverified", or a
+    # legacy "blocked-no-changes" string a pre-refactor orchestrator version
+    # wrote (still present in archived sessions, no longer produced by
+    # current code). Report it rather than guessing or raising.
+    return {"class": "UNKNOWN", "detail": f"unclassified terminal state: status={raw!r}", "evidenceIds": []}
 
 
 class V2Error(RuntimeError):
@@ -1066,12 +1166,25 @@ def main():
             save()
             print(f"[V2] checkpoint={checkpoint_sha}")
             print("[V2] No push. Starting controlled repair round.")
+    except (V2Interrupted, KeyboardInterrupt):
+        # R6: previously SIGTERM/Ctrl-C left manifest["status"] wherever the
+        # last completed step set it (e.g. still "initialized" if killed
+        # during the very first engineer invocation), silently misreporting a
+        # cancelled session as an in-progress one forever — research for this
+        # task confirmed no cancellation status was ever written. Record the
+        # real terminal reason before `finally` collapses/saves, then
+        # re-raise so __main__'s existing exit-130 handling is unchanged.
+        manifest["status"] = "cancelled-sigterm"
+        manifest["state"] = canonical_session_state(manifest["status"])
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+        raise
     finally:
         collapse(ws, baseline)
         manifest["finalHead"] = head(ws)
         manifest["finalChangedFiles"] = changed_files(ws, baseline)
         manifest["checkpointsCollapsed"] = head(ws) == baseline
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
+        manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
         save()
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
         # the canonical manifest["state"], not the raw manifest["status"].
@@ -1093,7 +1206,60 @@ def _sigterm_handler(signum, frame):
     raise V2Interrupted(f"Received signal {signum}")
 
 
+def _r6_selfcheck() -> None:
+    """R6: exercises classify_failure branches the real archived sessions in
+    ~/.muse-glimmer/sessions don't happen to hit on disk today (no
+    TIMEOUT/CODE_FAIL/POLICY_BLOCK/SCOPE_FAILURE/PARSER_FAILURE/
+    USER_CANCELLED terminal session exists there yet). Run with:
+    python3 glimmer-v2.py --r6-selfcheck
+    """
+    assert classify_failure({"status": "verified"}, []) is None
+    assert classify_failure({"status": "no-change-verified"}, []) is None
+    assert classify_failure({"status": "repo-map-only"}, []) is None
+    assert classify_failure({"status": "blocked-infra_blocked"}, [])["class"] == "INFRA_BLOCKED"
+    assert classify_failure({"status": "blocked-timeout"}, [])["class"] == "TIMEOUT"
+    assert classify_failure({"status": "failed-repair-budget-exhausted"}, [])["class"] == "CODE_FAIL"
+    assert classify_failure({"status": "failed-verifier-mutated-repo"}, [])["class"] == "POLICY_BLOCK"
+    assert classify_failure({"status": "cancelled-sigterm"}, [])["class"] == "USER_CANCELLED"
+
+    # A real, verified archived session can still carry tool_blocked events
+    # (20260817-183716-glimmer-smoke-test-r1 has 2) — success must win
+    # regardless of what advisory events fired along the way.
+    blocked_evt = {"id": "e1", "type": "tool_blocked", "reason": "rm -rf blocked"}
+    assert classify_failure({"status": "verified"}, [blocked_evt]) is None
+
+    # A terminal status this function doesn't specifically recognize falls
+    # through to event evidence when present...
+    r = classify_failure({"status": "no-change-unverified"}, [blocked_evt])
+    assert r == {"class": "POLICY_BLOCK", "detail": "rm -rf blocked", "evidenceIds": ["e1"]}
+
+    scope_evt = {"id": "e2", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/x.ts"]}
+    r = classify_failure({"status": "no-change-unverified"}, [scope_evt])
+    assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2"]
+
+    parser_evts = [{"id": f"p{i}", "type": "parser_recovery", "attempt": i} for i in range(1, 3)]
+    r = classify_failure({"status": "no-change-unverified"}, parser_evts)
+    assert r["class"] == "PARSER_FAILURE" and r["evidenceIds"] == ["p1", "p2"]
+    # ...but a single recovery is below threshold and stays UNKNOWN.
+    assert classify_failure({"status": "no-change-unverified"}, parser_evts[:1])["class"] == "UNKNOWN"
+
+    # Legacy raw status this function was never taught (real archived
+    # "blocked-no-changes"), and no status at all — both degrade to
+    # UNKNOWN, never raise.
+    assert classify_failure({"status": "blocked-no-changes"}, [])["class"] == "UNKNOWN"
+    assert classify_failure({}, [])["class"] == "UNKNOWN"
+
+    # R6's new raw status maps to the same "cancelled" canonical bucket
+    # repo-map-only already uses.
+    assert canonical_session_state("cancelled-sigterm") == "cancelled"
+
+    print("R6 classify_failure self-check: PASS")
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--r6-selfcheck"]:
+        _r6_selfcheck()
+        raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         raise SystemExit(main())
