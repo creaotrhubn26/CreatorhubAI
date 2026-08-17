@@ -19,6 +19,8 @@ import time
 import urllib.error
 import urllib.request
 
+from glimmer_events import emit as emit_event
+
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
 STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
 NODE_OPTIONS_DEFAULT = "--max-old-space-size=12288"
@@ -116,6 +118,20 @@ def changed_files(ws, baseline):
     tracked = lines(git(ws, "diff", "--name-only", baseline, "--"))
     untracked = lines(git(ws, "ls-files", "--others", "--exclude-standard"))
     return sorted(set(tracked + untracked))
+
+
+def file_change_types(ws, baseline):
+    """Map path -> 'added'|'modified'|'deleted', derived from real git status vs
+    baseline (untracked files count as 'added'). Used only to populate file_changed
+    event payloads with a real changeType instead of a hardcoded one."""
+    out = {}
+    for line in lines(git(ws, "diff", "--name-status", baseline, "--")):
+        parts = line.split("\t")
+        code, path = parts[0], parts[-1]
+        out[path] = "deleted" if code.startswith("D") else "added" if code.startswith(("A", "R", "C")) else "modified"
+    for rel in lines(git(ws, "ls-files", "--others", "--exclude-standard")):
+        out[rel] = "added"
+    return out
 
 
 def diff_hash(ws, baseline):
@@ -476,7 +492,8 @@ def remove_baseline_worktree(ws, target):
     shutil.rmtree(target, ignore_errors=True)
 
 
-def verify(ws, commands, timeout, session, iteration, repo_map, source_root, baseline, toolchain_mode="path"):
+def verify(ws, commands, timeout, session, iteration, repo_map, source_root, baseline, toolchain_mode="path",
+           events_path=None, session_id=None):
     current_bridges = []
     if toolchain_mode == "linked":
         _, current_bridges = prepare_toolchain_bridges(ws, repo_map)
@@ -489,6 +506,8 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
         for i, cmd in enumerate(commands, 1):
             label = shlex.join(cmd)
             print(f"\n[V2 verify {iteration}.{i}] {label}")
+            if events_path is not None:
+                emit_event(events_path, "verification_started", session_id, command=label)
             result = run_verifier_command(ws, cmd, timeout, env)
 
             if result["status"] == "CODE_FAIL":
@@ -520,6 +539,9 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             (session / f"verify-{iteration:02d}-{i:02d}.json").write_text(
                 json.dumps(result, indent=2), encoding="utf-8"
             )
+            if events_path is not None:
+                emit_event(events_path, "verification_completed", session_id, check=label,
+                           status=result["status"], baselineAware=bool(result.get("baseline")))
             if result["status"] == "PASS":
                 print("PASS")
             elif result["status"] == "PASS_BASELINE":
@@ -627,7 +649,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     """).strip()
 
 
-def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path):
+def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id):
     cmd = [str(engineer), "--workspace", str(ws)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
@@ -635,9 +657,12 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path):
         cmd.append("--yes")
     cmd.append(prompt)
     print("\n[V2] Launching existing glimmer-engineer.py...")
+    env = os.environ.copy()
+    env["GLIMMER_EVENTS_PATH"] = str(events_path)
+    env["GLIMMER_SESSION_ID"] = session_id
     with log_path.open("w", encoding="utf-8") as log:
         p = subprocess.Popen(cmd, cwd=str(ws), text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, env=os.environ.copy(), bufsize=1)
+                             stderr=subprocess.STDOUT, env=env, bufsize=1)
         assert p.stdout is not None
         for line in p.stdout:
             sys.stdout.write(line)
@@ -703,6 +728,7 @@ def main():
     sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     session = STATE_ROOT / f"{sid}-{b.replace('/', '-')}"
     session.mkdir()
+    events_path = session / "events.jsonl"
 
     repo = build_repo_map(ws)
     (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
@@ -710,7 +736,8 @@ def main():
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
-        "verificationLevel": args.verification_level, "attempts": [], "status": "initialized"
+        "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
+        "eventsFile": "events.jsonl",
     }
     manifest_path = session / "manifest.json"
 
@@ -719,6 +746,10 @@ def main():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     save()
+    # session_created isn't a real EVENT_TYPES variant; agent_state_changed with
+    # state="preflight" is the closest real type (maps to GlimmerSessionStatus's
+    # "preflight" value).
+    emit_event(events_path, "agent_state_changed", sid, state="preflight")
 
     print("=" * 72)
     print(" MUSE GLIMMER ENGINEERING MODE V2.1")
@@ -734,6 +765,10 @@ def main():
     if args.repo_map_only:
         print("\n" + summary)
         manifest["status"] = "repo-map-only"
+        # R1: raw manifest status string emitted as `state`; Task 4 (R3) will map
+        # this (and the other manifest["status"] sites in main()) to the canonical
+        # GlimmerSessionStatus vocabulary.
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
         save()
         return 0
 
@@ -758,11 +793,17 @@ def main():
             save()
 
         for iteration in range(args.max_repairs + 1):
+            if iteration > 0:
+                emit_event(events_path, "repair_started", sid, iteration=iteration)
             prompt = make_prompt(task, summary, iteration, failure, checkpoint_sha)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
-                                 session / f"engineer-{iteration:02d}.log")
+                                 session / f"engineer-{iteration:02d}.log", events_path, sid)
             files = changed_files(ws, baseline)
+            change_types = file_change_types(ws, baseline)
+            for f in files:
+                emit_event(events_path, "file_changed", sid, path=f,
+                           changeType=change_types.get(f, "modified"))
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
@@ -774,13 +815,18 @@ def main():
                         commands.append(cmd)
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
-                                         repo, source_root, baseline, args.toolchain_mode)
+                                         repo, source_root, baseline, args.toolchain_mode,
+                                         events_path, sid)
                     attempt["verificationCommands"] = [shlex.join(c) for c in commands]
                     attempt["verificationResults"] = results
                     if ok:
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
+                        # R1: raw manifest status string emitted as `state`; Task 4 (R3)
+                        # will map this (and the other manifest["status"] sites in
+                        # main()) to the canonical GlimmerSessionStatus vocabulary.
+                        emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
                         success = True
                         final_label = "NO CHANGE REQUIRED — VERIFIED"
                         save()
@@ -788,6 +834,9 @@ def main():
                 attempt["status"] = "no-change-unverified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "no-change-unverified"
+                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
+                # map this to the canonical GlimmerSessionStatus vocabulary.
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
                 save()
                 break
 
@@ -804,7 +853,8 @@ def main():
 
             before = diff_hash(ws, baseline)
             ok, results = verify(ws, commands, args.timeout, session, iteration,
-                                 repo, source_root, baseline, args.toolchain_mode)
+                                 repo, source_root, baseline, args.toolchain_mode,
+                                 events_path, sid)
             after = diff_hash(ws, baseline)
             attempt["verificationResults"] = results
             attempt["diffHashAfterVerify"] = after
@@ -812,6 +862,9 @@ def main():
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "failed-verifier-mutated-repo"
+                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
+                # map this to the canonical GlimmerSessionStatus vocabulary.
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
                 save()
                 raise V2Error("Verifier changed repository content; refusing to continue")
 
@@ -819,6 +872,9 @@ def main():
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
+                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
+                # map this to the canonical GlimmerSessionStatus vocabulary.
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
                 save()
                 success = True
                 final_label = "VERIFIED"
@@ -832,12 +888,18 @@ def main():
             failed_status = next((r.get("status") for r in results if not r.get("ok")), "CODE_FAIL")
             if failed_status in {"INFRA_BLOCKED", "TIMEOUT"}:
                 manifest["status"] = f"blocked-{failed_status.lower()}"
+                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
+                # map this to the canonical GlimmerSessionStatus vocabulary.
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
                 save()
                 print(f"\n[V2] {failed_status}: repair budget will NOT be consumed.")
                 break
 
             if iteration >= args.max_repairs:
                 manifest["status"] = "failed-repair-budget-exhausted"
+                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
+                # map this to the canonical GlimmerSessionStatus vocabulary.
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
                 save()
                 break
 
@@ -854,6 +916,7 @@ def main():
         manifest["checkpointsCollapsed"] = head(ws) == baseline
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
         save()
+        emit_event(events_path, "session_completed", sid, status=manifest["status"])
 
     print("\n" + "=" * 72)
     print(f" GLIMMER V2.1: {final_label}")
