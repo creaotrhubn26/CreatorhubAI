@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import functools
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, error
 
@@ -888,6 +890,73 @@ def _capped_display_args(args, limit=MAX_EVENT_FIELD):
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def _evidence_file_path():
+    """C5 (glimmer-v7): evidence-NN.jsonl path in the session directory
+    (parent of GLIMMER_EVENTS_PATH, same convention load_validation_
+    script_allowlist above already uses), or None when it can't be
+    determined (e.g. standalone invocation per new-glimmer-task.sh) — same
+    no-op guarantee as _emit() above.
+
+    NN mirrors the iteration numbering verify-NN-MM.json and prompt-NN.txt
+    already use (see verify()/the main loop in glimmer-v2.py). v2.py writes
+    prompt-{iteration:02d}.txt to the session dir *before* spawning this
+    subprocess (invoke_engineer in glimmer-v2.py), so the highest-numbered
+    prompt-NN.txt already present at process startup is this process's own
+    iteration — no new env var or v2.py change needed to learn it.
+
+    Cached (lru_cache on a zero-arg function) because this process only
+    ever runs one iteration; computed once, reused for every add_evidence
+    call.
+    """
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return None
+
+    session_dir = Path(GLIMMER_EVENTS_PATH).parent
+    numbers = [
+        int(m.group(1))
+        for p in session_dir.glob("prompt-*.txt")
+        for m in [re.match(r"prompt-(\d+)\.txt$", p.name)]
+        if m
+    ]
+    iteration = max(numbers) if numbers else 0
+    return session_dir / f"evidence-{iteration:02d}.jsonl"
+
+
+_evidence_seq = 0
+
+
+def _persist_evidence(tool_name, arguments, content):
+    """Append one evidence-NN.jsonl line with a stable, citable id.
+
+    Unlike glimmer_events.emit() (glimmer_events.py), this file is only
+    ever written by this single process — glimmer-v2.py never writes to
+    it — so there's no cross-process race to defend against and no need
+    for emit()'s uuid-based id scheme. A plain in-process incrementing
+    counter gives stable, unique-within-session ids more simply.
+    """
+    path = _evidence_file_path()
+    if path is None:
+        return
+
+    global _evidence_seq
+    _evidence_seq += 1
+
+    record = {
+        "id": f"{GLIMMER_SESSION_ID}-ev-{_evidence_seq}",
+        "sessionId": GLIMMER_SESSION_ID,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tool": tool_name,
+        "arguments": arguments,
+        "content": content[:MAX_EVIDENCE_RESULT],
+    }
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
+        print(f"[glimmer-engineer] failed to persist evidence: {exc}", flush=True)
+
+
 def add_evidence(
     ledger,
     tool_name,
@@ -917,6 +986,8 @@ def add_evidence(
         + "\nRESULT:\n"
         + content[:MAX_EVIDENCE_RESULT]
     )
+
+    _persist_evidence(tool_name, arguments, content)
 
 
 def compact_evidence(ledger):
@@ -1424,6 +1495,78 @@ def _repeat_guard_selfcheck() -> None:
         http_json = real_http_json
 
     print("repeat-validation-command guard self-check: PASS")
+
+
+def _evidence_persistence_selfcheck() -> None:
+    """C5 (glimmer-v7): evidence-NN.jsonl persistence. Run with:
+    python3 glimmer-engineer.py --evidence-selfcheck
+    """
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID, _evidence_seq
+
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            (session_dir / "events.jsonl").write_text("")
+            # v2.py writes prompt-NN.txt for every iteration before it
+            # spawns this process, including earlier iterations' — the
+            # highest NN present at startup is this process's iteration.
+            (session_dir / "prompt-00.txt").write_text("first attempt")
+            (session_dir / "prompt-01.txt").write_text("repair 1")
+
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-abc"
+            _evidence_file_path.cache_clear()
+            _evidence_seq = 0
+
+            ledger = []
+            add_evidence(ledger, "read_file", {"path": "a.py"}, "contents of a.py")
+            add_evidence(ledger, "grep_search", {"pattern": "foo"}, "a.py:1:foo")
+            # Not in the "interesting" set: must not append to the ledger
+            # or the persisted file.
+            add_evidence(ledger, "some_other_tool", {}, "irrelevant")
+
+            assert len(ledger) == 2, "uninteresting tool must not reach the ledger"
+
+            evidence_path = session_dir / "evidence-01.jsonl"
+            assert evidence_path.exists(), (
+                "evidence must persist to evidence-<iteration>.jsonl, "
+                "iteration derived from the highest prompt-NN.txt present"
+            )
+            lines = evidence_path.read_text().splitlines()
+            assert len(lines) == 2, f"expected 2 persisted entries, got {len(lines)}"
+
+            records = [json.loads(line) for line in lines]
+            ids = [r["id"] for r in records]
+            assert len(set(ids)) == len(ids), "evidence ids must be unique within a session"
+            assert all(i.startswith("sess-abc-ev-") for i in ids), "ids must be stable/traceable to the session"
+            assert records[0]["tool"] == "read_file"
+            assert records[1]["tool"] == "grep_search"
+            assert records[0]["content"] == "contents of a.py"
+
+            # No-op path: session dir can't be determined (unset env) must
+            # not crash, and must not write a file.
+            GLIMMER_EVENTS_PATH = None
+            GLIMMER_SESSION_ID = None
+            _evidence_file_path.cache_clear()
+            ledger2 = []
+            add_evidence(ledger2, "read_file", {"path": "b.py"}, "contents of b.py")
+            assert len(ledger2) == 1, "in-memory ledger must keep working with no session dir"
+            assert evidence_path.read_text().splitlines() == lines, (
+                "no-op path must not touch any evidence file"
+            )
+
+    finally:
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+        _evidence_file_path.cache_clear()
+        _evidence_seq = 0
+
+    print("evidence persistence self-check: PASS")
 
 
 # ============================================================
@@ -2641,6 +2784,10 @@ def main():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--repeat-guard-selfcheck"]:
         _repeat_guard_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--evidence-selfcheck"]:
+        _evidence_persistence_selfcheck()
         sys.exit(0)
 
     try:
