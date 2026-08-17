@@ -377,6 +377,23 @@ def load_validation_script_allowlist():
     return names
 
 
+# Shared with _is_idempotent_validation_command below (Fix 1 follow-up,
+# fix-followups-a-c round 2) so the repeat-command cache's notion of
+# "read-only git" / "typecheck-shaped npm script" can never drift from
+# what shell_policy itself actually allows.
+SAFE_READONLY_GIT_SUBCOMMANDS = {
+    "status",
+    "diff",
+    "show",
+    "log",
+    "rev-parse",
+}
+
+
+def _is_typecheck_script(script):
+    return script == "typecheck" or script.startswith("typecheck:")
+
+
 def shell_policy(
     command,
     workspace,
@@ -428,15 +445,7 @@ def shell_policy(
 
         subcommand = tokens[1]
 
-        safe_git = {
-            "status",
-            "diff",
-            "show",
-            "log",
-            "rev-parse",
-        }
-
-        if subcommand in safe_git:
+        if subcommand in SAFE_READONLY_GIT_SUBCOMMANDS:
             if "--no-index" in tokens:
                 return False, (
                     "git diff --no-index blocked"
@@ -552,8 +561,7 @@ def shell_policy(
             safe_validation = script in validation_allowlist
         else:
             safe_validation = (
-                script == "typecheck"
-                or script.startswith("typecheck:")
+                _is_typecheck_script(script)
                 or script == "test:unit"
                 or script.startswith("test:unit:")
                 or script == "test:e2e"
@@ -632,6 +640,60 @@ def shell_policy(
         "Command executable is outside "
         f"the allowlist: {executable}"
     )
+
+
+def _is_idempotent_validation_command(command):
+    """Fix 1 follow-up (fix-followups-a-c round 2): classify an
+    ALREADY shell_policy-allowed command as safe to short-circuit from
+    the repeat-command cache (execute_tool). shell_policy allows more
+    than this — it also allows npm run test:unit/test:e2e and
+    cargo test, since those are legitimate validation commands to
+    *run* — but their output is not provably stable run-to-run (flaky
+    tests, network calls inside tests, timing-dependent assertions,
+    coverage/snapshot writes). Only the genuinely side-effect-free,
+    deterministic subset — read-only git, typecheck-shaped npm
+    scripts, python -m py_compile, cargo check — is cache-eligible.
+    Mirrors shell_policy's own branch structure and reuses its shared
+    SAFE_READONLY_GIT_SUBCOMMANDS / _is_typecheck_script so this can
+    never silently drift from what shell_policy actually allows."""
+    try:
+        tokens = shlex.split(command.strip())
+    except ValueError:
+        return False
+
+    if not tokens:
+        return False
+
+    executable = tokens[0]
+
+    if executable == "git":
+        return len(tokens) >= 2 and (
+            tokens[1] in SAFE_READONLY_GIT_SUBCOMMANDS
+            or (
+                tokens[1] == "branch"
+                and tokens[2:] == ["--show-current"]
+            )
+        )
+
+    if executable == "npm" and "run" in tokens:
+        index = tokens.index("run")
+
+        return (
+            index + 1 < len(tokens)
+            and _is_typecheck_script(tokens[index + 1])
+        )
+
+    if (
+        executable in {"python", "python3"}
+        and len(tokens) >= 4
+        and tokens[1:3] == ["-m", "py_compile"]
+    ):
+        return True
+
+    if executable == "cargo":
+        return len(tokens) >= 2 and tokens[1] == "check"
+
+    return False
 
 
 # ============================================================
@@ -1102,6 +1164,44 @@ def execute_tool(
 
             return message, False
 
+        # ----------------------------------------------------
+        # REPEAT-COMMAND GUARD (Fix 1, fix-followups-a-c)
+        # ----------------------------------------------------
+        #
+        # Every command that reaches here already passed shell_policy's
+        # allowlist — but that allowlist is broader than "safe to cache":
+        # it also allows npm run test:unit/test:e2e and cargo test, whose
+        # output isn't provably stable run-to-run (flaky tests, network
+        # calls, timing, coverage/snapshot writes). Only the genuinely
+        # idempotent subset (read-only git, typecheck-shaped npm scripts,
+        # py_compile, cargo check — see _is_idempotent_validation_command)
+        # is eligible to short-circuit from the same generic tool-result
+        # cache read_file/glob/grep already use above. That cache is
+        # already cleared on every write (see cache.clear() in
+        # run_engineer), which is exactly the invalidation this guard
+        # needs too. Test-shaped commands always fall through and
+        # re-execute — no caching, no cache_key at all.
+        if _is_idempotent_validation_command(command):
+            cache_key = json.dumps(
+                [
+                    "exec_shell_command",
+                    command,
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+
+            if cache_key in cache:
+                print(
+                    f"\n↻ CACHE: exec_shell_command "
+                    "(already ran this exact command — reusing prior result)"
+                )
+
+                return (
+                    cache[cache_key],
+                    False,
+                )
+
 
     # --------------------------------------------------------
     # HUMAN APPROVAL
@@ -1204,6 +1304,126 @@ def execute_tool(
     )
 
     return content, changed
+
+
+def _repeat_guard_selfcheck() -> None:
+    """Fix 1 (fix-followups-a-c): repeat-validation-command guard on
+    exec_shell_command in execute_tool, reusing the same generic
+    tool-result cache read_file/glob/grep already use (cleared on every
+    write). Monkeypatches http_json so no live llama-server/tool endpoint
+    is needed. Run with:
+    python3 glimmer-engineer.py --repeat-guard-selfcheck
+    """
+    global http_json
+
+    calls = []
+
+    def fake_http_json(method, endpoint, payload=None, extra_headers=None):
+        calls.append(payload["params"]["command"])
+        return {"plain_text_response": f"result #{len(calls)}"}
+
+    real_http_json = http_json
+    http_json = fake_http_json
+
+    try:
+        cache = {}
+        ledger = []
+        approval_state = {"approve_all": True}
+        workspace = Path(".")
+
+        # First run of a validation-shaped command: actually executes.
+        result1, changed1 = execute_tool(
+            "exec_shell_command",
+            {"command": "git status"},
+            workspace,
+            approval_state,
+            cache,
+            ledger,
+        )
+        assert changed1 is False
+        assert len(calls) == 1, "first run must actually execute"
+
+        # Same command again, no intervening write: short-circuited from
+        # the cache — no second execution, same result returned.
+        result2, changed2 = execute_tool(
+            "exec_shell_command",
+            {"command": "git status"},
+            workspace,
+            approval_state,
+            cache,
+            ledger,
+        )
+        assert result2 == result1
+        assert changed2 is False
+        assert len(calls) == 1, (
+            "repeat command without an intervening write must be "
+            "short-circuited from cache, not re-executed"
+        )
+
+        # A write invalidates prior validation results — same mechanism
+        # run_engineer's loop already applies (cache.clear() on any
+        # WRITE_TOOLS success). Simulate that here.
+        cache.clear()
+
+        # Same command again, AFTER a write: guard must NOT block it —
+        # cache correctly invalidated, so it actually re-executes.
+        result3, changed3 = execute_tool(
+            "exec_shell_command",
+            {"command": "git status"},
+            workspace,
+            approval_state,
+            cache,
+            ledger,
+        )
+        assert changed3 is False
+        assert len(calls) == 2, (
+            "repeat command AFTER a write must re-execute, not be "
+            "blocked by a stale cache entry"
+        )
+        assert result3 != result1
+
+        # Test-shaped commands (round 2 follow-up fix): shell_policy allows
+        # npm run test:unit/test:e2e — legitimate to *run* — but their
+        # output isn't provably stable run-to-run (flaky tests, network
+        # calls, timing). These must NEVER be served from cache, even with
+        # no intervening write: both calls must genuinely re-execute.
+        test_cache = {}
+        calls.clear()
+
+        result_t1, changed_t1 = execute_tool(
+            "exec_shell_command",
+            {"command": "npm run test:unit"},
+            workspace,
+            approval_state,
+            test_cache,
+            ledger,
+        )
+        assert changed_t1 is False
+        assert len(calls) == 1, "first test run must actually execute"
+
+        result_t2, changed_t2 = execute_tool(
+            "exec_shell_command",
+            {"command": "npm run test:unit"},
+            workspace,
+            approval_state,
+            test_cache,
+            ledger,
+        )
+        assert changed_t2 is False
+        assert len(calls) == 2, (
+            "test-shaped command must always re-execute, never be "
+            "short-circuited from cache, even with no intervening write "
+            "(its output isn't provably stable run-to-run)"
+        )
+        assert result_t2 != result_t1
+        assert test_cache == {}, (
+            "test-shaped command must never populate the cache at all"
+        )
+
+    finally:
+        http_json = real_http_json
+
+    print("repeat-validation-command guard self-check: PASS")
 
 
 # ============================================================
@@ -2419,6 +2639,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--repeat-guard-selfcheck"]:
+        _repeat_guard_selfcheck()
+        sys.exit(0)
+
     try:
         main()
 
