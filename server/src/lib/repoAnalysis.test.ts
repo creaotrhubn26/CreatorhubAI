@@ -115,4 +115,30 @@ describe("computeScopeGuard", () => {
     expect(result.inScope).toBe(false);
     expect(result.expected).toEqual(["backend"]);
   });
+
+  // F5: the composer previously let a user pick "directory"/"files" scope
+  // with no path input at all, leaving scope.area/scope.paths empty forever.
+  // expectedPrefixes() then returned [], and the old computeScopeGuard read
+  // that identically to genuinely-unbounded "repository" scope, reporting
+  // inScope: true for literally any changed file — Scope Guard silently
+  // disabled while claiming everything is fine. Must never report inScope:
+  // true for this case, even though the gateway can't reconstruct what the
+  // real boundary should have been.
+  it("does not report inScope: true for a directory scope with no concrete path — unbounded, not honestly-boundaryless", () => {
+    const result = computeScopeGuard({ package: "directory", area: "" }, files("anything/anywhere.ts"), REPO_MAP);
+    expect(result.inScope).toBe(false);
+    expect(result.unbounded).toBe(true);
+  });
+
+  it("does not report inScope: true for a files scope with no concrete paths", () => {
+    const result = computeScopeGuard({ package: "files", paths: [] }, files("anything/anywhere.ts"), REPO_MAP);
+    expect(result.inScope).toBe(false);
+    expect(result.unbounded).toBe(true);
+  });
+
+  it("keeps the honest inScope: true, unbounded: undefined for genuinely repository-wide scope", () => {
+    const result = computeScopeGuard({ package: "repository" }, files("anything/anywhere.ts"), REPO_MAP);
+    expect(result.inScope).toBe(true);
+    expect(result.unbounded).toBeFalsy();
+  });
 });

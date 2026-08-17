@@ -37,4 +37,23 @@ describe("RiskAndScopeSummary", () => {
     render(<RiskAndScopeSummary analysis={{ riskScore: "LOW", scopeGuard: null, provenance: "git-derived" }} />);
     expect(screen.getByText(/git-derived/)).toBeInTheDocument();
   });
+
+  // F5: directory/files scope with no concrete path can no longer report
+  // inScope: true — the gateway now returns unbounded: true instead. Must
+  // render an honest "can't verify" notice (mirroring the scopeGuard === null
+  // pattern above), never blank silence and never the SCOPE EXPANSION box
+  // (which would show misleadingly empty expected/actual/expandedFiles lists).
+  it("renders an explicit 'Unbounded' notice, not SCOPE EXPANSION, when scope is directory/files with no concrete path", () => {
+    render(
+      <RiskAndScopeSummary
+        analysis={{
+          riskScore: "LOW",
+          scopeGuard: { inScope: false, expected: [], actual: ["anything/anywhere.ts"], expandedFiles: [], unbounded: true },
+          provenance: "git-derived",
+        }}
+      />
+    );
+    expect(screen.queryByText(/SCOPE EXPANSION/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/Scope guard: Unbounded/i)).toBeInTheDocument();
+  });
 });

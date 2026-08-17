@@ -90,7 +90,19 @@ export function computeScopeGuard(
 ): ScopeGuardResult {
   const expected = expectedPrefixes(scope, repoMap);
   const actual = changedFiles.map((f) => f.path);
-  if (expected.length === 0) return { inScope: true, expected, actual, expandedFiles: [] };
+  if (expected.length === 0) {
+    // F5: "directory"/"files" scope CLAIMS to be bounded to a concrete path,
+    // but the composer previously allowed submitting one with no path ever
+    // filled in — expectedPrefixes() then has nothing to guard against.
+    // Reporting inScope: true here would be indistinguishable from the
+    // honest, intentional "repository" scope (no boundary by design) below.
+    // Never trust the client on this: report the state as unbounded instead
+    // of silently passing every file as "in scope".
+    if (scope.package === "directory" || scope.package === "files") {
+      return { inScope: false, expected, actual, expandedFiles: [], unbounded: true };
+    }
+    return { inScope: true, expected, actual, expandedFiles: [] };
+  }
   const expandedFiles = actual.filter((p) => !expected.some((prefix) => p.startsWith(prefix)));
   return { inScope: expandedFiles.length === 0, expected, actual, expandedFiles };
 }

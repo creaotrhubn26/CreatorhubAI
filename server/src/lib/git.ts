@@ -72,7 +72,8 @@ export async function gitDiff(workspace: string, paths: string[] = []): Promise<
 export async function gitRevertFile(
   workspace: string,
   allowedPaths: string[],
-  targetPath: string
+  targetPath: string,
+  baselineSha: string
 ): Promise<void> {
   if (!allowedPaths.includes(targetPath)) {
     throw new Error(`Refusing to revert ${targetPath}: not in this session's changed files`);
@@ -82,5 +83,20 @@ export async function gitRevertFile(
   if (!resolved.startsWith(resolvedWorkspace)) {
     throw new Error(`Refusing to revert ${targetPath}: resolves outside workspace`);
   }
-  await git(workspace, ["checkout", "--", targetPath]);
+  if (!baselineSha) {
+    throw new Error(`Refusing to revert ${targetPath}: session has no recorded baseline commit`);
+  }
+  // F4: restore from the session's actual starting commit, not the index/HEAD.
+  // A dirty workspace (uncommitted edits present in OTHER files before the
+  // session ever started) is not rejected at session creation — `checkout --`
+  // would restore this file from HEAD, which is correct only by coincidence,
+  // and touches nothing else, so unrelated pre-session-dirty edits to other
+  // files are preserved either way. Using baselineSha instead of HEAD matters
+  // when HEAD has moved since the session started (e.g. other commits landed
+  // meanwhile) — this restores exactly what the session actually started from.
+  // Residual limitation (not fixed here, needs a pre-session snapshot this
+  // codebase doesn't take): if THIS file itself was already dirty at baseline,
+  // those pre-session edits are still lost — baselineSha only has committed
+  // content, not whatever was uncommitted in the workspace at session start.
+  await git(workspace, ["checkout", baselineSha, "--", targetPath]);
 }

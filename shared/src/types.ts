@@ -247,6 +247,11 @@ export interface ScopeGuardResult {
   expected: string[];
   actual: string[];
   expandedFiles: string[];
+  // F5: set when scope type is "directory"/"files" (a scope that CLAIMS to be
+  // bounded) but no concrete path was ever given, so nothing could actually be
+  // checked. Distinct from the honest, intentional inScope:true/expected:[]
+  // case for "repository" scope, which has no boundary by design.
+  unbounded?: boolean;
 }
 
 export interface SessionAnalysis {

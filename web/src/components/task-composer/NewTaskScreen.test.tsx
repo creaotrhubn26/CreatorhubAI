@@ -57,4 +57,40 @@ describe("NewTaskScreen", () => {
     fireEvent.click(box);
     expect(box.checked).toBe(true);
   });
+
+  // F5: "directory"/"files" scope previously had no way to enter a concrete
+  // path at all — scopeArea stayed "" forever, so the backend's scope guard
+  // could never tell what was in/out of scope and silently reported
+  // inScope: true for any change. A path input must appear for these scope
+  // types, and submission must be blocked while it's empty.
+  it("does not show a scope-path input for the default 'Entire repository' scope", () => {
+    render(withQuery(<NewTaskScreen />));
+    expect(screen.queryByLabelText(/scope path/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a required scope-path input when 'Selected directory' is chosen, and blocks submission until filled", () => {
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+      target: { value: "directory" },
+    });
+
+    const pathInput = screen.getByLabelText(/scope path/i) as HTMLInputElement;
+    expect(pathInput).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), { target: { value: "Fix the dialog" } });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+
+    expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeDisabled();
+
+    fireEvent.change(pathInput, { target: { value: "frontend/src/dialog" } });
+    expect(screen.getByRole("button", { name: "RUN GLIMMER" })).not.toBeDisabled();
+  });
+
+  it("shows the same required scope-path input when 'Selected files' is chosen", () => {
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+      target: { value: "files" },
+    });
+    expect(screen.getByLabelText(/scope path/i)).toBeInTheDocument();
+  });
 });

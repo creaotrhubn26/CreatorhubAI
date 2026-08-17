@@ -35,7 +35,10 @@ export function RiskAndScopeSummary({ analysis }: { analysis: SessionAnalysis })
       {analysis.scopeGuard === null && (
         <p>Scope guard: Unavailable — no task contract on record for this session.</p>
       )}
-      {analysis.scopeGuard && !analysis.scopeGuard.inScope && (
+      {analysis.scopeGuard?.unbounded && (
+        <p>Scope guard: Unbounded — this task's scope had no concrete path set, so scope could not be verified.</p>
+      )}
+      {analysis.scopeGuard && !analysis.scopeGuard.unbounded && !analysis.scopeGuard.inScope && (
         <div style={{ border: "1px solid var(--red)", borderRadius: "var(--radius)", padding: 8, marginTop: 8 }}>
           <strong style={{ color: "var(--red)" }}>SCOPE EXPANSION</strong>
           <dl>

@@ -219,7 +219,7 @@ sessionsRouter.post("/sessions/:id/revert-file", async (req, res) => {
     const targetPath = req.body?.path;
     if (typeof targetPath !== "string") return res.status(400).json({ error: "path required" });
     try {
-      await gitRevertFile(session.workspace, session.changedFiles.map((f) => f.path), targetPath);
+      await gitRevertFile(session.workspace, session.changedFiles.map((f) => f.path), targetPath, session.baselineSha);
       res.json({ reverted: targetPath });
     } catch (err: any) {
       res.status(403).json({ error: err.message });
