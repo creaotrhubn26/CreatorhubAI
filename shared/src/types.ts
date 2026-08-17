@@ -231,3 +231,36 @@ export interface DashboardStatus {
   recentSessions: Array<Pick<GlimmerSession, "id" | "task" | "status" | "changedFiles" | "completedAt">>;
   verification: VerificationSummary | null;
 }
+
+export interface TaskIntelligence {
+  likelyArea: string | null;
+  likelyPackage: string | null;
+  suggestedVerification: string[];
+  estimatedRisk: RiskLevel | null;
+  provenance: DataProvenance;
+}
+
+export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
+export interface ScopeGuardResult {
+  inScope: boolean;
+  expected: string[];
+  actual: string[];
+  expandedFiles: string[];
+  // F5: set when scope type is "directory"/"files" (a scope that CLAIMS to be
+  // bounded) but no concrete path was ever given, so nothing could actually be
+  // checked. Distinct from the honest, intentional inScope:true/expected:[]
+  // case for "repository" scope, which has no boundary by design.
+  unbounded?: boolean;
+}
+
+export interface SessionAnalysis {
+  riskScore: RiskLevel;
+  scopeGuard: ScopeGuardResult | null;
+  provenance: DataProvenance;
+}
+
+export interface SessionAssistantAnswer {
+  answer: string;
+  provenance: "model-output";
+}

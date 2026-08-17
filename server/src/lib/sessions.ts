@@ -3,7 +3,7 @@ import path from "node:path";
 import { sessionsDir } from "../config.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
-  VerificationSummary, VerificationCheckResult, VerificationOverall,
+  VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
 } from "@glimmer/shared";
 
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
@@ -118,11 +118,40 @@ export async function readManifestRaw(id: string): Promise<unknown | null> {
   }
 }
 
+export async function writeGatewayContract(dir: string, contract: TaskContract): Promise<void> {
+  await fs.writeFile(path.join(dir, "gateway-contract.json"), JSON.stringify(contract), "utf-8");
+}
+
+export async function readGatewayContract(id: string): Promise<TaskContract | null> {
+  const real = resolveSessionId(id);
+  try {
+    const raw = await fs.readFile(path.join(sessionsDir(), real, "gateway-contract.json"), "utf-8");
+    return JSON.parse(raw) as TaskContract;
+  } catch (err: any) {
+    if (err.code !== "ENOENT") {
+      console.warn(`[sessions] unreadable gateway-contract for ${real}: ${err?.message ?? err}`);
+    }
+    return null;
+  }
+}
+
+async function copyGatewayContract(fromId: string, toId: string): Promise<void> {
+  try {
+    const raw = await fs.readFile(path.join(sessionsDir(), fromId, "gateway-contract.json"), "utf-8");
+    await fs.writeFile(path.join(sessionsDir(), toId, "gateway-contract.json"), raw, "utf-8");
+  } catch {
+    // No contract to carry over — e.g. glimmer-v2.py was run standalone from a
+    // terminal, not through this gateway. Not an error.
+  }
+}
+
 export async function readSession(id: string): Promise<GlimmerSession | null> {
   const real = resolveSessionId(id);
   const raw = await readManifestRaw(real);
   if (!raw) return null;
-  return parseManifest(raw, real);
+  const session = parseManifest(raw, real);
+  const taskContract = await readGatewayContract(real);
+  return taskContract ? { ...session, taskContract } : session;
 }
 
 // --- pending-id -> real-session-id aliasing -------------------------------
@@ -166,6 +195,7 @@ export async function adoptRealSessionDir(
       );
       if (candidates.length === 1) {
         sessionAliases.set(pendingId, candidates[0]);
+        await copyGatewayContract(pendingId, candidates[0]);
         return candidates[0];
       }
       if (candidates.length > 1) {
@@ -204,6 +234,7 @@ export async function adoptRealSessionDir(
             const match = myIndex === -1 ? undefined : stillCandidates[myIndex]?.id;
             if (match && !stillClaimed.has(match)) {
               sessionAliases.set(pendingId, match);
+              await copyGatewayContract(pendingId, match);
               return match;
             }
           }

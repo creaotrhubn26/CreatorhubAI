@@ -5,17 +5,45 @@ import { randomUUID } from "node:crypto";
 import { CONFIG, sessionsDir } from "../config.js";
 import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
-  resolveSessionId, adoptRealSessionDir,
+  resolveSessionId, adoptRealSessionDir, writeGatewayContract,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { parseLogToEvents } from "../lib/events.js";
 import { runGlimmer, buildArgs } from "../lib/runner.js";
-import type { TaskContract, GlimmerSession } from "@glimmer/shared";
+import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
+import { findRepoMap } from "./repository.js";
+import { askSessionAssistant } from "../lib/sessionAssistant.js";
+import type { TaskContract, GlimmerSession, SessionAnalysis, GlimmerEvent, RepoMap } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
 
 const activeRuns = new Map<string, { cancel(): void }>();
 const pendingContracts = new Map<string, { contract: TaskContract; workspace: string }>();
+
+// This session's own repo-map.json, if glimmer-v2.py wrote one for this run.
+// Must take priority over the global findRepoMap() fallback (which walks ALL
+// sessions newest-first) — otherwise analyzing any session that isn't the
+// most-recently-created one scores against a stranger session's repo map.
+async function findOwnRepoMap(id: string): Promise<RepoMap | null> {
+  const mapPath = path.join(sessionsDir(), resolveSessionId(id), "repo-map.json");
+  try {
+    return JSON.parse(await fs.readFile(mapPath, "utf-8")) as RepoMap;
+  } catch (err: any) {
+    if (err.code !== "ENOENT") throw err;
+    return null;
+  }
+}
+
+export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]> {
+  const logPath = path.join(sessionsDir(), resolveSessionId(id), "engineer-00.log");
+  try {
+    const text = await fs.readFile(logPath, "utf-8");
+    return parseLogToEvents(id, text);
+  } catch (err: any) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+}
 
 sessionsRouter.get("/sessions", async (_req, res) => {
   const ids = await listSessionIds();
@@ -70,11 +98,32 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
   }
 
   try {
-    const text = await fs.readFile(logPathNow(), "utf-8");
-    res.json(parseLogToEvents(req.params.id, text));
+    res.json(await readSessionEventsBatch(req.params.id));
   } catch (err: any) {
-    if (err.code === "ENOENT") return res.json([]);
     res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.post("/sessions/:id/ask", async (req, res) => {
+  const question = req.body?.question;
+  if (typeof question !== "string" || !question.trim()) {
+    return res.status(400).json({ error: "question is required" });
+  }
+  let session, events;
+  try {
+    session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    events = await readSessionEventsBatch(req.params.id);
+  } catch (err: any) {
+    // Fault reading our own session/event state — a gateway-side error, not
+    // the model's fault. Must not be reported as a 502 (upstream unreachable).
+    return res.status(500).json({ error: err.message });
+  }
+  try {
+    const answer = await askSessionAssistant(CONFIG.modelBaseUrl, session, events, question);
+    res.json(answer);
+  } catch (err: any) {
+    res.status(502).json({ error: err.message });
   }
 });
 
@@ -108,6 +157,7 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
 
   const dir = path.join(sessionsDir(), req.params.id);
   await fs.mkdir(dir, { recursive: true });
+  await writeGatewayContract(dir, pending.contract);
 
   // Snapshot before spawning: glimmer-v2.py creates its own session directory
   // early in main(), and whichever directory appears next is this run's.
@@ -132,6 +182,25 @@ sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
   res.json({ cancelled: true });
 });
 
+sessionsRouter.get("/sessions/:id/analysis", async (req, res) => {
+  try {
+    const session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    const repoMap = (await findOwnRepoMap(req.params.id)) ?? (await findRepoMap());
+    const riskScore = computeRiskScore(session.changedFiles, repoMap);
+    const scopeGuard = session.taskContract
+      ? computeScopeGuard(session.taskContract.scope, session.changedFiles, repoMap)
+      : null;
+    // changedFiles always comes from this session's own real manifest/git
+    // state (never a model guess) — see repoAnalysis.ts for how riskScore and
+    // scopeGuard are derived from it.
+    const body: SessionAnalysis = { riskScore, scopeGuard, provenance: "git-derived" };
+    res.json(body);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 sessionsRouter.get("/sessions/:id/diff", async (req, res) => {
   try {
     const session = await readSession(req.params.id);
@@ -150,7 +219,7 @@ sessionsRouter.post("/sessions/:id/revert-file", async (req, res) => {
     const targetPath = req.body?.path;
     if (typeof targetPath !== "string") return res.status(400).json({ error: "path required" });
     try {
-      await gitRevertFile(session.workspace, session.changedFiles.map((f) => f.path), targetPath);
+      await gitRevertFile(session.workspace, session.changedFiles.map((f) => f.path), targetPath, session.baselineSha);
       res.json({ reverted: targetPath });
     } catch (err: any) {
       res.status(403).json({ error: err.message });

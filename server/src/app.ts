@@ -5,6 +5,7 @@ import { sessionsRouter } from "./routes/sessions.js";
 import { workspacesRouter } from "./routes/workspaces.js";
 import { modelRouter } from "./routes/model.js";
 import { repositoryRouter } from "./routes/repository.js";
+import { taskIntelligenceRouter } from "./routes/taskIntelligence.js";
 
 export function createApp(): Express {
   const app = express();
@@ -18,6 +19,7 @@ export function createApp(): Express {
   app.use("/api", workspacesRouter);
   app.use("/api", modelRouter);
   app.use("/api", repositoryRouter);
+  app.use("/api", taskIntelligenceRouter);
   // Terminal error handler: Express 4 does not catch async handler rejections,
   // and an unhandled rejection kills the gateway (orphaning running agents).
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

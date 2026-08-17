@@ -3,16 +3,25 @@ import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
+import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
   objective: "", scopePackage: "repository", scopeArea: "", mode: "implement",
   verification: [], repairBudget: 2, maxTurns: undefined,
 };
 
+const PATH_SCOPED_PACKAGES = new Set(["directory", "files"]);
+
 export function NewTaskScreen() {
   const [form, setForm] = useState(DEFAULT_FORM);
   const [workspace, setWorkspace] = useState("");
   const navigate = useNavigate();
+  // F5: "directory"/"files" scope claims to be bounded to a concrete path —
+  // without one, the backend's scope guard has nothing to check against and
+  // silently reports every change as in-scope. Require the path here so that
+  // state is now rare, not the default outcome of picking these scope types.
+  const needsScopePath = PATH_SCOPED_PACKAGES.has(form.scopePackage);
+  const scopePathMissing = needsScopePath && !form.scopeArea?.trim();
 
   const runMutation = useMutation({
     mutationFn: async () => {
@@ -46,6 +55,17 @@ export function NewTaskScreen() {
           <option value="directory">Selected directory</option>
           <option value="files">Selected files</option>
         </select>
+        {needsScopePath && (
+          <label>
+            Scope path
+            <input
+              value={form.scopeArea ?? ""}
+              onChange={(e) => setForm({ ...form, scopeArea: e.target.value })}
+              placeholder={form.scopePackage === "files" ? "e.g. src/foo.ts" : "e.g. frontend/src/dialog"}
+            />
+            {scopePathMissing && <span role="alert"> A path is required for this scope.</span>}
+          </label>
+        )}
       </fieldset>
 
       <fieldset>
@@ -56,6 +76,8 @@ export function NewTaskScreen() {
           ))}
         </select>
       </fieldset>
+
+      <TaskIntelligencePanel scopePackage={form.scopePackage} scopeArea={form.scopeArea || undefined} />
 
       <fieldset>
         <legend>Verification</legend>
@@ -113,7 +135,7 @@ export function NewTaskScreen() {
 
       <button
         onClick={() => runMutation.mutate()}
-        disabled={!form.objective || !workspace || runMutation.isPending}
+        disabled={!form.objective || !workspace || scopePathMissing || runMutation.isPending}
       >
         RUN GLIMMER
       </button>

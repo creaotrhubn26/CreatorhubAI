@@ -62,17 +62,58 @@ describe("gitDiff with an untracked (new) file", () => {
 });
 
 describe("gitRevertFile", () => {
-  it("restores an allowed file", async () => {
-    await gitRevertFile(repo, ["a.txt"], "a.txt");
+  it("restores an allowed file to the given baseline commit", async () => {
+    const baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+    await gitRevertFile(repo, ["a.txt"], "a.txt", baselineSha);
     expect(await fs.readFile(path.join(repo, "a.txt"), "utf-8")).toBe("one\n");
   });
 
   it("refuses a file not in the allow-list", async () => {
+    const baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
     await fs.writeFile(path.join(repo, "a.txt"), "three\n");
-    await expect(gitRevertFile(repo, ["other.txt"], "a.txt")).rejects.toThrow();
+    await expect(gitRevertFile(repo, ["other.txt"], "a.txt", baselineSha)).rejects.toThrow();
   });
 
   it("refuses a path-traversal attempt", async () => {
-    await expect(gitRevertFile(repo, ["../secret.txt"], "../secret.txt")).rejects.toThrow();
+    const baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+    await expect(gitRevertFile(repo, ["../secret.txt"], "../secret.txt", baselineSha)).rejects.toThrow();
+  });
+
+  it("refuses to revert when no baseline commit is known, instead of silently trusting HEAD", async () => {
+    await expect(gitRevertFile(repo, ["a.txt"], "a.txt", "")).rejects.toThrow(/baseline/i);
+  });
+
+  // F4 (data-loss bug): the session's baselineSha is the commit it actually
+  // started from. HEAD can move on past that (e.g. another commit lands on
+  // this branch while the session is running) — reverting must restore this
+  // file to baseline's content, NOT whatever's at HEAD/index by the time
+  // Revert is clicked. The old buggy implementation (`git checkout -- file`)
+  // would restore from HEAD here and get "post-baseline\n", which is wrong.
+  it("restores to the baseline commit's content, not to a HEAD that has since moved on", async () => {
+    const isolated = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-git-baseline-test-"));
+    try {
+      await exec("git", ["init", "-q"], { cwd: isolated });
+      await exec("git", ["config", "user.email", "t@t.com"], { cwd: isolated });
+      await exec("git", ["config", "user.name", "t"], { cwd: isolated });
+      await fs.writeFile(path.join(isolated, "b.txt"), "baseline-content\n");
+      await exec("git", ["add", "b.txt"], { cwd: isolated });
+      await exec("git", ["commit", "-q", "-m", "baseline"], { cwd: isolated });
+      const baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: isolated })).stdout.trim();
+
+      // A commit lands AFTER the session's baseline (e.g. someone else pushed,
+      // or the orchestrator committed something) — HEAD is now ahead of
+      // baselineSha, with different committed content for the same file.
+      await fs.writeFile(path.join(isolated, "b.txt"), "post-baseline\n");
+      await exec("git", ["commit", "-aq", "-m", "moved on"], { cwd: isolated });
+
+      // The session's own (uncommitted) edit, made after that commit landed.
+      await fs.writeFile(path.join(isolated, "b.txt"), "session-edit\n");
+
+      await gitRevertFile(isolated, ["b.txt"], "b.txt", baselineSha);
+
+      expect(await fs.readFile(path.join(isolated, "b.txt"), "utf-8")).toBe("baseline-content\n");
+    } finally {
+      await fs.rm(isolated, { recursive: true, force: true });
+    }
   });
 });
