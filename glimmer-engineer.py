@@ -51,6 +51,29 @@ def _emit_engineer_phase(phase: str) -> None:
     )
 
 
+# C1 fix round 1 (Important finding): a lifecycle marker for run_architect,
+# distinguishing its activity from the main engineer run's in the same
+# events.jsonl stream. Deliberately reuses the real "agent_state_changed"
+# EVENT_TYPES member (this project never emits an event type outside
+# @glimmer/shared's 12-variant EVENT_TYPES set) rather than the pattern
+# just above (mapping to the closest real GlimmerSessionStatus member):
+# unlike engineer_phase's sub-states, which occur INSIDE a normal
+# in-progress session and could plausibly be confused with one of the 14
+# real statuses if left unmapped, architect mode is a distinct pre-session
+# step that doesn't correspond to any of them — there is no "closest real
+# member" to map to, so a distinct, unambiguous marker is used instead. No
+# matching "end" marker is emitted: the next real agent_state_changed
+# event (the main run's own state transitions, or v2.py's own
+# "initialized") already marks the boundary, so a downstream consumer can
+# segment "everything between this event and the next agent_state_changed
+# event is architect activity" without a second marker.
+def _emit_architect_started() -> None:
+    _emit(
+        "agent_state_changed",
+        state="architect_planning",
+    )
+
+
 API_BASE = os.environ.get(
     "GLIMMER_URL",
     "http://127.0.0.1:8080",
@@ -114,6 +137,22 @@ REQUIRED_ENGINEERING_TOOLS = {
 # (not merely by omission) whenever mode == "architect", so a model that
 # calls an unoffered write tool anyway still cannot execute it.
 ARCHITECT_TOOL_NAMES = READ_TOOLS | {"exec_shell_command"}
+
+# C1 fix round 1 (Minor finding): engineer mode's existing default,
+# preserved exactly (was a bare literal `default=32` in main()'s argparse
+# block, now named so it can be referenced from both main() and here).
+ENGINEER_MAX_TURNS_DEFAULT = 32
+
+# Architect mode gets its OWN, smaller default: unbounded/oversized turn
+# budgets are exactly the latency risk the reconciliation doc's C1 entry
+# names for an unmeasured Architect ("An Architect that only adds latency
+# is worse than no Architect"). Read-only exploration + one final JSON
+# turn should converge well inside run_engineer's own 8-call discovery
+# budget for a write-capable loop; 12 leaves headroom for a couple of
+# re-prompts if the model's first final answer isn't valid JSON (see
+# run_architect's re-prompt-on-invalid-JSON path) without approaching
+# engineer mode's 32. Still overridable via --max-turns for either mode.
+ARCHITECT_MAX_TURNS_DEFAULT = 12
 
 
 # ============================================================
@@ -462,7 +501,15 @@ def shell_policy(
                     "git diff --no-index blocked"
                 )
 
-            if "--output" in tokens:
+            # Fix round 1 (Critical finding root cause): `in tokens` only
+            # matched the space-separated form (`--output X`) and missed
+            # the `=`-joined form (`--output=X`), letting `git diff
+            # --output=path` clobber an arbitrary file in both engineer
+            # and architect mode. Catch both forms.
+            if any(
+                token == "--output" or token.startswith("--output=")
+                for token in tokens
+            ):
                 return False, (
                     "git output-to-file blocked"
                 )
@@ -653,37 +700,38 @@ def shell_policy(
     )
 
 
-def architect_shell_policy(command):
+def architect_shell_policy(command, workspace):
     """C1 (glimmer-v7): exec_shell_command policy for architect mode.
 
-    Strictly narrower than shell_policy above — architect mode has no
-    legitimate use for npm/cargo/py_compile validation commands (nothing
-    it does is ever verified against a change, since it never writes), so
-    those are not offered here even though shell_policy itself allows
-    them for the engineer. Reuses the SAME SAFE_READONLY_GIT_SUBCOMMANDS
-    module-level set shell_policy's own git branch and the repeat-command
-    guard already share, per ADR-0002's "one allowlist" rule — this must
-    never drift into a second, independently-maintained read-only-git
-    list.
+    Fix round 1 (Critical finding): this MUST be a strict subset of
+    shell_policy BY CONSTRUCTION — by delegating to it — not by
+    re-implementing shell_policy's own preamble. A prior version
+    re-implemented the composition/pipe/quoting checks and, in doing so,
+    silently dropped shell_policy's git-specific `--no-index` and
+    `--output` guards, making architect mode MORE permissive than engineer
+    mode on both writes (`git diff --output CLOBBER.txt`) and path
+    containment (`git diff --no-index /etc/passwd /etc/hosts`) — the exact
+    inversion this mode exists to prevent. Delegating means this can never
+    be more permissive than shell_policy for any command shape, now or
+    after any future change to shell_policy, without anyone having to
+    remember to mirror that change here too.
+
+    Additionally requires `git <subcommand>` where subcommand is in the
+    SAME module-level SAFE_READONLY_GIT_SUBCOMMANDS set shell_policy's own
+    git branch and the repeat-command guard already share (per ADR-0002's
+    "one allowlist" rule) — architect mode has no legitimate use for
+    npm/cargo/py_compile validation commands or `git branch
+    --show-current` (shell_policy allows all of those; architect mode is
+    narrower still).
     """
-    if not isinstance(command, str):
-        return False, "Command must be a string"
+    allowed, reason = shell_policy(command, workspace)
 
-    command = command.strip()
+    if not allowed:
+        return False, reason
 
-    if not command:
-        return False, "Empty command"
-
-    if re.search(r"[;&|><\n\r`]", command) or "$(" in command:
-        return False, "Shell composition, pipes, redirects and substitution are blocked"
-
-    try:
-        tokens = shlex.split(command)
-    except ValueError as exc:
-        return False, f"Invalid shell quoting: {exc}"
-
-    if not tokens:
-        return False, "Empty command"
+    # shell_policy already proved this parses (allowed == True), so this
+    # can't raise — re-split just to inspect the executable/subcommand.
+    tokens = shlex.split(command.strip())
 
     if tokens[0] != "git" or len(tokens) < 2 or tokens[1] not in SAFE_READONLY_GIT_SUBCOMMANDS:
         return False, (
@@ -1288,7 +1336,7 @@ def execute_tool(
         if mode == "architect":
             # Stricter than shell_policy: read-only git only. See
             # architect_shell_policy's docstring.
-            allowed, reason = architect_shell_policy(command)
+            allowed, reason = architect_shell_policy(command, workspace)
         else:
             allowed, reason = shell_policy(
                 command,
@@ -1741,14 +1789,95 @@ def _architect_mode_selfcheck() -> None:
     )
 
     # exec_shell_command in architect mode: only read-only git passes.
-    assert architect_shell_policy("git status")[0] is True
-    assert architect_shell_policy("git diff --stat")[0] is True
-    assert architect_shell_policy("git rev-parse --show-toplevel")[0] is True
-    assert architect_shell_policy("npm run typecheck")[0] is False
-    assert architect_shell_policy("git commit -m x")[0] is False
-    assert architect_shell_policy("git push")[0] is False
-    assert architect_shell_policy("cat package.json")[0] is False
-    assert architect_shell_policy("git status; rm -rf /")[0] is False
+    ws = Path("/tmp")
+    assert architect_shell_policy("git status", ws)[0] is True
+    assert architect_shell_policy("git diff --stat", ws)[0] is True
+    assert architect_shell_policy("git rev-parse --show-toplevel", ws)[0] is True
+    assert architect_shell_policy("npm run typecheck", ws)[0] is False
+    assert architect_shell_policy("git commit -m x", ws)[0] is False
+    assert architect_shell_policy("git push", ws)[0] is False
+    assert architect_shell_policy("cat package.json", ws)[0] is False
+    assert architect_shell_policy("git status; rm -rf /", ws)[0] is False
+    # git branch --show-current: shell_policy itself allows this, but
+    # architect mode is narrower still (branch isn't in
+    # SAFE_READONLY_GIT_SUBCOMMANDS) — proves delegation narrows, not
+    # just inherits, shell_policy's allowlist.
+    assert shell_policy("git branch --show-current", ws)[0] is True
+    assert architect_shell_policy("git branch --show-current", ws)[0] is False
+
+    # Fix round 1 (Critical finding) regression test: the exact two
+    # commands the reviewer confirmed were wrongly ALLOWED by a prior
+    # version of architect_shell_policy (a write via `--output` and a
+    # path escape via `--no-index`). Both must now be rejected, and must
+    # be rejected for the SAME reason shell_policy itself rejects them
+    # (proving delegation, not a second parallel guard that could drift).
+    clobber_allowed, clobber_reason = architect_shell_policy("git diff --output CLOBBER.txt", ws)
+    assert clobber_allowed is False, "git diff --output must be blocked in architect mode"
+    assert clobber_reason == shell_policy("git diff --output CLOBBER.txt", ws)[1]
+
+    escape_allowed, escape_reason = architect_shell_policy("git diff --no-index /etc/passwd /etc/hosts", ws)
+    assert escape_allowed is False, "git diff --no-index must be blocked in architect mode"
+    assert escape_reason == shell_policy("git diff --no-index /etc/passwd /etc/hosts", ws)[1]
+
+    # Root cause (also affects engineer mode): `--output=X` (=-joined
+    # form) must be blocked exactly like `--output X`, in BOTH policies.
+    assert shell_policy("git diff --output=CLOBBER.txt", ws)[0] is False
+    assert architect_shell_policy("git diff --output=CLOBBER.txt", ws)[0] is False
+
+    # ------------------------------------------------------------
+    # 1b. Fix round 1 (Important finding): run_architect must emit a
+    #     lifecycle marker (real "agent_state_changed" EVENT_TYPES member,
+    #     distinct state value) so architect activity is segmentable in
+    #     events.jsonl. No live session dir needed — monkeypatch _emit
+    #     to capture the call.
+    # ------------------------------------------------------------
+    captured = []
+    real_emit_fn = globals()["_emit"]
+    globals()["_emit"] = lambda event_type, **fields: captured.append((event_type, fields))
+    try:
+        _emit_architect_started()
+    finally:
+        globals()["_emit"] = real_emit_fn
+    assert captured == [("agent_state_changed", {"state": "architect_planning"})], captured
+
+    # ------------------------------------------------------------
+    # 1c. Fix round 1 (Minor finding): the fallback plan's objective must
+    #     be the real (short) task objective, not the whole multi-KB
+    #     constructed architect prompt (contract JSON + repo map).
+    # ------------------------------------------------------------
+    fake_prompt = (
+        "TASK CONTRACT (authoritative — sole source of scope/mode/constraints for this task):\n"
+        '{"objective": "restore a session after reload", "scope": {"package": "repository"}}\n'
+        "\n"
+        "USER TASK:\n"
+        "restore a session after reload\n"
+        "\n"
+        "MODE: implement\n"
+        "SCOPE: package=repository\n"
+        "\n"
+        "TRUSTED REPOSITORY MAP:\n"
+        + ("x" * 2000)  # stand-in for a large repo map — must NOT leak into the extracted objective
+    )
+    assert _extract_task_objective(fake_prompt) == "restore a session after reload"
+    assert len(_extract_task_objective(fake_prompt)) < 100  # nowhere near the ~2KB+ full prompt
+
+    # No "USER TASK:" marker (e.g. a standalone --mode architect
+    # invocation not routed through glimmer-v2.py) -> bounded fallback,
+    # never raises, never unbounded.
+    assert _extract_task_objective("just do the thing") == "just do the thing"
+    huge = "y" * 5000
+    truncated = _extract_task_objective(huge)
+    assert len(truncated) <= _TASK_OBJECTIVE_LIMIT + len("...(truncated)")
+    assert truncated.endswith("...(truncated)")
+    assert _extract_task_objective(None) == ""
+    assert _extract_task_objective("") == ""
+
+    # ------------------------------------------------------------
+    # 1d. Fix round 1 (Minor finding): architect mode gets its own
+    #     smaller default turn budget, engineer mode's is unchanged.
+    # ------------------------------------------------------------
+    assert ARCHITECT_MAX_TURNS_DEFAULT < ENGINEER_MAX_TURNS_DEFAULT
+    assert ENGINEER_MAX_TURNS_DEFAULT == 32, "engineer mode's pre-C1 default must be unchanged"
 
     # ------------------------------------------------------------
     # 2. Valid model-shaped JSON: parses, validates, and writes
@@ -2358,6 +2487,32 @@ def _fallback_architecture_plan(objective, reason):
     return plan
 
 
+_TASK_OBJECTIVE_LIMIT = 500
+
+
+def _extract_task_objective(task_text):
+    """C1 fix round 1 (Minor finding): `task` as received by run_architect
+    is the FULL constructed architect prompt (glimmer-v2.py's
+    make_architect_prompt: the whole TASK CONTRACT json blob + up to
+    ~12KB repo map, not just the objective) — using it verbatim as a
+    fallback plan's "objective" field made that field multi-KB and
+    useless as a summary. make_architect_prompt always embeds the real
+    objective verbatim as "USER TASK:\\n<objective>\\n\\nMODE: ...", so
+    extract just that line. Falls back to a bounded prefix of the raw
+    text when the marker isn't found (e.g. a standalone --mode architect
+    invocation that didn't go through glimmer-v2.py) — never raises,
+    same "always produce something usable" spirit as the rest of this
+    file's fallback paths.
+    """
+    match = re.search(r"USER TASK:\s*\n(.*?)\n\s*\n", task_text or "", re.DOTALL)
+    objective = match.group(1).strip() if match else (task_text or "").strip()
+
+    if len(objective) > _TASK_OBJECTIVE_LIMIT:
+        objective = objective[:_TASK_OBJECTIVE_LIMIT] + "...(truncated)"
+
+    return objective
+
+
 def _write_architecture_plan_file(output):
     """Write architecture-plan.json (whether a real plan or the fallback
     marker) to the session dir. Never raises: a write failure here must
@@ -2504,6 +2659,8 @@ def run_architect(task, workspace, max_turns):
             f"Workspace: {workspace}\n"
             f"Git root:  {git_root}"
         )
+
+    _emit_architect_started()
 
     metadata, tools = get_tools()
 
@@ -2686,7 +2843,10 @@ def run_architect(task, workspace, max_turns):
         print(f"Risk:      {output['risk']}")
         print(f"Packages:  {output['packages']}")
     else:
-        output = _fallback_architecture_plan(task, failure_reason or "unknown failure")
+        output = _fallback_architecture_plan(
+            _extract_task_objective(task),
+            failure_reason or "unknown failure",
+        )
         print()
         print(f"⚠ Architect planning failed: {failure_reason or 'unknown failure'}")
         print("Writing fallback architecture-plan.json (planningFailed=true).")
@@ -3498,7 +3658,13 @@ def main():
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=32,
+        default=None,
+        help=(
+            "Turn budget. Default (when omitted): "
+            f"{ENGINEER_MAX_TURNS_DEFAULT} for engineer mode (unchanged), "
+            f"{ARCHITECT_MAX_TURNS_DEFAULT} for architect mode — see "
+            "ARCHITECT_MAX_TURNS_DEFAULT's comment."
+        ),
     )
 
     parser.add_argument(
@@ -3533,16 +3699,26 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "architect":
+        max_turns = (
+            args.max_turns
+            if args.max_turns is not None
+            else ARCHITECT_MAX_TURNS_DEFAULT
+        )
         run_architect(
             " ".join(args.prompt),
             args.workspace,
-            args.max_turns,
+            max_turns,
         )
     else:
+        max_turns = (
+            args.max_turns
+            if args.max_turns is not None
+            else ENGINEER_MAX_TURNS_DEFAULT
+        )
         run_engineer(
             " ".join(args.prompt),
             args.workspace,
-            args.max_turns,
+            max_turns,
             args.yes,
         )
 

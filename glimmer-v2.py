@@ -1086,7 +1086,22 @@ def load_architecture_plan(session_dir):
     return data
 
 
-def run_architect_first(engineer, ws, contract, summary, session, events_path, sid, max_turns):
+def architect_plan_manifest_record(plan):
+    """C1 fix round 1 (Important finding): a small, real record of whether
+    the architect step did anything useful for this session — the
+    measurable signal the reconciliation doc's C1 entry requires before
+    this could ever run automatically. `plan` is whatever run_
+    architect_first returned (already None on any failure per load_
+    architecture_plan's contract), so "used" is literally "was a plan
+    actually threaded into make_prompt for this session."
+    """
+    return {
+        "used": plan is not None,
+        "risk": plan.get("risk") if plan else None,
+    }
+
+
+def run_architect_first(engineer, ws, contract, summary, session, events_path, sid):
     """C1 (glimmer-v7): opt-in-only pre-step, invoked from main() ONLY when
     --architect-first was explicitly passed. Spawns glimmer-engineer.py
     --mode architect BEFORE iteration 0, then reads back architecture-
@@ -1094,19 +1109,33 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     invalid output) degrades to "no plan" and the caller proceeds with
     the main run exactly as if this had never run — see load_
     architecture_plan's uniform None-on-any-failure contract above.
+
+    Fix round 1 (Minor finding): everything that can raise now lives
+    inside the try — this function's own docstring promises "must never
+    raise," and the prompt file write was previously outside the try
+    block, contradicting that.
+
+    Fix round 1 (Minor finding, turn budget): no max_turns parameter —
+    v2.py's own --max-turns is meant for the ENGINEERING run and is not
+    threaded through to the architect subprocess at all, so architect
+    mode always gets glimmer-engineer.py's own smaller mode-aware
+    default (ARCHITECT_MAX_TURNS_DEFAULT, currently 12) regardless of
+    what --max-turns the caller set for the real run. If a future need
+    arises to independently tune architect's budget from v2.py, add a
+    separate --architect-max-turns flag then.
     """
     print("\n" + "=" * 72)
     print(" [V2] --architect-first: running Architect mode before iteration 0")
     print("=" * 72)
 
-    architect_prompt = make_architect_prompt(contract, summary)
-    (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
-
     try:
+        architect_prompt = make_architect_prompt(contract, summary)
+        (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
+
         rc = invoke_engineer(
             engineer, ws, architect_prompt,
             True,  # auto_approve is forced regardless inside invoke_engineer for mode="architect"
-            max_turns,
+            None,  # let glimmer-engineer.py's own architect-mode default apply, see docstring
             session / "architect.log",
             events_path, sid,
             mode="architect",
@@ -1115,7 +1144,14 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     except Exception as exc:  # noqa: BLE001 - architect failure must never block the real run
         print(f"[V2] WARN: architect subprocess failed to run: {exc}")
 
+    # Deliberately OUTSIDE the try above: load_architecture_plan already
+    # degrades to None internally on any read/parse failure (see its own
+    # docstring), so it's always safe to call regardless of whether the
+    # subprocess spawn itself raised — including the edge case where the
+    # architect subprocess completed and wrote a valid plan file but
+    # invoke_engineer's own Python-side stdout streaming then raised.
     plan = load_architecture_plan(session)
+
     if plan is not None:
         print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
     else:
@@ -1303,12 +1339,19 @@ def main():
         # having passed the flag) whenever it's skipped, or the architect
         # run fails/times out/produces invalid JSON — see
         # run_architect_first/load_architecture_plan's uniform-None
-        # degradation contract.
+        # degradation contract. manifest["architectPlan"] is only ever
+        # added when --architect-first was actually passed (fix round 1,
+        # Important finding: without this, there's no way to measure
+        # architect-mode activity/usefulness separately from the main
+        # run — the reconciliation doc requires shipping C1 "behind a
+        # measured gate" before it runs automatically).
         architecture_plan = None
         if args.architect_first:
             architecture_plan = run_architect_first(
-                engineer, ws, contract, summary, session, events_path, sid, args.max_turns,
+                engineer, ws, contract, summary, session, events_path, sid,
             )
+            manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
+            save()
 
         for iteration in range(args.max_repairs + 1):
             if iteration > 0:
@@ -1711,6 +1754,22 @@ def _architect_first_selfcheck() -> None:
     # available to a subprocess spawned this way.
     import inspect
     assert inspect.signature(invoke_engineer).parameters["mode"].default is None
+
+    # Fix round 1 (Minor finding): run_architect_first no longer accepts
+    # a max_turns parameter at all — v2's own --max-turns (meant for the
+    # ENGINEERING run) is never threaded through to the architect
+    # subprocess, so it always gets glimmer-engineer.py's own smaller
+    # architect-mode default regardless of what the real run's budget is.
+    assert "max_turns" not in inspect.signature(run_architect_first).parameters
+
+    # Fix round 1 (Important finding): the manifest record is a real,
+    # small signal of whether the architect step did anything useful —
+    # exactly the measured-gate signal the reconciliation doc requires.
+    assert architect_plan_manifest_record(None) == {"used": False, "risk": None}
+    assert architect_plan_manifest_record({"risk": "high", "objective": "x", "packages": []}) == {
+        "used": True,
+        "risk": "high",
+    }
 
     print("architect-first self-check: PASS")
 
