@@ -893,21 +893,59 @@ def recover_interrupted_checkpoint(ws):
     }
 
 
-def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None):
-    # R2: the contract dict (same shape as manifest["contract"]) is the sole
-    # source of truth for scope/mode/constraints — derive the human-readable
-    # OPERATING CONTRACT lines below FROM it rather than maintaining separate
-    # hardcoded prose that can drift out of sync with the CLI flags.
-    task = contract["objective"]
+def _contract_scope_text(contract):
+    """Shared by make_prompt and make_architect_prompt (C1) so the
+    human-readable SCOPE line can't drift between the two prompts built
+    from the same contract."""
     scope = contract["scope"]
-    constraints = contract["constraints"]
-
     scope_bits = [f"package={scope['package']}"]
     if scope.get("area"):
         scope_bits.append(f"area={scope['area']}")
     if scope.get("paths"):
         scope_bits.append(f"paths={scope['paths']}")
-    scope_text = ", ".join(scope_bits)
+    return ", ".join(scope_bits)
+
+
+def make_architect_prompt(contract, summary):
+    """C1 (glimmer-v7): the "task" text handed to `glimmer-engineer.py
+    --mode architect` — NOT make_prompt's full engineering OPERATING
+    CONTRACT (that prose is write-loop-specific: freeze rules, diff/
+    validation instructions, none of which apply to a read-only planning
+    run). Architect mode's own system prompt (glimmer-engineer.py's
+    ARCHITECT_SYSTEM_PROMPT) already carries the permissions/output-shape
+    instructions; this is just the objective + contract + repo map it
+    needs to plan against.
+    """
+    return textwrap.dedent(f"""
+    TASK CONTRACT (authoritative — sole source of scope/mode/constraints for this task):
+    {json.dumps(contract)}
+
+    USER TASK:
+    {contract["objective"]}
+
+    MODE: {contract['mode']}
+    SCOPE: {_contract_scope_text(contract)}
+
+    TRUSTED REPOSITORY MAP:
+    {summary}
+    """).strip()
+
+
+def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None):
+    # R2: the contract dict (same shape as manifest["contract"]) is the sole
+    # source of truth for scope/mode/constraints — derive the human-readable
+    # OPERATING CONTRACT lines below FROM it rather than maintaining separate
+    # hardcoded prose that can drift out of sync with the CLI flags.
+    #
+    # C1 (glimmer-v7): `plan` is the ArchitecturePlan dict loaded from
+    # architecture-plan.json (V7 §5.4 handoff, scoped down per the C1 task
+    # entry to just these fields — no skills/allowed-tools/scope-constraint
+    # systems, those don't exist here). Only ever non-None when the caller
+    # passed --architect-first AND the architect run produced a usable
+    # (non-planningFailed) plan; every other invocation shape is unaffected.
+    task = contract["objective"]
+    constraints = contract["constraints"]
+    scope_text = _contract_scope_text(contract)
 
     constraint_lines = []
     if constraints.get("minimalChange"):
@@ -936,6 +974,34 @@ PREVIOUS LOCAL-ONLY CHECKPOINT:
 
 Repair only failures introduced by this task. Preserve correct prior work and pre-existing baseline failures.
 """
+
+    # C1 (glimmer-v7): appended AFTER the existing template's .strip() below
+    # (not interpolated into the dedent block) so that plan=None/{} produces
+    # a prompt string that is byte-for-byte IDENTICAL to make_prompt's
+    # pre-C1 output — no --architect-first, no observable change at all.
+    # Only implementationPlan/constraints/candidateFiles/verificationPlan
+    # are threaded through, per the C1 task's scoped-down §5.4 handoff
+    # (not skills/allowed-tools/scope-constraints — those systems don't
+    # exist here).
+    plan_block = ""
+    if plan:
+        plan_fields = {
+            key: plan.get(key, [])
+            for key in (
+                "implementationPlan",
+                "constraints",
+                "candidateFiles",
+                "verificationPlan",
+            )
+        }
+        plan_block = (
+            "\n\nARCHITECTURE PLAN (from --architect-first Architect mode; "
+            "a hint from prior read-only exploration, not a substitute for "
+            "your own verification — if evidence contradicts it, deviate "
+            "and say why):\n"
+            + json.dumps(plan_fields, indent=2)
+        )
+
     return textwrap.dedent(f"""
     MUSE GLIMMER ENGINEERING MODE V2.1 — {'IMPLEMENT' if iteration == 0 else f'REPAIR {iteration}'}
 
@@ -963,17 +1029,26 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     - Narrow diagnostic commands are allowed when needed.
     - Inspect the exact diff before finishing.
     - If the task cannot safely be completed, do not make speculative changes.
-    """).strip()
+    """).strip() + plan_block
 
 
-def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id):
+def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None):
     cmd = [str(engineer), "--workspace", str(ws)]
+    if mode is not None:
+        # C1 (glimmer-v7): mode="architect" is the only caller that ever
+        # sets this — reuses this same spawn shape (same env plumbing,
+        # same stdout/log tee) instead of a second subprocess helper.
+        cmd += ["--mode", mode]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
-    if auto_approve:
+    # Architect mode has no approval path (C1 scoping): it runs unattended
+    # with no interactive stdin, so it must always get --yes regardless of
+    # what the caller's own --auto-approve flag says.
+    if auto_approve or mode == "architect":
         cmd.append("--yes")
     cmd.append(prompt)
-    print("\n[V2] Launching existing glimmer-engineer.py...")
+    label = "glimmer-engineer.py" if mode is None else f"glimmer-engineer.py --mode {mode}"
+    print(f"\n[V2] Launching existing {label}...")
     env = os.environ.copy()
     env["GLIMMER_EVENTS_PATH"] = str(events_path)
     env["GLIMMER_SESSION_ID"] = session_id
@@ -985,6 +1060,68 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
             sys.stdout.write(line)
             log.write(line)
         return p.wait()
+
+
+def load_architecture_plan(session_dir):
+    """C1 (glimmer-v7): load architecture-plan.json from the session dir
+    (same convention glimmer-engineer.py's _architecture_plan_file_path
+    writes to — the parent of GLIMMER_EVENTS_PATH, which IS session_dir
+    from this side). Returns the parsed dict when it's a usable plan, or
+    None uniformly for every degraded case: file missing, unreadable,
+    not valid JSON, not a JSON object, or explicitly marked
+    planningFailed. Callers never need to distinguish these cases —
+    None always means "proceed without a plan, exactly as if
+    --architect-first had never been passed."
+    """
+    path = Path(session_dir) / "architecture-plan.json"
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    if not isinstance(data, dict) or data.get("planningFailed"):
+        return None
+
+    return data
+
+
+def run_architect_first(engineer, ws, contract, summary, session, events_path, sid, max_turns):
+    """C1 (glimmer-v7): opt-in-only pre-step, invoked from main() ONLY when
+    --architect-first was explicitly passed. Spawns glimmer-engineer.py
+    --mode architect BEFORE iteration 0, then reads back architecture-
+    plan.json. Must never raise: an architect failure (crash, timeout,
+    invalid output) degrades to "no plan" and the caller proceeds with
+    the main run exactly as if this had never run — see load_
+    architecture_plan's uniform None-on-any-failure contract above.
+    """
+    print("\n" + "=" * 72)
+    print(" [V2] --architect-first: running Architect mode before iteration 0")
+    print("=" * 72)
+
+    architect_prompt = make_architect_prompt(contract, summary)
+    (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
+
+    try:
+        rc = invoke_engineer(
+            engineer, ws, architect_prompt,
+            True,  # auto_approve is forced regardless inside invoke_engineer for mode="architect"
+            max_turns,
+            session / "architect.log",
+            events_path, sid,
+            mode="architect",
+        )
+        print(f"[V2] Architect subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - architect failure must never block the real run
+        print(f"[V2] WARN: architect subprocess failed to run: {exc}")
+
+    plan = load_architecture_plan(session)
+    if plan is not None:
+        print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
+    else:
+        print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
+
+    return plan
 
 
 def main():
@@ -1017,6 +1154,15 @@ def main():
     ap.add_argument("--readiness-timeout", type=int, default=180)
     ap.add_argument("--toolchain-mode", choices=("path", "linked", "none"), default="path",
                     help="path=reuse source tool binaries via env (safe default); linked=temporary ignored node_modules symlinks during trusted verification only; none=no source toolchain reuse")
+    # C1 (glimmer-v7): opt-in only, default False. Never auto-triggered by
+    # risk or anything else — TaskContract has no risk field today (risk is
+    # computed post-run, client-side, in a separate TS project), so there is
+    # nothing to gate an automatic invocation on. A human/caller must pass
+    # this explicitly. Every existing invocation (this flag omitted) takes
+    # the exact same code path as before this change.
+    ap.add_argument("--architect-first", action="store_true",
+                    help="Run glimmer-engineer.py --mode architect before iteration 0 and feed its "
+                         "ArchitecturePlan into the engineering prompt. Off by default; never auto-triggered.")
     args = ap.parse_args()
 
     ws = Path(args.workspace).expanduser().resolve()
@@ -1152,10 +1298,22 @@ def main():
             manifest["modelReadiness"] = {"status": "SKIPPED"}
             save()
 
+        # C1 (glimmer-v7): opt-in only (--architect-first), runs once before
+        # iteration 0. architecture_plan stays None (identical to never
+        # having passed the flag) whenever it's skipped, or the architect
+        # run fails/times out/produces invalid JSON — see
+        # run_architect_first/load_architecture_plan's uniform-None
+        # degradation contract.
+        architecture_plan = None
+        if args.architect_first:
+            architecture_plan = run_architect_first(
+                engineer, ws, contract, summary, session, events_path, sid, args.max_turns,
+            )
+
         for iteration in range(args.max_repairs + 1):
             if iteration > 0:
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
-            prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha)
+            prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha, plan=architecture_plan)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid)
@@ -1472,6 +1630,91 @@ def _repomap_cache_selfcheck() -> None:
     print("repo-map cache self-check: PASS")
 
 
+def _architect_first_selfcheck() -> None:
+    """C1 (glimmer-v7): proves (a) a valid architecture-plan.json's fields
+    get threaded into make_prompt's output, and (b) a missing/invalid/
+    planningFailed plan file produces make_prompt output BYTE-IDENTICAL to
+    never having passed --architect-first at all (true no-op degradation).
+    Run with: python3 glimmer-v2.py --architect-first-selfcheck
+    """
+    contract = {
+        "objective": "restore a session after reload",
+        "scope": {"package": "repository"},
+        "mode": "implement",
+        "constraints": {
+            "minimalChange": True, "noCommit": True, "noPush": True,
+            "noDeploy": True, "noDependencyInstall": True,
+        },
+        "verification": [],
+        "repairBudget": 0,
+    }
+    summary = "repo summary text"
+
+    baseline = make_prompt(contract, summary, 0)
+
+    # plan=None (the default) and plan={} (falsy) must both be exactly the
+    # pre-C1 output — no new line, no new whitespace, nothing.
+    assert make_prompt(contract, summary, 0) == baseline
+    assert make_prompt(contract, summary, 0, plan=None) == baseline
+    assert make_prompt(contract, summary, 0, plan={}) == baseline
+
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+
+        # Missing file entirely.
+        assert load_architecture_plan(session_dir) is None
+        assert make_prompt(contract, summary, 0, plan=load_architecture_plan(session_dir)) == baseline
+
+        # Present but not valid JSON.
+        plan_path = session_dir / "architecture-plan.json"
+        plan_path.write_text("not json{{{", encoding="utf-8")
+        assert load_architecture_plan(session_dir) is None
+
+        # Present, valid JSON, but explicitly marked failed.
+        plan_path.write_text(
+            json.dumps({"planningFailed": True, "objective": "x", "packages": [], "risk": "medium"}),
+            encoding="utf-8",
+        )
+        assert load_architecture_plan(session_dir) is None
+        assert make_prompt(contract, summary, 0, plan=load_architecture_plan(session_dir)) == baseline
+
+        # A genuinely valid plan.
+        valid_plan = {
+            "objective": "restore a session after reload",
+            "packages": ["frontend"],
+            "risk": "medium",
+            "implementationPlan": ["inspect hydration path", "add restoration hook"],
+            "constraints": ["reuse existing persistence mechanism"],
+            "candidateFiles": [{"path": "a.ts", "reason": "owns init", "confidence": 0.9}],
+            "verificationPlan": ["frontend_typecheck"],
+        }
+        plan_path.write_text(json.dumps(valid_plan), encoding="utf-8")
+
+        loaded = load_architecture_plan(session_dir)
+        assert loaded is not None
+        assert loaded["risk"] == "medium"
+
+        with_plan = make_prompt(contract, summary, 0, plan=loaded)
+        assert with_plan != baseline
+        # Plan block is strictly appended — the pre-C1 prefix is untouched.
+        assert with_plan.startswith(baseline)
+        assert "inspect hydration path" in with_plan
+        assert "reuse existing persistence mechanism" in with_plan
+        assert "a.ts" in with_plan
+        assert "frontend_typecheck" in with_plan
+        # Handoff is scoped down (per C1 task entry) to exactly these four
+        # fields — no skills/allowed-tools/scope-constraint systems.
+        assert '"objective"' not in with_plan[len(baseline):]
+
+    # invoke_engineer's mode="architect" path always forces --yes,
+    # regardless of the caller's own auto_approve — no interactive stdin
+    # available to a subprocess spawned this way.
+    import inspect
+    assert inspect.signature(invoke_engineer).parameters["mode"].default is None
+
+    print("architect-first self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
@@ -1481,6 +1724,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--repomap-cache-selfcheck"]:
         _repomap_cache_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-first-selfcheck"]:
+        _architect_first_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:

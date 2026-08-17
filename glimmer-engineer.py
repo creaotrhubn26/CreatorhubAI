@@ -106,6 +106,15 @@ REQUIRED_ENGINEERING_TOOLS = {
     "exec_shell_command",
 }
 
+# C1 (glimmer-v7): Architect mode's entire tool set (V7 §5.2 "recommended
+# tools", scoped down to what this repo's tool server actually exposes).
+# READ_TOOLS already excludes write_file/edit_file by construction — this
+# is the ONLY tool set ever offered to the model in architect mode, and
+# execute_tool() below additionally hard-blocks WRITE_TOOLS by tool name
+# (not merely by omission) whenever mode == "architect", so a model that
+# calls an unoffered write tool anyway still cannot execute it.
+ARCHITECT_TOOL_NAMES = READ_TOOLS | {"exec_shell_command"}
+
 
 # ============================================================
 # FILESYSTEM PROTECTION
@@ -644,6 +653,47 @@ def shell_policy(
     )
 
 
+def architect_shell_policy(command):
+    """C1 (glimmer-v7): exec_shell_command policy for architect mode.
+
+    Strictly narrower than shell_policy above — architect mode has no
+    legitimate use for npm/cargo/py_compile validation commands (nothing
+    it does is ever verified against a change, since it never writes), so
+    those are not offered here even though shell_policy itself allows
+    them for the engineer. Reuses the SAME SAFE_READONLY_GIT_SUBCOMMANDS
+    module-level set shell_policy's own git branch and the repeat-command
+    guard already share, per ADR-0002's "one allowlist" rule — this must
+    never drift into a second, independently-maintained read-only-git
+    list.
+    """
+    if not isinstance(command, str):
+        return False, "Command must be a string"
+
+    command = command.strip()
+
+    if not command:
+        return False, "Empty command"
+
+    if re.search(r"[;&|><\n\r`]", command) or "$(" in command:
+        return False, "Shell composition, pipes, redirects and substitution are blocked"
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        return False, f"Invalid shell quoting: {exc}"
+
+    if not tokens:
+        return False, "Empty command"
+
+    if tokens[0] != "git" or len(tokens) < 2 or tokens[1] not in SAFE_READONLY_GIT_SUBCOMMANDS:
+        return False, (
+            "Architect mode allows only read-only git commands: "
+            "git {" + ", ".join(sorted(SAFE_READONLY_GIT_SUBCOMMANDS)) + "}"
+        )
+
+    return True, f"safe read-only git {tokens[1]} (architect mode)"
+
+
 def _is_idempotent_validation_command(command):
     """Fix 1 follow-up (fix-followups-a-c round 2): classify an
     ALREADY shell_policy-allowed command as safe to short-circuit from
@@ -1147,7 +1197,35 @@ def execute_tool(
     cache,
     ledger,
     validation_allowlist=None,
+    mode="engineer",
 ):
+    # C1 (glimmer-v7): architect mode must be STRUCTURALLY incapable of
+    # writing, not merely un-offered the tool. run_architect() never puts
+    # write_file/edit_file in the tool schema sent to the model, but a
+    # model can still emit a tool_call naming an unoffered tool (some
+    # local function-calling backends don't hard-enforce the offered
+    # `tools` list) — so this is the single authoritative gate: even if
+    # such a call arrives, it is rejected here, before argument
+    # sanitization or any dispatch, regardless of caller. This must stay
+    # the ONLY place execute_tool short-circuits on tool identity so the
+    # guarantee can't be bypassed by adding a new call path later.
+    if mode == "architect" and tool_name in WRITE_TOOLS:
+        message = (
+            "ENGINEERING SECURITY BLOCK: architect mode is read-only; "
+            "write_file/edit_file are never executed in this mode."
+        )
+
+        print()
+        print(f"✗ BLOCKED: {tool_name} (architect mode is read-only)")
+
+        _emit(
+            "tool_blocked",
+            command=tool_name,
+            reason="architect mode is read-only",
+        )
+
+        return message, False
+
     arguments = secure_tool_arguments(
         tool_name,
         arguments,
@@ -1207,11 +1285,16 @@ def execute_tool(
             except (TypeError, ValueError):
                 arguments["timeout"] = minimum_timeout
 
-        allowed, reason = shell_policy(
-            command,
-            workspace,
-            validation_allowlist,
-        )
+        if mode == "architect":
+            # Stricter than shell_policy: read-only git only. See
+            # architect_shell_policy's docstring.
+            allowed, reason = architect_shell_policy(command)
+        else:
+            allowed, reason = shell_policy(
+                command,
+                workspace,
+                validation_allowlist,
+            )
 
         if not allowed:
             message = (
@@ -1363,12 +1446,25 @@ def execute_tool(
     if cache_key is not None:
         cache[cache_key] = content
 
-    add_evidence(
-        ledger,
-        tool_name,
-        arguments,
-        content,
-    )
+    # C1 (glimmer-v7): architect mode does NOT persist to evidence-NN.jsonl
+    # (C5's engineer-iteration ledger). GLIMMER_EVENTS_PATH is the same
+    # session dir the real engineer subprocess for iteration 0 will use
+    # moments later, and C5's iteration-numbering (derived from the
+    # highest prompt-NN.txt present at process startup) defaults to "00"
+    # both when no prompt files exist yet (this architect run, spawned
+    # before v2.py writes prompt-00.txt) and when prompt-00.txt exists
+    # (the real iteration-0 engineer run right after it) — so persisting
+    # here would collide filenames with a DIFFERENT process's independent
+    # _evidence_seq counter, producing duplicate evidence ids in one file.
+    # Architect exploration evidence is not part of C5's scope; only the
+    # architecture-plan.json artifact (a separate, non-numbered file) is.
+    if mode != "architect":
+        add_evidence(
+            ledger,
+            tool_name,
+            arguments,
+            content,
+        )
 
     changed = (
         tool_name in WRITE_TOOLS
@@ -1567,6 +1663,189 @@ def _evidence_persistence_selfcheck() -> None:
         _evidence_seq = 0
 
     print("evidence persistence self-check: PASS")
+
+
+def _architect_mode_selfcheck() -> None:
+    """C1 (glimmer-v7): proves architect mode's core invariants without a
+    live llama-server. Run with:
+    python3 glimmer-engineer.py --architect-mode-selfcheck
+    """
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    # ------------------------------------------------------------
+    # 1. Structural read-only guarantee: the tool set ever offered to
+    #    the model in architect mode never includes write_file/edit_file
+    #    — this is the SAME filter expression run_architect() uses to
+    #    build `architect_tools`, exercised here directly against a
+    #    synthetic full tool-definition list standing in for whatever
+    #    the live /tools endpoint returns. Since run_architect computes
+    #    this list exactly ONCE (no engineer_phase, no per-turn state —
+    #    unlike run_engineer's active_tools, there is no state that
+    #    could ever widen it mid-session), one assertion here covers
+    #    every turn/phase by construction.
+    # ------------------------------------------------------------
+    all_tool_names = READ_TOOLS | WRITE_TOOLS | {"exec_shell_command", "get_datetime"}
+    synthetic_tools = [
+        {"type": "function", "function": {"name": name}}
+        for name in sorted(all_tool_names)
+    ]
+
+    architect_tools = [
+        tool
+        for tool in synthetic_tools
+        if (tool.get("function") or {}).get("name") in ARCHITECT_TOOL_NAMES
+    ]
+    architect_tool_names = {
+        (t.get("function") or {}).get("name") for t in architect_tools
+    }
+
+    assert "write_file" not in architect_tool_names, "architect tool set must never offer write_file"
+    assert "edit_file" not in architect_tool_names, "architect tool set must never offer edit_file"
+    assert architect_tool_names == ARCHITECT_TOOL_NAMES, (
+        "architect tool set must be exactly READ_TOOLS + exec_shell_command"
+    )
+    assert architect_tool_names.issuperset(READ_TOOLS), "architect mode must still offer all read tools"
+
+    # Defense-in-depth: even a tool_call NAMING an unoffered write tool
+    # must be rejected before it can execute (execute_tool's own gate,
+    # not just "we didn't offer it"). No live server needed — this path
+    # returns before any HTTP call is made.
+    for write_tool in WRITE_TOOLS:
+        result, changed = execute_tool(
+            write_tool,
+            {"path": "whatever.py", "content": "x"},
+            Path("/tmp"),
+            {"approve_all": True},
+            {},
+            [],
+            None,
+            mode="architect",
+        )
+        assert changed is False, f"{write_tool} must never report a change in architect mode"
+        assert "read-only" in result.lower() or "block" in result.lower(), (
+            f"{write_tool} block message must be explicit, got: {result!r}"
+        )
+
+    # The same call names, with mode="engineer" (the default every
+    # existing caller uses), must NOT be intercepted by the architect
+    # gate — proven at the signature level (no live server available
+    # here to exercise the real dispatch), i.e. engineer mode is the
+    # untouched default.
+    import inspect
+
+    assert inspect.signature(execute_tool).parameters["mode"].default == "engineer", (
+        "execute_tool's mode default must stay 'engineer' so every "
+        "existing call site (which never passes mode=) is unaffected"
+    )
+
+    # exec_shell_command in architect mode: only read-only git passes.
+    assert architect_shell_policy("git status")[0] is True
+    assert architect_shell_policy("git diff --stat")[0] is True
+    assert architect_shell_policy("git rev-parse --show-toplevel")[0] is True
+    assert architect_shell_policy("npm run typecheck")[0] is False
+    assert architect_shell_policy("git commit -m x")[0] is False
+    assert architect_shell_policy("git push")[0] is False
+    assert architect_shell_policy("cat package.json")[0] is False
+    assert architect_shell_policy("git status; rm -rf /")[0] is False
+
+    # ------------------------------------------------------------
+    # 2. Valid model-shaped JSON: parses, validates, and writes
+    #    architecture-plan.json with the right fields.
+    # ------------------------------------------------------------
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-architect-selfcheck"
+
+            model_text = (
+                "```json\n"
+                + json.dumps(
+                    {
+                        "objective": "restore a session after reload",
+                        "area": "role-room",
+                        "packages": ["frontend", "server"],
+                        "existingPatterns": [
+                            {"name": "session hydration", "evidence": ["a.ts"]}
+                        ],
+                        "candidateFiles": [
+                            {"path": "a.ts", "reason": "owns init", "confidence": 0.9}
+                        ],
+                        "constraints": ["reuse existing persistence"],
+                        "implementationPlan": ["inspect hydration path", "implement hook"],
+                        "verificationPlan": ["frontend_typecheck"],
+                        "risk": "medium",
+                        "expectedScope": {"minFiles": 1, "maxFiles": 4},
+                        "uncertainties": [],
+                    }
+                )
+                + "\n```"
+            )
+
+            parsed = _extract_json_object(model_text)
+            ok, normalized = validate_architecture_plan(parsed)
+            assert ok, f"valid model plan must validate, got: {normalized}"
+            assert normalized["objective"] == "restore a session after reload"
+            assert normalized["packages"] == ["frontend", "server"]
+            assert normalized["risk"] == "medium"
+            assert normalized["implementationPlan"] == ["inspect hydration path", "implement hook"]
+            assert "planningFailed" not in normalized
+
+            written_path = _write_architecture_plan_file(normalized)
+            assert written_path is not None
+            assert written_path.name == "architecture-plan.json"
+            on_disk = json.loads(written_path.read_text(encoding="utf-8"))
+            assert on_disk["objective"] == normalized["objective"]
+            assert on_disk["risk"] == "medium"
+            assert on_disk.get("planningFailed") is not True
+
+            # --------------------------------------------------------
+            # 3. Invalid/malformed response -> fallback file, not a crash.
+            # --------------------------------------------------------
+            for bad_text in (
+                "not json at all",
+                json.dumps({"objective": "x"}),  # missing packages/risk
+                json.dumps({"packages": [], "risk": "medium"}),  # missing objective
+                json.dumps({"objective": "x", "packages": [], "risk": "extreme"}),  # bad risk enum
+            ):
+                try:
+                    parsed_bad = _extract_json_object(bad_text)
+                    ok_bad, reason = validate_architecture_plan(parsed_bad)
+                except ValueError:
+                    ok_bad, reason = False, "unparseable"
+                assert ok_bad is False, f"must reject: {bad_text!r}"
+
+            fallback = _fallback_architecture_plan("original objective text", "model never produced valid JSON")
+            assert fallback["planningFailed"] is True
+            assert fallback["objective"] == "original objective text"
+            assert fallback["risk"] in ARCHITECT_PLAN_RISK_VALUES
+            for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
+                assert fallback[field] == []
+
+            written_fallback = _write_architecture_plan_file(fallback)
+            assert written_fallback is not None
+            on_disk_fallback = json.loads(written_fallback.read_text(encoding="utf-8"))
+            assert on_disk_fallback["planningFailed"] is True
+            assert on_disk_fallback["objective"] == "original objective text"
+            # Same file identity as the success case above — glimmer-v2.py's
+            # reader needs exactly one path/name, not two.
+            assert written_fallback == written_path
+
+            # No-op path: no session dir configured -> must not crash, must
+            # not write anything.
+            GLIMMER_EVENTS_PATH = None
+            GLIMMER_SESSION_ID = None
+            assert _write_architecture_plan_file(fallback) is None
+    finally:
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+
+    print("architect mode self-check: PASS")
 
 
 # ============================================================
@@ -1953,6 +2232,466 @@ def postflight(workspace):
         )
         print(result.stdout)
         print(result.stderr)
+
+
+# ============================================================
+# ARCHITECT MODE (C1, glimmer-v7)
+# ============================================================
+#
+# Opt-in only (glimmer-v2.py's --architect-first flag; never auto-
+# triggered — see the reconciliation doc's C1 entry and §12 risk 2).
+# Read-only: see ARCHITECT_TOOL_NAMES / architect_shell_policy above and
+# the mode == "architect" gate in execute_tool. No approval path: run_
+# architect below always passes approve_all=True regardless of caller,
+# since it runs unattended as a subprocess with no interactive stdin.
+# Output is architecture-plan.json (V7 §5.3 shape), not a prose report.
+
+ARCHITECT_PLAN_RISK_VALUES = {
+    "low",
+    "medium",
+    "high",
+    "critical",
+}
+
+# V7 §5.3's optional array fields — always present in the written plan,
+# defaulted to empty when the model omits them (spec: "don't be overly
+# strict — a plan with some empty optional fields is still useful").
+ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS = (
+    "existingPatterns",
+    "candidateFiles",
+    "constraints",
+    "implementationPlan",
+    "verificationPlan",
+    "uncertainties",
+)
+
+ARCHITECT_SYSTEM_PROMPT = (
+    "Reasoning strength: high. "
+    "You are Glimmer Architect: a read-only architecture-planning agent "
+    "operating inside one git repository, one step before an engineer "
+    "implements anything.\n\n"
+
+    "You have NO write access. write_file and edit_file are not offered "
+    "to you in this mode, and any attempt to call them is rejected "
+    "before it can touch the filesystem. Your exec_shell_command access "
+    "is restricted to read-only git commands only "
+    "(git status, git diff, git show, git log, git rev-parse). You "
+    "cannot install dependencies, run tests or builds, commit, push, or "
+    "deploy.\n\n"
+
+    "Your job, in order: understand the requested outcome; inspect the "
+    "actual repository (not assumptions) before making any repository-"
+    "specific claim; identify the relevant package, domain, subsystem, "
+    "and ownership boundaries; locate existing patterns and reusable "
+    "components, services, utilities, state stores, APIs, and schemas "
+    "that already solve part of the problem; find likely candidate "
+    "files and symbols; identify related tests and verification paths; "
+    "identify architectural constraints; note likely cross-system "
+    "consequences; estimate risk and expected scope; produce an "
+    "implementation sequence and a verification strategy. Optimize for "
+    "reuse before invention: do not propose a new store, service, "
+    "abstraction, dependency, API, database object, or framework until "
+    "you have checked whether an appropriate mechanism already exists. "
+    "Record uncertainties instead of inventing missing facts.\n\n"
+
+    "When you are done exploring, your FINAL answer must be exactly one "
+    "JSON object and nothing else — no prose before or after it, no "
+    "markdown code fence — matching this shape:\n\n"
+    "{\n"
+    '  "objective": "restated task objective (string, REQUIRED)",\n'
+    '  "area": "sub-path/domain within the repo (string, optional)",\n'
+    '  "packages": ["frontend", "backend", "..."],\n'
+    '  "existingPatterns": [\n'
+    '    {"name": "pattern name", "evidence": ["path/to/file.ts"]}\n'
+    "  ],\n"
+    '  "candidateFiles": [\n'
+    '    {"path": "path/to/file.ts", "reason": "why", "confidence": 0.9}\n'
+    "  ],\n"
+    '  "constraints": ["reuse existing X", "avoid a second Y"],\n'
+    '  "implementationPlan": ["step 1", "step 2"],\n'
+    '  "verificationPlan": ["typecheck", "targeted_unit_tests"],\n'
+    '  "risk": "low|medium|high|critical (REQUIRED)",\n'
+    '  "expectedScope": {"minFiles": 1, "maxFiles": 4},\n'
+    '  "uncertainties": ["anything you could not confirm"]\n'
+    "}\n\n"
+    "objective, packages, and risk are REQUIRED. Every other field must "
+    "still be present, but may be an empty array/object if you have "
+    "nothing to report for it — never omit a key."
+)
+
+
+def _architecture_plan_file_path():
+    """C1 (glimmer-v7): same session-dir-derivation convention C5's
+    _evidence_file_path() above already uses — the parent of
+    GLIMMER_EVENTS_PATH — so this is not a third way of locating the
+    session directory. Unlike evidence-NN.jsonl, this file is NOT
+    iteration-numbered: exactly one architecture-plan.json exists per
+    session, written once by the (at most one) architect run that
+    precedes iteration 0. Returns None when no session dir is available
+    (standalone invocation), matching every other _emit()/evidence-style
+    no-op guarantee in this file.
+    """
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return None
+
+    return Path(GLIMMER_EVENTS_PATH).parent / "architecture-plan.json"
+
+
+def _fallback_architecture_plan(objective, reason):
+    """Minimal, always-valid-JSON degradation target (see module docstring
+    above run_architect). Deliberately the SAME SHAPE as a successful
+    plan (same keys, "planningFailed" only ADDED, never a different
+    schema) so glimmer-v2.py's reader needs exactly one code path: parse
+    the file, check "planningFailed", and either use it or don't.
+    """
+    plan = {
+        "objective": objective or "",
+        "packages": [],
+        "risk": "medium",
+        "planningFailed": True,
+        "planningFailureReason": reason,
+    }
+
+    for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
+        plan[field] = []
+
+    return plan
+
+
+def _write_architecture_plan_file(output):
+    """Write architecture-plan.json (whether a real plan or the fallback
+    marker) to the session dir. Never raises: a write failure here must
+    degrade the same way a planning failure does (log and move on), not
+    take down the architect subprocess. Returns the path written, or
+    None when no session dir is available (standalone invocation) or the
+    write failed.
+    """
+    path = _architecture_plan_file_path()
+
+    if path is None:
+        print(
+            "[glimmer-engineer] no session dir available (standalone "
+            "invocation); architecture-plan.json not written."
+        )
+        return None
+
+    try:
+        path.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Wrote: {path}")
+        return path
+    except OSError as exc:
+        print(f"[glimmer-engineer] failed to write architecture-plan.json: {exc}")
+        return None
+
+
+def validate_architecture_plan(data):
+    """Validate a parsed JSON object against V7 §5.3's ArchitecturePlan
+    shape. Minimum bar (per the C1 task scoping): objective (string),
+    packages (array), risk (low/medium/high/critical) must be present
+    and well-typed — everything else is filled in with an empty
+    default when missing/malformed rather than rejected, since a plan
+    with some empty optional fields is still useful evidence for
+    make_prompt.
+
+    Returns (True, normalized_plan_dict) or (False, reason_string).
+    """
+    if not isinstance(data, dict):
+        return False, "response is not a JSON object"
+
+    objective = data.get("objective")
+    if not isinstance(objective, str) or not objective.strip():
+        return False, "missing/invalid 'objective' (must be a non-empty string)"
+
+    packages = data.get("packages")
+    if not isinstance(packages, list):
+        return False, "missing/invalid 'packages' (must be an array)"
+
+    risk = data.get("risk")
+    if risk not in ARCHITECT_PLAN_RISK_VALUES:
+        return False, (
+            "missing/invalid 'risk' (must be one of: "
+            + ", ".join(sorted(ARCHITECT_PLAN_RISK_VALUES))
+            + ")"
+        )
+
+    normalized = {
+        "objective": objective,
+        "packages": packages,
+        "risk": risk,
+    }
+
+    area = data.get("area")
+    if isinstance(area, str):
+        normalized["area"] = area
+
+    for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
+        value = data.get(field, [])
+        normalized[field] = value if isinstance(value, list) else []
+
+    expected_scope = data.get("expectedScope")
+    if isinstance(expected_scope, dict):
+        normalized["expectedScope"] = expected_scope
+
+    return True, normalized
+
+
+def _extract_json_object(text):
+    """Best-effort extraction of a single JSON object from the model's
+    final-turn text. The system prompt asks for bare JSON, but models
+    sometimes wrap it in prose or a ```json fence anyway; tolerate that
+    before giving up, same spirit as final_synthesis's "never crash,
+    always produce something usable" philosophy — just applied to
+    parsing instead of report generation.
+    """
+    text = (text or "").strip()
+
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+
+    fence_match = re.search(
+        r"```(?:json)?\s*(\{.*\})\s*```",
+        text,
+        re.DOTALL,
+    )
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except ValueError:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except ValueError:
+            pass
+
+    raise ValueError("no parseable JSON object found in final answer")
+
+
+def run_architect(task, workspace, max_turns):
+    """C1 (glimmer-v7): read-only architecture-planning loop.
+
+    Structurally simpler than run_engineer's write-oriented state machine
+    (engineer_phase, discovery/post-gate budgets, write-freeze, diff/
+    validation tracking) — none of that exists to serve write decisions
+    that architect mode can never make, so reusing run_engineer's 700+
+    lines and threading a mode flag through every branch would be a
+    forced fit, not a simplification. This function instead reuses the
+    shared LOW-LEVEL primitives (get_tools, execute_tool, chat_with_retry,
+    git_local, parse_arguments, compact_tool_result_for_model) so nothing
+    about tool dispatch, shell policy, or HTTP plumbing is duplicated or
+    can drift from the engineer path.
+    """
+    workspace = workspace.expanduser().resolve()
+
+    if not workspace.is_dir():
+        raise RuntimeError(f"Workspace missing: {workspace}")
+
+    git_root = Path(
+        git_local(workspace, "rev-parse", "--show-toplevel")
+    ).resolve()
+
+    if git_root != workspace:
+        raise RuntimeError(
+            "Architect workspace must be the git repository root.\n"
+            f"Workspace: {workspace}\n"
+            f"Git root:  {git_root}"
+        )
+
+    metadata, tools = get_tools()
+
+    architect_tools = [
+        tool
+        for tool in tools
+        if (tool.get("function") or {}).get("name") in ARCHITECT_TOOL_NAMES
+    ]
+
+    print("Glimmer Architect Mode (C1, read-only)")
+    print(f"Workspace: {workspace}")
+    print(f"Tools:     {len(architect_tools)} (read-only)")
+    print("Writes:    STRUCTURALLY BLOCKED")
+    print()
+
+    messages = [
+        {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
+        {"role": "user", "content": task},
+    ]
+
+    # No approval path (C1 scoping): this runs unattended as a subprocess
+    # with no interactive terminal, so approve() must never block on
+    # input(). Forced True here regardless of any caller-supplied flag —
+    # this is architect mode's own structural property, not something a
+    # caller opts into.
+    approvals = {"approve_all": True}
+    cache = {}
+    ledger = []  # kept for execute_tool's signature; never persisted (see execute_tool's mode == "architect" guard)
+
+    plan = None
+    failure_reason = None
+
+    try:
+        for turn in range(max_turns):
+            final_turn = turn == max_turns - 1
+
+            payload = {
+                "model": "muse-glimmer",
+                "messages": messages,
+                "tools": architect_tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,
+                "max_tokens": 4096,
+            }
+
+            if final_turn:
+                payload.pop("tools", None)
+                payload.pop("tool_choice", None)
+                payload.pop("parallel_tool_calls", None)
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Tool budget is exhausted. Do not request "
+                            "tools. Produce your final answer now: the "
+                            "single ArchitecturePlan JSON object "
+                            "described earlier, and nothing else."
+                        ),
+                    }
+                )
+
+            try:
+                response = chat_with_retry(payload, attempts=3)
+            except RuntimeError as exc:
+                if "peg-native" not in str(exc):
+                    raise
+                failure_reason = f"PEG parser repeatedly failed: {exc}"
+                break
+
+            message = response["choices"][0]["message"]
+            content = message.get("content") or ""
+            tool_calls = message.get("tool_calls") or []
+
+            if not tool_calls:
+                try:
+                    data = _extract_json_object(content)
+                except ValueError as exc:
+                    if final_turn:
+                        failure_reason = f"final answer was not parseable JSON: {exc}"
+                        break
+
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your response must be exactly one JSON "
+                                "object matching the ArchitecturePlan "
+                                "shape given earlier — nothing else. "
+                                "Try again."
+                            ),
+                        }
+                    )
+                    continue
+
+                ok, result = validate_architecture_plan(data)
+                if not ok:
+                    if final_turn:
+                        failure_reason = f"plan failed validation: {result}"
+                        break
+
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Invalid plan: {result}. Re-send the "
+                                "corrected single JSON object."
+                            ),
+                        }
+                    )
+                    continue
+
+                plan = result
+                break
+
+            # ------------------------------------------------
+            # EXECUTE TOOL CALLS (read-only tool set only)
+            # ------------------------------------------------
+
+            for index, call in enumerate(tool_calls):
+                if not call.get("id"):
+                    call["id"] = f"call_{turn}_{index}"
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content"),
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for call in tool_calls:
+                function = call.get("function") or {}
+                tool_name = function.get("name") or ""
+
+                if tool_name not in metadata:
+                    result = "Unknown/unavailable tool: " + tool_name
+                else:
+                    try:
+                        arguments = parse_arguments(function.get("arguments"))
+                        result, _changed = execute_tool(
+                            tool_name,
+                            arguments,
+                            workspace,
+                            approvals,
+                            cache,
+                            ledger,
+                            None,
+                            mode="architect",
+                        )
+                    except Exception as exc:
+                        result = "TOOL BLOCKED/ERROR: " + str(exc)
+                        print()
+                        print("✗ " + result)
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": compact_tool_result_for_model(tool_name, result),
+                    }
+                )
+        else:
+            # Loop exhausted max_turns without break (plan or failure_reason).
+            if plan is None and failure_reason is None:
+                failure_reason = f"reached max turns ({max_turns}) without a final plan"
+
+    except Exception as exc:  # noqa: BLE001 - architect failure must degrade, never crash the caller
+        failure_reason = f"{type(exc).__name__}: {exc}"
+
+    if plan is not None:
+        output = plan
+        print()
+        print("════════════════════════════════════")
+        print("ARCHITECTURE PLAN")
+        print("════════════════════════════════════")
+        print(f"Objective: {output['objective']}")
+        print(f"Risk:      {output['risk']}")
+        print(f"Packages:  {output['packages']}")
+    else:
+        output = _fallback_architecture_plan(task, failure_reason or "unknown failure")
+        print()
+        print(f"⚠ Architect planning failed: {failure_reason or 'unknown failure'}")
+        print("Writing fallback architecture-plan.json (planningFailed=true).")
+
+    _write_architecture_plan_file(output)
 
 
 # ============================================================
@@ -2771,14 +3510,41 @@ def main():
         ),
     )
 
+    # C1 (glimmer-v7): opt-in only. Default "engineer" means every
+    # existing invocation (direct or via new-glimmer-task.sh / v2.py's
+    # existing spawn) is completely unaffected unless a caller explicitly
+    # passes --mode architect. There is no auto-trigger anywhere in this
+    # file — glimmer-v2.py's --architect-first is the only thing that
+    # ever requests architect mode, and only when a human/caller passes
+    # that flag explicitly.
+    parser.add_argument(
+        "--mode",
+        choices=("engineer", "architect"),
+        default="engineer",
+        help=(
+            "engineer (default): the existing full read/write "
+            "engineering loop, unchanged. "
+            "architect: read-only planning mode (V7 §5) — explores the "
+            "repository with a read-only tool set and writes "
+            "architecture-plan.json instead of editing files."
+        ),
+    )
+
     args = parser.parse_args()
 
-    run_engineer(
-        " ".join(args.prompt),
-        args.workspace,
-        args.max_turns,
-        args.yes,
-    )
+    if args.mode == "architect":
+        run_architect(
+            " ".join(args.prompt),
+            args.workspace,
+            args.max_turns,
+        )
+    else:
+        run_engineer(
+            " ".join(args.prompt),
+            args.workspace,
+            args.max_turns,
+            args.yes,
+        )
 
 
 if __name__ == "__main__":
@@ -2788,6 +3554,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--evidence-selfcheck"]:
         _evidence_persistence_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--architect-mode-selfcheck"]:
+        _architect_mode_selfcheck()
         sys.exit(0)
 
     try:
