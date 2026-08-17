@@ -149,6 +149,55 @@ def changed_files(ws, baseline):
     return sorted(set(tracked + untracked))
 
 
+def _expected_prefixes(scope: dict) -> list:
+    """Python port of repoAnalysis.ts's expectedPrefixes(). glimmer-v2.py has
+    no repoMap object at this call site (that's a control-center-only
+    concept), so the frontend/backend -> repoMap.packages lookup is dropped;
+    scope.package falls straight through to the bare-name fallback the TS
+    itself uses when repoMap has no match for that package."""
+    paths = scope.get("paths") or []
+    if paths:
+        return list(paths)
+    if scope.get("area"):
+        return [scope["area"]]
+    package = scope.get("package")
+    if package in ("frontend", "backend"):
+        return [package]
+    return []  # repository/directory/files with no explicit path: nothing meaningful to guard against
+
+
+def compute_scope_guard(changed: list, contract: dict) -> dict:
+    """Python port of control-center's computeScopeGuard/expectedPrefixes
+    (control-center/server/src/lib/repoAnalysis.ts, read in full for this
+    port). Mirrors that TS logic exactly as it stands today, INCLUDING a
+    known gap: the TS prefix match is a plain `p.startsWith(prefix)`, not
+    boundary-safe (`frontend/src/dialog` would match `frontend/src/dialog-old`).
+    An earlier draft of this task's brief believed that had already been
+    hardened; re-reading repoAnalysis.ts and its test file (repoAnalysis.test.ts)
+    for this task confirmed it has NOT — no boundary-safe test exists, and the
+    implementation is plain startsWith. Per this task's own instructions, the
+    real TS is the source of truth over the brief's aspirational snippet, so
+    this port intentionally preserves the TS's real (imperfect) behavior
+    rather than silently diverging from the reference it's ported from. See
+    task-6a-report.md for the follow-up recommendation."""
+    scope = contract.get("scope") or {}
+    expected = _expected_prefixes(scope)
+    actual = list(changed)
+    if not expected:
+        # F5: "directory"/"files" scope CLAIMS to be bounded to a concrete
+        # path, but nothing concrete was ever given — expectedPrefixes() then
+        # has nothing to guard against. Reporting inScope: true here would be
+        # indistinguishable from the honest, intentional "repository" scope
+        # (no boundary by design) below. Report the state as unbounded
+        # instead of silently passing every file as "in scope".
+        if scope.get("package") in ("directory", "files"):
+            return {"inScope": False, "expected": expected, "actual": actual,
+                     "expandedFiles": [], "unbounded": True}
+        return {"inScope": True, "expected": expected, "actual": actual, "expandedFiles": []}
+    expanded = [p for p in actual if not any(p.startswith(prefix) for prefix in expected)]
+    return {"inScope": len(expanded) == 0, "expected": expected, "actual": actual, "expandedFiles": expanded}
+
+
 def file_change_types(ws, baseline):
     """Map path -> 'added'|'modified'|'deleted', derived from real git status vs
     baseline (untracked files count as 'added'). Used only to populate file_changed
@@ -907,6 +956,20 @@ def main():
                            changeType=change_types.get(f, "modified"))
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
+
+            # R4 Scope Guard: classify (does not block yet — staged rollout,
+            # see compute_scope_guard's docstring and task-6a-report.md).
+            scope_result = compute_scope_guard(files, manifest.get("contract", {}))
+            attempt["scopeGuard"] = scope_result
+            if scope_result["expandedFiles"]:
+                print(f"[V2] WARN: scope guard — {len(scope_result['expandedFiles'])} changed "
+                      f"file(s) outside expected scope {scope_result['expected']}: {scope_result['expandedFiles']}")
+                emit_event(events_path, "scope_expanded", sid,
+                           expected=scope_result["expected"], actual=scope_result["actual"])
+            elif scope_result.get("unbounded"):
+                print("[V2] WARN: scope guard — scope.package="
+                      f"{manifest['contract']['scope'].get('package')!r} claims a bounded scope but no "
+                      "area/paths were given; cannot verify (unbounded)")
 
             if not files:
                 commands = [["git", "diff", "--check"]]
