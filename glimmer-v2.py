@@ -23,6 +23,10 @@ from glimmer_events import emit as emit_event
 
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
 STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
+# C7 (glimmer-v7): cross-session repo-map cache, keyed by HEAD SHA. Separate
+# from STATE_ROOT's per-session repo-map.json (that per-session artifact is
+# unchanged by this cache; it's just a copy of whatever build_repo_map returns).
+REPO_MAP_CACHE_ROOT = Path.home() / ".muse-glimmer/repo-maps"
 NODE_OPTIONS_DEFAULT = "--max-old-space-size=12288"
 READINESS_URL_DEFAULT = os.environ.get("GLIMMER_TOOLS_URL", "http://127.0.0.1:8080/tools")
 
@@ -56,6 +60,8 @@ CONFIG_NAMES = {
     "eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "tsconfig.json",
     "turbo.json", "nx.json",
 }
+
+LOCKFILE_NAMES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"}
 
 PASS_STATUSES = {"PASS", "PASS_BASELINE"}
 
@@ -386,7 +392,10 @@ def safe_json(path):
         return None
 
 
-def build_repo_map(ws):
+def _build_repo_map_uncached(ws):
+    """The real (expensive) repo-map walk. Renamed from build_repo_map so
+    build_repo_map below can wrap it with the C7 cross-session cache without
+    touching this function's shape or behavior at all."""
     packages, configs, workflows, locks = [], [], [], []
     for path in walk_files(ws):
         rel = path.relative_to(ws).as_posix()
@@ -413,7 +422,7 @@ def build_repo_map(ws):
             configs.append(rel)
         if rel.startswith(".github/workflows/") and path.suffix in {".yml", ".yaml"}:
             workflows.append(rel)
-        if path.name in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"}:
+        if path.name in LOCKFILE_NAMES:
             locks.append(rel)
     return {
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -424,6 +433,60 @@ def build_repo_map(ws):
         "workflows": sorted(set(workflows)),
         "lockfiles": sorted(set(locks)),
     }
+
+
+def _lockfile_state(ws):
+    """Cheap stand-in for the full repo-map walk: just enough to tell whether
+    an uncommitted `npm install`/lockfile edit invalidated the cache, without
+    parsing every package.json. rel path -> mtime (ns, so same-second edits
+    still register), sorted-dict-stable via plain dict (insertion order from
+    walk_files, which os.walk keeps deterministic-enough for equality checks
+    since we only ever compare it back against itself)."""
+    state = {}
+    for path in walk_files(ws):
+        if path.name in LOCKFILE_NAMES:
+            rel = path.relative_to(ws).as_posix()
+            try:
+                state[rel] = path.stat().st_mtime_ns
+            except OSError:
+                pass
+    return state
+
+
+def build_repo_map(ws):
+    """C7 (glimmer-v7): cross-session cache around _build_repo_map_uncached,
+    keyed by the repo's current HEAD SHA and invalidated on either a HEAD
+    change (new cache key) or a lockfile mtime change (dependencies/scripts
+    can change without a new commit, e.g. an uncommitted `npm install`).
+    Cache lives at ~/.muse-glimmer/repo-maps/<head>.json, separate from the
+    per-session repo-map.json main() writes into the session dir (unchanged).
+
+    Caching only — no new repo-map fields (scope note: C7 is deliberately
+    narrowed to caching; tests-per-package / route-schema hints are deferred
+    to whenever a real consumer exists, per doc §5's "add fields only when a
+    consumer exists")."""
+    sha = head(ws)
+    lock_state = _lockfile_state(ws)
+    cache_path = REPO_MAP_CACHE_ROOT / f"{sha}.json"
+    cached = safe_json(cache_path) if sha and cache_path.exists() else None
+    if (
+        cached
+        and isinstance(cached.get("repoMap"), dict)
+        and cached.get("lockfileState") == lock_state
+    ):
+        return cached["repoMap"]
+
+    repo_map = _build_repo_map_uncached(ws)
+    if sha:
+        try:
+            REPO_MAP_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps({"repoMap": repo_map, "lockfileState": lock_state}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # cache write is an optimization, never fatal to the session
+    return repo_map
 
 
 def repo_summary(m):
@@ -1326,12 +1389,98 @@ def _r6_selfcheck() -> None:
     print("R6 classify_failure self-check: PASS")
 
 
+def _repomap_cache_selfcheck() -> None:
+    """C7: proves the cross-session repo-map cache actually short-circuits
+    the real walk on a hit, and actually invalidates on both trigger
+    conditions (new HEAD, changed lockfile). Uses a throwaway git repo plus a
+    throwaway cache root (module-global swapped back in `finally`) so this
+    never touches a real ~/.muse-glimmer/repo-maps. Run with:
+    python3 glimmer-v2.py --repomap-cache-selfcheck
+    """
+    global REPO_MAP_CACHE_ROOT
+    import tempfile as _tempfile
+
+    real_root = REPO_MAP_CACHE_ROOT
+    calls = {"n": 0}
+    real_uncached = _build_repo_map_uncached
+
+    def _counting_uncached(ws):
+        calls["n"] += 1
+        return real_uncached(ws)
+
+    with _tempfile.TemporaryDirectory() as td, _tempfile.TemporaryDirectory() as cache_td:
+        ws = Path(td)
+        REPO_MAP_CACHE_ROOT = Path(cache_td) / "repo-maps"
+        globals()["_build_repo_map_uncached"] = _counting_uncached
+        try:
+            run(["git", "init", "-q"], ws)
+            run(["git", "config", "user.email", "test@example.com"], ws)
+            run(["git", "config", "user.name", "Test"], ws)
+            (ws / "package.json").write_text(json.dumps({"name": "x", "scripts": {"test": "vitest"}}), encoding="utf-8")
+            (ws / "package-lock.json").write_text("{}", encoding="utf-8")
+            run(["git", "add", "-A"], ws)
+            run(["git", "commit", "-q", "-m", "init"], ws)
+            sha1 = head(ws)
+
+            # 1. Cache miss (nothing cached yet) -> real build runs, cache file written.
+            m1 = build_repo_map(ws)
+            assert calls["n"] == 1, "first call must hit the real walk"
+            cache_file = REPO_MAP_CACHE_ROOT / f"{sha1}.json"
+            assert cache_file.exists(), "cache miss must write the cache file"
+            on_disk = json.loads(cache_file.read_text(encoding="utf-8"))
+            assert on_disk["repoMap"] == m1
+            assert "package-lock.json" in on_disk["lockfileState"]
+
+            # 2. Cache hit (same HEAD, same lockfile mtimes) -> no re-walk.
+            m2 = build_repo_map(ws)
+            assert calls["n"] == 1, "cache hit must not re-run the real walk"
+            assert m2 == m1
+
+            # 3. Lockfile mtime change, same HEAD SHA -> invalidates, real walk reruns.
+            lock_path = ws / "package-lock.json"
+            old_mtime = lock_path.stat().st_mtime
+            new_mtime = old_mtime + 5
+            os.utime(lock_path, (new_mtime, new_mtime))
+            assert head(ws) == sha1, "HEAD must be unchanged for this to test lockfile invalidation"
+            m3 = build_repo_map(ws)
+            assert calls["n"] == 2, "lockfile mtime change must force a real rebuild"
+            # Same repo state -> same content, modulo the real walk's own
+            # generatedAt timestamp (which legitimately differs per rebuild).
+            assert {k: v for k, v in m3.items() if k != "generatedAt"} == \
+                   {k: v for k, v in m1.items() if k != "generatedAt"}
+
+            # 4. New HEAD -> new cache key, real walk reruns, old cache entry untouched.
+            (ws / "README.md").write_text("x", encoding="utf-8")
+            run(["git", "add", "-A"], ws)
+            run(["git", "commit", "-q", "-m", "second"], ws)
+            sha2 = head(ws)
+            assert sha2 != sha1
+            build_repo_map(ws)
+            assert calls["n"] == 3, "new HEAD must force a real rebuild"
+            assert (REPO_MAP_CACHE_ROOT / f"{sha2}.json").exists()
+            assert cache_file.exists()  # sha1's entry is untouched, not deleted
+
+            # 5. Corrupted cache file for current HEAD -> falls back to a real
+            # rebuild instead of crashing.
+            (REPO_MAP_CACHE_ROOT / f"{sha2}.json").write_text("not json{{{", encoding="utf-8")
+            build_repo_map(ws)
+            assert calls["n"] == 4, "corrupted cache must fall back to a real rebuild, not crash"
+        finally:
+            globals()["_build_repo_map_uncached"] = real_uncached
+            REPO_MAP_CACHE_ROOT = real_root
+
+    print("repo-map cache self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--scope-guard-selfcheck"]:
         _scope_guard_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--repomap-cache-selfcheck"]:
+        _repomap_cache_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
