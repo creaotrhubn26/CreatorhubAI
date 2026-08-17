@@ -1,0 +1,19 @@
+:root {
+  --bg: #0a0a0c;
+  --surface: #131317;
+  --surface-raised: #1a1a20;
+  --border: #26262e;
+  --text: #e6e6ea;
+  --text-muted: #8b8b96;
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+  --sans: -apple-system, "Inter", system-ui, sans-serif;
+  --radius: 4px;
+  --green: #3fb950;
+  --amber: #d29922;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --gray: #6e7681;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+code, .mono { font-family: var(--mono); }
