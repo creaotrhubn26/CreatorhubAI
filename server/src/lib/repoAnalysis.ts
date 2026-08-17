@@ -103,6 +103,8 @@ export function computeScopeGuard(
     }
     return { inScope: true, expected, actual, expandedFiles: [] };
   }
-  const expandedFiles = actual.filter((p) => !expected.some((prefix) => p.startsWith(prefix)));
+  const expandedFiles = actual.filter(
+    (p) => !expected.some((prefix) => p === prefix || p.startsWith(prefix.replace(/\/$/, "") + "/"))
+  );
   return { inScope: expandedFiles.length === 0, expected, actual, expandedFiles };
 }

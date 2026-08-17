@@ -141,4 +141,20 @@ describe("computeScopeGuard", () => {
     expect(result.inScope).toBe(true);
     expect(result.unbounded).toBeFalsy();
   });
+
+  // Codex PR-review finding (P2): expandedFiles used a plain startsWith prefix
+  // match, so a declared scope of "frontend/src/dialog" also matched sibling
+  // paths that merely share the string prefix — "frontend/src/dialog-old/..."
+  // or "frontend/src/dialog.bak" — treating out-of-scope changes as in-scope.
+  // Must only match on the prefix itself or prefix + "/" (a real path boundary).
+  it("does not treat a sibling path that merely shares the string prefix as in-scope", () => {
+    const scope: TaskContract["scope"] = { package: "directory", area: "frontend/src/dialog" };
+    const result = computeScopeGuard(
+      scope,
+      files("frontend/src/dialog/Dialog.tsx", "frontend/src/dialog-old/file.ts", "frontend/src/dialog.bak"),
+      REPO_MAP
+    );
+    expect(result.inScope).toBe(false);
+    expect(result.expandedFiles).toEqual(["frontend/src/dialog-old/file.ts", "frontend/src/dialog.bak"]);
+  });
 });
