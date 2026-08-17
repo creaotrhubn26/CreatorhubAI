@@ -59,6 +59,35 @@ CONFIG_NAMES = {
 
 PASS_STATUSES = {"PASS", "PASS_BASELINE"}
 
+# R3 (glimmer-v7): Python port of control-center's mapManifestStatus
+# (control-center/server/src/lib/sessions.ts) — that TS function is the
+# already-tested translation table FROM these raw manifest["status"] strings
+# TO the canonical 14-value GlimmerSessionStatus vocabulary (shared/src/types.ts).
+# Keep this in sync with mapManifestStatus if either side changes.
+#
+# manifest["status"] keeps writing the raw strings below unchanged (backward
+# read-compatibility with the 24 archived sessions that predate this task).
+# manifest["state"] is the new field carrying the canonical value, and is
+# also what agent_state_changed events now emit as `state=`.
+def canonical_session_state(raw_status: str) -> str:
+    if raw_status == "initialized":
+        return "preflight"
+    if raw_status in ("verified", "no-change-verified"):
+        return "verified"
+    if raw_status == "no-change-unverified":
+        return "needs_review"
+    if raw_status.startswith("blocked-"):
+        return "blocked"
+    if raw_status.startswith("failed-"):
+        return "failed"
+    # repo-map-only is TERMINAL (v2 writes it and exits immediately, no
+    # engineering work attempted) — must not map to an in-flight state.
+    if raw_status == "repo-map-only":
+        return "cancelled"
+    # Unrecognized raw status: never default to in-flight — surface it for a
+    # human to look at instead of misreporting a live session.
+    return "needs_review"
+
 
 class V2Error(RuntimeError):
     pass
@@ -810,6 +839,7 @@ def main():
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
+        "state": canonical_session_state("initialized"),
         "eventsFile": "events.jsonl", "contract": contract,
     }
     manifest_path = session / "manifest.json"
@@ -819,10 +849,10 @@ def main():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     save()
-    # session_created isn't a real EVENT_TYPES variant; agent_state_changed with
-    # state="preflight" is the closest real type (maps to GlimmerSessionStatus's
-    # "preflight" value).
-    emit_event(events_path, "agent_state_changed", sid, state="preflight")
+    # session_created isn't a real EVENT_TYPES variant; agent_state_changed is
+    # the closest real type. state= is now the canonical GlimmerSessionStatus
+    # value (R3) — manifest["state"] mirrors what "initialized" maps to.
+    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
 
     print("=" * 72)
     print(" MUSE GLIMMER ENGINEERING MODE V2.1")
@@ -838,10 +868,8 @@ def main():
     if args.repo_map_only:
         print("\n" + summary)
         manifest["status"] = "repo-map-only"
-        # R1: raw manifest status string emitted as `state`; Task 4 (R3) will map
-        # this (and the other manifest["status"] sites in main()) to the canonical
-        # GlimmerSessionStatus vocabulary.
-        emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+        manifest["state"] = canonical_session_state(manifest["status"])
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         save()
         return 0
 
@@ -896,10 +924,8 @@ def main():
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
-                        # R1: raw manifest status string emitted as `state`; Task 4 (R3)
-                        # will map this (and the other manifest["status"] sites in
-                        # main()) to the canonical GlimmerSessionStatus vocabulary.
-                        emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+                        manifest["state"] = canonical_session_state(manifest["status"])
+                        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                         success = True
                         final_label = "NO CHANGE REQUIRED — VERIFIED"
                         save()
@@ -907,9 +933,8 @@ def main():
                 attempt["status"] = "no-change-unverified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "no-change-unverified"
-                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
-                # map this to the canonical GlimmerSessionStatus vocabulary.
-                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 break
 
@@ -935,9 +960,8 @@ def main():
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "failed-verifier-mutated-repo"
-                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
-                # map this to the canonical GlimmerSessionStatus vocabulary.
-                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 raise V2Error("Verifier changed repository content; refusing to continue")
 
@@ -945,9 +969,8 @@ def main():
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
-                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
-                # map this to the canonical GlimmerSessionStatus vocabulary.
-                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 success = True
                 final_label = "VERIFIED"
@@ -961,18 +984,16 @@ def main():
             failed_status = next((r.get("status") for r in results if not r.get("ok")), "CODE_FAIL")
             if failed_status in {"INFRA_BLOCKED", "TIMEOUT"}:
                 manifest["status"] = f"blocked-{failed_status.lower()}"
-                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
-                # map this to the canonical GlimmerSessionStatus vocabulary.
-                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 print(f"\n[V2] {failed_status}: repair budget will NOT be consumed.")
                 break
 
             if iteration >= args.max_repairs:
                 manifest["status"] = "failed-repair-budget-exhausted"
-                # R1: raw manifest status string emitted as `state`; Task 4 (R3) will
-                # map this to the canonical GlimmerSessionStatus vocabulary.
-                emit_event(events_path, "agent_state_changed", sid, state=manifest["status"])
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 break
 
@@ -989,7 +1010,9 @@ def main():
         manifest["checkpointsCollapsed"] = head(ws) == baseline
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
         save()
-        emit_event(events_path, "session_completed", sid, status=manifest["status"])
+        # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
+        # the canonical manifest["state"], not the raw manifest["status"].
+        emit_event(events_path, "session_completed", sid, status=manifest["state"])
 
     print("\n" + "=" * 72)
     print(f" GLIMMER V2.1: {final_label}")

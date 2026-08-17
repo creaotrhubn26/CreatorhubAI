@@ -1775,7 +1775,6 @@ def run_engineer(
     ledger = []
     changed_paths = set()
 
-    writes_made = False
     diff_checked = False
     validation_checked = False
 
@@ -1799,7 +1798,6 @@ def run_engineer(
     # repeatedly exploring the repository without selecting
     # a concrete engineering candidate.
     discovery_calls = 0
-    discovery_gate_sent = False
     discovery_tool_budget = 8
 
     # After broad discovery, allow only a very small number of
@@ -1807,7 +1805,20 @@ def run_engineer(
     # concrete edit/no-edit decision.
     post_gate_inspection_calls = 0
     post_gate_inspection_budget = 3
-    decision_deadline_sent = False
+
+    # R3 (glimmer-v7): single engineer-loop-scoped phase variable that drives
+    # active_tools, replacing the old writes_made / discovery_gate_sent /
+    # decision_deadline_sent boolean trio. This is a SEPARATE, smaller scope
+    # from the session-level manifest["state"] written by glimmer-v2.py — do
+    # not conflate the two. Monotonic, "writing" is absorbing:
+    #   discovering -> narrowed_to_read_edit -> narrowed_to_edit_only
+    #   (any phase) -> writing   [on first successful repository write]
+    # diff_checked / validation_checked / verification_typecheck_attempted
+    # stay separate variables: they track per-write verification completeness
+    # (reset on every write) and full-typecheck-attempt phase, an orthogonal
+    # axis that can't be folded into this enum without losing information.
+    engineer_phase = "discovering"
+    _emit("agent_state_changed", state=engineer_phase)
 
     discovery_tools = {
         "file_glob_search",
@@ -1824,10 +1835,13 @@ def run_engineer(
 
         active_tools = tools
 
-        # Once discovery budget is exhausted, remove broad
-        # exploration/shell tools until the first edit.
-        # The model can still inspect the selected target and edit it.
-        if decision_deadline_sent and not writes_made:
+        # active_tools is driven solely by engineer_phase (R3). Mapping from
+        # the old boolean combinations, preserved here for traceability:
+        #   decision_deadline_sent and not writes_made -> narrowed_to_edit_only
+        #   discovery_gate_sent and not writes_made    -> narrowed_to_read_edit
+        #   writes_made (from any prior phase)         -> writing (full tools)
+        #   neither gate sent yet, no write yet        -> discovering (full tools)
+        if engineer_phase == "narrowed_to_edit_only":
             # Verification budget is exhausted.
             # At this point the model must either edit the chosen
             # file or finish without making a change.
@@ -1844,7 +1858,7 @@ def run_engineer(
                 )
             ]
 
-        elif discovery_gate_sent and not writes_made:
+        elif engineer_phase == "narrowed_to_read_edit":
             allowed_before_edit = {
                 "read_file",
                 "grep_search",
@@ -1950,7 +1964,7 @@ def run_engineer(
         if not tool_calls:
 
             if (
-                writes_made
+                engineer_phase == "writing"
                 and turn < max_turns - 1
                 and (
                     not diff_checked
@@ -2040,14 +2054,16 @@ def run_engineer(
             )
 
             if (
-                not writes_made
+                engineer_phase != "writing"
                 and tool_name in discovery_tools
             ):
                 discovery_calls += 1
 
             if (
-                discovery_gate_sent
-                and not writes_made
+                engineer_phase in (
+                    "narrowed_to_read_edit",
+                    "narrowed_to_edit_only",
+                )
                 and tool_name in post_gate_inspection_tools
             ):
                 post_gate_inspection_calls += 1
@@ -2087,7 +2103,7 @@ def run_engineer(
                         frontend_typecheck_already_attempted,
                     ) = frontend_typecheck_guard_decision(
                         is_full_frontend_typecheck,
-                        writes_made,
+                        engineer_phase == "writing",
                         diagnostic_typecheck_attempted,
                         verification_typecheck_attempted,
                     )
@@ -2185,7 +2201,12 @@ def run_engineer(
                                     )
 
                     if changed:
-                        writes_made = True
+                        if engineer_phase != "writing":
+                            engineer_phase = "writing"
+                            _emit(
+                                "agent_state_changed",
+                                state=engineer_phase,
+                            )
                         diff_checked = False
                         validation_checked = False
 
@@ -2295,11 +2316,11 @@ def run_engineer(
         # ----------------------------------------------------
 
         if (
-            not writes_made
-            and not discovery_gate_sent
+            engineer_phase == "discovering"
             and discovery_calls >= discovery_tool_budget
         ):
-            discovery_gate_sent = True
+            engineer_phase = "narrowed_to_read_edit"
+            _emit("agent_state_changed", state=engineer_phase)
 
             messages.append(
                 {
@@ -2327,13 +2348,12 @@ def run_engineer(
 
 
         if (
-            discovery_gate_sent
-            and not writes_made
-            and not decision_deadline_sent
+            engineer_phase == "narrowed_to_read_edit"
             and post_gate_inspection_calls
                 >= post_gate_inspection_budget
         ):
-            decision_deadline_sent = True
+            engineer_phase = "narrowed_to_edit_only"
+            _emit("agent_state_changed", state=engineer_phase)
 
             messages.append(
                 {
