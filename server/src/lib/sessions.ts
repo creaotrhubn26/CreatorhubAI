@@ -179,6 +179,11 @@ export async function adoptRealSessionDir(
         // orchestrator startup order roughly matching directory-creation
         // order. A deterministic fix needs glimmer-v2.py to hand back an
         // explicit session tag (future work, out of scope here).
+        // Note: pendingSpawnQueue is global across ALL in-flight adoptions,
+        // not scoped to the ones actually racing — a 3rd, unrelated pending
+        // id still polling delays this pairing (via the count check below)
+        // until it resolves or times out and is spliced out. Self-heals,
+        // does not deadlock, but is unbounded-latency by design.
         const waiting = pendingSpawnQueue.filter((id) => !sessionAliases.has(id));
         if (candidates.length === waiting.length) {
           const stamped = await Promise.all(
