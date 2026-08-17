@@ -15,5 +15,8 @@ backups/
 # Disposable throwaway repos used for live smoke-test checkpoints
 .smoke-test-repo/
 
+# Superpowers SDD/fix workflow scratch (ledgers, briefs, review packages) — git history is the record
+.superpowers/
+
 # Already its own independent git repo (github.com/creaotrhubn26/CreatorhubAI) — do not nest
 control-center/
