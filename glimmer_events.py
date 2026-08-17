@@ -11,8 +11,7 @@ event line.
 """
 import json
 import os
-import threading
-import time
+import uuid
 from datetime import datetime, timezone
 
 EVENT_TYPES = {
@@ -21,24 +20,6 @@ EVENT_TYPES = {
     "candidate_selected", "scope_expanded", "repair_started",
     "parser_recovery", "session_completed",
 }
-
-_seq_lock = threading.Lock()
-_seq_by_path: dict[str, int] = {}
-
-
-def _next_sequence(events_path: str) -> int:
-    with _seq_lock:
-        if events_path not in _seq_by_path:
-            # Seed from existing line count so a second process attaching to
-            # an already-started file (engineer joining v2's session) doesn't
-            # reuse sequence numbers v2 already wrote.
-            try:
-                with open(events_path, "r", encoding="utf-8") as f:
-                    _seq_by_path[events_path] = sum(1 for _ in f)
-            except FileNotFoundError:
-                _seq_by_path[events_path] = 0
-        _seq_by_path[events_path] += 1
-        return _seq_by_path[events_path]
 
 
 def emit(events_path: str, event_type: str, session_id: str, **fields) -> None:
@@ -50,7 +31,7 @@ def emit(events_path: str, event_type: str, session_id: str, **fields) -> None:
         return
     try:
         record = {
-            "id": f"{session_id}-{_next_sequence(events_path)}",
+            "id": f"{session_id}-{uuid.uuid4().hex[:12]}",
             "sessionId": session_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
