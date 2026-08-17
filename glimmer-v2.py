@@ -612,7 +612,38 @@ def recover_interrupted_checkpoint(ws):
     }
 
 
-def make_prompt(task, summary, iteration, failure=None, checkpoint_sha=None):
+def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None):
+    # R2: the contract dict (same shape as manifest["contract"]) is the sole
+    # source of truth for scope/mode/constraints — derive the human-readable
+    # OPERATING CONTRACT lines below FROM it rather than maintaining separate
+    # hardcoded prose that can drift out of sync with the CLI flags.
+    task = contract["objective"]
+    scope = contract["scope"]
+    constraints = contract["constraints"]
+
+    scope_bits = [f"package={scope['package']}"]
+    if scope.get("area"):
+        scope_bits.append(f"area={scope['area']}")
+    if scope.get("paths"):
+        scope_bits.append(f"paths={scope['paths']}")
+    scope_text = ", ".join(scope_bits)
+
+    constraint_lines = []
+    if constraints.get("minimalChange"):
+        constraint_lines.append("Make the smallest complete implementation; do not modify unrelated files.")
+    banned = []
+    if constraints.get("noCommit"):
+        banned.append("commit")
+    if constraints.get("noPush"):
+        banned.append("push")
+    if constraints.get("noDeploy"):
+        banned.append("deploy")
+    if constraints.get("noDependencyInstall"):
+        banned.append("install packages")
+    if banned:
+        constraint_lines.append(f"Do not {', '.join(banned)}, change Git configuration.")
+    constraint_text = "\n".join(f"    - {line}" for line in constraint_lines)
+
     repair = ""
     if iteration:
         repair = f"""
@@ -627,8 +658,14 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     return textwrap.dedent(f"""
     MUSE GLIMMER ENGINEERING MODE V2.1 — {'IMPLEMENT' if iteration == 0 else f'REPAIR {iteration}'}
 
+    TASK CONTRACT (authoritative — sole source of scope/mode/constraints for this task):
+    {json.dumps(contract)}
+
     USER TASK:
     {task}
+
+    MODE: {contract['mode']}
+    SCOPE: {scope_text}
 
     TRUSTED REPOSITORY MAP:
     {summary}
@@ -639,8 +676,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     - Work only inside this isolated Glimmer worktree.
     - Inspect only files/symbols needed for this task.
     - Reuse existing architecture only when it is genuinely applicable.
-    - Make the smallest complete implementation.
-    - Do not commit, push, deploy, install packages, change Git configuration, or modify unrelated files.
+{constraint_text}
     - Do NOT run broad/full typecheck, lint, full test suite, or full build.
       The trusted v2.1 wrapper runs authoritative post-edit verification.
     - Narrow diagnostic commands are allowed when needed.
@@ -680,6 +716,17 @@ def main():
     ap.add_argument("--verify", action="append", default=[])
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--max-turns", type=int)
+    # Task Contract fields (glimmer-v7 R2). Choices mirror @glimmer/shared's real
+    # TaskContract union types (control-center/shared/src/types.ts) field-for-field
+    # so the manifest["contract"] this CLI produces is interchangeable with the
+    # contract the control-center composer builds via buildTaskContract.ts.
+    ap.add_argument("--scope-package", choices=("repository", "frontend", "backend", "directory", "files"),
+                    default="repository", help="Contract scope.package: what category of the repo this task is scoped to")
+    ap.add_argument("--scope-area", default=None, help="Contract scope.area: sub-path within the package this task is scoped to")
+    ap.add_argument("--scope-paths", action="append", default=None,
+                    help="Contract scope.paths: explicit file path this task is scoped to (repeatable)")
+    ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review"),
+                    default="implement", help="Contract mode: the kind of work this task performs")
     ap.add_argument("--auto-approve", action="store_true")
     ap.add_argument("--repo-map-only", action="store_true")
     ap.add_argument("--allow-non-glimmer-branch", action="store_true")
@@ -733,11 +780,37 @@ def main():
     repo = build_repo_map(ws)
     (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
     summary = repo_summary(repo)
+
+    # Task Contract (glimmer-v7 R2): one source of truth for scope/mode/constraints,
+    # shared verbatim (field-for-field with @glimmer/shared TaskContract) between
+    # manifest.json and the prompt built below, instead of separately-maintained
+    # prose. noCommit/noPush/noDeploy/noDependencyInstall are project-wide hard
+    # constraints, never configurable via CLI flags.
+    contract = {
+        "objective": task,
+        "scope": {
+            "package": args.scope_package,
+            "area": args.scope_area,
+            "paths": args.scope_paths,
+        },
+        "mode": args.mode,
+        "constraints": {
+            "minimalChange": True,
+            "noCommit": True,
+            "noPush": True,
+            "noDeploy": True,
+            "noDependencyInstall": True,
+        },
+        "verification": args.verify,
+        "repairBudget": args.max_repairs,
+        "maxTurns": args.max_turns,
+    }
+
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
-        "eventsFile": "events.jsonl",
+        "eventsFile": "events.jsonl", "contract": contract,
     }
     manifest_path = session / "manifest.json"
 
@@ -795,7 +868,7 @@ def main():
         for iteration in range(args.max_repairs + 1):
             if iteration > 0:
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
-            prompt = make_prompt(task, summary, iteration, failure, checkpoint_sha)
+            prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid)
