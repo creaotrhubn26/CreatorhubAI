@@ -19,6 +19,8 @@ import time
 import urllib.error
 import urllib.request
 
+from glimmer_events import emit as emit_event
+
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
 STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
 NODE_OPTIONS_DEFAULT = "--max-old-space-size=12288"
@@ -56,6 +58,141 @@ CONFIG_NAMES = {
 }
 
 PASS_STATUSES = {"PASS", "PASS_BASELINE"}
+
+# R3 (glimmer-v7): Python port of control-center's mapManifestStatus
+# (control-center/server/src/lib/sessions.ts) — that TS function is the
+# already-tested translation table FROM these raw manifest["status"] strings
+# TO the canonical 14-value GlimmerSessionStatus vocabulary (shared/src/types.ts).
+# Keep this in sync with mapManifestStatus if either side changes.
+#
+# manifest["status"] keeps writing the raw strings below unchanged (backward
+# read-compatibility with the 24 archived sessions that predate this task).
+# manifest["state"] is the new field carrying the canonical value, and is
+# also what agent_state_changed events now emit as `state=`.
+def canonical_session_state(raw_status: str) -> str:
+    if raw_status == "initialized":
+        return "preflight"
+    if raw_status in ("verified", "no-change-verified"):
+        return "verified"
+    if raw_status == "no-change-unverified":
+        return "needs_review"
+    if raw_status.startswith("blocked-"):
+        return "blocked"
+    if raw_status.startswith("failed-"):
+        return "failed"
+    # repo-map-only is TERMINAL (v2 writes it and exits immediately, no
+    # engineering work attempted) — must not map to an in-flight state.
+    if raw_status == "repo-map-only":
+        return "cancelled"
+    # R6: SIGTERM/Ctrl-C now write "cancelled-sigterm" (see _sigterm_handler's
+    # call site in main()) instead of silently leaving whatever status was
+    # last saved before the interrupt. Not yet mirrored in control-center's
+    # mapManifestStatus (out of this task's file scope) — that function's own
+    # unrecognized-status fallback ("needs_review", never in-flight) is a safe
+    # degrade until it is.
+    if raw_status.startswith("cancelled"):
+        return "cancelled"
+    # Unrecognized raw status: never default to in-flight — surface it for a
+    # human to look at instead of misreporting a live session.
+    return "needs_review"
+
+
+def read_session_events(events_path: Path) -> list:
+    """R6: read a session's own events.jsonl back at session end, so
+    classify_failure has real event evidence (tool_blocked/scope_expanded/
+    parser_recovery) to cite. Python-side equivalent of a
+    readSessionEventsBatch-style reader: one process, one run, so the file is
+    always small — a single full read is enough, no streaming/pagination
+    needed. Tolerates a missing file (archived sessions predating Task 1's
+    emitter have none) and malformed/partial lines (glimmer_events.emit's own
+    docstring notes O_APPEND is only atomic up to PIPE_BUF; never raise on a
+    torn last line)."""
+    try:
+        raw = events_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+PARSER_FAILURE_THRESHOLD = 2  # R6: one recovered parse is transient; repeated recoveries in one terminal session point at a structural parser problem
+
+
+def classify_failure(manifest: dict, events: list) -> dict | None:
+    """R6: classify a session's real terminal state into
+    {class, detail, evidenceIds}, or None for genuine success.
+
+    Reads manifest["status"] (the RAW string), not manifest["state"] — the
+    canonical GlimmerSessionStatus value collapses blocked-infra_blocked/
+    blocked-timeout (and any future blocked-*/failed-* variant) into one
+    generic "blocked"/"failed" bucket via canonical_session_state's prefix
+    match, which is exactly the distinction a failure taxonomy needs to keep.
+    Archived sessions from before R3 (Task 6) never got a "state" field at
+    all, so "status" is also the only field guaranteed to exist.
+
+    Precedence: manifest["status"] is the orchestrator's own authoritative
+    terminal signal and is checked first. Per-tool/per-file events
+    (tool_blocked, scope_expanded, parser_recovery) are advisory during the
+    run — e.g. a real archived "verified" session
+    (20260817-183716-glimmer-smoke-test-r1) has 2 tool_blocked events from a
+    denied command the engineer recovered from and still finished clean — so
+    they are only consulted for terminal states this function doesn't
+    otherwise recognize, never allowed to override a genuine success/no-op
+    status.
+    """
+    raw = manifest.get("status") or ""
+
+    if raw in ("verified", "no-change-verified"):
+        return None
+    if raw == "repo-map-only":
+        return None  # deliberate --repo-map-only early exit, not a failure
+
+    if raw == "blocked-infra_blocked":
+        return {"class": "INFRA_BLOCKED", "detail": "verifier infrastructure failure (missing binary/module)", "evidenceIds": []}
+    if raw == "blocked-timeout":
+        return {"class": "TIMEOUT", "detail": "verifier or engineer step timed out", "evidenceIds": []}
+    if raw == "failed-repair-budget-exhausted":
+        return {"class": "CODE_FAIL", "detail": "repair budget exhausted with failing checks remaining", "evidenceIds": []}
+    if raw == "failed-verifier-mutated-repo":
+        return {"class": "POLICY_BLOCK", "detail": "verifier command mutated the repository", "evidenceIds": []}
+    if raw == "failed-aborted":
+        return {"class": "ORCHESTRATION_ABORTED",
+                "detail": "orchestration raised an error before completing any attempt "
+                           "(e.g. model server unreachable at readiness_probe, or another "
+                           "run()/setup failure) — no repair loop iteration ever started",
+                "evidenceIds": []}
+    if raw.startswith("cancelled"):
+        return {"class": "USER_CANCELLED", "detail": "session terminated by SIGTERM/interrupt before reaching a terminal state", "evidenceIds": []}
+
+    blocked = [e for e in events if e.get("type") == "tool_blocked"]
+    if blocked:
+        return {"class": "POLICY_BLOCK", "detail": blocked[-1].get("reason") or "shell command blocked by policy",
+                "evidenceIds": [e["id"] for e in blocked if "id" in e]}
+
+    scope_events = [e for e in events if e.get("type") == "scope_expanded"]
+    if scope_events:
+        return {"class": "SCOPE_FAILURE", "detail": "changed files exceeded the task contract's declared scope",
+                "evidenceIds": [e["id"] for e in scope_events if "id" in e]}
+
+    parser_events = [e for e in events if e.get("type") == "parser_recovery"]
+    if len(parser_events) >= PARSER_FAILURE_THRESHOLD:
+        return {"class": "PARSER_FAILURE", "detail": f"model response parser recovered {len(parser_events)} times this session",
+                "evidenceIds": [e["id"] for e in parser_events if "id" in e]}
+
+    # Anything else reaching here is a real terminal status this function
+    # doesn't specifically recognize — e.g. "no-change-unverified", or a
+    # legacy "blocked-no-changes" string a pre-refactor orchestrator version
+    # wrote (still present in archived sessions, no longer produced by
+    # current code). Report it rather than guessing or raising.
+    return {"class": "UNKNOWN", "detail": f"unclassified terminal state: status={raw!r}", "evidenceIds": []}
 
 
 class V2Error(RuntimeError):
@@ -116,6 +253,69 @@ def changed_files(ws, baseline):
     tracked = lines(git(ws, "diff", "--name-only", baseline, "--"))
     untracked = lines(git(ws, "ls-files", "--others", "--exclude-standard"))
     return sorted(set(tracked + untracked))
+
+
+def _expected_prefixes(scope: dict) -> list:
+    """Python port of repoAnalysis.ts's expectedPrefixes(). glimmer-v2.py has
+    no repoMap object at this call site (that's a control-center-only
+    concept), so the frontend/backend -> repoMap.packages lookup is dropped;
+    scope.package falls straight through to the bare-name fallback the TS
+    itself uses when repoMap has no match for that package."""
+    paths = scope.get("paths") or []
+    if paths:
+        return list(paths)
+    if scope.get("area"):
+        return [scope["area"]]
+    package = scope.get("package")
+    if package in ("frontend", "backend"):
+        return [package]
+    return []  # repository/directory/files with no explicit path: nothing meaningful to guard against
+
+
+def compute_scope_guard(changed: list, contract: dict) -> dict:
+    """Python port of control-center's computeScopeGuard/expectedPrefixes
+    (control-center/server/src/lib/repoAnalysis.ts, read in full for this
+    port). Mirrors that TS logic exactly as it stands today, INCLUDING a
+    known gap: the TS prefix match is a plain `p.startsWith(prefix)`, not
+    boundary-safe (`frontend/src/dialog` would match `frontend/src/dialog-old`).
+    An earlier draft of this task's brief believed that had already been
+    hardened; re-reading repoAnalysis.ts and its test file (repoAnalysis.test.ts)
+    for this task confirmed it has NOT — no boundary-safe test exists, and the
+    implementation is plain startsWith. Per this task's own instructions, the
+    real TS is the source of truth over the brief's aspirational snippet, so
+    this port intentionally preserves the TS's real (imperfect) behavior
+    rather than silently diverging from the reference it's ported from. See
+    task-6a-report.md for the follow-up recommendation."""
+    scope = contract.get("scope") or {}
+    expected = _expected_prefixes(scope)
+    actual = list(changed)
+    if not expected:
+        # F5: "directory"/"files" scope CLAIMS to be bounded to a concrete
+        # path, but nothing concrete was ever given — expectedPrefixes() then
+        # has nothing to guard against. Reporting inScope: true here would be
+        # indistinguishable from the honest, intentional "repository" scope
+        # (no boundary by design) below. Report the state as unbounded
+        # instead of silently passing every file as "in scope".
+        if scope.get("package") in ("directory", "files"):
+            return {"inScope": False, "expected": expected, "actual": actual,
+                     "expandedFiles": [], "unbounded": True}
+        return {"inScope": True, "expected": expected, "actual": actual, "expandedFiles": []}
+    expanded = [p for p in actual if not any(p.startswith(prefix) for prefix in expected)]
+    return {"inScope": len(expanded) == 0, "expected": expected, "actual": actual, "expandedFiles": expanded}
+
+
+def file_change_types(ws, baseline):
+    """Map path -> 'added'|'modified'|'deleted', derived from real git status vs
+    baseline (untracked files count as 'added'). Used only to populate file_changed
+    event payloads with a real changeType instead of a hardcoded one."""
+    out = {}
+    for line in lines(git(ws, "diff", "--name-status", baseline, "--")):
+        parts = line.split("\t")
+        code, path = parts[0], parts[-1]
+        out[path] = "deleted" if code.startswith("D") else "added" if code.startswith(("A", "R", "C")) else "modified"
+    for rel in lines(git(ws, "ls-files", "--others", "--exclude-standard")):
+        out[rel] = "added"
+    return out
 
 
 def diff_hash(ws, baseline):
@@ -476,7 +676,8 @@ def remove_baseline_worktree(ws, target):
     shutil.rmtree(target, ignore_errors=True)
 
 
-def verify(ws, commands, timeout, session, iteration, repo_map, source_root, baseline, toolchain_mode="path"):
+def verify(ws, commands, timeout, session, iteration, repo_map, source_root, baseline, toolchain_mode="path",
+           events_path=None, session_id=None):
     current_bridges = []
     if toolchain_mode == "linked":
         _, current_bridges = prepare_toolchain_bridges(ws, repo_map)
@@ -489,6 +690,8 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
         for i, cmd in enumerate(commands, 1):
             label = shlex.join(cmd)
             print(f"\n[V2 verify {iteration}.{i}] {label}")
+            if events_path is not None:
+                emit_event(events_path, "verification_started", session_id, command=label)
             result = run_verifier_command(ws, cmd, timeout, env)
 
             if result["status"] == "CODE_FAIL":
@@ -520,6 +723,9 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             (session / f"verify-{iteration:02d}-{i:02d}.json").write_text(
                 json.dumps(result, indent=2), encoding="utf-8"
             )
+            if events_path is not None:
+                emit_event(events_path, "verification_completed", session_id, check=label,
+                           status=result["status"], baselineAware=bool(result.get("baseline")))
             if result["status"] == "PASS":
                 print("PASS")
             elif result["status"] == "PASS_BASELINE":
@@ -590,7 +796,38 @@ def recover_interrupted_checkpoint(ws):
     }
 
 
-def make_prompt(task, summary, iteration, failure=None, checkpoint_sha=None):
+def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None):
+    # R2: the contract dict (same shape as manifest["contract"]) is the sole
+    # source of truth for scope/mode/constraints — derive the human-readable
+    # OPERATING CONTRACT lines below FROM it rather than maintaining separate
+    # hardcoded prose that can drift out of sync with the CLI flags.
+    task = contract["objective"]
+    scope = contract["scope"]
+    constraints = contract["constraints"]
+
+    scope_bits = [f"package={scope['package']}"]
+    if scope.get("area"):
+        scope_bits.append(f"area={scope['area']}")
+    if scope.get("paths"):
+        scope_bits.append(f"paths={scope['paths']}")
+    scope_text = ", ".join(scope_bits)
+
+    constraint_lines = []
+    if constraints.get("minimalChange"):
+        constraint_lines.append("Make the smallest complete implementation; do not modify unrelated files.")
+    banned = []
+    if constraints.get("noCommit"):
+        banned.append("commit")
+    if constraints.get("noPush"):
+        banned.append("push")
+    if constraints.get("noDeploy"):
+        banned.append("deploy")
+    if constraints.get("noDependencyInstall"):
+        banned.append("install packages")
+    if banned:
+        constraint_lines.append(f"Do not {', '.join(banned)}, change Git configuration.")
+    constraint_text = "\n".join(f"    - {line}" for line in constraint_lines)
+
     repair = ""
     if iteration:
         repair = f"""
@@ -605,8 +842,14 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     return textwrap.dedent(f"""
     MUSE GLIMMER ENGINEERING MODE V2.1 — {'IMPLEMENT' if iteration == 0 else f'REPAIR {iteration}'}
 
+    TASK CONTRACT (authoritative — sole source of scope/mode/constraints for this task):
+    {json.dumps(contract)}
+
     USER TASK:
     {task}
+
+    MODE: {contract['mode']}
+    SCOPE: {scope_text}
 
     TRUSTED REPOSITORY MAP:
     {summary}
@@ -617,8 +860,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     - Work only inside this isolated Glimmer worktree.
     - Inspect only files/symbols needed for this task.
     - Reuse existing architecture only when it is genuinely applicable.
-    - Make the smallest complete implementation.
-    - Do not commit, push, deploy, install packages, change Git configuration, or modify unrelated files.
+{constraint_text}
     - Do NOT run broad/full typecheck, lint, full test suite, or full build.
       The trusted v2.1 wrapper runs authoritative post-edit verification.
     - Narrow diagnostic commands are allowed when needed.
@@ -627,7 +869,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     """).strip()
 
 
-def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path):
+def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id):
     cmd = [str(engineer), "--workspace", str(ws)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
@@ -635,9 +877,12 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path):
         cmd.append("--yes")
     cmd.append(prompt)
     print("\n[V2] Launching existing glimmer-engineer.py...")
+    env = os.environ.copy()
+    env["GLIMMER_EVENTS_PATH"] = str(events_path)
+    env["GLIMMER_SESSION_ID"] = session_id
     with log_path.open("w", encoding="utf-8") as log:
         p = subprocess.Popen(cmd, cwd=str(ws), text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, env=os.environ.copy(), bufsize=1)
+                             stderr=subprocess.STDOUT, env=env, bufsize=1)
         assert p.stdout is not None
         for line in p.stdout:
             sys.stdout.write(line)
@@ -655,6 +900,17 @@ def main():
     ap.add_argument("--verify", action="append", default=[])
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--max-turns", type=int)
+    # Task Contract fields (glimmer-v7 R2). Choices mirror @glimmer/shared's real
+    # TaskContract union types (control-center/shared/src/types.ts) field-for-field
+    # so the manifest["contract"] this CLI produces is interchangeable with the
+    # contract the control-center composer builds via buildTaskContract.ts.
+    ap.add_argument("--scope-package", choices=("repository", "frontend", "backend", "directory", "files"),
+                    default="repository", help="Contract scope.package: what category of the repo this task is scoped to")
+    ap.add_argument("--scope-area", default=None, help="Contract scope.area: sub-path within the package this task is scoped to")
+    ap.add_argument("--scope-paths", action="append", default=None,
+                    help="Contract scope.paths: explicit file path this task is scoped to (repeatable)")
+    ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review"),
+                    default="implement", help="Contract mode: the kind of work this task performs")
     ap.add_argument("--auto-approve", action="store_true")
     ap.add_argument("--repo-map-only", action="store_true")
     ap.add_argument("--allow-non-glimmer-branch", action="store_true")
@@ -703,14 +959,50 @@ def main():
     sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     session = STATE_ROOT / f"{sid}-{b.replace('/', '-')}"
     session.mkdir()
+    events_path = session / "events.jsonl"
 
     repo = build_repo_map(ws)
     (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
     summary = repo_summary(repo)
+
+    # Task Contract (glimmer-v7 R2): one source of truth for scope/mode/constraints,
+    # shared verbatim (field-for-field with @glimmer/shared TaskContract) between
+    # manifest.json and the prompt built below, instead of separately-maintained
+    # prose. noCommit/noPush/noDeploy/noDependencyInstall are project-wide hard
+    # constraints, never configurable via CLI flags.
+    # scope.area/scope.paths/maxTurns are `?:` (optional), not nullable, in
+    # @glimmer/shared's real TaskContract shape — omit the keys entirely
+    # when unset instead of writing an explicit null, to stay assignable
+    # under strictNullChecks.
+    scope = {"package": args.scope_package}
+    if args.scope_area is not None:
+        scope["area"] = args.scope_area
+    if args.scope_paths is not None:
+        scope["paths"] = args.scope_paths
+
+    contract = {
+        "objective": task,
+        "scope": scope,
+        "mode": args.mode,
+        "constraints": {
+            "minimalChange": True,
+            "noCommit": True,
+            "noPush": True,
+            "noDeploy": True,
+            "noDependencyInstall": True,
+        },
+        "verification": args.verify,
+        "repairBudget": args.max_repairs,
+    }
+    if args.max_turns is not None:
+        contract["maxTurns"] = args.max_turns
+
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
-        "verificationLevel": args.verification_level, "attempts": [], "status": "initialized"
+        "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
+        "state": canonical_session_state("initialized"),
+        "eventsFile": "events.jsonl", "contract": contract,
     }
     manifest_path = session / "manifest.json"
 
@@ -719,6 +1011,10 @@ def main():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     save()
+    # session_created isn't a real EVENT_TYPES variant; agent_state_changed is
+    # the closest real type. state= is now the canonical GlimmerSessionStatus
+    # value (R3) — manifest["state"] mirrors what "initialized" maps to.
+    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
 
     print("=" * 72)
     print(" MUSE GLIMMER ENGINEERING MODE V2.1")
@@ -734,6 +1030,8 @@ def main():
     if args.repo_map_only:
         print("\n" + summary)
         manifest["status"] = "repo-map-only"
+        manifest["state"] = canonical_session_state(manifest["status"])
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         save()
         return 0
 
@@ -758,13 +1056,33 @@ def main():
             save()
 
         for iteration in range(args.max_repairs + 1):
-            prompt = make_prompt(task, summary, iteration, failure, checkpoint_sha)
+            if iteration > 0:
+                emit_event(events_path, "repair_started", sid, iteration=iteration)
+            prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
-                                 session / f"engineer-{iteration:02d}.log")
+                                 session / f"engineer-{iteration:02d}.log", events_path, sid)
             files = changed_files(ws, baseline)
+            change_types = file_change_types(ws, baseline)
+            for f in files:
+                emit_event(events_path, "file_changed", sid, path=f,
+                           changeType=change_types.get(f, "modified"))
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
+
+            # R4 Scope Guard: classify (does not block yet — staged rollout,
+            # see compute_scope_guard's docstring and task-6a-report.md).
+            scope_result = compute_scope_guard(files, manifest.get("contract", {}))
+            attempt["scopeGuard"] = scope_result
+            if scope_result["expandedFiles"]:
+                print(f"[V2] WARN: scope guard — {len(scope_result['expandedFiles'])} changed "
+                      f"file(s) outside expected scope {scope_result['expected']}: {scope_result['expandedFiles']}")
+                emit_event(events_path, "scope_expanded", sid,
+                           expected=scope_result["expected"], actual=scope_result["actual"])
+            elif scope_result.get("unbounded"):
+                print("[V2] WARN: scope guard — scope.package="
+                      f"{manifest['contract']['scope'].get('package')!r} claims a bounded scope but no "
+                      "area/paths were given; cannot verify (unbounded)")
 
             if not files:
                 commands = [["git", "diff", "--check"]]
@@ -774,13 +1092,16 @@ def main():
                         commands.append(cmd)
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
-                                         repo, source_root, baseline, args.toolchain_mode)
+                                         repo, source_root, baseline, args.toolchain_mode,
+                                         events_path, sid)
                     attempt["verificationCommands"] = [shlex.join(c) for c in commands]
                     attempt["verificationResults"] = results
                     if ok:
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
+                        manifest["state"] = canonical_session_state(manifest["status"])
+                        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                         success = True
                         final_label = "NO CHANGE REQUIRED — VERIFIED"
                         save()
@@ -788,6 +1109,8 @@ def main():
                 attempt["status"] = "no-change-unverified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "no-change-unverified"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 break
 
@@ -804,7 +1127,8 @@ def main():
 
             before = diff_hash(ws, baseline)
             ok, results = verify(ws, commands, args.timeout, session, iteration,
-                                 repo, source_root, baseline, args.toolchain_mode)
+                                 repo, source_root, baseline, args.toolchain_mode,
+                                 events_path, sid)
             after = diff_hash(ws, baseline)
             attempt["verificationResults"] = results
             attempt["diffHashAfterVerify"] = after
@@ -812,6 +1136,8 @@ def main():
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "failed-verifier-mutated-repo"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 raise V2Error("Verifier changed repository content; refusing to continue")
 
@@ -819,6 +1145,8 @@ def main():
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 success = True
                 final_label = "VERIFIED"
@@ -832,12 +1160,16 @@ def main():
             failed_status = next((r.get("status") for r in results if not r.get("ok")), "CODE_FAIL")
             if failed_status in {"INFRA_BLOCKED", "TIMEOUT"}:
                 manifest["status"] = f"blocked-{failed_status.lower()}"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 print(f"\n[V2] {failed_status}: repair budget will NOT be consumed.")
                 break
 
             if iteration >= args.max_repairs:
                 manifest["status"] = "failed-repair-budget-exhausted"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
                 break
 
@@ -847,13 +1179,43 @@ def main():
             save()
             print(f"[V2] checkpoint={checkpoint_sha}")
             print("[V2] No push. Starting controlled repair round.")
+    except (V2Interrupted, KeyboardInterrupt):
+        # R6: previously SIGTERM/Ctrl-C left manifest["status"] wherever the
+        # last completed step set it (e.g. still "initialized" if killed
+        # during the very first engineer invocation), silently misreporting a
+        # cancelled session as an in-progress one forever — research for this
+        # task confirmed no cancellation status was ever written. Record the
+        # real terminal reason before `finally` collapses/saves, then
+        # re-raise so __main__'s existing exit-130 handling is unchanged.
+        manifest["status"] = "cancelled-sigterm"
+        manifest["state"] = canonical_session_state(manifest["status"])
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+        raise
     finally:
+        # I2: every exit path routes through this finally, including the
+        # already-handled SIGTERM/KeyboardInterrupt path above (which sets a
+        # real terminal status before falling through here) and the sibling
+        # V2Error path — e.g. readiness_probe's `raise V2Error` when the
+        # model server isn't reachable, or any other run()/orchestration
+        # failure inside the try block above — which has no except clause of
+        # its own and previously fell straight through with manifest["status"]
+        # still stuck at its initial "initialized" value forever. If nothing
+        # else set a real terminal status by the time we get here, record one
+        # now, before state is recomputed/saved below.
+        if manifest["status"] == "initialized":
+            manifest["status"] = "failed-aborted"
+            manifest["state"] = canonical_session_state(manifest["status"])
+            emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         collapse(ws, baseline)
         manifest["finalHead"] = head(ws)
         manifest["finalChangedFiles"] = changed_files(ws, baseline)
         manifest["checkpointsCollapsed"] = head(ws) == baseline
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
+        manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
         save()
+        # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
+        # the canonical manifest["state"], not the raw manifest["status"].
+        emit_event(events_path, "session_completed", sid, status=manifest["state"])
 
     print("\n" + "=" * 72)
     print(f" GLIMMER V2.1: {final_label}")
@@ -871,7 +1233,69 @@ def _sigterm_handler(signum, frame):
     raise V2Interrupted(f"Received signal {signum}")
 
 
+def _r6_selfcheck() -> None:
+    """R6: exercises classify_failure branches the real archived sessions in
+    ~/.muse-glimmer/sessions don't happen to hit on disk today (no
+    TIMEOUT/CODE_FAIL/POLICY_BLOCK/SCOPE_FAILURE/PARSER_FAILURE/
+    USER_CANCELLED terminal session exists there yet). Run with:
+    python3 glimmer-v2.py --r6-selfcheck
+    """
+    assert classify_failure({"status": "verified"}, []) is None
+    assert classify_failure({"status": "no-change-verified"}, []) is None
+    assert classify_failure({"status": "repo-map-only"}, []) is None
+    assert classify_failure({"status": "blocked-infra_blocked"}, [])["class"] == "INFRA_BLOCKED"
+    assert classify_failure({"status": "blocked-timeout"}, [])["class"] == "TIMEOUT"
+    assert classify_failure({"status": "failed-repair-budget-exhausted"}, [])["class"] == "CODE_FAIL"
+    assert classify_failure({"status": "failed-verifier-mutated-repo"}, [])["class"] == "POLICY_BLOCK"
+    assert classify_failure({"status": "cancelled-sigterm"}, [])["class"] == "USER_CANCELLED"
+    # I2: the finally-block guard's terminal status for a V2Error (or any
+    # other) exit that never got past "initialized" (e.g. readiness_probe
+    # raising V2Error before any repair iteration) — must classify as
+    # something more useful than UNKNOWN, and must NOT be swallowed by the
+    # generic "failed-" prefix branches above it.
+    assert classify_failure({"status": "failed-aborted"}, [])["class"] == "ORCHESTRATION_ABORTED"
+
+    # A real, verified archived session can still carry tool_blocked events
+    # (20260817-183716-glimmer-smoke-test-r1 has 2) — success must win
+    # regardless of what advisory events fired along the way.
+    blocked_evt = {"id": "e1", "type": "tool_blocked", "reason": "rm -rf blocked"}
+    assert classify_failure({"status": "verified"}, [blocked_evt]) is None
+
+    # A terminal status this function doesn't specifically recognize falls
+    # through to event evidence when present...
+    r = classify_failure({"status": "no-change-unverified"}, [blocked_evt])
+    assert r == {"class": "POLICY_BLOCK", "detail": "rm -rf blocked", "evidenceIds": ["e1"]}
+
+    scope_evt = {"id": "e2", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/x.ts"]}
+    r = classify_failure({"status": "no-change-unverified"}, [scope_evt])
+    assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2"]
+
+    parser_evts = [{"id": f"p{i}", "type": "parser_recovery", "attempt": i} for i in range(1, 3)]
+    r = classify_failure({"status": "no-change-unverified"}, parser_evts)
+    assert r["class"] == "PARSER_FAILURE" and r["evidenceIds"] == ["p1", "p2"]
+    # ...but a single recovery is below threshold and stays UNKNOWN.
+    assert classify_failure({"status": "no-change-unverified"}, parser_evts[:1])["class"] == "UNKNOWN"
+
+    # Legacy raw status this function was never taught (real archived
+    # "blocked-no-changes"), and no status at all — both degrade to
+    # UNKNOWN, never raise.
+    assert classify_failure({"status": "blocked-no-changes"}, [])["class"] == "UNKNOWN"
+    assert classify_failure({}, [])["class"] == "UNKNOWN"
+
+    # R6's new raw status maps to the same "cancelled" canonical bucket
+    # repo-map-only already uses.
+    assert canonical_session_state("cancelled-sigterm") == "cancelled"
+    # I2: "failed-aborted" rides the existing generic "failed-" prefix match
+    # in canonical_session_state (no new branch needed there).
+    assert canonical_session_state("failed-aborted") == "failed"
+
+    print("R6 classify_failure self-check: PASS")
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--r6-selfcheck"]:
+        _r6_selfcheck()
+        raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         raise SystemExit(main())

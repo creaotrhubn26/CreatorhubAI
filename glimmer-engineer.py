@@ -10,6 +10,44 @@ import sys
 from pathlib import Path
 from urllib import request, error
 
+from glimmer_events import emit as emit_event
+
+GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
+GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
+
+
+def _emit(event_type: str, **fields) -> None:
+    # No-op when the events file isn't configured (e.g. direct standalone
+    # invocation per new-glimmer-task.sh) so this never gates normal operation.
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return
+    emit_event(GLIMMER_EVENTS_PATH, event_type, GLIMMER_SESSION_ID, **fields)
+
+
+# R3/I1 (glimmer-v7): engineer_phase is a local, engineer-loop-scoped concept
+# (see the R3 comment near its first assignment below) and its raw values
+# (discovering / narrowed_to_read_edit / narrowed_to_edit_only / writing) are
+# NOT members of @glimmer/shared's GlimmerSessionStatus union. Emitting them
+# verbatim as agent_state_changed.state would render as unrecognized strings
+# on the dashboard, and worse, any name that happened to collide with a real
+# union member (e.g. "verified") would be misread as an authoritative session
+# status. Map each local phase to the closest real GlimmerSessionStatus member
+# before emitting, so observability into the loop's internal phase never
+# masquerades as (or collides with) a real session-level status.
+ENGINEER_PHASE_TO_SESSION_STATUS = {
+    "discovering": "discovery",
+    "narrowed_to_read_edit": "candidate_selection",
+    "narrowed_to_edit_only": "candidate_selection",
+    "writing": "implementing",
+}
+
+
+def _emit_engineer_phase(phase: str) -> None:
+    _emit(
+        "agent_state_changed",
+        state=ENGINEER_PHASE_TO_SESSION_STATUS[phase],
+    )
+
 
 API_BASE = os.environ.get(
     "GLIMMER_URL",
@@ -21,13 +59,15 @@ API_KEY_FILE = (
     / "AI/muse-glimmer/config/api-key.txt"
 )
 
-DEFAULT_WORKSPACE = Path(
-    "/Users/danielqazi/Creatorhubn-monorepo"
-)
-
 MAX_TOOL_RESULT = 28000
 MAX_EVIDENCE_RESULT = 7000
 MAX_EVIDENCE_TOTAL = 50000
+
+# Matches Task 3's existing tool_completed.resultSummary cap (1800, inline
+# below at its own reviewed call site — left untouched). tool_started.args
+# and tool_blocked.command carry unbounded model-controlled strings with no
+# cap at all; reuse the same limit for consistency across event fields.
+MAX_EVENT_FIELD = 1800
 
 
 # ============================================================
@@ -279,9 +319,68 @@ def secure_tool_arguments(
 # SHELL SECURITY
 # ============================================================
 
+def load_validation_script_allowlist():
+    """
+    Derive the npm validation allowlist from the real script names in the
+    session's repo-map.json (written by glimmer-v2.py, R3, to the same
+    session directory as GLIMMER_EVENTS_PATH).
+
+    Returns a set of exact, real script names matching the validation
+    shape (typecheck/test:unit/test:e2e, generalized across packages), or
+    None when no repo map is available (standalone invocation per
+    new-glimmer-task.sh, or the file is missing/unreadable) — callers
+    fall back to the old shape-only pattern match in that case. The
+    derived set is always a subset of what the shape-only match would
+    allow, so this can only narrow the allowlist, never widen it.
+    """
+    if not GLIMMER_EVENTS_PATH:
+        return None
+
+    repo_map_path = (
+        Path(GLIMMER_EVENTS_PATH).parent
+        / "repo-map.json"
+    )
+
+    try:
+        data = json.loads(
+            repo_map_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+
+    names = set()
+
+    for package in data.get("packages") or []:
+        scripts = package.get("scripts")
+
+        if not isinstance(scripts, dict):
+            continue
+
+        for name in scripts:
+            if (
+                name == "typecheck"
+                or name.startswith("typecheck:")
+                or name == "test:unit"
+                or name.startswith("test:unit:")
+                or name == "test:e2e"
+                or name.startswith("test:e2e:")
+            ):
+                names.add(name)
+
+    # A repo map that read/parsed successfully but has zero matching
+    # scripts must return an empty set here, NOT None — None is reserved
+    # for "no repo map available at all" (the two early returns above),
+    # where callers fall back to the shape-only match. Falling back to
+    # `names or None` would collapse "repo map says nothing matches" into
+    # that same fallback, which is wider than an empty allowlist and
+    # violates ADR-0002's "always a subset, narrows, never widens".
+    return names
+
+
 def shell_policy(
     command,
     workspace,
+    validation_allowlist=None,
 ):
     if not isinstance(command, str):
         return False, "Command must be a string"
@@ -441,14 +540,25 @@ def shell_policy(
                 f"blocked: {script}"
             )
 
-        safe_validation = (
-            script == "typecheck"
-            or script.startswith("typecheck:")
-            or script == "test:unit"
-            or script.startswith("test:unit:")
-            or script == "test:e2e"
-            or script.startswith("test:e2e:")
-        )
+        # R5 (glimmer-v7): when a repo map is available (this process was
+        # launched by glimmer-v2.py, R3), the allowlist is exactly the real
+        # script names it derived — never wider than the shape-only check
+        # below, since every derived name must ALSO match that shape (see
+        # load_validation_script_allowlist). Only without a repo map
+        # (standalone invocation with no session, or an unreadable/missing
+        # repo-map.json) does this fall back to the old shape-only match,
+        # unchanged from before this task — fail closed, not loosened.
+        if validation_allowlist is not None:
+            safe_validation = script in validation_allowlist
+        else:
+            safe_validation = (
+                script == "typecheck"
+                or script.startswith("typecheck:")
+                or script == "test:unit"
+                or script.startswith("test:unit:")
+                or script == "test:e2e"
+                or script.startswith("test:e2e:")
+            )
 
         if not safe_validation:
             return False, (
@@ -699,6 +809,23 @@ def result_text(result):
     return text
 
 
+def _capped_display_args(args, limit=MAX_EVENT_FIELD):
+    """Cap each top-level string value in an args dict before it's emitted
+    as tool_started.args. Must run on top of (i.e. AFTER) the caller's
+    WRITE_TOOLS redaction into display_args — this only bounds length of
+    already-safe values, it must never be used in place of that redaction
+    or run on raw, unredacted arguments."""
+    if not isinstance(args, dict):
+        return args
+    out = {}
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > limit:
+            out[key] = value[:limit] + "...(truncated)"
+        else:
+            out[key] = value
+    return out
+
+
 def add_evidence(
     ledger,
     tool_name,
@@ -816,151 +943,62 @@ def approve(
 
 
 # ============================================================
-# FRONTEND TYPECHECK NORMALIZATION
+# VERIFICATION OWNERSHIP (R5, glimmer-v7 — see ADR-0002)
 # ============================================================
-
-def is_full_frontend_typecheck_command(
-    command,
-    workspace,
-):
-    """
-    Recognize the canonical CreatorHub frontend typecheck
-    semantically instead of relying on one exact command string.
-
-    These are equivalent when they resolve to workspace/frontend:
-
-      npm --prefix frontend run typecheck
-      npm --prefix ./frontend run typecheck
-      npm --prefix=/absolute/workspace/frontend run typecheck
-      npm --prefix /absolute/workspace/frontend run typecheck
-
-    Commands targeting any other prefix are not classified as the
-    full frontend typecheck.
-    """
-
-    import shlex
-
-    try:
-        tokens = shlex.split(command)
-    except (TypeError, ValueError):
-        return False
-
-    if not tokens or tokens[0] != "npm":
-        return False
-
-    has_run_typecheck = any(
-        tokens[index] == "run"
-        and tokens[index + 1] == "typecheck"
-        for index in range(len(tokens) - 1)
-    )
-
-    if not has_run_typecheck:
-        return False
-
-    prefix_values = []
-    index = 1
-
-    while index < len(tokens):
-        token = tokens[index]
-
-        if token == "--prefix":
-            if index + 1 >= len(tokens):
-                return False
-
-            prefix_values.append(
-                tokens[index + 1]
-            )
-
-            index += 2
-            continue
-
-        if token.startswith("--prefix="):
-            prefix_values.append(
-                token.split("=", 1)[1]
-            )
-
-        index += 1
-
-    # Ambiguous/no-prefix forms are intentionally not treated as
-    # the canonical CreatorHub frontend validation command.
-    if len(prefix_values) != 1:
-        return False
-
-    prefix = Path(
-        prefix_values[0]
-    ).expanduser()
-
-    workspace_path = Path(
-        workspace
-    ).expanduser().resolve()
-
-    if not prefix.is_absolute():
-        prefix = workspace_path / prefix
-
-    try:
-        resolved_prefix = prefix.resolve()
-        expected_prefix = (
-            workspace_path / "frontend"
-        ).resolve()
-    except (OSError, RuntimeError):
-        return False
-
-    return resolved_prefix == expected_prefix
-
-
-def frontend_typecheck_guard_decision(
-    is_full_frontend_typecheck,
-    writes_made,
-    diagnostic_typecheck_attempted,
-    verification_typecheck_attempted,
-):
-    """
-    Return (phase, blocked) for frontend typecheck governance.
-
-    Before first successful edit:
-        one diagnostic typecheck.
-
-    After first successful edit:
-        one verification typecheck.
-    """
-
-    if not is_full_frontend_typecheck:
-        return None, False
-
-    phase = (
-        "verification"
-        if writes_made
-        else "diagnostic"
-    )
-
-    if phase == "diagnostic":
-        return (
-            phase,
-            bool(diagnostic_typecheck_attempted),
-        )
-
-    return (
-        phase,
-        bool(verification_typecheck_attempted),
-    )
-
+#
+# v2 (glimmer-v2.py, R3) owns authoritative verification and writes the
+# canonical GlimmerSessionStatus vocabulary to manifest["state"] — but it
+# always runs that verification AFTER this process exits (invoke_engineer
+# is a blocking subprocess call; verify() only runs once it returns), so
+# manifest["state"] can never actually reach "verified" while THIS process
+# is still executing. Reading it here would be dead code, exactly like the
+# CreatorHub-frontend-specific mechanism this replaces.
+#
+# What this process CAN own is the in-process equivalent for its own tool
+# loop, using the same vocabulary and the same rule for any repository:
+# once a validation command has been attempted after a successful write,
+# that write is presumed load-bearing evidence and repository writes
+# freeze. There is no CreatorHub-specific command detection and no
+# diagnostic/verification two-phase split — one rule, repo-agnostic.
 
 
 def repository_write_guard_decision(
     tool_name,
-    verification_typecheck_attempted,
+    engineer_state,
 ):
     """
-    Freeze repository writes after the first post-edit full
-    frontend verification typecheck has actually been attempted.
+    Freeze repository writes once the local verification state has
+    reached "verified" — the same vocabulary Task 6 (R3) uses for
+    manifest["state"], applied in-process instead of cross-process.
 
-    PASS, FAIL, and TIMEOUT are all terminal verification evidence.
+    Any post-write validation command (npm run <script>, cargo
+    check/test, python -m py_compile — see is_post_write_validation_
+    command) that has actually been attempted is terminal verification
+    evidence, regardless of whether it passed, failed, or timed out.
     Once that evidence exists, later repository edits would invalidate
     the verified snapshot and therefore must be blocked.
     """
     return bool(
-        verification_typecheck_attempted
+        engineer_state == "verified"
         and tool_name in WRITE_TOOLS
+    )
+
+
+def is_post_write_validation_command(command):
+    """
+    Generic (repo-agnostic) recognizer for a validation command: any
+    npm script invocation, cargo check/test, or a Python syntax check.
+    Replaces the old CreatorHub-frontend-specific --prefix/typecheck
+    detection — shell_policy already restricts which npm scripts are
+    actually runnable, so this only needs to recognize the command
+    shape to drive the write-freeze state.
+    """
+    return (
+        command.startswith("npm ")
+        or command.startswith("python3 -m py_compile")
+        or command.startswith("python -m py_compile")
+        or command.startswith("cargo check")
+        or command.startswith("cargo test")
     )
 
 
@@ -975,6 +1013,7 @@ def execute_tool(
     approval_state,
     cache,
     ledger,
+    validation_allowlist=None,
 ):
     arguments = secure_tool_arguments(
         tool_name,
@@ -1021,16 +1060,7 @@ def execute_tool(
 
         # Large monorepo validation commands can legitimately
         # take several minutes.
-        #
-        # Full frontend TypeScript validation is especially heavy
-        # in CreatorHub and has a manually verified clean baseline,
-        # so allow up to 20 minutes.
-        if is_full_frontend_typecheck_command(
-            command,
-            workspace,
-        ):
-            minimum_timeout = 1200
-        elif command.startswith(("npm ", "cargo ")):
+        if command.startswith(("npm ", "cargo ")):
             minimum_timeout = 300
         else:
             minimum_timeout = None
@@ -1047,6 +1077,7 @@ def execute_tool(
         allowed, reason = shell_policy(
             command,
             workspace,
+            validation_allowlist,
         )
 
         if not allowed:
@@ -1061,6 +1092,12 @@ def execute_tool(
             )
             print(
                 f"  {reason}"
+            )
+
+            _emit(
+                "tool_blocked",
+                command=command[:MAX_EVENT_FIELD],
+                reason=reason,
             )
 
             return message, False
@@ -1095,26 +1132,33 @@ def execute_tool(
     print(f"→ TOOL: {tool_name}")
 
     if tool_name in WRITE_TOOLS:
-        print(
-            json.dumps(
-                {
-                    "path":
-                        arguments.get("path"),
-                    "keys":
-                        list(arguments.keys()),
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
+        # Redacted: write-tool arguments can carry full file content, so only
+        # the path and key names are ever printed/emitted, never the values.
+        display_args = {
+            "path":
+                arguments.get("path"),
+            "keys":
+                list(arguments.keys()),
+        }
     else:
-        print(
-            json.dumps(
-                arguments,
-                indent=2,
-                ensure_ascii=False,
-            )
+        display_args = arguments
+
+    print(
+        json.dumps(
+            display_args,
+            indent=2,
+            ensure_ascii=False,
         )
+    )
+
+    _emit(
+        "tool_started",
+        tool=tool_name,
+        # Redaction (display_args, above) happens first; this only caps
+        # length on top of it (Minor finding: tool_started.args was
+        # previously unbounded).
+        args=_capped_display_args(display_args),
+    )
 
     result = http_json(
         "POST",
@@ -1131,11 +1175,19 @@ def execute_tool(
 
     content = result_text(result)
 
+    result_summary = content[:1800]
+
     print("← RESULT:")
-    print(content[:1800])
+    print(result_summary)
 
     if len(content) > 1800:
         print("...")
+
+    _emit(
+        "tool_completed",
+        tool=tool_name,
+        resultSummary=result_summary,
+    )
 
     if cache_key is not None:
         cache[cache_key] = content
@@ -1304,6 +1356,8 @@ def chat_with_retry(
                 "chat_template_kwargs"
             ] = template_kwargs
 
+        debug_path = None
+
         try:
             if os.environ.get("GLIMMER_DEBUG_PEG_PAYLOAD") == "1":
                 debug_dir = (
@@ -1359,6 +1413,12 @@ def chat_with_retry(
             print(
                 "⚠ PEG parser failure "
                 f"({attempt}/{attempts})"
+            )
+
+            _emit(
+                "parser_recovery",
+                attempt=attempt,
+                payloadPath=str(debug_path) if debug_path else "",
             )
 
             if attempt < attempts:
@@ -1571,6 +1631,12 @@ def run_engineer(
 
     metadata, tools = get_tools()
 
+    # R5 (glimmer-v7): load once per session, not per shell_policy call —
+    # repo-map.json doesn't change mid-session.
+    validation_allowlist = (
+        load_validation_script_allowlist()
+    )
+
     baseline_status = git_local(
         workspace,
         "status",
@@ -1685,15 +1751,13 @@ def run_engineer(
         "Run relevant non-destructive typecheck or "
         "unit tests. Run git diff --check. "
 
-        "The full frontend typecheck may be executed "
-        "at most once before the first successful edit for "
-        "diagnosis, and at most once after the first "
-        "successful edit for verification. Equivalent "
-        "--prefix forms resolving to workspace/frontend "
-        "count as the same validation command. A pass, "
-        "failure, or timeout is final evidence for that "
-        "phase; never retry the frontend typecheck within "
-        "the same phase. "
+        "Once you have made a successful edit and then "
+        "run a validation command (npm run <script>, "
+        "cargo check/test, or python -m py_compile), "
+        "repository writes freeze: a pass, failure, or "
+        "timeout is final evidence, and further edit_file "
+        "or write_file calls will be blocked. Finish your "
+        "report from that result instead of retrying. "
 
         "Do not claim that validation passed unless "
         "you actually ran the validation command and "
@@ -1736,31 +1800,19 @@ def run_engineer(
     ledger = []
     changed_paths = set()
 
-    writes_made = False
     diff_checked = False
     validation_checked = False
 
-    # Full frontend typecheck governance is phase-aware.
-    #
-    # Before the first successful edit:
-    #   one diagnostic typecheck may be executed.
-    #
-    # After the first successful edit:
-    #   one verification typecheck may be executed.
-    #
-    # PASS, FAIL, or TIMEOUT is terminal evidence for that phase.
-    # A third attempt, or a retry within either phase, is blocked.
-    diagnostic_typecheck_attempted = False
-    diagnostic_typecheck_result = None
-
-    verification_typecheck_attempted = False
-    verification_typecheck_result = None
+    # R5 (glimmer-v7): local verification state (see repository_write_
+    # guard_decision above / ADR-0002). "verified" is monotonic — once a
+    # post-write validation command has been attempted, it never resets,
+    # so repository writes stay frozen for the rest of this process.
+    engineer_state = "preflight"
 
     # Prevent the model from spending the entire turn budget
     # repeatedly exploring the repository without selecting
     # a concrete engineering candidate.
     discovery_calls = 0
-    discovery_gate_sent = False
     discovery_tool_budget = 8
 
     # After broad discovery, allow only a very small number of
@@ -1768,7 +1820,21 @@ def run_engineer(
     # concrete edit/no-edit decision.
     post_gate_inspection_calls = 0
     post_gate_inspection_budget = 3
-    decision_deadline_sent = False
+
+    # R3 (glimmer-v7): single engineer-loop-scoped phase variable that drives
+    # active_tools, replacing the old writes_made / discovery_gate_sent /
+    # decision_deadline_sent boolean trio. This is a SEPARATE, smaller scope
+    # from the session-level manifest["state"] written by glimmer-v2.py — do
+    # not conflate the two. Monotonic, "writing" is absorbing:
+    #   discovering -> narrowed_to_read_edit -> narrowed_to_edit_only
+    #   (any phase) -> writing   [on first successful repository write]
+    # diff_checked / validation_checked stay separate variables: they track
+    # per-write verification completeness and reset on every write.
+    # engineer_state (R5) is a third, orthogonal axis — it does NOT reset on
+    # write, because its whole purpose is to freeze writes permanently once
+    # reached (see repository_write_guard_decision).
+    engineer_phase = "discovering"
+    _emit_engineer_phase(engineer_phase)
 
     discovery_tools = {
         "file_glob_search",
@@ -1785,10 +1851,13 @@ def run_engineer(
 
         active_tools = tools
 
-        # Once discovery budget is exhausted, remove broad
-        # exploration/shell tools until the first edit.
-        # The model can still inspect the selected target and edit it.
-        if decision_deadline_sent and not writes_made:
+        # active_tools is driven solely by engineer_phase (R3). Mapping from
+        # the old boolean combinations, preserved here for traceability:
+        #   decision_deadline_sent and not writes_made -> narrowed_to_edit_only
+        #   discovery_gate_sent and not writes_made    -> narrowed_to_read_edit
+        #   writes_made (from any prior phase)         -> writing (full tools)
+        #   neither gate sent yet, no write yet        -> discovering (full tools)
+        if engineer_phase == "narrowed_to_edit_only":
             # Verification budget is exhausted.
             # At this point the model must either edit the chosen
             # file or finish without making a change.
@@ -1805,7 +1874,7 @@ def run_engineer(
                 )
             ]
 
-        elif discovery_gate_sent and not writes_made:
+        elif engineer_phase == "narrowed_to_read_edit":
             allowed_before_edit = {
                 "read_file",
                 "grep_search",
@@ -1911,7 +1980,7 @@ def run_engineer(
         if not tool_calls:
 
             if (
-                writes_made
+                engineer_phase == "writing"
                 and turn < max_turns - 1
                 and (
                     not diff_checked
@@ -1936,9 +2005,10 @@ def run_engineer(
                             "relevant validation if it has "
                             "not already been attempted, and "
                             "run git diff --check before "
-                            "finishing. Never retry the "
-                            "post-change frontend typecheck "
-                            "after a failure or timeout."
+                            "finishing. Do not repeat a "
+                            "validation command after a "
+                            "pass, failure, or timeout — "
+                            "that result is final evidence."
                         ),
                     }
                 )
@@ -2001,14 +2071,16 @@ def run_engineer(
             )
 
             if (
-                not writes_made
+                engineer_phase != "writing"
                 and tool_name in discovery_tools
             ):
                 discovery_calls += 1
 
             if (
-                discovery_gate_sent
-                and not writes_made
+                engineer_phase in (
+                    "narrowed_to_read_edit",
+                    "narrowed_to_edit_only",
+                )
                 and tool_name in post_gate_inspection_tools
             ):
                 post_gate_inspection_calls += 1
@@ -2036,27 +2108,10 @@ def run_engineer(
                             .strip()
                         )
 
-                    is_full_frontend_typecheck = (
-                        is_full_frontend_typecheck_command(
-                            command_for_guard,
-                            workspace,
-                        )
-                    )
-
-                    (
-                        frontend_typecheck_phase,
-                        frontend_typecheck_already_attempted,
-                    ) = frontend_typecheck_guard_decision(
-                        is_full_frontend_typecheck,
-                        writes_made,
-                        diagnostic_typecheck_attempted,
-                        verification_typecheck_attempted,
-                    )
-
                     repository_write_blocked = (
                         repository_write_guard_decision(
                             tool_name,
-                            verification_typecheck_attempted,
+                            engineer_state,
                         )
                     )
 
@@ -2064,38 +2119,18 @@ def run_engineer(
                         result = (
                             "ENGINEERING VALIDATION BLOCK: "
                             "repository writes are frozen because "
-                            "the post-edit frontend verification "
-                            "typecheck has already been attempted. "
-                            "PASS, FAIL, or TIMEOUT is terminal "
-                            "verification evidence. Do not modify "
-                            "repository files after verification."
+                            "a post-edit validation command has "
+                            "already been attempted. PASS, FAIL, "
+                            "or TIMEOUT is terminal verification "
+                            "evidence. Do not modify repository "
+                            "files after verification."
                         )
                         changed = False
 
                         print()
                         print(
                             "✗ WRITE BLOCKED: repository is frozen "
-                            "after frontend verification"
-                        )
-
-                    elif frontend_typecheck_already_attempted:
-                        result = (
-                            "ENGINEERING VALIDATION BLOCK: "
-                            "the full frontend typecheck has "
-                            "already been attempted in the "
-                            f"{frontend_typecheck_phase} phase. "
-                            "Do not retry it. Use the recorded "
-                            "result from that phase as final "
-                            "validation evidence."
-                        )
-                        changed = False
-
-                        print()
-                        print(
-                            "✗ VALIDATION BLOCKED: "
-                            "full frontend typecheck already "
-                            f"attempted in {frontend_typecheck_phase} "
-                            "phase"
+                            "after post-edit verification"
                         )
 
                     else:
@@ -2107,14 +2142,22 @@ def run_engineer(
                                 approvals,
                                 cache,
                                 ledger,
+                                validation_allowlist,
                             )
                         )
 
-                        if is_full_frontend_typecheck:
+                        if (
+                            tool_name == "exec_shell_command"
+                            and engineer_phase == "writing"
+                            and engineer_state != "verified"
+                            and is_post_write_validation_command(
+                                command_for_guard
+                            )
+                        ):
                             # Mark only after an execution was
                             # actually attempted. A normal command
                             # failure or timeout still counts as
-                            # terminal evidence for its phase.
+                            # terminal verification evidence (R5).
                             result_text = str(result)
 
                             execution_was_attempted = not any(
@@ -2127,26 +2170,20 @@ def run_engineer(
                             )
 
                             if execution_was_attempted:
-                                if (
-                                    frontend_typecheck_phase
-                                    == "diagnostic"
-                                ):
-                                    diagnostic_typecheck_attempted = True
-                                    diagnostic_typecheck_result = (
-                                        result_text
-                                    )
-
-                                elif (
-                                    frontend_typecheck_phase
-                                    == "verification"
-                                ):
-                                    verification_typecheck_attempted = True
-                                    verification_typecheck_result = (
-                                        result_text
-                                    )
+                                # I1: engineer_state is a local write-freeze
+                                # marker (see R5 comment above), not a
+                                # session-level verification claim. It must
+                                # NOT be emitted as agent_state_changed — v2
+                                # owns the real "verified" GlimmerSessionStatus
+                                # and emits it only once its own verification
+                                # actually runs (see readiness_probe /
+                                # verification_started in glimmer-v2.py).
+                                engineer_state = "verified"
 
                     if changed:
-                        writes_made = True
+                        if engineer_phase != "writing":
+                            engineer_phase = "writing"
+                            _emit_engineer_phase(engineer_phase)
                         diff_checked = False
                         validation_checked = False
 
@@ -2256,11 +2293,11 @@ def run_engineer(
         # ----------------------------------------------------
 
         if (
-            not writes_made
-            and not discovery_gate_sent
+            engineer_phase == "discovering"
             and discovery_calls >= discovery_tool_budget
         ):
-            discovery_gate_sent = True
+            engineer_phase = "narrowed_to_read_edit"
+            _emit_engineer_phase(engineer_phase)
 
             messages.append(
                 {
@@ -2288,13 +2325,12 @@ def run_engineer(
 
 
         if (
-            discovery_gate_sent
-            and not writes_made
-            and not decision_deadline_sent
+            engineer_phase == "narrowed_to_read_edit"
             and post_gate_inspection_calls
                 >= post_gate_inspection_budget
         ):
-            decision_deadline_sent = True
+            engineer_phase = "narrowed_to_edit_only"
+            _emit_engineer_phase(engineer_phase)
 
             messages.append(
                 {
@@ -2347,7 +2383,14 @@ def main():
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=DEFAULT_WORKSPACE,
+        required=True,
+        help=(
+            "Git repository root to operate in. "
+            "No default — every caller (glimmer-v2.py, "
+            "new-glimmer-task.sh) already passes this "
+            "explicitly, so a repo-specific fallback "
+            "would only mask a missing argument."
+        ),
     )
 
     parser.add_argument(
