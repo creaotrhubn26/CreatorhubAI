@@ -10,6 +10,19 @@ import sys
 from pathlib import Path
 from urllib import request, error
 
+from glimmer_events import emit as emit_event
+
+GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
+GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
+
+
+def _emit(event_type: str, **fields) -> None:
+    # No-op when the events file isn't configured (e.g. direct standalone
+    # invocation per new-glimmer-task.sh) so this never gates normal operation.
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return
+    emit_event(GLIMMER_EVENTS_PATH, event_type, GLIMMER_SESSION_ID, **fields)
+
 
 API_BASE = os.environ.get(
     "GLIMMER_URL",
@@ -1063,6 +1076,12 @@ def execute_tool(
                 f"  {reason}"
             )
 
+            _emit(
+                "tool_blocked",
+                command=command,
+                reason=reason,
+            )
+
             return message, False
 
 
@@ -1095,26 +1114,30 @@ def execute_tool(
     print(f"→ TOOL: {tool_name}")
 
     if tool_name in WRITE_TOOLS:
-        print(
-            json.dumps(
-                {
-                    "path":
-                        arguments.get("path"),
-                    "keys":
-                        list(arguments.keys()),
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
+        # Redacted: write-tool arguments can carry full file content, so only
+        # the path and key names are ever printed/emitted, never the values.
+        display_args = {
+            "path":
+                arguments.get("path"),
+            "keys":
+                list(arguments.keys()),
+        }
     else:
-        print(
-            json.dumps(
-                arguments,
-                indent=2,
-                ensure_ascii=False,
-            )
+        display_args = arguments
+
+    print(
+        json.dumps(
+            display_args,
+            indent=2,
+            ensure_ascii=False,
         )
+    )
+
+    _emit(
+        "tool_started",
+        tool=tool_name,
+        args=display_args,
+    )
 
     result = http_json(
         "POST",
@@ -1131,11 +1154,19 @@ def execute_tool(
 
     content = result_text(result)
 
+    result_summary = content[:1800]
+
     print("← RESULT:")
-    print(content[:1800])
+    print(result_summary)
 
     if len(content) > 1800:
         print("...")
+
+    _emit(
+        "tool_completed",
+        tool=tool_name,
+        resultSummary=result_summary,
+    )
 
     if cache_key is not None:
         cache[cache_key] = content
@@ -1304,6 +1335,8 @@ def chat_with_retry(
                 "chat_template_kwargs"
             ] = template_kwargs
 
+        debug_path = None
+
         try:
             if os.environ.get("GLIMMER_DEBUG_PEG_PAYLOAD") == "1":
                 debug_dir = (
@@ -1359,6 +1392,12 @@ def chat_with_retry(
             print(
                 "⚠ PEG parser failure "
                 f"({attempt}/{attempts})"
+            )
+
+            _emit(
+                "parser_recovery",
+                attempt=attempt,
+                payloadPath=str(debug_path) if debug_path else "",
             )
 
             if attempt < attempts:
