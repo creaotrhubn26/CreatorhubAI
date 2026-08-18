@@ -1163,6 +1163,7 @@ def read_candidate_evidence(plan, ws):
     ws_resolved = Path(ws).resolve()
     evidence = []
     total_chars = 0
+    seen = set()
 
     for entry in usable:
         if len(evidence) >= PLAN_EVIDENCE_MAX_FILES:
@@ -1174,6 +1175,12 @@ def read_candidate_evidence(plan, ws):
         resolved = _resolve_candidate_path(raw_path, ws_resolved)
         if resolved is None:
             print(f"[V2] evidence handoff: skipped candidate file outside workspace: {raw_path!r}")
+            continue
+        # Dedup on the resolved real path -- the same file listed under
+        # multiple spellings (e.g. "src/greet.js" and "sub/../src/greet.js")
+        # must not consume two of the five cap slots with duplicate content.
+        if resolved in seen:
+            print(f"[V2] evidence handoff: skipped duplicate candidate (already embedded): {raw_path!r}")
             continue
         if not resolved.is_file():
             print(f"[V2] evidence handoff: skipped non-file candidate: {raw_path!r}")
@@ -1208,6 +1215,7 @@ def read_candidate_evidence(plan, ws):
         rel_path = resolved.relative_to(ws_resolved).as_posix()
         evidence.append({"path": rel_path, "content": text})
         total_chars += len(text)
+        seen.add(resolved)
 
     return evidence
 
@@ -2142,6 +2150,19 @@ def _architect_first_selfcheck() -> None:
         assert {e["path"] for e in many_evidence} == {
             "many/f7.txt", "many/f6.txt", "many/f5.txt", "many/f4.txt", "many/f3.txt",
         }
+
+        # (b2) Dedup: same file under two spellings embeds it once and
+        # leaves the freed slot for a genuinely distinct candidate.
+        dedup_plan = {
+            "candidateFiles": [
+                {"path": "src/greet.js", "confidence": 0.9},
+                {"path": "sub/../src/greet.js", "confidence": 0.8},
+                {"path": "many/f0.txt", "confidence": 0.1},
+            ]
+        }
+        dedup_evidence = read_candidate_evidence(dedup_plan, ws_dir)
+        assert len(dedup_evidence) == 2
+        assert sorted(e["path"] for e in dedup_evidence) == ["many/f0.txt", "src/greet.js"]
 
         # Oversized file -> truncated with an explicit marker.
         big_file = ws_dir / "big.txt"
