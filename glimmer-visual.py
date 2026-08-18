@@ -135,17 +135,19 @@ def build_findings(captures, findings=None):
 
     `status` here reflects ONLY capture success/failure, since no model
     inspection ran in this pass (run_vision_model is not wired up yet):
-      - "PASS" when every viewport was captured cleanly. This was chosen
-        over "NOT_RUN" because it most honestly represents this pass's
-        real state -- screenshots exist and are ready for a future vision
-        model to inspect, capture itself found nothing wrong, but semantic
-        review has not happened. "NOT_RUN" would overstate that nothing at
-        all happened, when capture mechanics genuinely did run and
-        succeed; "PASS_WITH_WARNINGS" or "BLOCKED" would misrepresent a
-        clean capture as having a known problem.
+      - "NOT_RUN" when every viewport was captured cleanly. "Capture
+        succeeded" and "review passed" are two different facts -- `PASS`
+        would tell a downstream reader "this UI was visually inspected,
+        found fine," which is false: findings[] is always [] because no
+        semantic review ever ran, not because one ran and found nothing.
+        "Capture succeeded" already has its own honest home in
+        visual-manifest.json's status; NOT_RUN is the real, V7
+        §22.4-sanctioned value for "not reviewed" as distinct from
+        "reviewed, fine." PASS/FAIL are reserved for once run_vision_model
+        is actually wired up and produces real findings.
       - "FAIL" when capture failed for every viewport -- there is nothing
         for even a future model step to inspect, so this cannot honestly
-        be PASS.
+        be anything else.
     `viewport` is "multi" (rather than V7 §22.4's single-viewport string
     example) because this script captures the full requested viewport set
     per run; `viewports` carries the real list.
@@ -153,7 +155,7 @@ def build_findings(captures, findings=None):
     """
     findings = findings if findings is not None else []
     ok = [c for c in captures if c["status"] == "captured"]
-    status = "PASS" if (captures and ok) else "FAIL"
+    status = "NOT_RUN" if (captures and ok) else "FAIL"
     return {
         "status": status,
         "viewport": "multi",
@@ -247,7 +249,11 @@ def _selfcheck() -> None:
         # findings.json shape (V7 §22.4): status/viewport/findings, empty
         # findings in this pass regardless of capture outcome (no model call).
         findings_pass = build_findings([c_ok])
-        assert findings_pass["status"] == "PASS"
+        # Fix round 1: capture succeeding is NOT the same fact as "reviewed,
+        # fine" -- status must be NOT_RUN (not PASS) since no semantic
+        # review ran (findings[] is empty because nothing looked, not
+        # because something looked and found nothing).
+        assert findings_pass["status"] == "NOT_RUN"
         assert findings_pass["findings"] == []
         assert set(findings_pass.keys()) >= {"status", "viewport", "findings"}
 

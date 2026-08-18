@@ -586,6 +586,21 @@ def is_visual_check_command(cmd):
     return str(GLIMMER_VISUAL) in cmd
 
 
+def validate_visual_url(raw_verify_entries, visual_url):
+    """Fix round 1 (C4): --visual-url has no default. A guessable default
+    like http://localhost:3000 is actively dangerous here -- if a caller
+    forgets to pass a real URL and something else happens to be listening
+    on that port, capture would silently "succeed" against the wrong app.
+    Fail loudly (main()'s existing V2Error convention) instead, but only
+    when "visual" is actually opted into -- every other verification plan
+    is unaffected."""
+    if any(r.strip().lower() == VISUAL_VERIFY_TOKEN for r in raw_verify_entries) and not visual_url:
+        raise V2Error(
+            "--visual-url is required when the visual check is enabled "
+            '("visual" is in --verify / contract.verification)'
+        )
+
+
 def expand_verify_entries(commands, raw_entries, session, visual_url):
     """Expand contract.verification / --verify entries into real subprocess
     argv lists, appended onto `commands`. Mirrors the pre-C4
@@ -629,6 +644,15 @@ def classify_visual_check_result(result, session):
     §22.13: "only required failures should block" -- this pass never
     populates findings[] with anything since no model call is wired up yet,
     so this path always yields PASS today, but the classification is real).
+
+    Blocking is driven SOLELY by findings[] severities, never by
+    findings_doc["status"] itself -- that field (PASS/FAIL/NOT_RUN/...) is
+    informational metadata for humans/Control Center about whether semantic
+    review ran at all (fix round 1: glimmer-visual.py now honestly writes
+    "NOT_RUN" for a clean capture with no review, not "PASS" -- see its
+    build_findings docstring), so this function deliberately never branches
+    on it: NOT_RUN with an empty findings[] takes the exact same
+    non-blocking PASS path below as any other empty-findings result.
     """
     if result.get("status") != "PASS":
         result["status"] = "INFRA_BLOCKED"
@@ -1294,11 +1318,13 @@ def main():
     ap.add_argument("--verification-level", choices=("minimal", "standard", "full"), default="standard")
     ap.add_argument("--verify", action="append", default=[])
     # C4 (glimmer-v7): only consulted when the literal token "visual" is
-    # among --verify entries (see expand_verify_entries). Unused, harmless
-    # to leave at its default, for every session that doesn't opt in.
-    ap.add_argument("--visual-url", default="http://localhost:3000",
-                    help="URL Playwright navigates to for the visual verification check "
-                         "(consulted only when \"visual\" is one of the --verify entries)")
+    # among --verify entries (see expand_verify_entries). No default (fix
+    # round 1) -- validate_visual_url fails loudly below if "visual" is
+    # opted into without an explicit URL, rather than silently guessing
+    # http://localhost:3000 and possibly capturing the wrong app.
+    ap.add_argument("--visual-url", default=None,
+                    help="URL Playwright navigates to for the visual verification check. "
+                         "Required when \"visual\" is one of the --verify entries; ignored otherwise.")
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--max-turns", type=int)
     # Task Contract fields (glimmer-v7 R2). Choices mirror @glimmer/shared's real
@@ -1344,6 +1370,7 @@ def main():
         raise V2Error(f"Existing engineer missing: {engineer}")
     if args.max_repairs < 0 or args.max_repairs > 5:
         raise V2Error("--max-repairs must be 0..5")
+    validate_visual_url(args.verify, args.visual_url)
 
     recovery = recover_interrupted_checkpoint(ws)
     if recovery:
@@ -1954,7 +1981,10 @@ def _visual_selfcheck() -> None:
             "states": ["initial"], "status": manifest_status, "captures": [], "findings": [],
         }), encoding="utf-8")
         (vdir / "findings.json").write_text(json.dumps({
-            "status": "PASS" if manifest_status == "pass" else "FAIL",
+            # Fix round 1: matches glimmer-visual.py's real build_findings
+            # output -- "NOT_RUN" (not "PASS") for a clean capture with no
+            # semantic review, "FAIL" only when capture itself failed.
+            "status": "NOT_RUN" if manifest_status == "pass" else "FAIL",
             "viewport": "multi", "viewports": ["1440x900", "390x844"], "findings": findings,
         }), encoding="utf-8")
 
@@ -1996,10 +2026,17 @@ def _visual_selfcheck() -> None:
         result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
         assert result["status"] == "PASS" and result["ok"] is True
 
-    # Empty findings (this pass's real, honest output) -> does not block.
+    # Empty findings (this pass's real, honest output) -> does not block,
+    # and findings.json's own status is genuinely "NOT_RUN" (fix round 1),
+    # never "PASS" -- capture succeeding is not the same fact as "reviewed,
+    # fine". NOT_RUN with empty findings takes the identical non-blocking
+    # path as any other empty-findings result (classification never
+    # branches on findings_doc["status"], only on findings[] severities).
     with tempfile.TemporaryDirectory() as td:
         session = Path(td)
         _write_capture(session, "pass", [])
+        written = json.loads((session / "visual" / "findings.json").read_text(encoding="utf-8"))
+        assert written["status"] == "NOT_RUN", "must not be 'PASS' -- no semantic review ran"
         result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
         assert result["status"] == "PASS" and result["ok"] is True
 
@@ -2039,6 +2076,28 @@ def _visual_selfcheck() -> None:
         )
         result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
         assert result["status"] == "INFRA_BLOCKED"
+
+    # --- fix round 1: --visual-url is required (fails loudly), not
+    # silently defaulted, whenever "visual" is opted into. ---
+    for missing in (None, ""):
+        try:
+            validate_visual_url(["visual"], missing)
+            assert False, f"expected V2Error for visual_url={missing!r}"
+        except V2Error as exc:
+            assert "--visual-url is required" in str(exc)
+    # Case-insensitive token match, same as expand_verify_entries.
+    try:
+        validate_visual_url(["VISUAL"], None)
+        assert False, "expected V2Error"
+    except V2Error:
+        pass
+    # A real URL provided -> no error.
+    validate_visual_url(["visual"], "http://localhost:4000")
+    # "visual" not requested at all -> no error even with no URL (opt-in
+    # only; every session that doesn't ask for the visual check is
+    # unaffected).
+    validate_visual_url(["npm run typecheck"], None)
+    validate_visual_url([], None)
 
     print("visual (C4) self-check: PASS")
 
