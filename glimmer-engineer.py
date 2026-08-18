@@ -1986,6 +1986,7 @@ def _delivery_review_selfcheck() -> None:
     import tempfile
 
     global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID, _evidence_seq
+    global _known_delivery_review_evidence_ids
 
     # ------------------------------------------------------------
     # 1. run_delivery_review can only receive plain data — assert its
@@ -2056,6 +2057,37 @@ def _delivery_review_selfcheck() -> None:
     assert "reviewFailed" not in normalized
 
     # ------------------------------------------------------------
+    # 3b. Malformed concern/nextStep sub-fields (fix round 1, Minor):
+    #     unknown severity/category/priority coerce to a safe default;
+    #     a concern with no real description, or a nextStep with no
+    #     real action, is dropped rather than kept with fabricated
+    #     content.
+    # ------------------------------------------------------------
+    ok_bad_sub, normalized_bad_sub = validate_delivery_review(
+        {
+            "summary": "x",
+            "customerReadiness": "needs_polish",
+            "confidence": {"level": "low", "reason": "r"},
+            "concerns": [
+                {"severity": "catastrophic", "category": "vibes", "description": "Real concern text."},
+                {"severity": "high", "category": "security", "description": "   "},  # blank -> dropped
+                {"severity": "high", "category": "security"},  # no description -> dropped
+            ],
+            "nextSteps": [
+                {"priority": "asap!!", "action": "Do the thing."},
+                {"priority": "recommended_next"},  # no action -> dropped
+            ],
+        },
+        known_ids,
+    )
+    assert ok_bad_sub, f"malformed sub-fields must not reject the whole review, got: {normalized_bad_sub}"
+    assert len(normalized_bad_sub["concerns"]) == 1, "concerns with no real description must be dropped"
+    assert normalized_bad_sub["concerns"][0]["severity"] == "low", "unknown severity must coerce to 'low'"
+    assert normalized_bad_sub["concerns"][0]["category"] == "functionality", "unknown category must coerce to 'functionality'"
+    assert len(normalized_bad_sub["nextSteps"]) == 1, "nextSteps with no real action must be dropped"
+    assert normalized_bad_sub["nextSteps"][0]["priority"] == "recommended_next", "unknown priority must coerce to 'recommended_next'"
+
+    # ------------------------------------------------------------
     # 4. Invalid/malformed input -> reviewFailed fallback, not a crash.
     # ------------------------------------------------------------
     for bad_text in (
@@ -2117,6 +2149,44 @@ def _delivery_review_selfcheck() -> None:
         GLIMMER_EVENTS_PATH = real_events_path
         GLIMMER_SESSION_ID = real_session_id
         _evidence_seq = real_evidence_seq
+
+    # ------------------------------------------------------------
+    # 6. Never-raises guarantee (fix round 1, Critical): the whole body
+    #    of run_delivery_review is now inside its own try block,
+    #    including the two calls that used to run BEFORE it
+    #    (_known_delivery_review_evidence_ids / _build_delivery_review_
+    #    payload). Prove it by making one of them raise and confirming
+    #    run_delivery_review still returns normally and still writes
+    #    the reviewFailed fallback file instead of propagating.
+    # ------------------------------------------------------------
+    real_known_ids_fn = _known_delivery_review_evidence_ids
+
+    def _boom():
+        raise RuntimeError("injected failure before the model call")
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-boom"
+            _known_delivery_review_evidence_ids = _boom
+
+            try:
+                run_delivery_review("task", [], "report")
+            except Exception as exc:  # noqa: BLE001 - this IS the assertion
+                assert False, f"run_delivery_review must never raise, got: {exc}"
+
+            written = _delivery_review_file_path()
+            assert written is not None and written.exists(), (
+                "a pre-try failure must still land in the reviewFailed fallback file"
+            )
+            on_disk = json.loads(written.read_text(encoding="utf-8"))
+            assert on_disk["reviewFailed"] is True
+            assert "injected failure" in on_disk["reviewFailureReason"]
+    finally:
+        _known_delivery_review_evidence_ids = real_known_ids_fn
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
 
     print("delivery review self-check: PASS")
 
@@ -3022,6 +3092,27 @@ DELIVERY_REVIEW_READINESS_VALUES = {
 
 DELIVERY_REVIEW_CONFIDENCE_LEVELS = {"low", "medium", "high"}
 
+# DeliveryConcern sub-fields (V7 §23.7) and NextStep priority. Malformed
+# values here are coerced to a conservative default rather than
+# rejecting the whole review (fix round 1, Minor) — same tolerant-but-
+# honest bar as the top-level fields, just applied one level deeper.
+DELIVERY_CONCERN_SEVERITY_VALUES = {"low", "medium", "high", "critical"}
+DELIVERY_CONCERN_CATEGORY_VALUES = {
+    "architecture",
+    "functionality",
+    "visual",
+    "ux",
+    "performance",
+    "security",
+    "verification",
+    "maintainability",
+}
+NEXT_STEP_PRIORITY_VALUES = {
+    "required_before_ship",
+    "recommended_next",
+    "future_opportunity",
+}
+
 # V7 §23.7's optional array fields — always present in the written
 # review, defaulted to empty when the model omits them (same tolerant-
 # but-honest philosophy as ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS).
@@ -3106,6 +3197,19 @@ def validate_delivery_review(data, known_evidence_ids):
     hallucinated citation is visible in the written file instead of
     trusted as real.
 
+    Sub-fields one level deeper (fix round 1, Minor) get the same
+    tolerant-but-honest treatment: an unrecognized concern severity
+    coerces to "low" and an unrecognized category coerces to
+    "functionality" (conservative defaults — malformed input should
+    never silently escalate a concern's apparent severity); an
+    unrecognized nextStep priority coerces to "recommended_next". A
+    concern with no real (non-empty string) description, or a
+    nextStep with no real action, is dropped entirely rather than kept
+    with fabricated content — a concern's only substance IS its
+    description, so a hollow one is worse than none (same "don't
+    invent dissatisfaction" principle, applied to malformed input
+    instead of a live model's own claims).
+
     Returns (True, normalized_review_dict) or (False, reason_string).
     """
     if not isinstance(data, dict):
@@ -3144,7 +3248,7 @@ def validate_delivery_review(data, known_evidence_ids):
     }
 
     for field in DELIVERY_REVIEW_ARRAY_FIELDS:
-        if field == "concerns":
+        if field in ("concerns", "nextSteps"):
             continue
         value = data.get(field, [])
         normalized[field] = value if isinstance(value, list) else []
@@ -3155,15 +3259,42 @@ def validate_delivery_review(data, known_evidence_ids):
     for concern in raw_concerns if isinstance(raw_concerns, list) else []:
         if not isinstance(concern, dict):
             continue
-        concern = dict(concern)
+        description = concern.get("description")
+        if not isinstance(description, str) or not description.strip():
+            continue
+        severity = concern.get("severity")
+        category = concern.get("category")
         ids = concern.get("evidenceIds")
         ids = ids if isinstance(ids, list) else []
-        concern["evidenceIds"] = [i for i in ids if i in known_evidence_ids]
+        concerns_out.append(
+            {
+                "severity": severity if severity in DELIVERY_CONCERN_SEVERITY_VALUES else "low",
+                "category": category if category in DELIVERY_CONCERN_CATEGORY_VALUES else "functionality",
+                "description": description,
+                "evidenceIds": [i for i in ids if i in known_evidence_ids],
+            }
+        )
         filtered_ids.extend(i for i in ids if i not in known_evidence_ids)
-        concerns_out.append(concern)
     normalized["concerns"] = concerns_out
     if filtered_ids:
         normalized["filteredEvidenceIds"] = sorted(set(filtered_ids))
+
+    raw_next_steps = data.get("nextSteps", [])
+    next_steps_out = []
+    for step in raw_next_steps if isinstance(raw_next_steps, list) else []:
+        if not isinstance(step, dict):
+            continue
+        action = step.get("action")
+        if not isinstance(action, str) or not action.strip():
+            continue
+        priority = step.get("priority")
+        next_steps_out.append(
+            {
+                "priority": priority if priority in NEXT_STEP_PRIORITY_VALUES else "recommended_next",
+                "action": action,
+            }
+        )
+    normalized["nextSteps"] = next_steps_out
 
     return True, normalized
 
@@ -3297,10 +3428,9 @@ def run_delivery_review(task, ledger, prose_report):
     failure path. The caller's return value/session outcome never
     depends on this function.
     """
-    known_ids = _known_delivery_review_evidence_ids()
-    payload = _build_delivery_review_payload(task, ledger, prose_report)
-
     try:
+        known_ids = _known_delivery_review_evidence_ids()
+        payload = _build_delivery_review_payload(task, ledger, prose_report)
         response = chat_with_retry(payload, attempts=3)
         content = response["choices"][0]["message"].get("content") or ""
         data = _extract_json_object(content)
@@ -3793,7 +3923,15 @@ def run_engineer(
                     )
                 )
             else:
-                run_delivery_review(task, ledger, content)
+                # Belt-and-suspenders on top of run_delivery_review's own
+                # try/except (fix round 1): this call site must survive
+                # even if a future edit to that function reintroduces a
+                # statement outside its try block. Session outcome must
+                # never depend on this turn.
+                try:
+                    run_delivery_review(task, ledger, content)
+                except Exception as exc:  # noqa: BLE001 - see comment above
+                    print(f"[glimmer-engineer] delivery review turn failed: {exc}")
 
             postflight(workspace)
 
