@@ -29,6 +29,15 @@ STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
 REPO_MAP_CACHE_ROOT = Path.home() / ".muse-glimmer/repo-maps"
 NODE_OPTIONS_DEFAULT = "--max-old-space-size=12288"
 READINESS_URL_DEFAULT = os.environ.get("GLIMMER_TOOLS_URL", "http://127.0.0.1:8080/tools")
+# C4 (glimmer-v7): Vision Verification plumbing. GLIMMER_VISUAL is the
+# standalone capture script this module shells out to when the literal
+# token "visual" appears in contract.verification / --verify -- it is just
+# another verifier command, not a second pipeline (see expand_verify_entries
+# / classify_visual_check_result below). VISUAL_DEFAULT_VIEWPORTS is V7
+# §22.6's stated desktop+mobile minimum.
+GLIMMER_VISUAL = Path(__file__).resolve().parent / "glimmer-visual.py"
+VISUAL_VERIFY_TOKEN = "visual"
+VISUAL_DEFAULT_VIEWPORTS = ("1440x900", "390x844")
 
 IGNORE_DIRS = {
     ".git", "node_modules", ".next", ".turbo", ".cache", "coverage",
@@ -558,6 +567,113 @@ def verifier_commands(m, files, level):
     return result
 
 
+def build_visual_verify_command(session, url):
+    """C4 (glimmer-v7): real subprocess argv for the visual capture check,
+    targeting sessions/<id>/visual/ (V7 §22.14 evidence store layout).
+    Creates the output directory up front so glimmer-visual.py -- which is
+    handed only --output-dir, never a workspace path -- has somewhere to
+    write and never needs to reach outside it (V7 §22.19: Vision Verifier
+    must be read-only)."""
+    out_dir = session / "visual"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, str(GLIMMER_VISUAL), "--url", url, "--output-dir", str(out_dir)]
+    for vp in VISUAL_DEFAULT_VIEWPORTS:
+        cmd += ["--viewport", vp]
+    return cmd
+
+
+def is_visual_check_command(cmd):
+    return str(GLIMMER_VISUAL) in cmd
+
+
+def expand_verify_entries(commands, raw_entries, session, visual_url):
+    """Expand contract.verification / --verify entries into real subprocess
+    argv lists, appended onto `commands`. Mirrors the pre-C4
+    shlex.split-and-append behavior exactly for every entry EXCEPT the
+    literal token "visual" (case-insensitive): that one entry is C4's
+    opt-in vision-verification check and expands to a glimmer-visual.py
+    invocation instead of being shell-split (shlex.split("visual") would
+    otherwise silently try to exec a nonexistent "visual" binary). A
+    verification plan that never contains "visual" takes the identical
+    path through this function as the old inline loop did -- zero behavior
+    change for every existing invocation shape.
+    """
+    for raw in raw_entries:
+        if raw.strip().lower() == VISUAL_VERIFY_TOKEN:
+            cmd = build_visual_verify_command(session, visual_url)
+        else:
+            cmd = shlex.split(raw)
+        if cmd and cmd not in commands:
+            commands.append(cmd)
+    return commands
+
+
+def classify_visual_check_result(result, session):
+    """C4 (glimmer-v7): apply the V7 §22.5 severity model on top of the
+    generic subprocess classification run_verifier_command already computed.
+
+    Any non-zero exit / timeout of glimmer-visual.py itself -- and any
+    missing/unreadable/incomplete capture output -- is classified
+    INFRA_BLOCKED, reusing the existing convention verbatim (reconciliation
+    doc §12 risk 5: "Vision flakiness... treat capture failures as
+    INFRA_BLOCKED -- the existing convention that does not consume repair
+    budget"). This is deliberately NOT classify_raw_result's generic
+    text-pattern guess: e.g. a Python traceback from a missing `playwright`
+    import would otherwise be misclassified as CODE_FAIL (a real code
+    defect) instead of an infra problem with the capture pipeline itself.
+
+    Only a clean, fully-captured run (manifest status == "pass") is
+    inspected for findings[]: any critical/high finding fails the check
+    (CODE_FAIL -- a real, repair-worthy defect, consumes repair budget like
+    any other verification failure); low/medium/no findings pass it (V7
+    §22.13: "only required failures should block" -- this pass never
+    populates findings[] with anything since no model call is wired up yet,
+    so this path always yields PASS today, but the classification is real).
+    """
+    if result.get("status") != "PASS":
+        result["status"] = "INFRA_BLOCKED"
+        result["ok"] = False
+        result["visualInfraReason"] = "glimmer-visual.py exited non-zero or timed out"
+        return result
+
+    visual_dir = session / "visual"
+    try:
+        manifest_doc = json.loads((visual_dir / "visual-manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        result["status"] = "INFRA_BLOCKED"
+        result["ok"] = False
+        result["visualInfraReason"] = f"visual-manifest.json unreadable: {exc}"
+        return result
+
+    if manifest_doc.get("status") != "pass":
+        result["status"] = "INFRA_BLOCKED"
+        result["ok"] = False
+        result["visualInfraReason"] = f"capture incomplete: manifest status={manifest_doc.get('status')!r}"
+        result["visualManifest"] = manifest_doc
+        return result
+
+    try:
+        findings_doc = json.loads((visual_dir / "findings.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        result["status"] = "INFRA_BLOCKED"
+        result["ok"] = False
+        result["visualInfraReason"] = f"findings.json unreadable: {exc}"
+        return result
+
+    findings = findings_doc.get("findings", [])
+    blocking = [f for f in findings if str(f.get("severity", "")).lower() in ("critical", "high")]
+    result["visualManifest"] = manifest_doc
+    result["visualFindings"] = findings_doc
+    if blocking:
+        result["status"] = "CODE_FAIL"
+        result["ok"] = False
+        result["visualBlockingFindings"] = blocking
+    else:
+        result["status"] = "PASS"
+        result["ok"] = True
+    return result
+
+
 def common_repo_root(ws):
     raw = git(ws, "rev-parse", "--git-common-dir")
     p = Path(raw)
@@ -790,8 +906,17 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             if events_path is not None:
                 emit_event(events_path, "verification_started", session_id, command=label)
             result = run_verifier_command(ws, cmd, timeout, env)
+            # C4: the visual check is classified by its own severity model
+            # (V7 §22.5), not the generic text-pattern classifier, and is
+            # deliberately excluded from the baseline-worktree comparison
+            # below -- re-running a live browser capture against a detached
+            # baseline commit doesn't observe anything meaningful (the
+            # running app under test isn't rebuilt per git worktree).
+            is_visual = is_visual_check_command(cmd)
+            if is_visual:
+                result = classify_visual_check_result(result, session)
 
-            if result["status"] == "CODE_FAIL":
+            if result["status"] == "CODE_FAIL" and not is_visual:
                 if baseline_ws is None:
                     baseline_ws = add_baseline_worktree(ws, baseline, session)
                     baseline_map = build_repo_map(baseline_ws)
@@ -1168,6 +1293,12 @@ def main():
     ap.add_argument("--max-repairs", type=int, default=2)
     ap.add_argument("--verification-level", choices=("minimal", "standard", "full"), default="standard")
     ap.add_argument("--verify", action="append", default=[])
+    # C4 (glimmer-v7): only consulted when the literal token "visual" is
+    # among --verify entries (see expand_verify_entries). Unused, harmless
+    # to leave at its default, for every session that doesn't opt in.
+    ap.add_argument("--visual-url", default="http://localhost:3000",
+                    help="URL Playwright navigates to for the visual verification check "
+                         "(consulted only when \"visual\" is one of the --verify entries)")
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--max-turns", type=int)
     # Task Contract fields (glimmer-v7 R2). Choices mirror @glimmer/shared's real
@@ -1384,10 +1515,7 @@ def main():
 
             if not files:
                 commands = [["git", "diff", "--check"]]
-                for raw in args.verify:
-                    cmd = shlex.split(raw)
-                    if cmd and cmd not in commands:
-                        commands.append(cmd)
+                commands = expand_verify_entries(commands, args.verify, session, args.visual_url)
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
                                          repo, source_root, baseline, args.toolchain_mode,
@@ -1417,10 +1545,7 @@ def main():
                 print(f"  - {f}")
 
             commands = verifier_commands(repo, files, args.verification_level)
-            for raw in args.verify:
-                cmd = shlex.split(raw)
-                if cmd and cmd not in commands:
-                    commands.append(cmd)
+            commands = expand_verify_entries(commands, args.verify, session, args.visual_url)
             attempt["verificationCommands"] = [shlex.join(c) for c in commands]
 
             before = diff_hash(ws, baseline)
@@ -1774,6 +1899,150 @@ def _architect_first_selfcheck() -> None:
     print("architect-first self-check: PASS")
 
 
+def _visual_selfcheck() -> None:
+    """C4 (glimmer-v7): proves the vision-verification plumbing without a
+    live browser or a live model call.
+    Run with: python3 glimmer-v2.py --visual-selfcheck
+    """
+    # --- opt-in guarantee: a verification plan without "visual" is
+    # byte-identical to the pre-C4 inline shlex.split-and-append loop. ---
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        raw = ["npm run typecheck", "npm run lint"]
+
+        old_style = [["git", "diff", "--check"]]
+        for r in raw:
+            c = shlex.split(r)
+            if c and c not in old_style:
+                old_style.append(c)
+
+        new_style = expand_verify_entries(
+            [["git", "diff", "--check"]], raw, session, "http://localhost:3000",
+        )
+        assert new_style == old_style, "non-visual entries must expand identically to the pre-C4 loop"
+        assert not (session / "visual").exists(), "no visual output dir when 'visual' never appears"
+
+        # Empty --verify entirely: identical to today (empty list stays empty).
+        assert expand_verify_entries([["git", "diff", "--check"]], [], session, "http://x") == [
+            ["git", "diff", "--check"]
+        ]
+
+    # --- "visual" token expands to a real glimmer-visual.py invocation and
+    # creates sessions/<id>/visual/. ---
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        commands = expand_verify_entries([["git", "diff", "--check"]], ["VISUAL"], session, "http://x/route")
+        assert len(commands) == 2
+        visual_cmd = commands[1]
+        assert is_visual_check_command(visual_cmd)
+        assert not is_visual_check_command(["git", "diff", "--check"])
+        assert visual_cmd[0] == sys.executable
+        assert visual_cmd[1] == str(GLIMMER_VISUAL)
+        assert "--url" in visual_cmd and "http://x/route" in visual_cmd
+        assert visual_cmd.count("--viewport") == len(VISUAL_DEFAULT_VIEWPORTS)
+        for vp in VISUAL_DEFAULT_VIEWPORTS:
+            assert vp in visual_cmd
+        assert str(session / "visual") in visual_cmd
+        assert (session / "visual").is_dir(), "output dir must be created up front"
+
+    # --- severity classification: synthetic/injected findings.json. ---
+    def _write_capture(session, manifest_status, findings):
+        vdir = session / "visual"
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "visual-manifest.json").write_text(json.dumps({
+            "route": "/x", "viewports": ["1440x900", "390x844"],
+            "states": ["initial"], "status": manifest_status, "captures": [], "findings": [],
+        }), encoding="utf-8")
+        (vdir / "findings.json").write_text(json.dumps({
+            "status": "PASS" if manifest_status == "pass" else "FAIL",
+            "viewport": "multi", "viewports": ["1440x900", "390x844"], "findings": findings,
+        }), encoding="utf-8")
+
+    # Critical finding -> CODE_FAIL, which is NOT in the budget-skip set
+    # main() uses at the "failed_status in {INFRA_BLOCKED, TIMEOUT}" branch
+    # -- i.e. it DOES flow into the ordinary repair path, exactly like any
+    # other real verification failure.
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        _write_capture(session, "pass", [
+            {"id": "visual_001", "severity": "critical", "category": "clipping",
+             "element": "dialog", "description": "primary action inaccessible"},
+        ])
+        result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
+        assert result["status"] == "CODE_FAIL" and result["ok"] is False
+        assert result["status"] not in {"INFRA_BLOCKED", "TIMEOUT"}, \
+            "a real finding must consume repair budget, not be treated as infra"
+        assert len(result["visualBlockingFindings"]) == 1
+
+    # High finding -> same as critical.
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        _write_capture(session, "pass", [
+            {"id": "visual_002", "severity": "high", "category": "overlap",
+             "element": "footer", "description": "footer clipped"},
+        ])
+        result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
+        assert result["status"] == "CODE_FAIL" and result["ok"] is False
+
+    # Low/medium only -> does not block (V7 §22.13).
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        _write_capture(session, "pass", [
+            {"id": "visual_003", "severity": "medium", "category": "spacing",
+             "element": "header", "description": "spacing inconsistent"},
+            {"id": "visual_004", "severity": "low", "category": "style",
+             "element": "icon", "description": "minor cosmetic nit"},
+        ])
+        result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
+        assert result["status"] == "PASS" and result["ok"] is True
+
+    # Empty findings (this pass's real, honest output) -> does not block.
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        _write_capture(session, "pass", [])
+        result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
+        assert result["status"] == "PASS" and result["ok"] is True
+
+    # --- INFRA_BLOCKED path: glimmer-visual.py fails to run (nonexistent
+    # script path -> real nonzero subprocess exit), and does not consume
+    # repair budget (same set main() checks at the failed_status branch). ---
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        cmd = [sys.executable, "/definitely/does/not/exist/glimmer-visual.py"]
+        raw_result = run_verifier_command(Path.cwd(), cmd, 30, {})
+        assert raw_result["status"] != "PASS", "a nonexistent script must not report PASS"
+        result = classify_visual_check_result(raw_result, session)
+        assert result["status"] == "INFRA_BLOCKED"
+        assert result["ok"] is False
+        # This is exactly the set main() tests to skip repair-budget
+        # consumption at `failed_status in {"INFRA_BLOCKED", "TIMEOUT"}`.
+        assert result["status"] in {"INFRA_BLOCKED", "TIMEOUT"}
+
+    # Capture ran (script exit 0) but manifest reports incomplete capture
+    # (e.g. some/all viewports failed) -> also INFRA_BLOCKED, never a
+    # fabricated PASS or a code-defect CODE_FAIL.
+    for bad_status in ("partial", "failed"):
+        with tempfile.TemporaryDirectory() as td:
+            session = Path(td)
+            _write_capture(session, bad_status, [])
+            result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
+            assert result["status"] == "INFRA_BLOCKED", bad_status
+
+    # Script exit 0 but findings.json missing entirely -> INFRA_BLOCKED, not
+    # a crash and not a silent PASS.
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        (session / "visual").mkdir(parents=True)
+        (session / "visual" / "visual-manifest.json").write_text(
+            json.dumps({"route": "/x", "viewports": [], "states": [], "status": "pass", "findings": []}),
+            encoding="utf-8",
+        )
+        result = classify_visual_check_result({"status": "PASS", "ok": True}, session)
+        assert result["status"] == "INFRA_BLOCKED"
+
+    print("visual (C4) self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
@@ -1786,6 +2055,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-first-selfcheck"]:
         _architect_first_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--visual-selfcheck"]:
+        _visual_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
