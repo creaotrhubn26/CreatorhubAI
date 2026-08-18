@@ -1120,36 +1120,73 @@ def _resolve_candidate_path(raw_path, ws_resolved):
     return resolved
 
 
+def _collect_plan_evidence_targets(plan):
+    """Merge candidateFiles + existingPatterns[].evidence into ONE ordered
+    list of {"path", "confidence", "kind"} dicts feeding the single
+    evidence-reading pipeline in read_candidate_evidence -- candidateFiles
+    first (they're the primary targets), then existingPatterns evidence in
+    original order. Both fields are model output; every entry returned
+    here is still unvalidated/untrusted input -- the real security/cap
+    work happens in read_candidate_evidence's loop, not here.
+
+    Follow-up (large-repo experiment): for create-new-file tasks the
+    plan's only candidateFiles entry is often the NEW target path, which
+    doesn't exist yet and can't be pre-read -- zero evidence embedded,
+    budget never drops. existingPatterns[].evidence (V7 Section 5.3:
+    [{"name": ..., "evidence": ["path/to/file.ts"]}]) usually points at
+    real, existing convention files instead -- exactly what a create-task
+    engineer needs, so it's folded into the same merged list, tagged
+    "pattern" purely for prompt labeling (see make_prompt).
+    """
+    targets = []
+
+    candidates = plan.get("candidateFiles")
+    if isinstance(candidates, list):
+        for c in candidates:
+            if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip():
+                targets.append({"path": c["path"], "confidence": c.get("confidence"), "kind": "candidate"})
+
+    patterns = plan.get("existingPatterns")
+    if isinstance(patterns, list):
+        for pat in patterns:
+            if not isinstance(pat, dict):
+                continue
+            pat_evidence = pat.get("evidence")
+            if not isinstance(pat_evidence, list):
+                continue
+            for path in pat_evidence:
+                if isinstance(path, str) and path.strip():
+                    targets.append({"path": path, "confidence": None, "kind": "pattern"})
+
+    return targets
+
+
 def read_candidate_evidence(plan, ws):
     """C1 handoff enforcement (Fix 1): pre-read the architect plan's
-    candidateFiles directly from disk -- deterministic, zero model cost
-    -- so the engineer doesn't have to re-discover them itself. See
-    PLAN_EVIDENCE_MAX_* and _resolve_candidate_path's docstrings for the
-    security/cap contract. Every rejection (containment, non-file,
-    unreadable, binary, non-utf8) is skipped with a one-line printed
-    note; this function itself never raises and never includes rejected
-    content. Returns [] uniformly whenever there's nothing usable to
-    embed (no plan, no candidateFiles, nothing resolves) -- callers
-    never need to special-case "no evidence".
+    candidateFiles AND existingPatterns[].evidence directly from disk --
+    deterministic, zero model cost -- so the engineer doesn't have to
+    re-discover them itself (see _collect_plan_evidence_targets for why
+    both fields feed this). See PLAN_EVIDENCE_MAX_* and
+    _resolve_candidate_path's docstrings for the security/cap contract.
+    Every rejection (containment, non-file, unreadable, binary, non-utf8,
+    duplicate) is skipped with a one-line printed note; this function
+    itself never raises and never includes rejected content. Returns []
+    uniformly whenever there's nothing usable to embed (no plan, no
+    candidateFiles/existingPatterns, nothing resolves) -- callers never
+    need to special-case "no evidence".
 
-    Selection: candidateFiles entries with a numeric "confidence" sort
-    first (highest confidence first, per V7 Section 5.3's example
-    shape); entries without one keep their original relative order
-    after those (sorted() is stable). At most PLAN_EVIDENCE_MAX_FILES
-    are read.
+    Selection: entries with a numeric "confidence" (candidateFiles only)
+    sort first (highest confidence first, per V7 Section 5.3's example
+    shape); entries without one keep their original relative order after
+    those (sorted() is stable) -- which naturally preserves "candidateFiles
+    first, then existingPatterns evidence in order" for the common
+    no-confidence case. At most PLAN_EVIDENCE_MAX_FILES are read, same
+    caps and same pipeline regardless of which field a path came from.
     """
     if not plan:
         return []
-    candidates = plan.get("candidateFiles")
-    if not isinstance(candidates, list) or not candidates:
-        return []
 
-    # candidateFiles entries are model output too -- only well-shaped
-    # ones (dict with a non-empty string "path") are even eligible.
-    usable = [
-        c for c in candidates
-        if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip()
-    ]
+    usable = _collect_plan_evidence_targets(plan)
     if not usable:
         return []
 
@@ -1213,7 +1250,7 @@ def read_candidate_evidence(plan, ws):
             text += "\n\n[candidate file truncated by v2 evidence handoff]"
 
         rel_path = resolved.relative_to(ws_resolved).as_posix()
-        evidence.append({"path": rel_path, "content": text})
+        evidence.append({"path": rel_path, "content": text, "kind": entry.get("kind", "candidate")})
         total_chars += len(text)
         seen.add(resolved)
 
@@ -1290,22 +1327,32 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
             "and say why):\n"
             + json.dumps(plan_fields, indent=2)
         )
-        # C1 handoff enforcement (Fix 1, V7 spec Section 5.4): candidateFiles
-        # pre-read directly from disk by v2 (the trusted layer), zero model
-        # cost — appended as its own labeled block so the engineer knows
-        # these are already read and does not need to spend discovery calls
-        # re-reading them. Only present when read_candidate_evidence actually
-        # embedded something; plan_block above is otherwise unaffected.
+        # C1 handoff enforcement (Fix 1, V7 spec Section 5.4; follow-up:
+        # existingPatterns[].evidence): candidateFiles + existingPatterns
+        # evidence pre-read directly from disk by v2 (the trusted layer),
+        # zero model cost — appended as its own labeled block so the
+        # engineer knows these are already read and does not need to spend
+        # discovery calls re-reading them. Each entry is labeled by kind so
+        # the model treats CANDIDATE FILE entries as likely edit targets and
+        # PATTERN EVIDENCE entries as existing conventions to follow, not
+        # files to modify. Only present when read_candidate_evidence
+        # actually embedded something; plan_block above is otherwise
+        # unaffected.
         if evidence:
+            def _evidence_header(item):
+                if item.get("kind") == "pattern":
+                    return f"--- PATTERN EVIDENCE (existing convention to follow, not a file to modify): {item['path']} ---"
+                return f"--- CANDIDATE FILE: {item['path']} ---"
+
             evidence_text = "\n\n".join(
-                f"--- {item['path']} ---\n{item['content']}" for item in evidence
+                f"{_evidence_header(item)}\n{item['content']}" for item in evidence
             )
             plan_block += (
-                "\n\nPRE-READ CANDIDATE FILE EVIDENCE (read directly from "
-                "disk by the v2 orchestrator before this run started, per "
-                "the ARCHITECTURE PLAN's candidateFiles above — these "
-                "files do NOT need to be re-read; treat their contents "
-                "below as current and accurate):\n"
+                "\n\nPRE-READ PLAN EVIDENCE (read directly from disk by the "
+                "v2 orchestrator before this run started, per the "
+                "ARCHITECTURE PLAN above — these files do NOT need to be "
+                "re-read; treat their contents below as current and "
+                "accurate):\n"
                 + evidence_text
             )
 
@@ -2202,10 +2249,68 @@ def _architect_first_selfcheck() -> None:
         }
         with_evidence = make_prompt(contract, summary, 0, plan=real_plan,
                                      evidence=read_candidate_evidence(real_plan, ws_dir))
-        assert "PRE-READ CANDIDATE FILE EVIDENCE" in with_evidence
+        assert "PRE-READ PLAN EVIDENCE" in with_evidence
+        assert "--- CANDIDATE FILE: src/greet.js ---" in with_evidence
         assert "function greet" in with_evidence
         no_evidence_prompt = make_prompt(contract, summary, 0, plan=real_plan, evidence=[])
-        assert "PRE-READ CANDIDATE FILE EVIDENCE" not in no_evidence_prompt
+        assert "PRE-READ PLAN EVIDENCE" not in no_evidence_prompt
+
+        # ------------------------------------------------------------
+        # Follow-up (large-repo experiment): existingPatterns[].evidence
+        # feeds the SAME pipeline as candidateFiles -- create-task plans
+        # whose only candidateFiles entry is a not-yet-existing target
+        # still get real evidence embedded via existing convention files.
+        # ------------------------------------------------------------
+        pattern_file_a = ws_dir / "lib" / "lazyWithRetry.ts"
+        pattern_file_a.parent.mkdir(parents=True)
+        pattern_file_a.write_text("export function lazyWithRetry() {}\n", encoding="utf-8")
+        pattern_file_b = ws_dir / "lib" / "errorMessages.ts"
+        pattern_file_b.write_text("export const errorMessages = {};\n", encoding="utf-8")
+
+        # Only candidateFiles entry is a target that doesn't exist yet;
+        # existingPatterns evidence points at 2 real files -> both embedded.
+        create_task_plan = {
+            "candidateFiles": [{"path": "src/utils/shortDuration.ts", "confidence": 0.9}],
+            "existingPatterns": [
+                {"name": "lazy retry", "evidence": ["lib/lazyWithRetry.ts"]},
+                {"name": "error messages", "evidence": ["lib/errorMessages.ts"]},
+            ],
+        }
+        pattern_evidence = read_candidate_evidence(create_task_plan, ws_dir)
+        assert len(pattern_evidence) == 2
+        assert {e["path"] for e in pattern_evidence} == {"lib/lazyWithRetry.ts", "lib/errorMessages.ts"}
+        assert all(e["kind"] == "pattern" for e in pattern_evidence)
+
+        pattern_prompt = make_prompt(contract, summary, 0, plan=create_task_plan, evidence=pattern_evidence)
+        assert "PATTERN EVIDENCE (existing convention to follow, not a file to modify): lib/lazyWithRetry.ts" in pattern_prompt
+        assert "export function lazyWithRetry" in pattern_prompt
+
+        # Hostile paths inside existingPatterns evidence are rejected the
+        # same as candidateFiles' -- traversal and symlink escape here too.
+        hostile_pattern_plan = {
+            "candidateFiles": [],
+            "existingPatterns": [
+                {"name": "x", "evidence": ["../../../etc/passwd", "escape_link.txt", "lib/lazyWithRetry.ts"]},
+            ],
+        }
+        hostile_pattern_evidence = read_candidate_evidence(hostile_pattern_plan, ws_dir)
+        assert len(hostile_pattern_evidence) == 1
+        assert hostile_pattern_evidence[0]["path"] == "lib/lazyWithRetry.ts"
+        assert "SHOULD NEVER BE EMBEDDED" not in hostile_pattern_evidence[0]["content"]
+
+        # Dedup across the merged list: same file named in both
+        # candidateFiles and existingPatterns evidence -> embedded once.
+        cross_dedup_plan = {
+            "candidateFiles": [{"path": "lib/lazyWithRetry.ts", "confidence": 0.9}],
+            "existingPatterns": [{"name": "x", "evidence": ["lib/lazyWithRetry.ts"]}],
+        }
+        cross_dedup_evidence = read_candidate_evidence(cross_dedup_plan, ws_dir)
+        assert len(cross_dedup_evidence) == 1
+        assert cross_dedup_evidence[0]["kind"] == "candidate", (
+            "candidateFiles is merged first, so the surviving entry for a "
+            "path listed in both must be the candidate copy, not the "
+            "pattern-evidence duplicate"
+        )
 
     # Fix 2's env-var plumbing signature: plan_candidate_count defaults to
     # 0 (no env var set) so every existing invoke_engineer call site that
