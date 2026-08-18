@@ -1977,6 +1977,150 @@ def _architect_mode_selfcheck() -> None:
     print("architect mode self-check: PASS")
 
 
+def _delivery_review_selfcheck() -> None:
+    """C6 (glimmer-v7): proves DeliveryReview's core invariants without a
+    live llama-server. Run with:
+    python3 glimmer-engineer.py --delivery-review-selfcheck
+    """
+    import inspect
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID, _evidence_seq
+
+    # ------------------------------------------------------------
+    # 1. run_delivery_review can only receive plain data — assert its
+    #    signature has no parameter named/typed for workspace, manifest,
+    #    or engineer state, so it is structurally unable to read or
+    #    mutate anything session-outcome-relevant.
+    # ------------------------------------------------------------
+    params = set(inspect.signature(run_delivery_review).parameters)
+    assert params == {"task", "ledger", "prose_report"}, (
+        f"run_delivery_review must take only plain data, got: {params}"
+    )
+
+    # ------------------------------------------------------------
+    # 2. Request-building genuinely omits tools — structural, not
+    #    merely instructed.
+    # ------------------------------------------------------------
+    payload = _build_delivery_review_payload(
+        "fix the thing", ["TOOL: read_file\nARGS: {}\nRESULT:\nok"], "All good."
+    )
+    assert "tools" not in payload, "delivery review turn must never offer tools"
+    assert "functions" not in payload, "delivery review turn must never offer functions"
+    assert "tool_choice" not in payload
+    assert "parallel_tool_calls" not in payload
+
+    # ------------------------------------------------------------
+    # 3. Valid §23.7-shaped JSON parses, validates, and known
+    #    evidenceIds survive while unknown ones are filtered out.
+    # ------------------------------------------------------------
+    known_ids = {"sess-abc-ev-1", "sess-abc-ev-2"}
+    model_text = (
+        "```json\n"
+        + json.dumps(
+            {
+                "summary": "Restored session hydration via the existing service.",
+                "approachRationale": ["Reused sessionPersistence; avoided a duplicate store."],
+                "strengths": ["Small, targeted diff."],
+                "concerns": [
+                    {
+                        "severity": "medium",
+                        "category": "ux",
+                        "description": "Recovery gives little feedback while restoring.",
+                        "evidenceIds": ["sess-abc-ev-1", "sess-abc-ev-99"],
+                    }
+                ],
+                "customerReadiness": "ready_with_known_limitations",
+                "unresolvedItems": ["No loading indicator yet."],
+                "intentionallyNotChanged": ["No API contract changes."],
+                "nextSteps": [
+                    {"priority": "recommended_next", "action": "Add a restoring state."}
+                ],
+                "confidence": {"level": "high", "reason": "Change is small and reviewed."},
+            }
+        )
+        + "\n```"
+    )
+    parsed = _extract_json_object(model_text)
+    ok, normalized = validate_delivery_review(parsed, known_ids)
+    assert ok, f"valid model review must validate, got: {normalized}"
+    assert normalized["summary"].startswith("Restored session")
+    assert normalized["customerReadiness"] == "ready_with_known_limitations"
+    assert normalized["confidence"] == {"level": "high", "reason": "Change is small and reviewed."}
+    assert normalized["concerns"][0]["evidenceIds"] == ["sess-abc-ev-1"], (
+        "known evidence id must survive"
+    )
+    assert normalized["filteredEvidenceIds"] == ["sess-abc-ev-99"], (
+        "unknown/hallucinated evidence id must be filtered out, not persisted as real"
+    )
+    assert "reviewFailed" not in normalized
+
+    # ------------------------------------------------------------
+    # 4. Invalid/malformed input -> reviewFailed fallback, not a crash.
+    # ------------------------------------------------------------
+    for bad_text in (
+        "not json at all",
+        json.dumps({"summary": "x"}),  # missing customerReadiness/confidence
+        json.dumps({"customerReadiness": "ready_to_ship", "confidence": {"level": "high", "reason": "r"}}),  # missing summary
+        json.dumps({"summary": "x", "customerReadiness": "extremely_ready", "confidence": {"level": "high", "reason": "r"}}),  # bad enum
+        json.dumps({"summary": "x", "customerReadiness": "ready_to_ship", "confidence": {"level": "extreme", "reason": "r"}}),  # bad level
+    ):
+        try:
+            parsed_bad = _extract_json_object(bad_text)
+            ok_bad, _reason = validate_delivery_review(parsed_bad, known_ids)
+        except ValueError:
+            ok_bad = False
+        assert ok_bad is False, f"must reject: {bad_text!r}"
+
+    fallback = _fallback_delivery_review("model never produced valid JSON")
+    assert fallback["reviewFailed"] is True
+    assert fallback["customerReadiness"] in DELIVERY_REVIEW_READINESS_VALUES
+    assert fallback["confidence"]["level"] in DELIVERY_REVIEW_CONFIDENCE_LEVELS
+    for field in DELIVERY_REVIEW_ARRAY_FIELDS:
+        assert fallback[field] == []
+
+    # ------------------------------------------------------------
+    # 5. File writing: success and fallback share one file identity;
+    #    no-op path when no session dir is available.
+    # ------------------------------------------------------------
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+    real_evidence_seq = _evidence_seq
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-abc"
+            _evidence_seq = 2
+
+            assert _known_delivery_review_evidence_ids() == known_ids
+
+            written = _write_delivery_review_file(normalized)
+            assert written is not None
+            assert written.name == "delivery-review.json"
+            on_disk = json.loads(written.read_text(encoding="utf-8"))
+            assert on_disk["customerReadiness"] == "ready_with_known_limitations"
+
+            written_fallback = _write_delivery_review_file(fallback)
+            assert written_fallback == written, (
+                "success and fallback must share one file identity, same as "
+                "architecture-plan.json's convention"
+            )
+            on_disk_fallback = json.loads(written_fallback.read_text(encoding="utf-8"))
+            assert on_disk_fallback["reviewFailed"] is True
+
+            GLIMMER_EVENTS_PATH = None
+            GLIMMER_SESSION_ID = None
+            assert _write_delivery_review_file(fallback) is None
+    finally:
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+        _evidence_seq = real_evidence_seq
+
+    print("delivery review self-check: PASS")
+
+
 # ============================================================
 # TOOL ARGUMENT PARSING
 # ============================================================
@@ -2855,6 +2999,332 @@ def run_architect(task, workspace, max_turns):
 
 
 # ============================================================
+# DELIVERY REVIEW (C6, glimmer-v7 — V7 §23.7)
+# ============================================================
+#
+# One extra tool-free turn AFTER the existing prose "Final Engineering
+# Report" turn. The prose report stays the human-facing artifact,
+# unchanged; this is its machine-readable companion. Advisory only:
+# nothing here (or anywhere else in this file) reads customerReadiness
+# back into engineer_state/engineer_phase or any manifest-relevant
+# value — this section only ever WRITES delivery-review.json. The
+# function below deliberately takes no workspace/manifest/ledger-
+# mutating reference, only plain already-computed strings, so it is
+# structurally incapable of changing session outcome (§23.9/§23.11).
+
+DELIVERY_REVIEW_READINESS_VALUES = {
+    "ready_to_ship",
+    "ready_with_known_limitations",
+    "needs_polish",
+    "needs_rework",
+    "not_customer_ready",
+}
+
+DELIVERY_REVIEW_CONFIDENCE_LEVELS = {"low", "medium", "high"}
+
+# V7 §23.7's optional array fields — always present in the written
+# review, defaulted to empty when the model omits them (same tolerant-
+# but-honest philosophy as ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS).
+DELIVERY_REVIEW_ARRAY_FIELDS = (
+    "approachRationale",
+    "strengths",
+    "concerns",
+    "unresolvedItems",
+    "intentionallyNotChanged",
+    "nextSteps",
+)
+
+DELIVERY_REVIEW_SYSTEM_PROMPT = (
+    "Reasoning strength: low. "
+    "You are Glimmer's self-review layer. Implementation and "
+    "verification already happened and cannot be changed by you — you "
+    "have no tools this turn. Judge the delivered result the way a "
+    "senior engineer would before it reaches a customer.\n\n"
+
+    "Ground every claim in the task, evidence, and report given to "
+    "you below. Do not invent dissatisfaction: a concern must point "
+    "to something specific (a failed/skipped check, a TODO, a scope "
+    "compromise, a known limitation) — never a vague feeling.\n\n"
+
+    "Explain decisions, never narrate reasoning. 'Why this approach' "
+    "must be an externally useful decision summary (e.g. 'X already "
+    "owned this data, so reusing it avoided a duplicate store'), "
+    "never a thinking-out-loud trace ('first I considered..., "
+    "then...'). Do not include chain-of-thought anywhere in your "
+    "answer.\n\n"
+
+    "customerReadiness is an advisory product judgment only. It never "
+    "overrides, blocks, or replaces the technical verification status "
+    "already recorded for this session.\n\n"
+
+    "You are a reporter, not an implementer: nextSteps are "
+    "recommendations for a human to accept, defer, or turn into a "
+    "follow-up task. You are not authorized to act on them.\n\n"
+
+    "Respond with EXACTLY one JSON object and nothing else — no "
+    "prose, no markdown fence — matching this shape:\n\n"
+    "{\n"
+    '  "summary": "string, REQUIRED",\n'
+    '  "approachRationale": ["decision summary, not a reasoning trace"],\n'
+    '  "strengths": ["what is genuinely good, evidence-based"],\n'
+    '  "concerns": [\n'
+    "    {\n"
+    '      "severity": "low|medium|high|critical",\n'
+    '      "category": "architecture|functionality|visual|ux|'
+    'performance|security|verification|maintainability",\n'
+    '      "description": "string",\n'
+    '      "evidenceIds": ["cite ids from the EVIDENCE INDEX only"]\n'
+    "    }\n"
+    "  ],\n"
+    '  "customerReadiness": '
+    '"ready_to_ship|ready_with_known_limitations|needs_polish|'
+    'needs_rework|not_customer_ready (REQUIRED)",\n'
+    '  "unresolvedItems": ["string"],\n'
+    '  "intentionallyNotChanged": ["string"],\n'
+    '  "nextSteps": [\n'
+    '    {"priority": "required_before_ship|recommended_next|'
+    'future_opportunity", "action": "string"}\n'
+    "  ],\n"
+    '  "confidence": {"level": "low|medium|high (REQUIRED)", '
+    '"reason": "string (REQUIRED)"}\n'
+    "}\n\n"
+    "summary, customerReadiness, and confidence are REQUIRED. Other "
+    "fields may be empty arrays if you have nothing to report, but "
+    "must still be present."
+)
+
+
+def validate_delivery_review(data, known_evidence_ids):
+    """Validate a parsed JSON object against V7 §23.7's DeliveryReview
+    shape. Same tolerant-but-honest bar as validate_architecture_plan:
+    summary/customerReadiness/confidence are required and well-typed;
+    every other field is defaulted to [] when missing/malformed rather
+    than rejected. concerns[].evidenceIds are filtered against
+    known_evidence_ids (§23.5 — a cited id that isn't real is not
+    evidence); dropped ids are collected into a top-level
+    "filteredEvidenceIds" list rather than silently discarded, so a
+    hallucinated citation is visible in the written file instead of
+    trusted as real.
+
+    Returns (True, normalized_review_dict) or (False, reason_string).
+    """
+    if not isinstance(data, dict):
+        return False, "response is not a JSON object"
+
+    summary = data.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False, "missing/invalid 'summary' (must be a non-empty string)"
+
+    readiness = data.get("customerReadiness")
+    if readiness not in DELIVERY_REVIEW_READINESS_VALUES:
+        return False, (
+            "missing/invalid 'customerReadiness' (must be one of: "
+            + ", ".join(sorted(DELIVERY_REVIEW_READINESS_VALUES))
+            + ")"
+        )
+
+    confidence = data.get("confidence")
+    if (
+        not isinstance(confidence, dict)
+        or confidence.get("level") not in DELIVERY_REVIEW_CONFIDENCE_LEVELS
+        or not isinstance(confidence.get("reason"), str)
+    ):
+        return False, (
+            "missing/invalid 'confidence' (must be an object with "
+            "'level' in low/medium/high and a string 'reason')"
+        )
+
+    normalized = {
+        "summary": summary,
+        "customerReadiness": readiness,
+        "confidence": {
+            "level": confidence["level"],
+            "reason": confidence["reason"],
+        },
+    }
+
+    for field in DELIVERY_REVIEW_ARRAY_FIELDS:
+        if field == "concerns":
+            continue
+        value = data.get(field, [])
+        normalized[field] = value if isinstance(value, list) else []
+
+    raw_concerns = data.get("concerns", [])
+    concerns_out = []
+    filtered_ids = []
+    for concern in raw_concerns if isinstance(raw_concerns, list) else []:
+        if not isinstance(concern, dict):
+            continue
+        concern = dict(concern)
+        ids = concern.get("evidenceIds")
+        ids = ids if isinstance(ids, list) else []
+        concern["evidenceIds"] = [i for i in ids if i in known_evidence_ids]
+        filtered_ids.extend(i for i in ids if i not in known_evidence_ids)
+        concerns_out.append(concern)
+    normalized["concerns"] = concerns_out
+    if filtered_ids:
+        normalized["filteredEvidenceIds"] = sorted(set(filtered_ids))
+
+    return True, normalized
+
+
+def _fallback_delivery_review(reason):
+    """Minimal, always-valid-JSON degradation target — same shape as a
+    successful review (same keys, "reviewFailed" only ADDED, never a
+    different schema), mirroring _fallback_architecture_plan.
+    """
+    review = {
+        "summary": "",
+        "customerReadiness": "not_customer_ready",
+        "confidence": {"level": "low", "reason": "delivery review generation failed"},
+        "reviewFailed": True,
+        "reviewFailureReason": reason,
+    }
+    for field in DELIVERY_REVIEW_ARRAY_FIELDS:
+        review[field] = []
+    return review
+
+
+def _delivery_review_file_path():
+    """Same session-dir-derivation convention as _evidence_file_path()/
+    _architecture_plan_file_path() above — the parent of
+    GLIMMER_EVENTS_PATH. Not iteration-numbered: exactly one
+    delivery-review.json per session, written once at the very end.
+    Returns None when no session dir is available (standalone
+    invocation), same no-op guarantee as the rest of this file.
+    """
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return None
+
+    return Path(GLIMMER_EVENTS_PATH).parent / "delivery-review.json"
+
+
+def _write_delivery_review_file(output):
+    """Write delivery-review.json (real review or the reviewFailed
+    marker) to the session dir. Never raises. Returns the path written,
+    or None when no session dir is available or the write failed.
+    """
+    path = _delivery_review_file_path()
+
+    if path is None:
+        print(
+            "[glimmer-engineer] no session dir available (standalone "
+            "invocation); delivery-review.json not written."
+        )
+        return None
+
+    try:
+        path.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Wrote: {path}")
+        return path
+    except OSError as exc:
+        print(f"[glimmer-engineer] failed to write delivery-review.json: {exc}")
+        return None
+
+
+def _known_delivery_review_evidence_ids():
+    """Ids already persisted by _persist_evidence for THIS process (each
+    engineer iteration is its own subprocess with its own _evidence_seq
+    starting at 1, matching evidence-NN.jsonl's per-iteration file), as
+    a plain set for validate_delivery_review's evidenceIds filter.
+    """
+    return (
+        {f"{GLIMMER_SESSION_ID}-ev-{n}" for n in range(1, _evidence_seq + 1)}
+        if GLIMMER_SESSION_ID
+        else set()
+    )
+
+
+def _build_delivery_review_payload(task, ledger, prose_report):
+    """Pure request-builder, split out from run_delivery_review so a
+    self-check can assert the constructed payload has no "tools" (or
+    any tool-calling) key without needing a live model — the omission
+    of that key IS the structural (not merely instructed) tool-free
+    guarantee. Takes only plain data, same reasoning as
+    run_delivery_review's docstring.
+    """
+    evidence_lines = []
+    total = 0
+    for index, item in enumerate(ledger):
+        line = f"[{GLIMMER_SESSION_ID}-ev-{index + 1}] " + item.splitlines()[0]
+        if total + len(line) > MAX_EVIDENCE_TOTAL:
+            break
+        evidence_lines.append(line)
+        total += len(line)
+    evidence_index = "\n".join(evidence_lines) or "(no tool evidence recorded)"
+
+    objective = _extract_task_objective(task) or (task or "")[:_TASK_OBJECTIVE_LIMIT]
+
+    return {
+        "model": "muse-glimmer",
+        "messages": [
+            {"role": "system", "content": DELIVERY_REVIEW_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "TASK:\n" + objective + "\n\n"
+                    "EVIDENCE INDEX (id: first line of each recorded "
+                    "tool result; cite these exact ids in "
+                    "concerns[].evidenceIds, never invent new ones):\n"
+                    + evidence_index + "\n\n"
+                    "FINAL ENGINEERING REPORT (already delivered to "
+                    "the human; review it, do not repeat it "
+                    "verbatim):\n" + prose_report[:8000]
+                ),
+            },
+        ],
+        "max_tokens": 2048,
+    }
+    # No "tools"/"tool_choice"/"parallel_tool_calls" key is ever added
+    # above — this turn is structurally toolless, not merely instructed
+    # to avoid tools (same discipline as the control-center Session
+    # Assistant's tool-free turns).
+
+
+def run_delivery_review(task, ledger, prose_report):
+    """C6: build and send the one extra tool-free turn, then persist
+    the result. Takes only plain data (task text, the in-memory
+    evidence ledger, the already-produced prose report) — never a
+    workspace path, manifest, or engineer_state/engineer_phase
+    reference — so this function is structurally unable to read or
+    change anything session-outcome-relevant; it can only write
+    delivery-review.json. Never raises: any failure (unparseable JSON,
+    failed validation, model/network error) degrades to the
+    reviewFailed fallback file, exactly like architect mode's planning
+    failure path. The caller's return value/session outcome never
+    depends on this function.
+    """
+    known_ids = _known_delivery_review_evidence_ids()
+    payload = _build_delivery_review_payload(task, ledger, prose_report)
+
+    try:
+        response = chat_with_retry(payload, attempts=3)
+        content = response["choices"][0]["message"].get("content") or ""
+        data = _extract_json_object(content)
+        ok, result = validate_delivery_review(data, known_ids)
+        if not ok:
+            raise ValueError(result)
+    except Exception as exc:  # noqa: BLE001 - this turn must never affect session outcome
+        print(f"[glimmer-engineer] delivery review generation failed: {exc}")
+        _write_delivery_review_file(
+            _fallback_delivery_review(f"{type(exc).__name__}: {exc}")
+        )
+        return
+
+    print()
+    print("════════════════════════════════════")
+    print("DELIVERY REVIEW")
+    print("════════════════════════════════════")
+    print(f"Customer readiness: {result['customerReadiness']}")
+    print(f"Confidence:         {result['confidence']['level']}")
+
+    _write_delivery_review_file(result)
+
+
+# ============================================================
 # ENGINEERING LOOP
 # ============================================================
 
@@ -3109,7 +3579,16 @@ def run_engineer(
         "grep_search",
     }
 
+    # C6 (glimmer-v7): tracks whether THIS turn's response came from
+    # final_synthesis (the deterministic no-model fallback) rather than
+    # a real model turn. Reset every turn (not just once) because a
+    # PEG failure can be transient to a single turn — a later turn's
+    # real model response must not be treated as a synthesis result.
+    used_final_synthesis = False
+
     for turn in range(max_turns):
+
+        used_final_synthesis = False
 
         active_tools = tools
 
@@ -3215,6 +3694,7 @@ def run_engineer(
                 ledger,
                 changed_paths,
             )
+            used_final_synthesis = True
 
         message = (
             response["choices"][0]["message"]
@@ -3293,6 +3773,27 @@ def run_engineer(
             )
             print()
             print(content)
+
+            # C6 (glimmer-v7, V7 §23.7): DeliveryReview companion to the
+            # prose report just printed above. Runs for both success and
+            # failure outcomes of the engineer loop (§23.12 wants failed
+            # tasks to self-explain too) — the prose report above is
+            # unconditionally the final answer regardless of outcome, so
+            # this always runs right after it. When the prose report
+            # itself came from final_synthesis (the model was already
+            # failing to produce parseable output), skip the extra model
+            # call — one more request against a model that just failed
+            # is waste — and write the reviewFailed fallback directly.
+            if used_final_synthesis:
+                _write_delivery_review_file(
+                    _fallback_delivery_review(
+                        "skipped: prose report came from the "
+                        "deterministic final_synthesis fallback "
+                        "(PEG parser already failing this session)"
+                    )
+                )
+            else:
+                run_delivery_review(task, ledger, content)
 
             postflight(workspace)
 
@@ -3734,6 +4235,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--architect-mode-selfcheck"]:
         _architect_mode_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--delivery-review-selfcheck"]:
+        _delivery_review_selfcheck()
         sys.exit(0)
 
     try:
