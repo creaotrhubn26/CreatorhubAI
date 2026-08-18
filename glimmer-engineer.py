@@ -16,6 +16,11 @@ from glimmer_events import emit as emit_event
 
 GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
 GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
+# C1 handoff enforcement (Fix 2): set by glimmer-v2.py (same spawn-env code
+# path as the two vars above) to the count of architect-plan candidateFiles
+# it successfully pre-read and embedded in this run's prompt — only when
+# that count is > 0. See _plan_aware_discovery_budget below.
+GLIMMER_PLAN_CANDIDATES = os.environ.get("GLIMMER_PLAN_CANDIDATES")
 
 
 def _emit(event_type: str, **fields) -> None:
@@ -3458,6 +3463,71 @@ def run_delivery_review(task, ledger, prose_report):
 # ENGINEERING LOOP
 # ============================================================
 
+def _plan_aware_discovery_budget():
+    """C1 handoff enforcement (Fix 2): when glimmer-v2.py's --architect-
+    first handoff actually embedded pre-read candidate-file evidence in
+    this run's prompt (Fix 1), the engineer already has that evidence and
+    doesn't need the full discovery_tool_budget to re-explore the
+    repository from scratch — see docs/c1-measured-gate-results.md, which
+    measured 5 discovery calls with a plan vs. 4 without one on a smoke
+    repo. GLIMMER_PLAN_CANDIDATES is code-enforced, not prompt prose: it
+    directly gates the tool-router narrowing budget below, not just
+    something mentioned in the prompt text.
+
+    Fails open to the normal budget (8) on anything that isn't a clean
+    positive integer — unset, empty, non-numeric ("abc"), zero, or
+    negative — so a malformed/missing env var can never crash this
+    process or silently over-restrict a normal (non-plan) run.
+    """
+    if not GLIMMER_PLAN_CANDIDATES:
+        return 8
+    try:
+        n = int(GLIMMER_PLAN_CANDIDATES)
+    except ValueError:
+        return 8
+    return 3 if n > 0 else 8
+
+
+def _plan_aware_budget_selfcheck() -> None:
+    """C1 handoff enforcement (Fix 2): proves discovery_tool_budget is
+    driven by the real GLIMMER_PLAN_CANDIDATES module global that
+    run_engineer reads at startup (_plan_aware_discovery_budget), and
+    that malformed/absent values fail open to the safe default (8)
+    rather than crashing or over-restricting a normal run.
+    Run with: python3 glimmer-engineer.py --plan-aware-budget-selfcheck
+    """
+    global GLIMMER_PLAN_CANDIDATES
+
+    real_value = GLIMMER_PLAN_CANDIDATES
+    try:
+        for valid in ("1", "3", "5", "42"):
+            GLIMMER_PLAN_CANDIDATES = valid
+            assert _plan_aware_discovery_budget() == 3, (
+                f"valid positive candidate count {valid!r} must drop budget to 3"
+            )
+
+        for malformed in (None, "", "abc", "-1", "0", "  ", "3.5"):
+            GLIMMER_PLAN_CANDIDATES = malformed
+            assert _plan_aware_discovery_budget() == 8, (
+                f"malformed/absent {malformed!r} must fail open to the default budget 8"
+            )
+    finally:
+        GLIMMER_PLAN_CANDIDATES = real_value
+
+    # discovery_tool_budget in run_engineer is assigned directly from this
+    # function's return value (not a hardcoded 8) -- confirmed by source
+    # inspection so the self-check would break if a future edit reverted
+    # run_engineer back to a bare literal without updating this check.
+    import inspect
+    source = inspect.getsource(run_engineer)
+    assert "discovery_tool_budget = _plan_aware_discovery_budget()" in source, (
+        "run_engineer must assign discovery_tool_budget from "
+        "_plan_aware_discovery_budget(), not a hardcoded literal"
+    )
+
+    print("plan-aware-budget self-check: PASS")
+
+
 def run_engineer(
     task,
     workspace,
@@ -3674,8 +3744,14 @@ def run_engineer(
     # Prevent the model from spending the entire turn budget
     # repeatedly exploring the repository without selecting
     # a concrete engineering candidate.
+    #
+    # C1 handoff enforcement (Fix 2): plan-aware — drops to 3 when a real
+    # architect-plan evidence handoff is active for this run (see
+    # _plan_aware_discovery_budget). The narrowing machinery below
+    # (engineer_phase, discovery_calls >= discovery_tool_budget) is
+    # unchanged; only this constant becomes conditional.
     discovery_calls = 0
-    discovery_tool_budget = 8
+    discovery_tool_budget = _plan_aware_discovery_budget()
 
     # After broad discovery, allow only a very small number of
     # calls to verify the selected candidate before forcing a
@@ -4377,6 +4453,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--delivery-review-selfcheck"]:
         _delivery_review_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--plan-aware-budget-selfcheck"]:
+        _plan_aware_budget_selfcheck()
         sys.exit(0)
 
     try:

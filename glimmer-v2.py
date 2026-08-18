@@ -1080,7 +1080,147 @@ def make_architect_prompt(contract, summary):
     """).strip()
 
 
-def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None):
+
+# C1 handoff enforcement (Fix 1, V7 spec Section 5.4): "Engineer should
+# receive... selected repository evidence." candidateFiles[].path is MODEL
+# OUTPUT (the architect model wrote the plan) -- v2 (the trusted layer) is
+# about to open() paths a model chose, so every one is treated as hostile.
+# Caps bound how much of a possibly-adversarial plan gets embedded.
+PLAN_EVIDENCE_MAX_FILES = 5
+PLAN_EVIDENCE_MAX_FILE_CHARS = 16 * 1024
+PLAN_EVIDENCE_MAX_TOTAL_CHARS = 48 * 1024
+
+
+def _resolve_candidate_path(raw_path, ws_resolved):
+    """Containment check for one candidateFiles[].path, reimplementing
+    glimmer-engineer.py's resolve_workspace_path pattern (resolve, then
+    require relative_to the workspace to succeed) -- reimplemented here
+    rather than imported since v2.py and glimmer-engineer.py share no
+    module. Returns the resolved Path only when it stays strictly inside
+    ws_resolved AFTER resolution (symlink-safe: Path.resolve() follows
+    symlinks, and the containment check runs on that post-resolve path,
+    so a symlink pointing outside the workspace is caught here same as
+    a literal ../ escape or an absolute path elsewhere). None on any
+    rejection or malformed input -- never raises.
+    """
+    try:
+        p = Path(raw_path).expanduser()
+    except TypeError:
+        return None
+    if not p.is_absolute():
+        p = ws_resolved / p
+    try:
+        resolved = p.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        resolved.relative_to(ws_resolved)
+    except ValueError:
+        return None
+    return resolved
+
+
+def read_candidate_evidence(plan, ws):
+    """C1 handoff enforcement (Fix 1): pre-read the architect plan's
+    candidateFiles directly from disk -- deterministic, zero model cost
+    -- so the engineer doesn't have to re-discover them itself. See
+    PLAN_EVIDENCE_MAX_* and _resolve_candidate_path's docstrings for the
+    security/cap contract. Every rejection (containment, non-file,
+    unreadable, binary, non-utf8) is skipped with a one-line printed
+    note; this function itself never raises and never includes rejected
+    content. Returns [] uniformly whenever there's nothing usable to
+    embed (no plan, no candidateFiles, nothing resolves) -- callers
+    never need to special-case "no evidence".
+
+    Selection: candidateFiles entries with a numeric "confidence" sort
+    first (highest confidence first, per V7 Section 5.3's example
+    shape); entries without one keep their original relative order
+    after those (sorted() is stable). At most PLAN_EVIDENCE_MAX_FILES
+    are read.
+    """
+    if not plan:
+        return []
+    candidates = plan.get("candidateFiles")
+    if not isinstance(candidates, list) or not candidates:
+        return []
+
+    # candidateFiles entries are model output too -- only well-shaped
+    # ones (dict with a non-empty string "path") are even eligible.
+    usable = [
+        c for c in candidates
+        if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip()
+    ]
+    if not usable:
+        return []
+
+    def _confidence_key(c):
+        conf = c.get("confidence")
+        has_conf = isinstance(conf, (int, float)) and not isinstance(conf, bool)
+        return (0 if has_conf else 1, -conf if has_conf else 0)
+
+    usable.sort(key=_confidence_key)
+
+    ws_resolved = Path(ws).resolve()
+    evidence = []
+    total_chars = 0
+    seen = set()
+
+    for entry in usable:
+        if len(evidence) >= PLAN_EVIDENCE_MAX_FILES:
+            break
+        if total_chars >= PLAN_EVIDENCE_MAX_TOTAL_CHARS:
+            break
+
+        raw_path = entry["path"]
+        resolved = _resolve_candidate_path(raw_path, ws_resolved)
+        if resolved is None:
+            print(f"[V2] evidence handoff: skipped candidate file outside workspace: {raw_path!r}")
+            continue
+        # Dedup on the resolved real path -- the same file listed under
+        # multiple spellings (e.g. "src/greet.js" and "sub/../src/greet.js")
+        # must not consume two of the five cap slots with duplicate content.
+        if resolved in seen:
+            print(f"[V2] evidence handoff: skipped duplicate candidate (already embedded): {raw_path!r}")
+            continue
+        if not resolved.is_file():
+            print(f"[V2] evidence handoff: skipped non-file candidate: {raw_path!r}")
+            continue
+
+        try:
+            raw_bytes = resolved.read_bytes()
+        except OSError as exc:
+            print(f"[V2] evidence handoff: skipped unreadable candidate {raw_path!r}: {exc}")
+            continue
+
+        if b"\x00" in raw_bytes:
+            print(f"[V2] evidence handoff: skipped binary candidate: {raw_path!r}")
+            continue
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            print(f"[V2] evidence handoff: skipped non-utf8 candidate: {raw_path!r}")
+            continue
+
+        truncated = False
+        if len(text) > PLAN_EVIDENCE_MAX_FILE_CHARS:
+            text = text[:PLAN_EVIDENCE_MAX_FILE_CHARS]
+            truncated = True
+        remaining_budget = PLAN_EVIDENCE_MAX_TOTAL_CHARS - total_chars
+        if len(text) > remaining_budget:
+            text = text[:max(remaining_budget, 0)]
+            truncated = True
+        if truncated:
+            text += "\n\n[candidate file truncated by v2 evidence handoff]"
+
+        rel_path = resolved.relative_to(ws_resolved).as_posix()
+        evidence.append({"path": rel_path, "content": text})
+        total_chars += len(text)
+        seen.add(resolved)
+
+    return evidence
+
+
+def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None, evidence=None):
     # R2: the contract dict (same shape as manifest["contract"]) is the sole
     # source of truth for scope/mode/constraints — derive the human-readable
     # OPERATING CONTRACT lines below FROM it rather than maintaining separate
@@ -1150,6 +1290,24 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
             "and say why):\n"
             + json.dumps(plan_fields, indent=2)
         )
+        # C1 handoff enforcement (Fix 1, V7 spec Section 5.4): candidateFiles
+        # pre-read directly from disk by v2 (the trusted layer), zero model
+        # cost — appended as its own labeled block so the engineer knows
+        # these are already read and does not need to spend discovery calls
+        # re-reading them. Only present when read_candidate_evidence actually
+        # embedded something; plan_block above is otherwise unaffected.
+        if evidence:
+            evidence_text = "\n\n".join(
+                f"--- {item['path']} ---\n{item['content']}" for item in evidence
+            )
+            plan_block += (
+                "\n\nPRE-READ CANDIDATE FILE EVIDENCE (read directly from "
+                "disk by the v2 orchestrator before this run started, per "
+                "the ARCHITECTURE PLAN's candidateFiles above — these "
+                "files do NOT need to be re-read; treat their contents "
+                "below as current and accurate):\n"
+                + evidence_text
+            )
 
     return textwrap.dedent(f"""
     MUSE GLIMMER ENGINEERING MODE V2.1 — {'IMPLEMENT' if iteration == 0 else f'REPAIR {iteration}'}
@@ -1181,7 +1339,8 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     """).strip() + plan_block
 
 
-def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None):
+def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
+                     plan_candidate_count=0):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -1201,6 +1360,14 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     env = os.environ.copy()
     env["GLIMMER_EVENTS_PATH"] = str(events_path)
     env["GLIMMER_SESSION_ID"] = session_id
+    # C1 handoff enforcement (Fix 2): same spawn-env plumbing as the two
+    # lines above, signaling the engineer that a real (non-empty)
+    # evidence handoff happened for this run so its discovery budget can
+    # become plan-aware. Only ever set when plan_candidate_count > 0 —
+    # the architect run itself (mode="architect") never passes this, so
+    # its own budget/turns are untouched (C1 task scoping).
+    if plan_candidate_count > 0:
+        env["GLIMMER_PLAN_CANDIDATES"] = str(plan_candidate_count)
     with log_path.open("w", encoding="utf-8") as log:
         p = subprocess.Popen(cmd, cwd=str(ws), text=True, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, env=env, bufsize=1)
@@ -1504,20 +1671,29 @@ def main():
         # run — the reconciliation doc requires shipping C1 "behind a
         # measured gate" before it runs automatically).
         architecture_plan = None
+        # C1 handoff enforcement (Fix 1): computed once, deterministically,
+        # from disk — not re-read per repair iteration. [] whenever there's
+        # nothing to embed (no plan, no candidateFiles, nothing resolves),
+        # so plan_candidate_count below is 0 and the prompt/env are
+        # unaffected in every degraded case.
+        candidate_evidence = []
         if args.architect_first:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
             )
             manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
+            candidate_evidence = read_candidate_evidence(architecture_plan, ws)
             save()
 
         for iteration in range(args.max_repairs + 1):
             if iteration > 0:
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
-            prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha, plan=architecture_plan)
+            prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
+                                 plan=architecture_plan, evidence=candidate_evidence)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
-                                 session / f"engineer-{iteration:02d}.log", events_path, sid)
+                                 session / f"engineer-{iteration:02d}.log", events_path, sid,
+                                 plan_candidate_count=len(candidate_evidence))
             files = changed_files(ws, baseline)
             change_types = file_change_types(ws, baseline)
             for f in files:
@@ -1922,6 +2098,120 @@ def _architect_first_selfcheck() -> None:
         "used": True,
         "risk": "high",
     }
+
+    # ------------------------------------------------------------
+    # C1 handoff enforcement (Fix 1): evidence pre-read security/caps.
+    # candidateFiles[].path is MODEL OUTPUT — treated as hostile.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        ws_dir = Path(td) / "workspace"
+        ws_dir.mkdir()
+        outside_dir = Path(td) / "outside"
+        outside_dir.mkdir()
+
+        good_file = ws_dir / "src" / "greet.js"
+        good_file.parent.mkdir(parents=True)
+        good_file.write_text("function greet() {}\n", encoding="utf-8")
+
+        secret_file = outside_dir / "secret.txt"
+        secret_file.write_text("SHOULD NEVER BE EMBEDDED", encoding="utf-8")
+
+        # A real symlink inside the workspace pointing outside it.
+        escape_link = ws_dir / "escape_link.txt"
+        escape_link.symlink_to(secret_file)
+
+        # (a) Containment: traversal, absolute-outside, and symlink escape
+        # are ALL skipped — never embedded, never crash.
+        hostile_plan = {
+            "candidateFiles": [
+                {"path": "../../../etc/passwd", "confidence": 0.99},
+                {"path": str(secret_file), "confidence": 0.98},
+                {"path": "escape_link.txt", "confidence": 0.97},
+                {"path": "src/greet.js", "confidence": 0.5},
+            ]
+        }
+        evidence = read_candidate_evidence(hostile_plan, ws_dir)
+        assert len(evidence) == 1
+        assert evidence[0]["path"] == "src/greet.js"
+        assert "SHOULD NEVER BE EMBEDDED" not in " ".join(e["content"] for e in evidence)
+
+        # (b) Caps: >5 candidates -> only 5 read, highest-confidence first.
+        many_dir = ws_dir / "many"
+        many_dir.mkdir()
+        for i in range(8):
+            (many_dir / f"f{i}.txt").write_text(f"content {i}\n", encoding="utf-8")
+        many_plan = {
+            "candidateFiles": [
+                {"path": f"many/f{i}.txt", "confidence": i / 10} for i in range(8)
+            ]
+        }
+        many_evidence = read_candidate_evidence(many_plan, ws_dir)
+        assert len(many_evidence) == PLAN_EVIDENCE_MAX_FILES == 5
+        assert {e["path"] for e in many_evidence} == {
+            "many/f7.txt", "many/f6.txt", "many/f5.txt", "many/f4.txt", "many/f3.txt",
+        }
+
+        # (b2) Dedup: same file under two spellings embeds it once and
+        # leaves the freed slot for a genuinely distinct candidate.
+        dedup_plan = {
+            "candidateFiles": [
+                {"path": "src/greet.js", "confidence": 0.9},
+                {"path": "sub/../src/greet.js", "confidence": 0.8},
+                {"path": "many/f0.txt", "confidence": 0.1},
+            ]
+        }
+        dedup_evidence = read_candidate_evidence(dedup_plan, ws_dir)
+        assert len(dedup_evidence) == 2
+        assert sorted(e["path"] for e in dedup_evidence) == ["many/f0.txt", "src/greet.js"]
+
+        # Oversized file -> truncated with an explicit marker.
+        big_file = ws_dir / "big.txt"
+        big_file.write_text("x" * (PLAN_EVIDENCE_MAX_FILE_CHARS * 2), encoding="utf-8")
+        big_evidence = read_candidate_evidence({"candidateFiles": [{"path": "big.txt"}]}, ws_dir)
+        assert len(big_evidence) == 1
+        assert "[candidate file truncated by v2 evidence handoff]" in big_evidence[0]["content"]
+        assert len(big_evidence[0]["content"]) <= PLAN_EVIDENCE_MAX_FILE_CHARS + len(
+            "\n\n[candidate file truncated by v2 evidence handoff]"
+        )
+
+        # (c) Missing/binary files skipped without crash, never included.
+        binary_file = ws_dir / "image.bin"
+        binary_file.write_bytes(b"\x00\x01\x02not text")
+        mixed_evidence = read_candidate_evidence({
+            "candidateFiles": [
+                {"path": "does/not/exist.txt"},
+                {"path": "image.bin"},
+                {"path": "src/greet.js"},
+            ]
+        }, ws_dir)
+        assert len(mixed_evidence) == 1
+        assert mixed_evidence[0]["path"] == "src/greet.js"
+
+        # No candidateFiles / no plan at all -> [] uniformly.
+        assert read_candidate_evidence({"risk": "low"}, ws_dir) == []
+        assert read_candidate_evidence(None, ws_dir) == []
+        assert read_candidate_evidence({}, ws_dir) == []
+
+        # (d) make_prompt embeds real evidence in a clearly labeled block
+        # appended after the plan block; evidence=[] adds nothing (the
+        # "no plan" byte-identical contract extends to "plan present but
+        # nothing embedded").
+        real_plan = {
+            "objective": "x", "packages": [], "risk": "low",
+            "candidateFiles": [{"path": "src/greet.js", "confidence": 0.9}],
+        }
+        with_evidence = make_prompt(contract, summary, 0, plan=real_plan,
+                                     evidence=read_candidate_evidence(real_plan, ws_dir))
+        assert "PRE-READ CANDIDATE FILE EVIDENCE" in with_evidence
+        assert "function greet" in with_evidence
+        no_evidence_prompt = make_prompt(contract, summary, 0, plan=real_plan, evidence=[])
+        assert "PRE-READ CANDIDATE FILE EVIDENCE" not in no_evidence_prompt
+
+    # Fix 2's env-var plumbing signature: plan_candidate_count defaults to
+    # 0 (no env var set) so every existing invoke_engineer call site that
+    # never passes it — including run_architect_first's — is unaffected.
+    assert "plan_candidate_count" in inspect.signature(invoke_engineer).parameters
+    assert inspect.signature(invoke_engineer).parameters["plan_candidate_count"].default == 0
 
     print("architect-first self-check: PASS")
 
