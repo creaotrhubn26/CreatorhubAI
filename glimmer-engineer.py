@@ -3528,6 +3528,114 @@ def _plan_aware_budget_selfcheck() -> None:
     print("plan-aware-budget self-check: PASS")
 
 
+def _gate_allow_write_file_selfcheck() -> None:
+    """
+    Regression test for the R3 tool-router bug (fix: gate-allow-write-
+    file): once the discovery gate narrowed active_tools to
+    narrowed_to_read_edit / narrowed_to_edit_only, write_file was never
+    in either set. edit_file only works on an EXISTING file and
+    write_file only on a NEW one (check_write_path), so any task whose
+    only legitimate implementation is creating a new file became
+    structurally unreachable post-gate -- reproduced live in sessions
+    20260818-112524 and 20260818-113308, both ending
+    no-change-unverified with the model explicitly citing "blocked by
+    current tool availability".
+
+    Verifies via source inspection of the real run_engineer body (no
+    live server needed) that:
+      1. Both narrowed allowed_before_edit sets now include write_file.
+      2. narrowed_to_edit_only offers nothing beyond edit_file/write_file.
+      3. Both gate-transition directive messages sent to the model name
+         write_file explicitly, not just edit_file.
+      4. Architect mode's C1 structural read-only guarantee (proven in
+         full by _architect_mode_selfcheck) is unaffected: run_architect
+         never references engineer_phase/active_tools at all, so this
+         change -- confined to run_engineer -- cannot widen it. Also
+         re-checks ARCHITECT_TOOL_NAMES directly here as a second,
+         independent proof point next to the router fix.
+    Run with: python3 glimmer-engineer.py --gate-allow-write-file-selfcheck
+    """
+    import ast
+    import inspect
+
+    engineer_source = inspect.getsource(run_engineer)
+
+    def _extract_set(anchor: str) -> set:
+        idx = engineer_source.index(anchor)
+        start = engineer_source.index("{", idx)
+        end = engineer_source.index("}", start) + 1
+        return ast.literal_eval(engineer_source[start:end])
+
+    edit_only_set = _extract_set(
+        'if engineer_phase == "narrowed_to_edit_only":'
+    )
+    read_edit_set = _extract_set(
+        'elif engineer_phase == "narrowed_to_read_edit":'
+    )
+
+    assert edit_only_set == {"edit_file", "write_file"}, (
+        "narrowed_to_edit_only must offer exactly {edit_file, write_file}, "
+        f"got {edit_only_set}"
+    )
+    assert read_edit_set == {
+        "read_file", "grep_search", "edit_file", "write_file",
+    }, (
+        "narrowed_to_read_edit must include write_file alongside the "
+        f"existing read/edit tools, got {read_edit_set}"
+    )
+
+    # The directive user messages injected at each gate transition are
+    # what the model actually reads when deciding its next legal action
+    # -- the tool schema alone isn't enough evidence that creation is
+    # still possible if the prose still only names edit_file.
+    discovery_msg_idx = engineer_source.index(
+        "Repository discovery budget is exhausted."
+    )
+    discovery_msg = engineer_source[discovery_msg_idx:discovery_msg_idx + 700]
+    assert "write_file" in discovery_msg, (
+        "discovery-gate directive message must name write_file"
+    )
+
+    deadline_msg_idx = engineer_source.index(
+        "Candidate verification budget is exhausted."
+    )
+    deadline_msg = engineer_source[deadline_msg_idx:deadline_msg_idx + 700]
+    assert "write_file" in deadline_msg, (
+        "decision-deadline directive message must name write_file"
+    )
+
+    # Architect mode regression check: run_architect must remain
+    # structurally independent of engineer_phase/active_tools, and
+    # ARCHITECT_TOOL_NAMES must still exclude every write tool, exactly
+    # as proven at length in _architect_mode_selfcheck. Re-asserted here
+    # so THIS self-check fails on its own if a future change ever wires
+    # architect mode into the engineer-phase router.
+    architect_tree = ast.parse(inspect.getsource(run_architect))
+    architect_names = {
+        node.id
+        for node in ast.walk(architect_tree)
+        if isinstance(node, ast.Name)
+    }
+    assert "engineer_phase" not in architect_names, (
+        "run_architect must never USE engineer_phase as a real name "
+        "(docstring mentions for contrast are fine) -- it has its own "
+        "separate, fixed, read-only tool set"
+    )
+    assert "active_tools" not in architect_names, (
+        "run_architect must never USE active_tools as a real name "
+        "(docstring mentions for contrast are fine) -- it has its own "
+        "separate, fixed, read-only tool set"
+    )
+    assert "write_file" not in ARCHITECT_TOOL_NAMES, (
+        "architect tool set must never offer write_file"
+    )
+    assert "edit_file" not in ARCHITECT_TOOL_NAMES, (
+        "architect tool set must never offer edit_file"
+    )
+
+    print("gate-allow-write-file self-check: PASS")
+
+
 def run_engineer(
     task,
     workspace,
@@ -3806,10 +3914,22 @@ def run_engineer(
         #   neither gate sent yet, no write yet        -> discovering (full tools)
         if engineer_phase == "narrowed_to_edit_only":
             # Verification budget is exhausted.
-            # At this point the model must either edit the chosen
-            # file or finish without making a change.
+            # At this point the model must either edit/write the
+            # chosen file or finish without making a change.
+            # write_file is included alongside edit_file (fix:
+            # gate-allow-write-file) so that a task whose only
+            # legitimate implementation is a NEW file remains
+            # reachable post-gate -- edit_file only works on
+            # existing files (check_write_path), so without
+            # write_file here, creation tasks were structurally
+            # blocked once discovery narrowed. The real safety
+            # boundary (new-file-only for write_file, protected
+            # paths, write-freeze) is enforced at execute_tool
+            # dispatch (check_write_path / repository_write_guard_
+            # decision), independent of this router.
             allowed_before_edit = {
                 "edit_file",
+                "write_file",
             }
 
             active_tools = [
@@ -3826,6 +3946,7 @@ def run_engineer(
                 "read_file",
                 "grep_search",
                 "edit_file",
+                "write_file",
             }
 
             active_tools = [
@@ -4285,10 +4406,12 @@ def run_engineer(
                         "already collected, choose exactly one concrete, "
                         "small, low-risk candidate. You may use read_file "
                         "or grep_search only to verify that selected "
-                        "candidate. Then either call edit_file with the "
-                        "smallest behavior-preserving fix, or explicitly "
-                        "finish without changes if no candidate is safe. "
-                        "Do not continue browsing alternative candidates."
+                        "candidate. Then call edit_file (for an existing "
+                        "file) or write_file (only for a new file) with "
+                        "the smallest behavior-preserving change, or "
+                        "explicitly finish without changes if no "
+                        "candidate is safe. Do not continue browsing "
+                        "alternative candidates."
                     ),
                 }
             )
@@ -4317,9 +4440,10 @@ def run_engineer(
                         "Do not inspect or search any more files. "
                         "Make the engineering decision now. "
                         "If the selected candidate is objectively safe "
-                        "and behavior-preserving, call edit_file with "
-                        "exactly one minimal change. Otherwise finish "
-                        "without modifications and explain why. "
+                        "and behavior-preserving, call edit_file "
+                        "(existing file) or write_file (new file only) "
+                        "with exactly one minimal change. Otherwise "
+                        "finish without modifications and explain why. "
                         "Do not switch to another candidate."
                     ),
                 }
@@ -4330,7 +4454,7 @@ def run_engineer(
                 "↻ Decision deadline: "
                 f"{post_gate_inspection_calls} post-gate "
                 "inspection calls used. "
-                "Next action must be edit_file or finish."
+                "Next action must be edit_file, write_file, or finish."
             )
 
     raise RuntimeError(
@@ -4457,6 +4581,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--plan-aware-budget-selfcheck"]:
         _plan_aware_budget_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--gate-allow-write-file-selfcheck"]:
+        _gate_allow_write_file_selfcheck()
         sys.exit(0)
 
     try:
