@@ -45,6 +45,7 @@ export function ActiveSessionScreen() {
     <div>
       <h1>{session.task}</h1>
       <Link to={`/sessions/${id}/diff`}>View diff</Link>{" "}
+      <Link to={`/sessions/${id}/verification`}>Verification Center</Link>{" "}
       <button onClick={() => cancelMutation.mutate()} disabled={cancelMutation.isPending}>
         Cancel
       </button>

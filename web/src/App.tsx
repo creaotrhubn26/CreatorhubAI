@@ -42,6 +42,7 @@ export function App() {
         <Route path="/sessions" element={<SessionHistoryScreen />} />
         <Route path="/sessions/:id" element={<ActiveSessionScreen />} />
         <Route path="/sessions/:id/diff" element={<DiffReviewScreen />} />
+        <Route path="/sessions/:id/verification" element={<VerificationCenterScreen />} />
         <Route path="/verification" element={<VerificationCenterScreen />} />
         <Route path="/repository" element={<RepositoryMapScreen />} />
         <Route path="/model" element={<ModelStatusScreen />} />
