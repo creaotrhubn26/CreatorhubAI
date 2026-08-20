@@ -149,4 +149,77 @@ describe("ActiveSessionScreen", () => {
     fireEvent.click(await screen.findByRole("button", { name: /cancel/i }));
     await waitFor(() => expect(analysisSpy.mock.calls.length).toBeGreaterThan(1));
   });
+
+  it("renders session.failure as a small, unobtrusive note when present", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "failed", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [], verification: { overall: "FAILED", checks: [] },
+      repairsUsed: 0, repairBudget: 2,
+      failure: { class: "verification_exhausted", detail: "repair budget exhausted", evidenceIds: [] },
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText(/verification_exhausted/)).toBeInTheDocument());
+    expect(screen.getByText(/repair budget exhausted/)).toBeInTheDocument();
+  });
+
+  it("renders the architecture plan panel once the plan artifact loads", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [], verification: { overall: "PARTIAL", checks: [] },
+      repairsUsed: 0, repairBudget: 2,
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+    vi.spyOn(client.glimmerApi, "getArchitecturePlan").mockResolvedValue({
+      objective: "Add whisper()", packages: ["glimmer-smoke-test"], risk: "low",
+    } as any);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText("Add whisper()")).toBeInTheDocument());
+  });
+
+  it("renders nothing for the architect artifact panels when their endpoints 404 (absence is normal)", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [], verification: { overall: "PARTIAL", checks: [] },
+      repairsUsed: 0, repairBudget: 2,
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+    vi.spyOn(client.glimmerApi, "getArchitecturePlan").mockRejectedValue(new Error("GET /api/sessions/s1/plan failed: 404"));
+    vi.spyOn(client.glimmerApi, "getArchitectReviews").mockRejectedValue(new Error("GET /api/sessions/s1/architect-reviews failed: 404"));
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockRejectedValue(new Error("GET /api/sessions/s1/tasks failed: 404"));
+    vi.spyOn(client.glimmerApi, "getDeliveryReview").mockRejectedValue(new Error("GET /api/sessions/s1/delivery-review failed: 404"));
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText(/Changed files/)).toBeInTheDocument());
+    expect(screen.queryByText(/Architecture Plan/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Architect Reviews/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Tasks$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Delivery Review/)).not.toBeInTheDocument();
+  });
 });
