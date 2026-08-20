@@ -155,4 +155,59 @@ describe("NewTaskScreen", () => {
       expect(contract.advanced).toEqual({ timeoutSeconds: 300, toolchainMode: "linked", architectFirst: true });
     });
   });
+
+  // §27/§4.1 — the composer's "New worktree" affordance. glimmerApi.createWorkspace
+  // is the real client method (web/src/api/client.ts); these tests stub only the
+  // network boundary, exercising the actual pending/success/error wiring in the
+  // component.
+  describe("New worktree", () => {
+    it("disables Create until a task name is entered", () => {
+      render(withQuery(<NewTaskScreen />));
+      const createButton = screen.getByRole("button", { name: "Create" });
+      expect(createButton).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "role room story logic" } });
+      expect(createButton).not.toBeDisabled();
+    });
+
+    it("on success, adopts the created workspace path as the selected workspace", async () => {
+      let resolveCreate: (v: { workspace: string; branch: string; baselineSha: string }) => void;
+      vi.spyOn(client.glimmerApi, "createWorkspace").mockReturnValue(
+        new Promise((resolve) => { resolveCreate = resolve; })
+      );
+
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "role room story logic" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      // Pending state: fetch can take ~10s+, so the button must reflect that
+      // instead of looking inert/clickable-again.
+      expect(await screen.findByRole("button", { name: /creating worktree/i })).toBeInTheDocument();
+
+      resolveCreate!({
+        workspace: "/Users/danielqazi/glimmer-role-room-story-logic-20260821-010000",
+        branch: "glimmer/role-room-story-logic-20260821-010000",
+        baselineSha: "a".repeat(40),
+      });
+
+      await vi.waitFor(() =>
+        expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe(
+          "/Users/danielqazi/glimmer-role-room-story-logic-20260821-010000"
+        )
+      );
+    });
+
+    it("on failure, shows the server's error text — including a half-created path if one is named", async () => {
+      vi.spyOn(client.glimmerApi, "createWorkspace").mockRejectedValue(
+        new Error("workspace and branch were created but failed post-create verification: worktree is dirty — workspace: /Users/danielqazi/glimmer-x-20260821-010000 — branch: glimmer/x-20260821-010000")
+      );
+
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "x" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(/glimmer-x-20260821-010000/);
+      // Workspace path must NOT be silently adopted on failure.
+      expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe("");
+    });
+  });
 });
