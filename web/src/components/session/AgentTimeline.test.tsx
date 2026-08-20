@@ -21,4 +21,17 @@ describe("AgentTimeline", () => {
     expect(rendered).not.toContain("extraField");
     expect(rendered).toContain("read_file");
   });
+
+  it("renders a tool_blocked event as a formatted BLOCKED callout with the command and reason visible, no click needed", () => {
+    const blocked: GlimmerEvent = {
+      id: "e2", sessionId: "s1", timestamp: "t", type: "tool_blocked",
+      command: "git push origin main",
+      reason: "Remote writes are disabled for autonomous sessions.",
+    };
+    render(<AgentTimeline events={[blocked]} />);
+
+    expect(screen.getByText("BLOCKED")).toBeInTheDocument();
+    expect(screen.getByText("git push origin main")).toBeInTheDocument();
+    expect(screen.getByText("Remote writes are disabled for autonomous sessions.")).toBeInTheDocument();
+  });
 });

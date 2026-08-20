@@ -333,6 +333,12 @@ export interface ModelStatus {
   endpoint: string;
   httpStatus?: number;
   provenance: DataProvenance;
+  // Best-effort extras from llama.cpp's GET /props (public, no api-key check).
+  // Absent whenever /props didn't respond or didn't provide a given field —
+  // never fabricated (spec §25: "Unavailable" until the backend provides it).
+  contextSize?: number;
+  modelPath?: string;
+  speculativeDecoding?: boolean;
 }
 
 export interface WorkspaceInfo {
