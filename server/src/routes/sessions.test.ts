@@ -116,6 +116,51 @@ describe("POST /api/sessions/:id/revert-file", () => {
   });
 });
 
+// §14 Diff Review — human "accept for review" action, distinct from
+// technical verification. Server-side contract: gateway-owned sidecar,
+// idempotent, 404 for an unknown session.
+describe("POST /api/sessions/:id/accept", () => {
+  it("returns 404 for an unknown session", async () => {
+    const res = await request(app).post("/api/sessions/does-not-exist/accept");
+    expect(res.status).toBe(404);
+  });
+
+  it("accepts a real session, writes human-acceptance.json, and readSession reflects it", async () => {
+    const id = "20260821-000001-glimmer-accept-route";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ task: "test", status: "verified", workspace, branch: "main", baseline: null, attempts: [] })
+    );
+
+    const res = await request(app).post(`/api/sessions/${id}/accept`);
+    expect(res.status).toBe(200);
+    expect(res.body.accepted).toBe(true);
+    expect(typeof res.body.acceptedAt).toBe("string");
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "human-acceptance.json"), "utf-8"));
+    expect(onDisk).toEqual(res.body);
+
+    const sessionRes = await request(app).get(`/api/sessions/${id}`);
+    expect(sessionRes.body.humanAcceptance).toEqual(res.body);
+  });
+
+  it("is idempotent — accepting an already-accepted session returns the original record", async () => {
+    const id = "20260821-000002-glimmer-accept-twice-route";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ task: "test", status: "verified", workspace, branch: "main", baseline: null, attempts: [] })
+    );
+
+    const first = await request(app).post(`/api/sessions/${id}/accept`);
+    const second = await request(app).post(`/api/sessions/${id}/accept`);
+    expect(second.body).toEqual(first.body);
+  });
+});
+
 describe("POST /api/sessions", () => {
   it("rejects a taskContract missing verification/repairBudget instead of accepting it", async () => {
     const res = await request(app)

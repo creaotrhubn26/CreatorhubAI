@@ -195,6 +195,47 @@ describe("ActiveSessionScreen", () => {
     await waitFor(() => expect(screen.getByText("Add whisper()")).toBeInTheDocument());
   });
 
+  it("shows compact human-review acceptance state, distinct from technical verification", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "verified", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [{ path: "a.ts", status: "modified" }],
+      verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2,
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText(/human review: not yet accepted/i)).toBeInTheDocument());
+  });
+
+  it("shows the accepted timestamp once a session carries humanAcceptance", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "verified", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [{ path: "a.ts", status: "modified" }],
+      verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2,
+      humanAcceptance: { accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" },
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText(/human review: accepted/i)).toBeInTheDocument());
+  });
+
   it("renders nothing for the architect artifact panels when their endpoints 404 (absence is normal)", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
       id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",

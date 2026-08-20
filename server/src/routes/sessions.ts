@@ -7,6 +7,7 @@ import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
   readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
+  writeHumanAcceptance,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs } from "../lib/runner.js";
@@ -257,6 +258,22 @@ sessionsRouter.get("/sessions/:id/diff", async (req, res) => {
     if (!session) return res.status(404).json({ error: "not found" });
     const diff = await gitDiff(session.workspace, session.changedFiles.map((f) => f.path));
     res.json({ diff });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// §14 Diff Review — human "accept for review" action. Distinct from
+// technical verification: the model/orchestrator never writes this file (see
+// writeHumanAcceptance in lib/sessions.ts), only this route does, on a real
+// human's click. Idempotent — accepting an already-accepted session just
+// returns the original acceptance record.
+sessionsRouter.post("/sessions/:id/accept", async (req, res) => {
+  try {
+    const session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    const record = await writeHumanAcceptance(req.params.id);
+    res.json(record);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -14,6 +14,14 @@ export function ModelStatusScreen() {
       <dl>
         <dt>Endpoint</dt>
         <dd className="mono">{data.endpoint}</dd>
+        <dt>Context</dt>
+        <dd>{data.contextSize ?? "Unavailable"}</dd>
+        <dt>Model path</dt>
+        <dd className="mono">{data.modelPath ?? "Unavailable"}</dd>
+        <dt>Speculative decoding</dt>
+        <dd>{data.speculativeDecoding === undefined ? "Unavailable" : data.speculativeDecoding ? "Enabled" : "Disabled"}</dd>
+        <dt>Draft model</dt>
+        <dd>Unavailable</dd>
         <dt>Prompt tokens</dt>
         <dd>Unavailable</dd>
         <dt>Tokens/sec</dt>

@@ -4,7 +4,7 @@ import { sessionsDir } from "../config.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
-  ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask,
+  ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
 } from "@glimmer/shared";
 
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
@@ -218,6 +218,29 @@ export async function readGatewayContract(id: string): Promise<TaskContract | nu
   }
 }
 
+// --- human acceptance (§14 Diff Review) ------------------------------------
+// human-acceptance.json is gateway-owned, same as gateway-contract.json:
+// written ONLY here, from the /sessions/:id/accept route — glimmer-v2.py /
+// glimmer-engineer.py never read or write this file. That's what keeps
+// "VERIFIED" (technical, orchestrator-derived) and "accepted" (human
+// judgment) two genuinely separate facts instead of one the model could
+// flip on itself.
+export function readHumanAcceptance(id: string): Promise<HumanAcceptance | null> {
+  return readSessionJsonFile<HumanAcceptance>(id, "human-acceptance.json");
+}
+
+// Idempotent: re-accepting an already-accepted session is a no-op that
+// returns the original record untouched, rather than bumping acceptedAt —
+// "accepted twice" should still mean one acceptance event, not two.
+export async function writeHumanAcceptance(id: string): Promise<HumanAcceptance> {
+  const real = resolveSessionId(id);
+  const existing = await readHumanAcceptance(real);
+  if (existing?.accepted) return existing;
+  const record: HumanAcceptance = { accepted: true, acceptedAt: new Date().toISOString() };
+  await fs.writeFile(path.join(sessionsDir(), real, "human-acceptance.json"), JSON.stringify(record), "utf-8");
+  return record;
+}
+
 async function copyGatewayContract(fromId: string, toId: string): Promise<void> {
   try {
     const raw = await fs.readFile(path.join(sessionsDir(), fromId, "gateway-contract.json"), "utf-8");
@@ -232,9 +255,12 @@ export async function readSession(id: string): Promise<GlimmerSession | null> {
   const real = resolveSessionId(id);
   const raw = await readManifestRaw(real);
   if (!raw) return null;
-  const session = parseManifest(raw, real);
+  let session = parseManifest(raw, real);
   const taskContract = await readGatewayContract(real);
-  return taskContract ? { ...session, taskContract } : session;
+  if (taskContract) session = { ...session, taskContract };
+  const humanAcceptance = await readHumanAcceptance(real);
+  if (humanAcceptance) session = { ...session, humanAcceptance };
+  return session;
 }
 
 // --- pending-id -> real-session-id aliasing -------------------------------

@@ -66,6 +66,29 @@ export function AgentTimeline({ events }: { events: GlimmerEvent[] }) {
       <ul>
         {visible.map((e) => {
           const isOpen = expanded.has(e.id);
+          // Spec §21 Safety UX: a tool_blocked event is a security callout,
+          // not just another collapsible log line — command + reason must be
+          // visible without a click, in a visually distinct (red) tone.
+          if (e.type === "tool_blocked") {
+            return (
+              <li
+                key={e.id}
+                role="alert"
+                style={{
+                  border: "1px solid var(--red)",
+                  borderRadius: "var(--radius)",
+                  padding: 8,
+                  margin: "4px 0",
+                  color: "var(--red)",
+                }}
+              >
+                <strong>BLOCKED</strong>
+                <div className="mono">{e.command}</div>
+                <div>Reason:</div>
+                <div>{e.reason}</div>
+              </li>
+            );
+          }
           return (
             <li key={e.id}>
               <button onClick={() => setExpanded((prev) => {

@@ -377,3 +377,49 @@ describe("opt-in orchestrator artifact reads", () => {
     expect(await sessionsIsolated.readArchitectReviews(id)).toBeNull();
   });
 });
+
+describe("human acceptance (§14 Diff Review)", () => {
+  it("readHumanAcceptance returns null when no one has accepted yet (normal)", async () => {
+    const id = "20260817-000050-glimmer-not-accepted";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readHumanAcceptance(id)).toBeNull();
+  });
+
+  it("writeHumanAcceptance writes human-acceptance.json and readHumanAcceptance reflects it", async () => {
+    const id = "20260817-000051-glimmer-accept";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+
+    const record = await sessionsIsolated.writeHumanAcceptance(id);
+    expect(record.accepted).toBe(true);
+    expect(typeof record.acceptedAt).toBe("string");
+
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(contractStateRoot, "sessions", id, "human-acceptance.json"), "utf-8")
+    );
+    expect(onDisk).toEqual(record);
+    expect(await sessionsIsolated.readHumanAcceptance(id)).toEqual(record);
+  });
+
+  it("writeHumanAcceptance is idempotent — accepting an already-accepted session returns the original record unchanged", async () => {
+    const id = "20260817-000052-glimmer-accept-twice";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+
+    const first = await sessionsIsolated.writeHumanAcceptance(id);
+    const second = await sessionsIsolated.writeHumanAcceptance(id);
+    expect(second).toEqual(first);
+  });
+
+  it("readSession attaches humanAcceptance once accepted", async () => {
+    const id = "20260817-000053-glimmer-accept-in-session";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+
+    const before = await sessionsIsolated.readSession(id);
+    expect(before?.humanAcceptance).toBeUndefined();
+
+    await sessionsIsolated.writeHumanAcceptance(id);
+    const after = await sessionsIsolated.readSession(id);
+    expect(after?.humanAcceptance?.accepted).toBe(true);
+  });
+});

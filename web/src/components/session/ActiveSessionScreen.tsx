@@ -4,6 +4,7 @@ import { glimmerApi } from "../../api/client";
 import { useSessionEvents } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
 import { AgentStateStepper } from "./AgentStateStepper";
+import { RepairCycleStepper } from "./RepairCycleStepper";
 import { AgentTimeline } from "./AgentTimeline";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 import { SessionAssistant } from "./SessionAssistant";
@@ -57,9 +58,14 @@ export function ActiveSessionScreen() {
       <dl>
         <dt>Changed files</dt>
         <dd>{session.changedFiles.length}</dd>
-        <dt>Repair budget</dt>
-        <dd>{session.repairsUsed} / {session.repairBudget}</dd>
       </dl>
+      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        Human review:{" "}
+        {session.humanAcceptance?.accepted
+          ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
+          : "Not yet accepted"}
+      </p>
+      <RepairCycleStepper session={session} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}

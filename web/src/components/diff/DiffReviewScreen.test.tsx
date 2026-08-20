@@ -59,4 +59,44 @@ describe("DiffReviewScreen", () => {
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session-analysis", "s1"] })
     );
   });
+
+  // §14 Diff Review: human acceptance must be distinct from technical
+  // verification — both facts render, and only a real click sets acceptance.
+  it("shows technical verification and human review as two separate facts, with acceptance not yet accepted", async () => {
+    renderScreen();
+    await waitFor(() => screen.getByText(/technical: verified/i));
+    expect(screen.getByText(/human review: not yet accepted/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /accept for review/i })).toBeInTheDocument();
+  });
+
+  it("clicking Accept for review calls acceptSession with the session id", async () => {
+    const acceptSpy = vi.spyOn(client.glimmerApi, "acceptSession").mockResolvedValue({
+      accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z",
+    });
+    renderScreen();
+    await waitFor(() => screen.getByRole("button", { name: /accept for review/i }));
+    fireEvent.click(screen.getByRole("button", { name: /accept for review/i }));
+    await waitFor(() => expect(acceptSpy).toHaveBeenCalledWith("s1"));
+  });
+
+  it("shows the accepted timestamp and hides the button once the session is human-accepted", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "x", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc",
+      changedFiles: [{ path: "a.ts", status: "modified" }],
+      verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2,
+      humanAcceptance: { accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" },
+    } as any);
+    renderScreen();
+    await waitFor(() => screen.getByText(/human review: accepted/i));
+    expect(screen.queryByRole("button", { name: /accept for review/i })).not.toBeInTheDocument();
+  });
+
+  it("shows an error message when accept fails, without faking success", async () => {
+    vi.spyOn(client.glimmerApi, "acceptSession").mockRejectedValue(new Error("boom"));
+    renderScreen();
+    await waitFor(() => screen.getByRole("button", { name: /accept for review/i }));
+    fireEvent.click(screen.getByRole("button", { name: /accept for review/i }));
+    await waitFor(() => expect(screen.getByText(/could not accept/i)).toBeInTheDocument());
+    expect(screen.getByText(/human review: not yet accepted/i)).toBeInTheDocument();
+  });
 });
