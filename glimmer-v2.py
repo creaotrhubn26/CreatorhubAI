@@ -1319,8 +1319,15 @@ def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None,
         constraint_lines.append(f"Do not {', '.join(banned)}, change Git configuration.")
     constraint_text = "\n".join(f"    - {line}" for line in constraint_lines)
 
+    # Fix round 1 (Minor 5): gate on `failure is not None`, not `iteration`
+    # truthiness — a C2 architect-revise round always has failure text but
+    # can legitimately happen at outer iteration 0 (before any verify()-
+    # driven repair), and the two calls used to coincide only because the
+    # pre-C2 repair loop never called this with iteration==0 and a real
+    # failure at the same time. This keeps every pre-existing call site
+    # byte-identical (there, iteration>0 <=> failure is not None already).
     repair = ""
-    if iteration:
+    if failure is not None:
         repair = f"""
 AUTHORITATIVE V2 VERIFICATION FAILURE:
 {failure}
@@ -1563,27 +1570,14 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 # ============================================================
 # C2 (glimmer-v7): Architect consultation + review budget — V7 §§5.6-5.13
 # ============================================================
-#
-# Only ever active when --architect-first produced a usable plan
-# (architecture_plan is not None in main() — that itself only happens
-# when --architect-first was passed, see run_architect_first above): the
-# review compares implementation against the plan, so with no plan there
-# is nothing to review against and this entire feature is a no-op.
-#
-# Loop structure (documented once here, referenced from main()): the
-# review sits BEFORE verify() inside each outer repair-loop iteration
-# (V7 §5.9's "ENGINEER -> ARCHITECT REVIEW -> VERIFIER" ordering). A
-# REVISE_IMPLEMENTATION decision triggers exactly ONE bounded revise
-# round — a direct invoke_engineer() call, never routed through the
-# outer `for iteration in range(args.max_repairs+1)` loop — so it can
-# never advance `iteration`, create a checkpoint, or consume
-# --max-repairs. The two budgets (ARCHITECT_REVIEW_BUDGET for review
-# rounds, --max-repairs for verify()-driven repair rounds) are
-# independent counters that never touch each other's state.
+# Active only when --architect-first produced a usable plan; the review
+# sits BEFORE verify() each iteration; REVISE_IMPLEMENTATION runs one
+# bounded revise pass outside the outer repair loop (never touches
+# --max-repairs). Full loop structure documented at the call site in main().
 
-# V7 §5.13: "Architect reviews need a budget... do not let agents debate
-# indefinitely." Shared across the WHOLE session (every outer iteration),
-# not per-iteration — see manifest["architectReviews"].
+# V7 §5.13: budgets Architect<->Engineer disagreement (REVISE_IMPLEMENTATION
+# rounds), not plain reviews — see the main() call site and Important 1/2
+# of the round-1 review. Shared across the whole session.
 ARCHITECT_REVIEW_BUDGET = 3
 
 # Same order of magnitude as PLAN_EVIDENCE_MAX_TOTAL_CHARS above — bounds
@@ -1719,14 +1713,18 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
     print("=" * 72)
 
-    diff_text = git_diff_text(ws, baseline)
-    if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
-        diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
-
-    request = make_review_request(plan, files, change_types, diff_text, iteration, review_round)
     request_path = session / f"review-request-{iteration:02d}-{review_round:02d}.json"
 
     try:
+        # Fix round 1 (Minor 4): git_diff_text used to run OUTSIDE this
+        # try, contradicting this function's own never-raises contract —
+        # a git failure (e.g. baseline no longer resolvable) would have
+        # propagated straight to main() instead of degrading to None.
+        diff_text = git_diff_text(ws, baseline)
+        if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
+            diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
+
+        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round)
         request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
 
         rc = invoke_engineer(
@@ -1745,40 +1743,12 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
 
 
 # ============================================================
-# C3 (glimmer-v7): Task Graph (tasks.json) — "Task Planning & Live Task
-# List" chapter; reconciliation doc C3 entry.
+# C3 (glimmer-v7): Task Graph (tasks.json) — reconciliation doc C3 entry.
 # ============================================================
-#
-# Only ever active when --architect-first produced a usable plan
-# (architecture_plan is not None in main(), same gate as C2's gates/
-# architectReviews just above) — with no plan there is nothing to
-# derive tasks from, so tasks stays None and no tasks.json is ever
-# written (zero behavior change, same opt-in discipline as C1/C2).
-#
-# Flat list, sequential dependsOn only — deliberately NOT the chapter's
-# DAG/priority/source/evidenceIds/blockingReason model. The
-# reconciliation doc's own critique (§15) names this the item most
-# likely to be over-built and says to keep it flat-with-dependsOn
-# "until a real session needs a diamond." This ships exactly that: one
-# task per implementationPlan step (sequential chain) and one task per
-# verificationPlan entry (each depending on the last implementation
-# task), nothing else.
-#
-# Honest scale-downs (documented here, not just in the report):
-#   - Per-step implementation granularity is not evidencable: ONE
-#     engineer subprocess run executes the WHOLE implementationPlan in
-#     one shot, so all implementation tasks transition together, by
-#     the same evidence (changed-files set + engineer return code),
-#     not one at a time.
-#   - No per-task prompt injection: the C1 handoff already injects the
-#     full implementationPlan into the engineer prompt, and there is no
-#     per-task execution loop to point a single active task at. tasks
-#     .json is a session ARTIFACT for humans/the control center to
-#     observe later, not a prompt input, in this pass.
-#   - No dynamic task creation, no discovery/architecture_review/
-#     visual_verification/repair/approval/follow_up kinds, no
-#     priority/required-vs-optional semantics, no session-completion
-#     gate wired to task status. Those all stay out per the C3 scope.
+# Active only when --architect-first produced a usable plan. Flat list,
+# sequential dependsOn only (deliberately not a DAG/priority model — see
+# evaluate_implementation_tasks for why implementation tasks transition
+# as one group, not per-step).
 
 
 def derive_tasks(plan: dict) -> list:
@@ -1856,6 +1826,21 @@ def set_implementation_tasks_status(tasks, status: str) -> None:
             t["status"] = status
 
 
+def reset_verification_tasks_status(tasks) -> None:
+    """Fix round 1 (Minor 6): flip every kind=='verification' task back to
+    `pending`, in place. Called at the C2 revise-round re-spawn (alongside
+    set_implementation_tasks_status(tasks, "in_progress")) — a verification
+    task marked "complete" against the PRE-revise diff must not survive
+    unchanged once the revise round produces a different diff; it is
+    re-evaluated honestly by evaluate_verification_tasks after the next
+    real verify() call. No-op when `tasks` is None."""
+    if tasks is None:
+        return
+    for t in tasks:
+        if t.get("kind") == "verification":
+            t["status"] = "pending"
+
+
 def evaluate_implementation_tasks(tasks, files: list, engineer_rc) -> None:
     """C3: the ONLY evidence source for implementation task status —
     never a model claim. Per-step granularity is not honestly
@@ -1875,33 +1860,58 @@ def evaluate_implementation_tasks(tasks, files: list, engineer_rc) -> None:
 # still match single-word plan entries like "lint".
 _TASK_VERIFY_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
+# Fix round 1 (Important 3): runner/stopword tokens that appear in nearly
+# every npm command AND nearly every prose verificationPlan sentence —
+# left in, a first-match-on-any-shared-token scheme treats "run"/"npm"
+# (present in every `npm run X` command) as if they were meaningful
+# signal, so prose like "Run the typecheck..." could match ANY npm
+# command, not the one it names.
+_TASK_VERIFY_STOPWORDS = {"run", "npm", "yarn", "pnpm", "exec", "npx", "the", "and", "all", "for", "to", "no"}
+
 
 def _match_verify_result(description: str, results: list):
-    """C3: substring match, case-insensitive, documented here per the
-    task brief — a verificationPlan entry naming e.g. "typecheck" (or
-    "frontend_typecheck") maps to a real verify() command containing
-    "typecheck" (e.g. "npm --prefix frontend run typecheck"). Both
-    sides are tokenized on non-alphanumeric characters (tokens >= 3
-    chars, to skip stopword-length noise) and compared as whole-word
-    tokens (set intersection), NOT raw substring-of-string containment
-    — a naive `tok in cmd_string` check lets a short token like "check"
-    (from e.g. "nonexistent_check") spuriously match inside the
-    unrelated word "typecheck"; matching whole command tokens avoids
-    that false positive while still satisfying "contains typecheck"
-    for the real case, since "typecheck" is itself a whole token in
-    both the plan entry and the npm command. Returns the first matching
-    result dict, or None when nothing in `results` matches — callers
-    must leave the task `pending` in that case, never fabricate
-    completion."""
+    """C3: token-set argmax match, case-insensitive — a verificationPlan
+    entry (which may be a single word like "typecheck" OR a full prose
+    sentence like "Run the typecheck to confirm no type errors") maps to
+    the real verify() command whose command string shares the MOST
+    tokens with it, after stripping runner names and stopwords
+    (_TASK_VERIFY_STOPWORDS) from both sides — not the first result that
+    shares ANY token. Fix round 1 (Important 3): the prior first-match
+    scheme let a shared stopword-ish token (e.g. "run", present in every
+    `npm run X` command) match the wrong command; reproduced live with
+    "Run the typecheck to confirm no type errors" matching `npm run
+    lint` before `npm run typecheck` even existed in the token
+    intersection. Tokens are compared whole-word (set intersection), not
+    raw substring-of-string containment — a naive `tok in cmd_string`
+    check would let a short token like "check" spuriously match inside
+    the unrelated word "typecheck".
+
+    Returns the single result whose (post-stopword) token overlap with
+    `description` is strictly larger than every other result's; returns
+    None — leaving the task `pending`, never fabricating completion —
+    when no token survives stopword-stripping, no result shares any
+    token, or two or more results tie for the best (nonzero) overlap
+    (ambiguous is honest, not a guess)."""
     tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(description.lower()) if len(t) >= 3}
+    tokens -= _TASK_VERIFY_STOPWORDS
     if not tokens:
         return None
+
+    scored = []
     for r in results:
         cmd = (r.get("command") or "").lower()
-        cmd_tokens = set(_TASK_VERIFY_TOKEN_RE.findall(cmd))
-        if tokens & cmd_tokens:
-            return r
-    return None
+        cmd_tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(cmd) if len(t) >= 3} - _TASK_VERIFY_STOPWORDS
+        score = len(tokens & cmd_tokens)
+        if score > 0:
+            scored.append((score, r))
+
+    if not scored:
+        return None
+    best_score = max(score for score, _ in scored)
+    winners = [r for score, r in scored if score == best_score]
+    if len(winners) != 1:
+        return None  # tie -- ambiguous, stays pending
+    return winners[0]
 
 
 def evaluate_verification_tasks(tasks, results: list) -> None:
@@ -2239,23 +2249,28 @@ def main():
                 print(f"  - {f}")
 
             # C2 (glimmer-v7): pre-verification architect review (V7 §5.9)
-            # -- ONLY when --architect-first produced a usable plan
-            # (architecture_plan is not None; see the C2 module-docstring
-            # block above run_architect_review for the full loop-structure
-            # rationale). Sits strictly BEFORE verify(). A REVISE_
-            # IMPLEMENTATION round re-invokes the engineer directly, never
-            # through the outer `for iteration` loop, so it can never
-            # advance `iteration` or consume --max-repairs.
+            # -- ONLY when --architect-first produced a usable plan. Sits
+            # strictly BEFORE verify(). A REVISE_IMPLEMENTATION round
+            # re-invokes the engineer directly, never through the outer
+            # `for iteration` loop, so it never advances `iteration` or
+            # consumes --max-repairs.
+            #
+            # Fix round 1 (Important 1+2): the budget (§5.13) bounds
+            # Architect<->Engineer DISAGREEMENT, not review count. A plain
+            # review call -- whether it comes back APPROVED/
+            # APPROVED_WITH_CONDITIONS or fails open (no usable output) --
+            # never increments `used`; it is free every time. `used` only
+            # increments when a REVISE_IMPLEMENTATION decision is about to
+            # trigger another revise+re-review round, and the budget check
+            # runs BEFORE that increment, so the Nth allowed revise still
+            # gets its follow-up review. This also fixes fail-open (never
+            # counted) degrading into fail-closed (never blocks) under
+            # sustained review-machinery failure.
             if architecture_plan is not None:
                 review_round = 0
                 architect_outcome = None
                 while True:
-                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
-                        architect_outcome = "budget_exhausted"
-                        break
                     review_round += 1
-                    manifest["architectReviews"]["used"] += 1
-                    save()
                     emit_event(events_path, "agent_state_changed", sid, state="architect_review")
                     review = run_architect_review(
                         engineer, ws, architecture_plan, files, change_types, baseline,
@@ -2275,20 +2290,30 @@ def main():
                         architect_outcome = decision_outcome
                         break
 
-                    # decision_outcome == "revise": ONE bounded revise round
-                    # (repair-style prompt via make_prompt's existing repair
-                    # branch, architect's requiredChanges/findings standing
-                    # in for a verification failure), then loop back for
-                    # another review — budget permitting.
+                    # decision_outcome == "revise": this IS the disagreement
+                    # V7 §5.13 budgets. Check budget before spending it -- a
+                    # revise round that would exceed it never runs.
                     if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
                         architect_outcome = "budget_exhausted"
                         break
+                    manifest["architectReviews"]["used"] += 1
+                    save()
                     print(f"[V2] Architect review requested REVISE_IMPLEMENTATION "
                           f"(iteration={iteration}, round={review_round}); running one bounded revise pass.")
+                    # Fix round 1 (Minor 5): the real outer `iteration` and
+                    # the real `checkpoint_sha` (whatever the repair loop
+                    # last set, possibly still None on iteration 0) --
+                    # previously `review_round` was passed as `iteration`
+                    # (wrong REPAIR N label once the outer loop had already
+                    # advanced) and checkpoint_sha was hardcoded None
+                    # (dropping real checkpoint context on later
+                    # iterations). make_prompt's repair block now gates on
+                    # `failure is not None`, not `iteration` truthiness, so
+                    # this stays correct even when iteration == 0.
                     revise_prompt = make_prompt(
-                        contract, summary, review_round,
+                        contract, summary, iteration,
                         failure=architect_review_failure_text(review),
-                        checkpoint_sha=None, plan=architecture_plan, evidence=candidate_evidence,
+                        checkpoint_sha=checkpoint_sha, plan=architecture_plan, evidence=candidate_evidence,
                     )
                     (session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt").write_text(
                         revise_prompt, encoding="utf-8")
@@ -2297,8 +2322,13 @@ def main():
                     # implementation tasks go back to in_progress for this
                     # re-spawn and are re-evaluated after it returns,
                     # exactly like the main spawn/return pair above.
+                    # Fix round 1 (Minor 6): verification tasks reset to
+                    # pending too -- a stale "complete" from a PRE-revise
+                    # verify() result must not survive against a changed
+                    # diff; it is re-evaluated after the NEXT real verify().
                     if tasks is not None:
                         set_implementation_tasks_status(tasks, "in_progress")
+                        reset_verification_tasks_status(tasks)
                         save_tasks(session, tasks)
                     revise_rc = invoke_engineer(
                         engineer, ws, revise_prompt, args.auto_approve, args.max_turns,
@@ -3033,6 +3063,31 @@ def _architect_review_selfcheck() -> None:
     assert "iteration += 1" not in main_source
     assert "iteration = iteration" not in main_source
 
+    # ------------------------------------------------------------
+    # 10. Fix round 1 (Important 1+2): budget increments ONLY on a
+    #     REVISE_IMPLEMENTATION disagreement round -- a plain APPROVED/
+    #     APPROVED_WITH_CONDITIONS review, and a fail-open (no usable
+    #     review output) round, must both be free. Otherwise repeated
+    #     approvals across repair iterations pre-block later iterations
+    #     (Important 1), and persistent review-machinery failure burns
+    #     budget until fail-open degrades into fail-closed (Important 2).
+    #     Structural proof via source ordering: the ONE increment site
+    #     is only reachable after the review call AND after both the
+    #     fail-open break and the approved/rejected break have already
+    #     had their chance to fire -- i.e. only on the remaining case,
+    #     "revise".
+    # ------------------------------------------------------------
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1, (
+        "budget must increment in exactly one place"
+    )
+    increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
+    review_call_idx = main_source.index("review = run_architect_review(")
+    fail_open_idx = main_source.index('architect_outcome = "fail_open"')
+    approved_rejected_idx = main_source.index("architect_outcome = decision_outcome")
+    assert review_call_idx < increment_idx, "increment must happen after the review actually runs"
+    assert fail_open_idx < increment_idx, "increment must be unreachable from the fail-open branch"
+    assert approved_rejected_idx < increment_idx, "increment must be unreachable from the approved/rejected branch"
+
     print("architect review self-check: PASS")
 
 
@@ -3123,6 +3178,53 @@ def _tasks_selfcheck() -> None:
     evaluate_verification_tasks(
         tasks_timeout, [{"command": "npm run typecheck", "status": "TIMEOUT"}])
     assert tasks_timeout[0]["status"] == "pending"
+
+    # ------------------------------------------------------------
+    # 4b. Fix round 1 (Important 3): reviewer's exact reproduction --
+    #     "run"/"npm" are tokens of EVERY npm command, so the old
+    #     first-match-on-any-shared-token scheme matched a prose plan
+    #     entry to the wrong command whenever the wrong one came first
+    #     in `results`. The fix (stopword-stripped token-set argmax)
+    #     must pick "npm run typecheck", never "npm run lint", and must
+    #     do so regardless of result order.
+    # ------------------------------------------------------------
+    prose_description = "Run the typecheck to confirm no type errors"
+    lint_first = [
+        {"command": "npm run lint", "status": "CODE_FAIL"},
+        {"command": "npm run typecheck", "status": "PASS"},
+    ]
+    match = _match_verify_result(prose_description, lint_first)
+    assert match is not None and match["command"] == "npm run typecheck", (
+        f"prose entry must match the typecheck command, got: {match!r}"
+    )
+    # Order must not matter -- same result either way.
+    typecheck_first = list(reversed(lint_first))
+    match2 = _match_verify_result(prose_description, typecheck_first)
+    assert match2 is not None and match2["command"] == "npm run typecheck"
+
+    # Reproduce the OLD (first-match-on-any-token) bug directly, so this
+    # regression test fails if anyone reverts to that scheme: the naive
+    # any-shared-token check (no stopword stripping, first hit wins)
+    # picks "npm run lint" first purely because "run" is shared.
+    def _old_first_match(description, results):
+        old_tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(description.lower()) if len(t) >= 3}
+        for r in results:
+            cmd_tokens = set(_TASK_VERIFY_TOKEN_RE.findall((r.get("command") or "").lower()))
+            if old_tokens & cmd_tokens:
+                return r
+        return None
+    assert _old_first_match(prose_description, lint_first)["command"] == "npm run lint", (
+        "sanity check: the OLD matcher must reproduce the reviewer's bug on this input"
+    )
+
+    # Tie (two results with equal, nonzero overlap) -> unmatched, honest.
+    tie_results = [
+        {"command": "npm run build", "status": "PASS"},
+        {"command": "npm run app", "status": "CODE_FAIL"},
+    ]
+    assert _match_verify_result("build the app", tie_results) is None, (
+        "a genuine tie in token overlap must stay unmatched, never guess"
+    )
 
     # evaluate_*/set_* are no-ops on tasks=None (mirrors main()'s no-plan gate).
     set_implementation_tasks_status(None, "in_progress")
