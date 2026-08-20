@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""glimmer-visual.py -- C4 (glimmer-v7) capture script for Vision Verification.
+"""glimmer-visual.py -- C4 (glimmer-v7) capture + vision-review script.
 
-Plumbing-only pass (V7 §22; reconciliation doc §9 C4): this script launches a
-browser via Playwright, navigates to --url, captures one screenshot per
---viewport, and writes sessions/<id>/visual/visual-manifest.json +
-findings.json in the real V7 §22.4 / §22.14 shapes. It does NOT call a
-multimodal model in this pass -- see run_vision_model() below for the
-documented extension point a future pass wires up.
+This script launches a browser via Playwright, navigates to --url, captures
+one screenshot per --viewport, and writes sessions/<id>/visual/
+visual-manifest.json + findings.json in the real V7 §22.4 / §22.14 shapes.
+Capture always runs. With --vision (opt-in), each captured screenshot is
+also sent to the multimodal llama-server (--model-url) for a real V7 §22.2/
+22.3 review -- see run_vision_model() below. Without --vision, behavior is
+capture-only: findings.json status stays honestly NOT_RUN.
 
 Read-only w.r.t. the target application/workspace (V7 §22.19 -- Vision
 Verifier must be read-only: observe, classify, report; never edit). This
@@ -219,6 +220,12 @@ def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
     can mark that one viewport BLOCKED instead of silently treating a
     broken call as "reviewed, nothing found"."""
     post_fn = post_fn or _http_post_json
+    # ponytail: no size guard on the base64-encoded PNG here -- a
+    # pathologically large screenshot just makes a slow/failing HTTP POST,
+    # which already degrades honestly to that viewport's report being
+    # "blocked" (see the except below), same as any other call failure.
+    # Add an explicit size cap before base64-encoding if a real capture
+    # ever produces multi-tens-of-MB screenshots in practice.
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
     payload = _build_vision_payload(image_b64, route, viewport_slug, checks)
     endpoint = model_url.rstrip("/") + "/v1/chat/completions"
@@ -439,7 +446,7 @@ def build_findings(captures, findings=None, reports=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Glimmer C4 visual capture (plumbing-only: capture + manifest, no live model call yet)"
+        description="Glimmer C4 visual capture + review (capture always runs; --vision opts in a real multimodal model review)"
     )
     ap.add_argument("--url", required=True, help="URL Playwright navigates to")
     ap.add_argument("--viewport", action="append", default=None,

@@ -17,6 +17,7 @@ import tempfile
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from glimmer_events import emit as emit_event
@@ -597,18 +598,46 @@ def verifier_commands(m, files, level):
     return result
 
 
-def build_visual_verify_command(session, url):
+def _model_base_url(readiness_url):
+    """Derive the bare http://host:port glimmer-visual.py's --model-url
+    wants from v2's EXISTING model-readiness URL (same llama-server, just
+    a different path -- READINESS_URL_DEFAULT/--model-readiness-url hits
+    .../tools; glimmer-visual.py appends /v1/chat/completions itself).
+    Not a new source of truth -- reuses the one v2 already has."""
+    parts = urllib.parse.urlsplit(readiness_url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_DEFAULT):
     """C4 (glimmer-v7): real subprocess argv for the visual capture check,
     targeting sessions/<id>/visual/ (V7 §22.14 evidence store layout).
     Creates the output directory up front so glimmer-visual.py -- which is
     handed only --output-dir, never a workspace path -- has somewhere to
     write and never needs to reach outside it (V7 §22.19: Vision Verifier
-    must be read-only)."""
+    must be read-only).
+
+    Fix round 2 (live vision wiring): "visual" in the verification plan
+    now means the real thing -- full visual verification, not
+    capture-only. Without --vision here, findings.json would stay
+    NOT_RUN forever; every caller through this orchestrator would never
+    get a real review, only the direct (non-orchestrated) invocations
+    used for live checkpointing did. --model-url reuses
+    model_readiness_url (v2's existing, single source of the
+    llama-server's address) via _model_base_url -- not hardcoded again.
+    --api-key-file is deliberately NOT passed: glimmer-visual.py's own
+    default already resolves to the identical
+    Path.home()/"AI/muse-glimmer/config/api-key.txt" convention
+    glimmer-engineer.py uses, so there is nothing a v2-supplied value
+    here could improve on. No opt-out flag -- "visual" in the plan is
+    already the opt-in; capture-only mode stays available by running
+    glimmer-visual.py directly without --vision.
+    """
     out_dir = session / "visual"
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(GLIMMER_VISUAL), "--url", url, "--output-dir", str(out_dir)]
     for vp in VISUAL_DEFAULT_VIEWPORTS:
         cmd += ["--viewport", vp]
+    cmd += ["--vision", "--model-url", _model_base_url(model_readiness_url)]
     return cmd
 
 
@@ -631,7 +660,8 @@ def validate_visual_url(raw_verify_entries, visual_url):
         )
 
 
-def expand_verify_entries(commands, raw_entries, session, visual_url):
+def expand_verify_entries(commands, raw_entries, session, visual_url,
+                           model_readiness_url=READINESS_URL_DEFAULT):
     """Expand contract.verification / --verify entries into real subprocess
     argv lists, appended onto `commands`. Mirrors the pre-C4
     shlex.split-and-append behavior exactly for every entry EXCEPT the
@@ -645,7 +675,7 @@ def expand_verify_entries(commands, raw_entries, session, visual_url):
     """
     for raw in raw_entries:
         if raw.strip().lower() == VISUAL_VERIFY_TOKEN:
-            cmd = build_visual_verify_command(session, visual_url)
+            cmd = build_visual_verify_command(session, visual_url, model_readiness_url)
         else:
             cmd = shlex.split(raw)
         if cmd and cmd not in commands:
@@ -2229,7 +2259,7 @@ def main():
 
             if not files:
                 commands = [["git", "diff", "--check"]]
-                commands = expand_verify_entries(commands, args.verify, session, args.visual_url)
+                commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
                                          repo, source_root, baseline, args.toolchain_mode,
@@ -2382,7 +2412,7 @@ def main():
                     break
 
             commands = verifier_commands(repo, files, args.verification_level)
-            commands = expand_verify_entries(commands, args.verify, session, args.visual_url)
+            commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
             attempt["verificationCommands"] = [shlex.join(c) for c in commands]
 
             before = diff_hash(ws, baseline)
@@ -3311,7 +3341,10 @@ def _visual_selfcheck() -> None:
     # creates sessions/<id>/visual/. ---
     with tempfile.TemporaryDirectory() as td:
         session = Path(td)
-        commands = expand_verify_entries([["git", "diff", "--check"]], ["VISUAL"], session, "http://x/route")
+        commands = expand_verify_entries(
+            [["git", "diff", "--check"]], ["VISUAL"], session, "http://x/route",
+            "http://127.0.0.1:9999/tools",
+        )
         assert len(commands) == 2
         visual_cmd = commands[1]
         assert is_visual_check_command(visual_cmd)
@@ -3324,6 +3357,20 @@ def _visual_selfcheck() -> None:
             assert vp in visual_cmd
         assert str(session / "visual") in visual_cmd
         assert (session / "visual").is_dir(), "output dir must be created up front"
+
+        # Fix round 2: "visual" now means the real thing -- --vision must
+        # be present (a plan that says "visual" but never gets --vision
+        # can never leave findings.json at NOT_RUN forever, which was the
+        # Major finding), and --model-url must reuse v2's OWN
+        # model-readiness URL (not a hardcoded, possibly-wrong default).
+        assert "--vision" in visual_cmd
+        assert "--model-url" in visual_cmd
+        assert "http://127.0.0.1:9999" in visual_cmd, "must derive from model_readiness_url, not hardcode"
+
+        # Default model_readiness_url (no override) resolves through
+        # READINESS_URL_DEFAULT, same as every other model-readiness use.
+        default_cmd = build_visual_verify_command(session, "http://x/route")
+        assert _model_base_url(READINESS_URL_DEFAULT) in default_cmd
 
     # --- severity classification: synthetic/injected findings.json. ---
     def _write_capture(session, manifest_status, findings):
