@@ -122,6 +122,11 @@ export async function gitRevertFile(
 
 const SLUG_MAX_LEN = 40;
 const FETCH_TIMEOUT_MS = 120_000;
+// `worktree add` is a local filesystem op, not network — but it runs while
+// holding the global inFlight lock, so a hang here (stale lock file, wedged
+// filesystem) would 409 every other caller forever. Bound it too.
+const WORKTREE_ADD_TIMEOUT_MS = 60_000;
+const REF_NAME_REJECTION = /not a valid (branch|ref) name|invalid reference/i;
 
 // The slug is the ONLY fragment of this flow derived from user input, and it
 // feeds a branch name, a directory name, and (indirectly) git argv — so its
@@ -161,6 +166,16 @@ async function refExists(cwd: string, ref: string): Promise<boolean> {
   }
 }
 
+// Free local invariant, kept as its own pure function so it's directly
+// testable without having to route an adversarial value through
+// sanitizeTaskSlug first (which, by construction, never produces a slug that
+// could actually trip this — no "/" survives it — making the check itself
+// otherwise dead code from createWorkspace's one real caller).
+export function resolvesWithinRoot(root: string, candidate: string): boolean {
+  const resolvedRoot = path.resolve(root) + path.sep;
+  return path.resolve(candidate).startsWith(resolvedRoot);
+}
+
 async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
@@ -189,7 +204,10 @@ export class WorkspaceCreateError extends Error {
 // the check and the assignment), so Node's single-threaded event loop can't
 // interleave two callers through it.
 // ponytail: process-wide global lock, not per-repo — fine while there's one
-// source repo; move to a per-repo lock map if that ever changes.
+// source repo; move to a per-repo lock map if that ever changes. Also
+// unbounded in principle if a git call under it hangs — every git call in
+// this flow now carries a timeoutMs (fetch: FETCH_TIMEOUT_MS, worktree add:
+// WORKTREE_ADD_TIMEOUT_MS) specifically so this lock can't wedge forever.
 let inFlight = false;
 
 export async function createWorkspace(taskName: string): Promise<CreateWorkspaceResult> {
@@ -223,8 +241,12 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   try {
     await git(sourceRepo, ["fetch", "origin", "--prune"], { timeoutMs: FETCH_TIMEOUT_MS });
   } catch (err: any) {
-    const reason = err.killed ? `timed out after ${FETCH_TIMEOUT_MS}ms` : err.message;
-    throw new WorkspaceCreateError(`git fetch origin failed: ${reason}`, 502);
+    // Raw git stderr here can contain the origin remote URL — never put that
+    // in the HTTP response. Log the real detail server-side, return a fixed
+    // message.
+    console.error("[workspace-create] git fetch origin failed:", err);
+    const reason = err.killed ? `timed out after ${FETCH_TIMEOUT_MS}ms` : "see server logs";
+    throw new WorkspaceCreateError(`git fetch origin failed (${reason})`, 502);
   }
 
   const baselineSha = (await git(sourceRepo, ["rev-parse", CONFIG.worktreeBase])).trim();
@@ -232,6 +254,10 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   const stamp = timestamp();
   const branch = `glimmer/${slug}-${stamp}`;
   const workspace = path.join(CONFIG.worktreeRoot, `glimmer-${slug}-${stamp}`);
+
+  if (!resolvesWithinRoot(CONFIG.worktreeRoot, workspace)) {
+    throw new WorkspaceCreateError(`refusing to create a worktree outside worktreeRoot: ${workspace}`, 400);
+  }
 
   if (await refExists(sourceRepo, `refs/heads/${branch}`)) {
     throw new WorkspaceCreateError(`branch already exists: ${branch}`, 409);
@@ -241,14 +267,27 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   }
 
   try {
-    await git(sourceRepo, ["worktree", "add", "--no-track", "-b", branch, workspace, CONFIG.worktreeBase]);
+    await git(
+      sourceRepo,
+      ["worktree", "add", "--no-track", "-b", branch, workspace, CONFIG.worktreeBase],
+      { timeoutMs: WORKTREE_ADD_TIMEOUT_MS }
+    );
   } catch (err: any) {
     // Nothing was actually created if this call itself failed (git rejects
     // invalid refs/paths before creating anything) — so there's no partial
-    // state to report. Most likely cause is a taskName-derived branch/path
-    // git itself refuses (e.g. a still-unanticipated git ref-name rule); a
-    // safety net so that failure mode is a clean 400, not a raw crash.
-    throw new WorkspaceCreateError(`could not create branch/worktree for taskName: ${err.message}`, 400);
+    // state to report. Only downgrade to 400 (the taskName's fault) when git
+    // itself says the ref/branch name was rejected. Everything else — a
+    // colliding "glimmer" branch causing a D/F ref conflict under
+    // refs/heads/glimmer/*, an unwritable worktreeRoot, a stale lock, a full
+    // disk — is a server-side condition, not a bad taskName, and blanket-
+    // mapping it to 400 previously sent the user into an infinite rename
+    // loop trying to "fix" an input that was never the problem.
+    const detail = String(err.stderr ?? err.message ?? "");
+    if (REF_NAME_REJECTION.test(detail)) {
+      throw new WorkspaceCreateError(`could not create branch/worktree for taskName: ${err.message}`, 400);
+    }
+    console.error("[workspace-create] git worktree add failed:", err);
+    throw new WorkspaceCreateError("failed to create the worktree (server-side git error, see server logs)", 500);
   }
 
   // From here on the worktree and branch are real. A failure past this point
@@ -258,6 +297,12 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
     const headSha = (await git(workspace, ["rev-parse", "HEAD"])).trim();
     const currentBranch = (await git(workspace, ["branch", "--show-current"])).trim();
     const status = await git(workspace, ["status", "--porcelain"]);
+    // Reference script's fourth check: `--no-track` should mean no upstream
+    // got configured, but branch.autoSetupMerge can still wire one up behind
+    // it — verify the negative instead of assuming --no-track was enough.
+    const upstream = await git(workspace, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+      .then((s) => s.trim())
+      .catch(() => "");
 
     if (headSha !== baselineSha) {
       throw new Error(`HEAD (${headSha}) does not match fetched ${CONFIG.worktreeBase} (${baselineSha})`);
@@ -267,6 +312,9 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
     }
     if (status.trim() !== "") {
       throw new Error(`new worktree is unexpectedly dirty:\n${status}`);
+    }
+    if (upstream) {
+      throw new Error(`worktree unexpectedly has an upstream configured: ${upstream}`);
     }
   } catch (err: any) {
     throw new WorkspaceCreateError(

@@ -22,6 +22,7 @@ let originalMainSha: string;
 let createWorkspace: typeof import("./git.js").createWorkspace;
 let sanitizeTaskSlug: typeof import("./git.js").sanitizeTaskSlug;
 let WorkspaceCreateError: typeof import("./git.js").WorkspaceCreateError;
+let resolvesWithinRoot: typeof import("./git.js").resolvesWithinRoot;
 
 beforeAll(async () => {
   sourceRepo = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-wc-source-"));
@@ -49,6 +50,7 @@ beforeAll(async () => {
   createWorkspace = mod.createWorkspace;
   sanitizeTaskSlug = mod.sanitizeTaskSlug;
   WorkspaceCreateError = mod.WorkspaceCreateError;
+  resolvesWithinRoot = mod.resolvesWithinRoot;
 });
 
 afterAll(async () => {
@@ -89,21 +91,74 @@ describe("sanitizeTaskSlug", () => {
   });
 });
 
+describe("resolvesWithinRoot", () => {
+  // The one real call site (workspace = worktreeRoot joined with a
+  // slug-derived, slash-free directory name) can never actually trip this —
+  // exercise the pure function directly with adversarial input instead, so
+  // the containment assertion in createWorkspace has real coverage rather
+  // than being implied-but-untested dead code.
+  it("accepts a path genuinely inside root", () => {
+    expect(resolvesWithinRoot("/Users/danielqazi", "/Users/danielqazi/glimmer-x-1")).toBe(true);
+  });
+
+  it("rejects a path outside root, including a same-prefix sibling", () => {
+    expect(resolvesWithinRoot("/Users/danielqazi", "/etc/passwd")).toBe(false);
+    // "/Users/danielqazi-evil" starts with the string "/Users/danielqazi"
+    // but is NOT inside it — the trailing path.sep in the real check exists
+    // precisely to catch this case.
+    expect(resolvesWithinRoot("/Users/danielqazi", "/Users/danielqazi-evil")).toBe(false);
+  });
+
+  it("rejects a traversal that escapes root via ..", () => {
+    expect(resolvesWithinRoot("/Users/danielqazi/worktrees", "/Users/danielqazi/worktrees/../../etc/passwd")).toBe(false);
+  });
+});
+
+// Must run before any other describe block in this file that calls
+// createWorkspace successfully: this test needs refs/heads/glimmer/* to not
+// exist yet in the shared sourceRepo fixture, so it can create a plain
+// branch literally named "glimmer" (which a prior successful call already
+// forecloses, since that puts refs under refs/heads/glimmer/*).
+describe("createWorkspace — D/F ref conflict is a server-side condition, not a bad taskName", () => {
+  it("maps a non-ref-name-rejection worktree-add failure to 500, not 400", async () => {
+    // A plain branch literally named "glimmer" makes refs/heads/glimmer a
+    // FILE, blocking git from ever creating refs/heads/glimmer/<anything> —
+    // the exact repro from the security review: this must never blanket-map
+    // to 400 (which would send the user into an infinite rename loop trying
+    // to "fix" a taskName that was never the problem).
+    await exec("git", ["branch", "glimmer"], { cwd: sourceRepo });
+    try {
+      const err = await createWorkspace("df conflict task").catch((e) => e);
+      expect(err).toBeInstanceOf(WorkspaceCreateError);
+      expect(err.status).toBe(500);
+      expect(err.partial).toBeUndefined(); // worktree add itself failed -> nothing was created
+    } finally {
+      await exec("git", ["branch", "-D", "glimmer"], { cwd: sourceRepo });
+    }
+  });
+});
+
 describe("createWorkspace — success path", () => {
-  it("creates a branch+worktree with HEAD==origin/main and a clean working tree", async () => {
+  it("creates a branch+worktree with HEAD==origin/main and a clean working tree, and no upstream configured", async () => {
     const result = await createWorkspace("integration success task");
 
     expect(result.branch).toMatch(/^glimmer\/integration-success-task-\d{8}-\d{6}$/);
     expect(result.baselineSha).toBe(originalMainSha);
-    expect(path.resolve(result.workspace).startsWith(path.resolve(worktreeRoot) + path.sep)).toBe(true);
+    expect(resolvesWithinRoot(worktreeRoot, result.workspace)).toBe(true);
 
     const headSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: result.workspace })).stdout.trim();
     const currentBranch = (await exec("git", ["branch", "--show-current"], { cwd: result.workspace })).stdout.trim();
     const status = (await exec("git", ["status", "--porcelain"], { cwd: result.workspace })).stdout;
+    // Reference script's 4th verification check: --no-track must mean no
+    // upstream, not just no explicit tracking config.
+    const upstream = await exec("git", ["rev-parse", "--abbrev-ref", "@{upstream}"], { cwd: result.workspace })
+      .then((r) => r.stdout.trim())
+      .catch(() => "");
 
     expect(headSha).toBe(originalMainSha);
     expect(currentBranch).toBe(result.branch);
     expect(status.trim()).toBe("");
+    expect(upstream).toBe("");
   });
 });
 
