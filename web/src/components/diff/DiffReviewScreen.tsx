@@ -15,10 +15,30 @@ export function DiffReviewScreen() {
       queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
     },
   });
+  // §14 Diff Review: "accept for review" is a distinct human-judgment fact,
+  // never something the model/orchestrator can set — see acceptSession in
+  // api/client.ts and POST /sessions/:id/accept on the gateway.
+  const acceptMutation = useMutation({
+    mutationFn: () => glimmerApi.acceptSession(id!),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", id] }),
+  });
+  const humanAcceptance = session?.humanAcceptance;
 
   return (
     <div>
       <h1>Diff Review</h1>
+      <p>
+        Technical: {session?.verification?.overall ?? "Unavailable"} — Human review:{" "}
+        {humanAcceptance?.accepted
+          ? `Accepted ${new Date(humanAcceptance.acceptedAt).toLocaleString()}`
+          : "Not yet accepted"}
+      </p>
+      {!humanAcceptance?.accepted && (
+        <button onClick={() => acceptMutation.mutate()} disabled={acceptMutation.isPending}>
+          Accept for review
+        </button>
+      )}
+      {acceptMutation.isError && <div>Unavailable — could not accept this session.</div>}
       <ul>
         {session?.changedFiles.map((f) => (
           <li key={f.path}>

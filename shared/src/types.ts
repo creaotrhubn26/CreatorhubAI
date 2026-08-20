@@ -96,6 +96,16 @@ export interface GlimmerSession {
   gates?: { architectureApproved: boolean | null };
   architectPlan?: { used: boolean; risk: string | null };
   failure?: { class: string; detail: string; evidenceIds: string[] };
+  // §14 Diff Review — human "accept for review" fact. Written ONLY by the
+  // gateway (POST /sessions/:id/accept), never by the orchestrator/model:
+  // technical verification and human acceptance must stay two separate
+  // facts, or the model could self-approve its own delivered work.
+  humanAcceptance?: HumanAcceptance;
+}
+
+export interface HumanAcceptance {
+  accepted: boolean;
+  acceptedAt: string;
 }
 
 // V7 §5.3 ArchitecturePlan — opt-in architect-mode output, written to

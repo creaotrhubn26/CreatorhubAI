@@ -59,6 +59,12 @@ export function ActiveSessionScreen() {
         <dt>Changed files</dt>
         <dd>{session.changedFiles.length}</dd>
       </dl>
+      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        Human review:{" "}
+        {session.humanAcceptance?.accepted
+          ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
+          : "Not yet accepted"}
+      </p>
       <RepairCycleStepper session={session} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}

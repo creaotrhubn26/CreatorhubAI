@@ -90,6 +90,15 @@ describe("glimmerApi", () => {
     expect(result[0].id).toBe("t1");
   });
 
+  it("acceptSession POSTs to /api/sessions/:id/accept and returns the acceptance record", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" }), { status: 200 })
+    );
+    const result = await glimmerApi.acceptSession("s1");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/accept`, expect.objectContaining({ method: "POST" }));
+    expect(result).toEqual({ accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" });
+  });
+
   it("askSession POSTs the question and returns the model's answer", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ answer: "It owns the parser state.", provenance: "model-output" }), { status: 200 })

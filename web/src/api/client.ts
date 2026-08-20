@@ -1,6 +1,6 @@
 import type {
   DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
-  SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask,
+  SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -35,6 +35,9 @@ export const glimmerApi = {
   cancelSession: (id: string) => request<{ cancelled: boolean }>(`/api/sessions/${id}/cancel`, { method: "POST" }),
   revertFile: (id: string, path: string) =>
     request<{ reverted: string }>(`/api/sessions/${id}/revert-file`, { method: "POST", body: JSON.stringify({ path }) }),
+  // §14 Diff Review — human "accept for review", distinct from technical
+  // verification. Gateway-owned; see server/src/lib/sessions.ts.
+  acceptSession: (id: string) => request<HumanAcceptance>(`/api/sessions/${id}/accept`, { method: "POST" }),
   getTaskIntelligence: (scopePackage: string, scopeArea?: string) => {
     const params = new URLSearchParams({ scopePackage });
     if (scopeArea) params.set("scopeArea", scopeArea);
