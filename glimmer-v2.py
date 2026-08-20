@@ -675,14 +675,24 @@ def classify_visual_check_result(result, session):
     populates findings[] with anything since no model call is wired up yet,
     so this path always yields PASS today, but the classification is real).
 
-    Blocking is driven SOLELY by findings[] severities, never by
+    Blocking is driven mainly by findings[] severities, not by
     findings_doc["status"] itself -- that field (PASS/FAIL/NOT_RUN/...) is
-    informational metadata for humans/Control Center about whether semantic
-    review ran at all (fix round 1: glimmer-visual.py now honestly writes
-    "NOT_RUN" for a clean capture with no review, not "PASS" -- see its
-    build_findings docstring), so this function deliberately never branches
-    on it: NOT_RUN with an empty findings[] takes the exact same
-    non-blocking PASS path below as any other empty-findings result.
+    mostly informational metadata for humans/Control Center about whether
+    semantic review ran at all (fix round 1: glimmer-visual.py now honestly
+    writes "NOT_RUN" for a clean capture with no review, not "PASS" -- see
+    its build_findings docstring): NOT_RUN with an empty findings[] takes
+    the exact same non-blocking PASS path below as any other
+    empty-findings result.
+
+    C4 (live vision wiring) adds exactly one narrow exception:
+    findings_doc["status"] == "BLOCKED" means glimmer-visual.py's
+    run_vision_model itself failed/produced an unparseable reply for at
+    least one captured viewport (its own docstring: it never fabricates
+    findings on a failed call). An empty/non-blocking findings[] in that
+    case does NOT mean "reviewed, fine" -- some viewport was never
+    actually reviewed. Taking the plain PASS path below would silently
+    turn a real infra gap into a green check, so this one status value IS
+    read here, ahead of the findings[]-only PASS path.
     """
     if result.get("status") != "PASS":
         result["status"] = "INFRA_BLOCKED"
@@ -722,6 +732,12 @@ def classify_visual_check_result(result, session):
         result["status"] = "CODE_FAIL"
         result["ok"] = False
         result["visualBlockingFindings"] = blocking
+    elif findings_doc.get("status") == "BLOCKED":
+        result["status"] = "INFRA_BLOCKED"
+        result["ok"] = False
+        result["visualInfraReason"] = (
+            "vision model call failed/unparseable for at least one viewport"
+        )
     else:
         result["status"] = "PASS"
         result["ok"] = True
