@@ -1744,6 +1744,191 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     return load_architect_review(session, iteration, review_round)
 
 
+# ============================================================
+# C3 (glimmer-v7): Task Graph (tasks.json) — "Task Planning & Live Task
+# List" chapter; reconciliation doc C3 entry.
+# ============================================================
+#
+# Only ever active when --architect-first produced a usable plan
+# (architecture_plan is not None in main(), same gate as C2's gates/
+# architectReviews just above) — with no plan there is nothing to
+# derive tasks from, so tasks stays None and no tasks.json is ever
+# written (zero behavior change, same opt-in discipline as C1/C2).
+#
+# Flat list, sequential dependsOn only — deliberately NOT the chapter's
+# DAG/priority/source/evidenceIds/blockingReason model. The
+# reconciliation doc's own critique (§15) names this the item most
+# likely to be over-built and says to keep it flat-with-dependsOn
+# "until a real session needs a diamond." This ships exactly that: one
+# task per implementationPlan step (sequential chain) and one task per
+# verificationPlan entry (each depending on the last implementation
+# task), nothing else.
+#
+# Honest scale-downs (documented here, not just in the report):
+#   - Per-step implementation granularity is not evidencable: ONE
+#     engineer subprocess run executes the WHOLE implementationPlan in
+#     one shot, so all implementation tasks transition together, by
+#     the same evidence (changed-files set + engineer return code),
+#     not one at a time.
+#   - No per-task prompt injection: the C1 handoff already injects the
+#     full implementationPlan into the engineer prompt, and there is no
+#     per-task execution loop to point a single active task at. tasks
+#     .json is a session ARTIFACT for humans/the control center to
+#     observe later, not a prompt input, in this pass.
+#   - No dynamic task creation, no discovery/architecture_review/
+#     visual_verification/repair/approval/follow_up kinds, no
+#     priority/required-vs-optional semantics, no session-completion
+#     gate wired to task status. Those all stay out per the C3 scope.
+
+
+def derive_tasks(plan: dict) -> list:
+    """C3: derive the flat task list from plan["implementationPlan"] +
+    plan["verificationPlan"] (V7's structured-task-model fields, scoped
+    down to id/description/kind/dependsOn/status per the C3 task
+    entry). Sequential dependsOn chain within implementation tasks
+    (t2 depends on t1, etc.); every verification task depends on the
+    LAST implementation task (or has no dependency when there were no
+    implementation steps at all). ids are simple/stable: t1, t2, ... in
+    derivation order (implementation first, then verification).
+    Never raises: `plan` is already a validated dict by the time this
+    is called (load_architecture_plan's contract guarantees that), and
+    missing/non-list implementationPlan/verificationPlan fields degrade
+    to [] rather than erroring."""
+    tasks = []
+    impl_steps = plan.get("implementationPlan")
+    if not isinstance(impl_steps, list):
+        impl_steps = []
+    verify_steps = plan.get("verificationPlan")
+    if not isinstance(verify_steps, list):
+        verify_steps = []
+
+    prev_id = None
+    for step in impl_steps:
+        tid = f"t{len(tasks) + 1}"
+        tasks.append({
+            "id": tid,
+            "description": str(step),
+            "kind": "implementation",
+            "dependsOn": [prev_id] if prev_id else [],
+            "status": "pending",
+        })
+        prev_id = tid
+
+    last_impl_id = prev_id
+    for step in verify_steps:
+        tid = f"t{len(tasks) + 1}"
+        tasks.append({
+            "id": tid,
+            "description": str(step),
+            "kind": "verification",
+            "dependsOn": [last_impl_id] if last_impl_id else [],
+            "status": "pending",
+        })
+    return tasks
+
+
+def save_tasks(session_dir, tasks) -> None:
+    """C3: full-file rewrite at every transition point (spawn, engineer-
+    return, post-verify) — tasks.json is small, so a full rewrite is
+    simplest and cheapest. Never raises: same never-crash-the-session
+    discipline as C1/C6 — a disk write failure here (permissions, full
+    disk) must degrade to a log line, never take down an otherwise-
+    successful engineering session."""
+    try:
+        (Path(session_dir) / "tasks.json").write_text(
+            json.dumps(tasks, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[V2] WARN: failed to write tasks.json: {exc}")
+
+
+def set_implementation_tasks_status(tasks, status: str) -> None:
+    """C3: flip every kind=='implementation' task to `status`, in place.
+    Called at each engineer spawn (-> in_progress) — including the C2
+    revise-round re-spawn, which re-invokes the engineer directly
+    outside the outer repair loop: implementation tasks go back to
+    in_progress for that re-spawn and are re-evaluated after it
+    returns, exactly like the main spawn/return pair. No-op when
+    `tasks` is None (no plan, C3 inactive)."""
+    if tasks is None:
+        return
+    for t in tasks:
+        if t.get("kind") == "implementation":
+            t["status"] = status
+
+
+def evaluate_implementation_tasks(tasks, files: list, engineer_rc) -> None:
+    """C3: the ONLY evidence source for implementation task status —
+    never a model claim. Per-step granularity is not honestly
+    evidencable (one engineer run executes every implementationPlan
+    step at once), so the whole implementation group is marked
+    together, by the same evidence: complete iff the session's changed-
+    files set is non-empty AND the engineer subprocess exited 0;
+    failed otherwise (engineer errored, or ran and touched nothing).
+    No-op when `tasks` is None."""
+    if tasks is None:
+        return
+    outcome = "complete" if (files and engineer_rc == 0) else "failed"
+    set_implementation_tasks_status(tasks, outcome)
+
+
+# Tokens of 3+ alnum chars — long enough to skip noise, short enough to
+# still match single-word plan entries like "lint".
+_TASK_VERIFY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _match_verify_result(description: str, results: list):
+    """C3: substring match, case-insensitive, documented here per the
+    task brief — a verificationPlan entry naming e.g. "typecheck" (or
+    "frontend_typecheck") maps to a real verify() command containing
+    "typecheck" (e.g. "npm --prefix frontend run typecheck"). Both
+    sides are tokenized on non-alphanumeric characters (tokens >= 3
+    chars, to skip stopword-length noise) and compared as whole-word
+    tokens (set intersection), NOT raw substring-of-string containment
+    — a naive `tok in cmd_string` check lets a short token like "check"
+    (from e.g. "nonexistent_check") spuriously match inside the
+    unrelated word "typecheck"; matching whole command tokens avoids
+    that false positive while still satisfying "contains typecheck"
+    for the real case, since "typecheck" is itself a whole token in
+    both the plan entry and the npm command. Returns the first matching
+    result dict, or None when nothing in `results` matches — callers
+    must leave the task `pending` in that case, never fabricate
+    completion."""
+    tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(description.lower()) if len(t) >= 3}
+    if not tokens:
+        return None
+    for r in results:
+        cmd = (r.get("command") or "").lower()
+        cmd_tokens = set(_TASK_VERIFY_TOKEN_RE.findall(cmd))
+        if tokens & cmd_tokens:
+            return r
+    return None
+
+
+def evaluate_verification_tasks(tasks, results: list) -> None:
+    """C3: map each verification task to a real verify() result where a
+    deterministic mapping exists (see _match_verify_result). Matched ->
+    complete on PASS/PASS_BASELINE, failed on CODE_FAIL. Unmatched
+    entries (the plan named a check verify() never ran) stay `pending`
+    — HONEST, never fabricate completion. INFRA_BLOCKED/TIMEOUT matches
+    also stay `pending` (the check never really ran to a pass/fail
+    verdict). No-op when `tasks` is None."""
+    if tasks is None:
+        return
+    for t in tasks:
+        if t.get("kind") != "verification":
+            continue
+        match = _match_verify_result(t["description"], results)
+        if match is None:
+            continue  # plan named a check that never ran -- stays pending
+        status_name = match.get("status")
+        if status_name in ("PASS", "PASS_BASELINE"):
+            t["status"] = "complete"
+        elif status_name == "CODE_FAIL":
+            t["status"] = "failed"
+        # INFRA_BLOCKED / TIMEOUT / anything else: leave pending -- the
+        # check never really produced a pass/fail verdict.
+
+
 def main():
     ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
     ap.add_argument("task", nargs="+")
@@ -1945,6 +2130,10 @@ def main():
         # so plan_candidate_count below is 0 and the prompt/env are
         # unaffected in every degraded case.
         candidate_evidence = []
+        # C3: tasks stays None (no tasks.json ever written) in every
+        # degraded case, same uniform-None-on-no-plan contract as
+        # architecture_plan/candidate_evidence just above.
+        tasks = None
         if args.architect_first:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
@@ -1960,6 +2149,14 @@ def main():
             if architecture_plan is not None:
                 manifest["gates"] = {"architectureApproved": None}
                 manifest["architectReviews"] = {"max": ARCHITECT_REVIEW_BUDGET, "used": 0}
+                # C3: same gate as the two lines above -- tasks derive from
+                # the plan's implementationPlan/verificationPlan only when
+                # a usable plan exists. manifest["tasksFile"] mirrors the
+                # existing "eventsFile" precedent (a plain filename inside
+                # the session dir, no schema change beyond that one key).
+                tasks = derive_tasks(architecture_plan)
+                manifest["tasksFile"] = "tasks.json"
+                save_tasks(session, tasks)
             save()
 
         for iteration in range(args.max_repairs + 1):
@@ -1968,6 +2165,13 @@ def main():
             prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
                                  plan=architecture_plan, evidence=candidate_evidence)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
+            # C3: spawn -- deterministic evidence point 1/3. The engineer
+            # subprocess is about to execute the whole implementationPlan
+            # in one run (no per-task pointer, see the C3 module docstring
+            # above), so every implementation task flips together.
+            if tasks is not None:
+                set_implementation_tasks_status(tasks, "in_progress")
+                save_tasks(session, tasks)
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
                                  plan_candidate_count=len(candidate_evidence))
@@ -1976,6 +2180,10 @@ def main():
             for f in files:
                 emit_event(events_path, "file_changed", sid, path=f,
                            changeType=change_types.get(f, "modified"))
+            # C3: engineer-return -- deterministic evidence point 2/3.
+            if tasks is not None:
+                evaluate_implementation_tasks(tasks, files, rc)
+                save_tasks(session, tasks)
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
@@ -2002,6 +2210,12 @@ def main():
                                          events_path, sid)
                     attempt["verificationCommands"] = [shlex.join(c) for c in commands]
                     attempt["verificationResults"] = results
+                    # C3: post-verify -- deterministic evidence point 3/3,
+                    # applies here too so tasks.json stays honest even on
+                    # the no-changed-files path.
+                    if tasks is not None:
+                        evaluate_verification_tasks(tasks, results)
+                        save_tasks(session, tasks)
                     if ok:
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
@@ -2078,7 +2292,15 @@ def main():
                     )
                     (session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt").write_text(
                         revise_prompt, encoding="utf-8")
-                    invoke_engineer(
+                    # C3: a REVISE_IMPLEMENTATION round re-invokes the
+                    # engineer directly (outside the outer repair loop) --
+                    # implementation tasks go back to in_progress for this
+                    # re-spawn and are re-evaluated after it returns,
+                    # exactly like the main spawn/return pair above.
+                    if tasks is not None:
+                        set_implementation_tasks_status(tasks, "in_progress")
+                        save_tasks(session, tasks)
+                    revise_rc = invoke_engineer(
                         engineer, ws, revise_prompt, args.auto_approve, args.max_turns,
                         session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
                         events_path, sid, plan_candidate_count=len(candidate_evidence),
@@ -2088,6 +2310,9 @@ def main():
                     for f in files:
                         emit_event(events_path, "file_changed", sid, path=f,
                                    changeType=change_types.get(f, "modified"))
+                    if tasks is not None:
+                        evaluate_implementation_tasks(tasks, files, revise_rc)
+                        save_tasks(session, tasks)
                     attempt["changedFiles"] = files
                     attempt["diffHashBeforeVerify"] = diff_hash(ws, baseline)
                     scope_result = compute_scope_guard(files, manifest.get("contract", {}))
@@ -2121,6 +2346,10 @@ def main():
             after = diff_hash(ws, baseline)
             attempt["verificationResults"] = results
             attempt["diffHashAfterVerify"] = after
+            # C3: post-verify -- deterministic evidence point 3/3.
+            if tasks is not None:
+                evaluate_verification_tasks(tasks, results)
+                save_tasks(session, tasks)
             if before != after:
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
@@ -2807,6 +3036,131 @@ def _architect_review_selfcheck() -> None:
     print("architect review self-check: PASS")
 
 
+def _tasks_selfcheck() -> None:
+    """C3 (glimmer-v7): task graph self-check -- no live model needed.
+    Covers derivation from a synthetic plan (ids/kinds/dependsOn chain),
+    evidence-driven transitions (engineer success -> complete, engineer
+    fail -> failed, matched verify PASS/PASS_BASELINE -> complete,
+    matched CODE_FAIL -> failed, unmatched verificationPlan entry stays
+    pending, INFRA_BLOCKED/TIMEOUT stay pending), never-raises on a
+    write failure, and zero-behavior-change without a plan (no
+    tasks.json file). Run with: python3 glimmer-v2.py --tasks-selfcheck
+    """
+    plan = {
+        "implementationPlan": ["inspect hydration path", "add restoration hook"],
+        "verificationPlan": ["frontend_typecheck", "lint", "nonexistent_check"],
+    }
+
+    # ------------------------------------------------------------
+    # 1. Derivation: ids, kinds, sequential dependsOn chain.
+    # ------------------------------------------------------------
+    tasks = derive_tasks(plan)
+    assert [t["id"] for t in tasks] == ["t1", "t2", "t3", "t4", "t5"]
+    assert tasks[0]["kind"] == "implementation" and tasks[0]["dependsOn"] == []
+    assert tasks[1]["kind"] == "implementation" and tasks[1]["dependsOn"] == ["t1"]
+    assert tasks[2]["kind"] == "verification" and tasks[2]["dependsOn"] == ["t2"]
+    assert tasks[3]["kind"] == "verification" and tasks[3]["dependsOn"] == ["t2"]
+    assert tasks[4]["kind"] == "verification" and tasks[4]["dependsOn"] == ["t2"]
+    assert all(t["status"] == "pending" for t in tasks)
+    assert tasks[0]["description"] == "inspect hydration path"
+    assert tasks[2]["description"] == "frontend_typecheck"
+
+    # No implementation steps: verification tasks have no dependency.
+    tasks_no_impl = derive_tasks({"verificationPlan": ["typecheck"]})
+    assert tasks_no_impl[0]["id"] == "t1" and tasks_no_impl[0]["dependsOn"] == []
+
+    # Malformed plan fields degrade to [] rather than raising.
+    assert derive_tasks({}) == []
+    assert derive_tasks({"implementationPlan": "not a list"}) == []
+
+    # ------------------------------------------------------------
+    # 2. Spawn -> in_progress (implementation only; verification untouched).
+    # ------------------------------------------------------------
+    tasks = derive_tasks(plan)
+    set_implementation_tasks_status(tasks, "in_progress")
+    assert tasks[0]["status"] == "in_progress" and tasks[1]["status"] == "in_progress"
+    assert tasks[2]["status"] == "pending"
+
+    # ------------------------------------------------------------
+    # 3. Engineer-return: deterministic evidence only, never a model claim.
+    # ------------------------------------------------------------
+    evaluate_implementation_tasks(tasks, ["frontend/a.ts"], 0)  # changed files + rc==0
+    assert tasks[0]["status"] == "complete" and tasks[1]["status"] == "complete"
+
+    tasks_no_files = derive_tasks(plan)
+    set_implementation_tasks_status(tasks_no_files, "in_progress")
+    evaluate_implementation_tasks(tasks_no_files, [], 0)  # ran, touched nothing
+    assert all(t["status"] == "failed" for t in tasks_no_files if t["kind"] == "implementation")
+
+    tasks_engineer_err = derive_tasks(plan)
+    evaluate_implementation_tasks(tasks_engineer_err, ["frontend/a.ts"], 1)  # non-zero rc
+    assert all(t["status"] == "failed" for t in tasks_engineer_err if t["kind"] == "implementation")
+
+    # ------------------------------------------------------------
+    # 4. Verification: matched PASS/PASS_BASELINE/CODE_FAIL, unmatched
+    #    stays pending, INFRA_BLOCKED/TIMEOUT stay pending.
+    # ------------------------------------------------------------
+    results = [
+        {"command": "npm --prefix frontend run typecheck", "status": "PASS"},
+        {"command": "npm --prefix frontend run lint", "status": "CODE_FAIL"},
+    ]
+    evaluate_verification_tasks(tasks, results)
+    assert tasks[2]["status"] == "complete"   # "frontend_typecheck" matched, PASS
+    assert tasks[3]["status"] == "failed"     # "lint" matched, CODE_FAIL
+    assert tasks[4]["status"] == "pending"    # "nonexistent_check": no match -- honest
+
+    tasks_pb = derive_tasks({"verificationPlan": ["typecheck"]})
+    evaluate_verification_tasks(
+        tasks_pb, [{"command": "npm run typecheck", "status": "PASS_BASELINE"}])
+    assert tasks_pb[0]["status"] == "complete"
+
+    tasks_infra = derive_tasks({"verificationPlan": ["typecheck"]})
+    evaluate_verification_tasks(
+        tasks_infra, [{"command": "npm run typecheck", "status": "INFRA_BLOCKED"}])
+    assert tasks_infra[0]["status"] == "pending"  # check never really ran
+
+    tasks_timeout = derive_tasks({"verificationPlan": ["typecheck"]})
+    evaluate_verification_tasks(
+        tasks_timeout, [{"command": "npm run typecheck", "status": "TIMEOUT"}])
+    assert tasks_timeout[0]["status"] == "pending"
+
+    # evaluate_*/set_* are no-ops on tasks=None (mirrors main()'s no-plan gate).
+    set_implementation_tasks_status(None, "in_progress")
+    evaluate_implementation_tasks(None, ["x"], 0)
+    evaluate_verification_tasks(None, results)
+
+    # ------------------------------------------------------------
+    # 5. Never-raises: a tasks.json write failure must not propagate --
+    #    same never-crash-the-session discipline as C1/C6.
+    # ------------------------------------------------------------
+    real_write_text = Path.write_text
+
+    def _boom(self, *a, **kw):
+        raise OSError("disk full (simulated)")
+
+    Path.write_text = _boom
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            save_tasks(Path(td), tasks)  # must not raise
+    finally:
+        Path.write_text = real_write_text
+
+    # ------------------------------------------------------------
+    # 6. Zero behavior change without a plan: no tasks.json is ever
+    #    written -- mirrors main()'s `tasks = None` / no-derive gate.
+    # ------------------------------------------------------------
+    architecture_plan = None
+    tasks_none = derive_tasks(architecture_plan) if architecture_plan is not None else None
+    assert tasks_none is None
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+        if tasks_none is not None:
+            save_tasks(session_dir, tasks_none)
+        assert not (session_dir / "tasks.json").exists()
+
+    print("task graph (C3) self-check: PASS")
+
+
 def _visual_selfcheck() -> None:
     """C4 (glimmer-v7): proves the vision-verification plumbing without a
     live browser or a live model call.
@@ -2998,6 +3352,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-review-selfcheck"]:
         _architect_review_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--tasks-selfcheck"]:
+        _tasks_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--visual-selfcheck"]:
         _visual_selfcheck()
