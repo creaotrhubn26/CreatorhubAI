@@ -73,6 +73,16 @@ export interface TaskContract {
   verification: string[];
   repairBudget: number;
   maxTurns?: number;
+  // §7 New Task Composer "Advanced controls". Typed-only, closed enum for
+  // toolchainMode — no freeform command strings. Omitted entirely (or any
+  // individual field omitted) means "use the orchestrator's own default",
+  // so an untouched composer produces zero behavior change.
+  advanced?: {
+    timeoutSeconds?: number;
+    toolchainMode?: "path" | "linked" | "none";
+    modelReadinessUrl?: string;
+    architectFirst?: boolean;
+  };
 }
 
 export interface GlimmerSession {

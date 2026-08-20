@@ -189,6 +189,65 @@ describe("POST /api/sessions", () => {
   });
 });
 
+describe("POST /api/sessions — §7 advanced controls validation", () => {
+  const validBase = {
+    objective: "Fix a thing",
+    scope: { package: "frontend" },
+    mode: "implement",
+    constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+    verification: [],
+    repairBudget: 1,
+  };
+
+  it("rejects maxTurns out of 1..64 range with 400", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: { ...validBase, maxTurns: 100 }, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+  });
+
+  it("rejects timeoutSeconds out of 60..3600 range with 400", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: { ...validBase, advanced: { timeoutSeconds: 5 } }, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a toolchainMode outside the closed enum with 400", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: { ...validBase, advanced: { toolchainMode: "rm -rf /" } }, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects an unparseable/injection-attempt modelReadinessUrl with 400", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: { ...validBase, advanced: { modelReadinessUrl: "http://x; rm -rf /" } }, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a non-http(s) modelReadinessUrl scheme with 400", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .send({ taskContract: { ...validBase, advanced: { modelReadinessUrl: "javascript:alert(1)" } }, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+  });
+
+  it("accepts a well-formed advanced block", async () => {
+    const res = await request(app).post("/api/sessions").send({
+      taskContract: {
+        ...validBase,
+        maxTurns: 20,
+        advanced: { timeoutSeconds: 600, toolchainMode: "linked", modelReadinessUrl: "https://model.local/ready", architectFirst: true },
+      },
+      workspace: "/tmp/ws",
+    });
+    expect(res.status).toBe(201);
+  });
+});
+
 describe("POST /api/sessions/:id/run replay protection", () => {
   const validContract = {
     objective: "Fix a thing",

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { buildArgs, runGlimmer } from "./runner.js";
+import { buildArgs, runGlimmer, validateAdvanced } from "./runner.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -67,6 +67,126 @@ describe("buildArgs", () => {
     expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
     expect(args.filter((a) => a === "--verify")).toHaveLength(1);
     expect(args).toContain("npm --prefix frontend run typecheck");
+  });
+
+  // §7 Advanced controls: typed-only fields mapped to their real flags.
+  describe("advanced controls", () => {
+    it("maps advanced.timeoutSeconds to --timeout", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { timeoutSeconds: 300 } }, "/tmp/ws");
+      expect(args).toContain("--timeout");
+      expect(args[args.indexOf("--timeout") + 1]).toBe("300");
+    });
+
+    it("maps advanced.toolchainMode to --toolchain-mode", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { toolchainMode: "linked" } }, "/tmp/ws");
+      expect(args).toContain("--toolchain-mode");
+      expect(args[args.indexOf("--toolchain-mode") + 1]).toBe("linked");
+    });
+
+    it("maps advanced.modelReadinessUrl to --model-readiness-url as a single argv element", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { modelReadinessUrl: "http://127.0.0.1:8080/health" } }, "/tmp/ws");
+      const flagIndex = args.indexOf("--model-readiness-url");
+      expect(flagIndex).toBeGreaterThanOrEqual(0);
+      expect(args[flagIndex + 1]).toBe("http://127.0.0.1:8080/health");
+    });
+
+    it("maps advanced.architectFirst: true to a bare --architect-first flag", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { architectFirst: true } }, "/tmp/ws");
+      expect(args).toContain("--architect-first");
+    });
+
+    it("omits --architect-first when false or absent", () => {
+      expect(buildArgs({ ...CONTRACT, advanced: { architectFirst: false } }, "/tmp/ws")).not.toContain("--architect-first");
+      expect(buildArgs(CONTRACT, "/tmp/ws")).not.toContain("--architect-first");
+    });
+
+    it("emits none of the advanced flags when advanced is omitted entirely (zero behavior change when untouched)", () => {
+      const args = buildArgs(CONTRACT, "/tmp/ws");
+      for (const flag of ["--timeout", "--toolchain-mode", "--model-readiness-url", "--architect-first"]) {
+        expect(args).not.toContain(flag);
+      }
+    });
+
+    it("silently drops an unparseable modelReadinessUrl instead of forwarding it (defense in depth beyond route validation)", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { modelReadinessUrl: "http://x; rm -rf /" } }, "/tmp/ws");
+      expect(args).not.toContain("--model-readiness-url");
+      expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
+    });
+
+    it("silently drops a non-http(s) modelReadinessUrl scheme", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { modelReadinessUrl: "javascript:alert(1)" } }, "/tmp/ws");
+      expect(args).not.toContain("--model-readiness-url");
+    });
+
+    it("silently drops a toolchainMode value outside the closed enum", () => {
+      const args = buildArgs({ ...CONTRACT, advanced: { toolchainMode: "rm -rf /" as any } }, "/tmp/ws");
+      expect(args).not.toContain("--toolchain-mode");
+      expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
+    });
+
+    it("keeps '--' as the second-to-last element and the objective last, even with every advanced field set", () => {
+      const args = buildArgs(
+        {
+          ...CONTRACT,
+          maxTurns: 10,
+          advanced: { timeoutSeconds: 120, toolchainMode: "none", modelReadinessUrl: "https://model.local/ready", architectFirst: true },
+        },
+        "/tmp/ws"
+      );
+      expect(args[args.length - 2]).toBe("--");
+      expect(args[args.length - 1]).toBe(CONTRACT.objective);
+    });
+  });
+});
+
+describe("validateAdvanced", () => {
+  it("accepts a contract with no advanced fields at all", () => {
+    expect(validateAdvanced(CONTRACT)).toBeNull();
+  });
+
+  it("accepts maxTurns within 1..64", () => {
+    expect(validateAdvanced({ ...CONTRACT, maxTurns: 1 })).toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, maxTurns: 64 })).toBeNull();
+  });
+
+  it("rejects maxTurns outside 1..64", () => {
+    expect(validateAdvanced({ ...CONTRACT, maxTurns: 0 })).not.toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, maxTurns: 65 })).not.toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, maxTurns: 1.5 })).not.toBeNull();
+  });
+
+  it("accepts timeoutSeconds within 60..3600", () => {
+    expect(validateAdvanced({ ...CONTRACT, advanced: { timeoutSeconds: 60 } })).toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, advanced: { timeoutSeconds: 3600 } })).toBeNull();
+  });
+
+  it("rejects timeoutSeconds outside 60..3600", () => {
+    expect(validateAdvanced({ ...CONTRACT, advanced: { timeoutSeconds: 59 } })).not.toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, advanced: { timeoutSeconds: 3601 } })).not.toBeNull();
+  });
+
+  it("rejects a toolchainMode outside the closed enum", () => {
+    expect(validateAdvanced({ ...CONTRACT, advanced: { toolchainMode: "rm -rf /" as any } })).not.toBeNull();
+  });
+
+  it("accepts each closed-enum toolchainMode value", () => {
+    for (const mode of ["path", "linked", "none"] as const) {
+      expect(validateAdvanced({ ...CONTRACT, advanced: { toolchainMode: mode } })).toBeNull();
+    }
+  });
+
+  it("rejects an unparseable modelReadinessUrl", () => {
+    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "http://x; rm -rf /" } })).not.toBeNull();
+  });
+
+  it("rejects a non-http(s) modelReadinessUrl scheme", () => {
+    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "javascript:alert(1)" } })).not.toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "ftp://x.com" } })).not.toBeNull();
+  });
+
+  it("accepts a well-formed http/https modelReadinessUrl", () => {
+    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "http://127.0.0.1:8080/health" } })).toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "https://model.local/ready" } })).toBeNull();
   });
 });
 
