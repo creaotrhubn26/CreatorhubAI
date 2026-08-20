@@ -49,6 +49,13 @@ DEFAULT_VIEWPORTS = ("1440x900", "390x844")  # V7 §22.6 desktop+mobile minimum
 DEFAULT_MODEL_URL = "http://127.0.0.1:8080"
 DEFAULT_VISION_TIMEOUT_S = 120
 
+# Same convention as glimmer-engineer.py's API_KEY_FILE/api_key() (mirrored,
+# not imported -- this script stays standalone, per the module docstring):
+# llama-server is started with --api-key reading this same file
+# (start-glimmer-agent.sh), so vision calls need the identical
+# Authorization: Bearer <key> header engineer's http_json already sends.
+DEFAULT_API_KEY_FILE = Path.home() / "AI/muse-glimmer/config/api-key.txt"
+
 # V7 §22.2 basics -- used only when the caller doesn't pass --check at all.
 DEFAULT_CHECKS = (
     "no clipped or cut-off elements",
@@ -168,32 +175,54 @@ def _build_vision_payload(image_b64, route, viewport_slug, checks):
     # No "tools"/"tool_choice"/"parallel_tool_calls" key is ever added above.
 
 
-def _http_post_json(url, payload, timeout_s):
+def _read_api_key(path):
+    """Never raises. '' when the file is missing/unreadable/blank -- a
+    server started with no --api-key must still work, so a missing key
+    file degrades to "send no Authorization header", not a crash."""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _auth_headers(api_key_text):
+    """{'Authorization': 'Bearer <key>'} when api_key_text is non-empty,
+    else {} -- same header glimmer-engineer.py's http_json always sends
+    (API_KEY_FILE / api_key()), applied here only when a key was actually
+    found."""
+    if api_key_text:
+        return {"Authorization": f"Bearer {api_key_text}"}
+    return {}
+
+
+def _http_post_json(url, payload, timeout_s, headers=None):
     """glimmer-visual's own minimal stdlib POST helper -- mirrors
     glimmer-engineer.py's http_json in spirit but is not imported from it
     (this script stays standalone, per its module docstring)."""
     data = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = request.Request(url, data=data, headers=req_headers, method="POST")
     with request.urlopen(req, timeout=timeout_s) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     return json.loads(raw)
 
 
 def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
-                       timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None):
+                       timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None):
     """One chat-completions call for one screenshot. Returns the model's
     raw (untrusted) findings list. Raises on any failure -- network error,
-    timeout, non-2xx, unparseable JSON, missing/malformed 'findings' key --
-    so the caller (run_vision_model) can mark that one viewport BLOCKED
-    instead of silently treating a broken call as "reviewed, nothing
-    found"."""
+    timeout, non-2xx (401 included -- a missing/wrong Authorization header
+    against a --api-key server fails here like any other bad call), unparseable
+    JSON, missing/malformed 'findings' key -- so the caller (run_vision_model)
+    can mark that one viewport BLOCKED instead of silently treating a
+    broken call as "reviewed, nothing found"."""
     post_fn = post_fn or _http_post_json
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
     payload = _build_vision_payload(image_b64, route, viewport_slug, checks)
     endpoint = model_url.rstrip("/") + "/v1/chat/completions"
-    response = post_fn(endpoint, payload, timeout_s)
+    response = post_fn(endpoint, payload, timeout_s, _auth_headers(api_key_text))
     content = response["choices"][0]["message"].get("content") or ""
     data = _extract_json_object(content)
     if not isinstance(data, dict):
@@ -243,7 +272,7 @@ def _coerce_finding(raw, viewport_slug):
 
 
 def run_vision_model(captures, output_dir, route, checks, model_url,
-                      timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None):
+                      timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None):
     """Real implementation of the extension point C4-plumbing left
     documented-but-stubbed. One chat-completions call per successfully
     captured viewport (a viewport that failed to capture has nothing to
@@ -274,7 +303,7 @@ def run_vision_model(captures, output_dir, route, checks, model_url,
             image_bytes = (output_dir / c["screenshot"]).read_bytes()
             raw_findings = call_vision_model(
                 image_bytes, route, viewport_slug, checks, model_url,
-                timeout_s=timeout_s, post_fn=post_fn,
+                timeout_s=timeout_s, post_fn=post_fn, api_key_text=api_key_text,
             )
         except Exception as exc:  # noqa: BLE001 -- one viewport's model call must never crash the run or fabricate findings
             reports.append({
@@ -431,6 +460,11 @@ def main(argv=None):
                           "off-viewport elements/horizontal overflow) if omitted.")
     ap.add_argument("--vision-timeout", type=float, default=DEFAULT_VISION_TIMEOUT_S,
                      help=f"Per-viewport model call timeout in seconds. Default {DEFAULT_VISION_TIMEOUT_S}.")
+    ap.add_argument("--api-key-file", default=str(DEFAULT_API_KEY_FILE),
+                     help="Path to the llama-server API key (same convention as "
+                          f"glimmer-engineer.py's API_KEY_FILE). Default {DEFAULT_API_KEY_FILE}. "
+                          "Missing/unreadable -> vision calls go out with no Authorization "
+                          "header (a server started with no --api-key still works).")
     args = ap.parse_args(argv)
 
     viewports = args.viewport or list(DEFAULT_VIEWPORTS)
@@ -447,6 +481,7 @@ def main(argv=None):
         findings, reports = run_vision_model(
             captures, output_dir, args.url, checks, args.model_url,
             timeout_s=args.vision_timeout,
+            api_key_text=_read_api_key(args.api_key_file),
         )
         findings_doc = build_findings(captures, findings, reports)
     else:
@@ -544,6 +579,36 @@ def _selfcheck() -> None:
         }
         assert payload["messages"][0]["role"] == "system"
 
+        # --- llama-server auth (--api-key): request construction includes
+        # Authorization: Bearer <key> when a key file resolves, and omits
+        # the header entirely when it doesn't (server with no --api-key
+        # must still work; missing/unreadable file must never crash). Same
+        # convention as glimmer-engineer.py's API_KEY_FILE/api_key(). ---
+        assert str(DEFAULT_API_KEY_FILE).endswith("AI/muse-glimmer/config/api-key.txt")
+        assert _read_api_key("/definitely/does/not/exist.txt") == ""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as kf:
+            kf.write("  sekrit-123  \n")
+            key_path = kf.name
+        assert _read_api_key(key_path) == "sekrit-123"
+        Path(key_path).unlink()
+
+        assert _auth_headers("sekrit-123") == {"Authorization": "Bearer sekrit-123"}
+        assert _auth_headers("") == {}
+        assert _auth_headers(None) == {}
+
+        seen_headers = []
+
+        def fake_post_spy(url, payload, timeout_s, headers=None):
+            seen_headers.append(headers)
+            return {"choices": [{"message": {"content": '{"findings": []}'}}]}
+
+        call_vision_model(b"png", "http://x/route", "1440x900", DEFAULT_CHECKS,
+                           "http://model", post_fn=fake_post_spy, api_key_text="sekrit-123")
+        call_vision_model(b"png", "http://x/route", "1440x900", DEFAULT_CHECKS,
+                           "http://model", post_fn=fake_post_spy, api_key_text=None)
+        assert seen_headers[0] == {"Authorization": "Bearer sekrit-123"}
+        assert seen_headers[1] == {}, "no key resolved -> no Authorization header, not a crash"
+
         # --- finding coercion (mirrors validate_delivery_review's tolerant
         # conventions): unknown severity -> "low", missing/blank description
         # dropped, well-shaped region kept, malformed region dropped. ---
@@ -572,7 +637,7 @@ def _selfcheck() -> None:
 
         # --- run_vision_model: good reply, malformed reply, call failure --
         # (synthetic post_fn, no live model / network call).
-        def fake_post_good(url, payload, timeout_s):
+        def fake_post_good(url, payload, timeout_s, headers=None):
             body = json.dumps({"findings": [
                 {"severity": "critical", "category": "clipping", "element": "cta",
                  "description": "primary button below the fold"},
@@ -581,10 +646,10 @@ def _selfcheck() -> None:
             ]})
             return {"choices": [{"message": {"content": body}}]}
 
-        def fake_post_malformed(url, payload, timeout_s):
+        def fake_post_malformed(url, payload, timeout_s, headers=None):
             return {"choices": [{"message": {"content": "not json at all, sorry"}}]}
 
-        def fake_post_error(url, payload, timeout_s):
+        def fake_post_error(url, payload, timeout_s, headers=None):
             raise TimeoutError("simulated model call timeout")
 
         findings_good, reports_good = run_vision_model(
