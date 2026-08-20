@@ -91,6 +91,12 @@ def canonical_session_state(raw_status: str) -> str:
         return "verified"
     if raw_status == "no-change-unverified":
         return "needs_review"
+    # C2 (glimmer-v7): terminal status when the architect review gate
+    # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
+    # or the review budget is exhausted — V7 §5.10's rule: a session in
+    # this state must never be promoted to "verified".
+    if raw_status == "needs-architect-review":
+        return "needs_review"
     if raw_status.startswith("blocked-"):
         return "blocked"
     if raw_status.startswith("failed-"):
@@ -178,6 +184,8 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "CODE_FAIL", "detail": "repair budget exhausted with failing checks remaining", "evidenceIds": []}
     if raw == "failed-verifier-mutated-repo":
         return {"class": "POLICY_BLOCK", "detail": "verifier command mutated the repository", "evidenceIds": []}
+    if raw == "needs-architect-review":
+        return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation or the review budget was exhausted (V7 §5.10/§5.13)", "evidenceIds": []}
     if raw == "failed-aborted":
         return {"class": "ORCHESTRATION_ABORTED",
                 "detail": "orchestration raised an error before completing any attempt "
@@ -379,6 +387,28 @@ def diff_hash(ws, baseline):
             pass
         h.update(b"\0")
     return h.hexdigest()
+
+
+def git_diff_text(ws, baseline):
+    """C2 (glimmer-v7): the actual (not just hashed) diff v2 hands to the
+    architect review — same underlying git plumbing as diff_hash/
+    file_change_types above (tracked diff via `git diff`, untracked files
+    enumerated via `git ls-files --others`), just rendered as readable
+    text instead of a hash, and not a new discovery pass over the
+    workspace. Untracked files have no tracked diff to show, so each is
+    represented as a synthetic "new file" block; unreadable/binary/non-
+    utf8 content is noted and skipped, never raised.
+    """
+    parts = [run(["git", "diff", baseline, "--"], ws).stdout or ""]
+    for rel in lines(git(ws, "ls-files", "--others", "--exclude-standard")):
+        p = ws / rel
+        try:
+            content = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            parts.append(f"\n--- new file (untracked): {rel} (binary or unreadable; content omitted) ---\n")
+            continue
+        parts.append(f"\n--- new file (untracked): {rel} ---\n{content}")
+    return "".join(parts)
 
 
 def walk_files(ws, max_depth=5):
@@ -1387,13 +1417,20 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
-                     plan_candidate_count=0):
+                     plan_candidate_count=0, review_request=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
         # sets this — reuses this same spawn shape (same env plumbing,
         # same stdout/log tee) instead of a second subprocess helper.
         cmd += ["--mode", mode]
+    if review_request is not None:
+        # C2 (glimmer-v7): only ever set alongside mode="architect" —
+        # switches that SAME read-only invocation from planning to
+        # reviewing an implementation (glimmer-engineer.py's run_architect
+        # branches on this flag's presence). No new mode string, so every
+        # existing architect read-only guard still applies unchanged.
+        cmd += ["--review-request", str(review_request)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     # Architect mode has no approval path (C1 scoping): it runs unattended
@@ -1521,6 +1558,190 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
     return plan
+
+
+# ============================================================
+# C2 (glimmer-v7): Architect consultation + review budget — V7 §§5.6-5.13
+# ============================================================
+#
+# Only ever active when --architect-first produced a usable plan
+# (architecture_plan is not None in main() — that itself only happens
+# when --architect-first was passed, see run_architect_first above): the
+# review compares implementation against the plan, so with no plan there
+# is nothing to review against and this entire feature is a no-op.
+#
+# Loop structure (documented once here, referenced from main()): the
+# review sits BEFORE verify() inside each outer repair-loop iteration
+# (V7 §5.9's "ENGINEER -> ARCHITECT REVIEW -> VERIFIER" ordering). A
+# REVISE_IMPLEMENTATION decision triggers exactly ONE bounded revise
+# round — a direct invoke_engineer() call, never routed through the
+# outer `for iteration in range(args.max_repairs+1)` loop — so it can
+# never advance `iteration`, create a checkpoint, or consume
+# --max-repairs. The two budgets (ARCHITECT_REVIEW_BUDGET for review
+# rounds, --max-repairs for verify()-driven repair rounds) are
+# independent counters that never touch each other's state.
+
+# V7 §5.13: "Architect reviews need a budget... do not let agents debate
+# indefinitely." Shared across the WHOLE session (every outer iteration),
+# not per-iteration — see manifest["architectReviews"].
+ARCHITECT_REVIEW_BUDGET = 3
+
+# Same order of magnitude as PLAN_EVIDENCE_MAX_TOTAL_CHARS above — bounds
+# how much of a (potentially large) diff gets embedded in the review
+# request/prompt, purely a token-budget cap (the diff text itself is
+# v2-computed, not model output, so this isn't a security boundary like
+# PLAN_EVIDENCE_MAX_* is).
+ARCHITECT_REVIEW_DIFF_MAX_CHARS = 48 * 1024
+
+# Mirrors glimmer-engineer.py's ARCHITECT_REVIEW_DECISIONS. v2 is the
+# trusted layer and this decision string drives whether verify() runs at
+# all, so it re-checks the enum itself rather than blindly trusting that
+# glimmer-engineer.py's own validate_architect_review already did —
+# defense in depth on a safety-relevant branch, same spirit as C1's
+# read_candidate_evidence treating model output as untrusted.
+ARCHITECT_REVIEW_DECISIONS = {
+    "APPROVED",
+    "APPROVED_WITH_CONDITIONS",
+    "REVISE_IMPLEMENTATION",
+    "REPLAN_REQUIRED",
+    "HUMAN_REVIEW_REQUIRED",
+}
+
+
+def make_review_request(plan, files, change_types, diff_text, iteration, review_round):
+    """C2: the review-request payload v2 (trusted layer) writes to disk
+    for the architect-review subprocess to read directly (glimmer-
+    engineer.py's _load_review_request) — V7 §5.6's shape, scoped down
+    per the C2 task entry to what a pre-verification review actually
+    needs: the plan it's checking against, the real changed-files list,
+    and the real diff (git_diff_text — same underlying git plumbing as
+    diff_hash/file_change_types, not a new discovery pass).
+    """
+    return {
+        "type": "architect_review_request",
+        "iteration": iteration,
+        "reviewRound": review_round,
+        "architecturePlan": plan,
+        "changedFiles": [
+            {"path": f, "changeType": change_types.get(f, "modified")} for f in files
+        ],
+        "diff": diff_text,
+    }
+
+
+def load_architect_review(session_dir, iteration, review_round):
+    """C2: load architect-review-NN-MM.json, mirroring load_architecture_
+    plan's uniform-None-on-any-degraded-case contract — file missing,
+    unreadable, not valid JSON, not an object, explicitly marked
+    reviewFailed, or carrying a decision outside the 5-value enum all
+    return None uniformly. Callers never need to distinguish these
+    cases: None always means "this review did not produce a usable
+    result," which main()'s loop treats as fail-open (proceed exactly as
+    if no review had run).
+    """
+    path = Path(session_dir) / f"architect-review-{iteration:02d}-{review_round:02d}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("reviewFailed"):
+        return None
+    if data.get("decision") not in ARCHITECT_REVIEW_DECISIONS:
+        return None
+
+    normalized = {"decision": data["decision"], "confidence": data.get("confidence")}
+    for field in ("findings", "requiredChanges", "constraints", "verificationAdjustments"):
+        value = data.get(field, [])
+        normalized[field] = value if isinstance(value, list) else []
+    return normalized
+
+
+def classify_architect_review_decision(decision):
+    """Maps one ArchitectReview decision (V7 §5.7) to what main()'s
+    review sub-loop does next. Pure/deterministic — exercised directly
+    by --architect-review-selfcheck without a live model or session."""
+    if decision in ("APPROVED", "APPROVED_WITH_CONDITIONS"):
+        return "approved"
+    if decision == "REVISE_IMPLEMENTATION":
+        return "revise"
+    if decision in ("REPLAN_REQUIRED", "HUMAN_REVIEW_REQUIRED"):
+        return "rejected"
+    return "rejected"  # unrecognized decision must never silently proceed to verify()
+
+
+def architect_gates_value(outcome):
+    """Maps the review sub-loop's terminal outcome to gates.
+    architectureApproved (True/False/None) per the C2 gates contract:
+    True on approved, False on rejected/budget-exhausted, None when the
+    review never ran or failed open."""
+    if outcome == "approved":
+        return True
+    if outcome in ("rejected", "budget_exhausted"):
+        return False
+    return None  # outcome is None (never ran) or "fail_open"
+
+
+def architect_review_failure_text(review):
+    """C2: format an ArchitectReview's requiredChanges + findings into
+    the SAME "failure text" shape make_prompt's repair branch already
+    expects (failure_text(results), built for verify() failures) — a
+    REVISE_IMPLEMENTATION round is a repair round driven by architect
+    judgment instead of a failing verification command, so it reuses
+    that exact prompt slot rather than inventing a second one."""
+    out = []
+    if review.get("requiredChanges"):
+        out.append("Architect-required changes:")
+        out.extend(f"  - {c}" for c in review["requiredChanges"])
+    if review.get("findings"):
+        out.append("Architect findings:")
+        out.extend(f"  - {c}" for c in review["findings"])
+    if not out:
+        out.append("Architect review returned REVISE_IMPLEMENTATION with no specific findings/requiredChanges.")
+    return "\n".join(out)
+
+
+def run_architect_review(engineer, ws, plan, files, change_types, baseline, session, events_path, sid,
+                          iteration, review_round):
+    """C2 (glimmer-v7): pre-verification architect review (V7 §5.9),
+    invoked from main()'s per-iteration loop only when a plan exists.
+    Reuses invoke_engineer's SAME mode="architect" spawn path as C1's
+    planning step (glimmer-engineer.py's read-only enforcement —
+    ARCHITECT_TOOL_NAMES, the execute_tool hard-block, architect_shell_
+    policy — all key off mode == "architect"; --review-request only
+    changes what the architect subprocess DOES inside that same mode,
+    never widens what it's allowed to touch — see
+    _architect_review_selfcheck on the engineer side). Must never raise:
+    any failure (spawn error, missing/invalid output) degrades to None,
+    identical in meaning to "review never happened" — see load_
+    architect_review's uniform degradation contract.
+    """
+    print("\n" + "=" * 72)
+    print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
+    print("=" * 72)
+
+    diff_text = git_diff_text(ws, baseline)
+    if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
+        diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
+
+    request = make_review_request(plan, files, change_types, diff_text, iteration, review_round)
+    request_path = session / f"review-request-{iteration:02d}-{review_round:02d}.json"
+
+    try:
+        request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
+
+        rc = invoke_engineer(
+            engineer, ws,
+            "Perform the pre-verification architect review described in --review-request.",
+            True,  # auto_approve forced regardless, same as run_architect_first
+            None,  # architect mode's own smaller default turn budget applies
+            session / f"architect-review-{iteration:02d}-{review_round:02d}.log",
+            events_path, sid, mode="architect", review_request=request_path,
+        )
+        print(f"[V2] Architect review subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - review failure must never block the run
+        print(f"[V2] WARN: architect review subprocess failed to run: {exc}")
+
+    return load_architect_review(session, iteration, review_round)
 
 
 def main():
@@ -1730,6 +1951,15 @@ def main():
             )
             manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
             candidate_evidence = read_candidate_evidence(architecture_plan, ws)
+            # C2: gates/architectReviews are only ever added to the
+            # manifest when a usable plan exists — with no plan there is
+            # nothing to review against, so C2 never runs and these keys
+            # would otherwise be pure clutter on a --architect-first run
+            # that didn't even get a usable plan (mirrors architectPlan's
+            # own architect_first-only gating just above).
+            if architecture_plan is not None:
+                manifest["gates"] = {"architectureApproved": None}
+                manifest["architectReviews"] = {"max": ARCHITECT_REVIEW_BUDGET, "used": 0}
             save()
 
         for iteration in range(args.max_repairs + 1):
@@ -1793,6 +2023,92 @@ def main():
             print("\n[V2] Changed files:")
             for f in files:
                 print(f"  - {f}")
+
+            # C2 (glimmer-v7): pre-verification architect review (V7 §5.9)
+            # -- ONLY when --architect-first produced a usable plan
+            # (architecture_plan is not None; see the C2 module-docstring
+            # block above run_architect_review for the full loop-structure
+            # rationale). Sits strictly BEFORE verify(). A REVISE_
+            # IMPLEMENTATION round re-invokes the engineer directly, never
+            # through the outer `for iteration` loop, so it can never
+            # advance `iteration` or consume --max-repairs.
+            if architecture_plan is not None:
+                review_round = 0
+                architect_outcome = None
+                while True:
+                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
+                        architect_outcome = "budget_exhausted"
+                        break
+                    review_round += 1
+                    manifest["architectReviews"]["used"] += 1
+                    save()
+                    emit_event(events_path, "agent_state_changed", sid, state="architect_review")
+                    review = run_architect_review(
+                        engineer, ws, architecture_plan, files, change_types, baseline,
+                        session, events_path, sid, iteration, review_round,
+                    )
+                    attempt.setdefault("architectReviews", []).append(
+                        {"round": review_round, "review": review}
+                    )
+                    if review is None:
+                        print("[V2] Architect review produced no usable output; "
+                              "failing open (proceeding as if no review had run).")
+                        architect_outcome = "fail_open"
+                        break
+
+                    decision_outcome = classify_architect_review_decision(review["decision"])
+                    if decision_outcome in ("approved", "rejected"):
+                        architect_outcome = decision_outcome
+                        break
+
+                    # decision_outcome == "revise": ONE bounded revise round
+                    # (repair-style prompt via make_prompt's existing repair
+                    # branch, architect's requiredChanges/findings standing
+                    # in for a verification failure), then loop back for
+                    # another review — budget permitting.
+                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
+                        architect_outcome = "budget_exhausted"
+                        break
+                    print(f"[V2] Architect review requested REVISE_IMPLEMENTATION "
+                          f"(iteration={iteration}, round={review_round}); running one bounded revise pass.")
+                    revise_prompt = make_prompt(
+                        contract, summary, review_round,
+                        failure=architect_review_failure_text(review),
+                        checkpoint_sha=None, plan=architecture_plan, evidence=candidate_evidence,
+                    )
+                    (session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt").write_text(
+                        revise_prompt, encoding="utf-8")
+                    invoke_engineer(
+                        engineer, ws, revise_prompt, args.auto_approve, args.max_turns,
+                        session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
+                        events_path, sid, plan_candidate_count=len(candidate_evidence),
+                    )
+                    files = changed_files(ws, baseline)
+                    change_types = file_change_types(ws, baseline)
+                    for f in files:
+                        emit_event(events_path, "file_changed", sid, path=f,
+                                   changeType=change_types.get(f, "modified"))
+                    attempt["changedFiles"] = files
+                    attempt["diffHashBeforeVerify"] = diff_hash(ws, baseline)
+                    scope_result = compute_scope_guard(files, manifest.get("contract", {}))
+                    attempt["scopeGuard"] = scope_result
+
+                manifest["gates"] = {"architectureApproved": architect_gates_value(architect_outcome)}
+                save()
+
+                if architect_outcome in ("rejected", "budget_exhausted"):
+                    # V7 §5.10: tests-pass + architect-rejects must never be
+                    # promoted to "verified" -- stop the whole loop here,
+                    # before verify() ever runs for this iteration.
+                    attempt["status"] = "needs-architect-review"
+                    manifest["attempts"].append(attempt)
+                    manifest["status"] = "needs-architect-review"
+                    manifest["state"] = canonical_session_state(manifest["status"])
+                    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                    save()
+                    final_label = "ARCHITECTURE REVIEW REQUIRED — NOT VERIFIED"
+                    print(f"\n[V2] {architect_outcome}: architecture review gate blocks promotion to verified.")
+                    break
 
             commands = verifier_commands(repo, files, args.verification_level)
             commands = expand_verify_entries(commands, args.verify, session, args.visual_url)
@@ -2321,6 +2637,176 @@ def _architect_first_selfcheck() -> None:
     print("architect-first self-check: PASS")
 
 
+def _architect_review_selfcheck() -> None:
+    """C2 (glimmer-v7): proves the pre-verification review's core
+    invariants without a live model or a full main() run — decision
+    routing, budget/gates mapping, fail-open on malformed/missing
+    output, and the "no plan -> zero behavior change" contract.
+    Run with: python3 glimmer-v2.py --architect-review-selfcheck
+    """
+    import inspect
+
+    # ------------------------------------------------------------
+    # 1. Decision routing (V7 §5.7) — pure, exercised without a session.
+    # ------------------------------------------------------------
+    assert classify_architect_review_decision("APPROVED") == "approved"
+    assert classify_architect_review_decision("APPROVED_WITH_CONDITIONS") == "approved"
+    assert classify_architect_review_decision("REVISE_IMPLEMENTATION") == "revise"
+    assert classify_architect_review_decision("REPLAN_REQUIRED") == "rejected"
+    assert classify_architect_review_decision("HUMAN_REVIEW_REQUIRED") == "rejected"
+    assert classify_architect_review_decision("NOT_A_REAL_DECISION") == "rejected"  # never silently proceed
+
+    # ------------------------------------------------------------
+    # 2. gates.architectureApproved mapping (True/False/None).
+    # ------------------------------------------------------------
+    assert architect_gates_value("approved") is True
+    assert architect_gates_value("rejected") is False
+    assert architect_gates_value("budget_exhausted") is False
+    assert architect_gates_value("fail_open") is None
+    assert architect_gates_value(None) is None
+
+    # ------------------------------------------------------------
+    # 3. Terminal status maps to canonical "needs_review", session never
+    #    promoted to "verified" (V7 §5.10).
+    # ------------------------------------------------------------
+    assert canonical_session_state("needs-architect-review") == "needs_review"
+    failure = classify_failure({"status": "needs-architect-review"}, [])
+    assert failure is not None and failure["class"] == "POLICY_BLOCK"
+
+    # ------------------------------------------------------------
+    # 4. make_review_request shape + architect_review_failure_text.
+    # ------------------------------------------------------------
+    plan = {"objective": "x", "packages": [], "risk": "low"}
+    request = make_review_request(
+        plan, ["a.ts", "b.ts"], {"a.ts": "modified", "b.ts": "added"},
+        "diff text here", iteration=1, review_round=2,
+    )
+    assert request["type"] == "architect_review_request"
+    assert request["iteration"] == 1 and request["reviewRound"] == 2
+    assert request["architecturePlan"] == plan
+    assert request["changedFiles"] == [
+        {"path": "a.ts", "changeType": "modified"},
+        {"path": "b.ts", "changeType": "added"},
+    ]
+    assert request["diff"] == "diff text here"
+
+    revise_text = architect_review_failure_text({
+        "requiredChanges": ["reuse existing store"],
+        "findings": ["duplicate state introduced"],
+    })
+    assert "reuse existing store" in revise_text
+    assert "duplicate state introduced" in revise_text
+    assert architect_review_failure_text({}) != ""  # never empty, never raises
+
+    # ------------------------------------------------------------
+    # 5. load_architect_review: uniform None on every degraded case;
+    #    real values pass through on a genuinely valid file.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+
+        # Missing file entirely.
+        assert load_architect_review(session_dir, 0, 1) is None
+
+        # Present but not valid JSON.
+        bad_path = session_dir / "architect-review-00-01.json"
+        bad_path.write_text("not json{{{", encoding="utf-8")
+        assert load_architect_review(session_dir, 0, 1) is None
+
+        # Present, valid JSON, but explicitly marked failed (fail-open).
+        bad_path.write_text(
+            json.dumps({"reviewFailed": True, "decision": "HUMAN_REVIEW_REQUIRED", "confidence": 0.0}),
+            encoding="utf-8",
+        )
+        assert load_architect_review(session_dir, 0, 1) is None
+
+        # Present, valid JSON, decision outside the 5-value enum (v2's
+        # own defense-in-depth check, not just glimmer-engineer.py's).
+        bad_decision_path = session_dir / "architect-review-00-02.json"
+        bad_decision_path.write_text(
+            json.dumps({"decision": "MAYBE", "confidence": 0.5}), encoding="utf-8",
+        )
+        assert load_architect_review(session_dir, 0, 2) is None
+
+        # A genuinely valid review, correct NN-MM file naming.
+        good_path = session_dir / "architect-review-01-02.json"
+        good_path.write_text(
+            json.dumps({
+                "decision": "APPROVED_WITH_CONDITIONS",
+                "confidence": 0.9,
+                "constraints": ["do not move persistence into component state"],
+            }),
+            encoding="utf-8",
+        )
+        loaded = load_architect_review(session_dir, 1, 2)
+        assert loaded is not None
+        assert loaded["decision"] == "APPROVED_WITH_CONDITIONS"
+        assert loaded["confidence"] == 0.9
+        assert loaded["constraints"] == ["do not move persistence into component state"]
+        assert loaded["findings"] == []  # arrays default empty
+
+    # ------------------------------------------------------------
+    # 6. git_diff_text: tracked modification AND untracked new file both
+    #    show up (untracked files have no `git diff` entry by default —
+    #    represented as a synthetic "new file" block instead).
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        run(["git", "init", "-q"], ws)
+        run(["git", "config", "user.email", "test@example.com"], ws)
+        run(["git", "config", "user.name", "Test"], ws)
+        (ws / "a.txt").write_text("original\n", encoding="utf-8")
+        run(["git", "add", "-A"], ws)
+        run(["git", "commit", "-q", "-m", "init"], ws)
+        baseline = head(ws)
+
+        (ws / "a.txt").write_text("changed\n", encoding="utf-8")
+        (ws / "b.txt").write_text("brand new file\n", encoding="utf-8")
+
+        diff_text = git_diff_text(ws, baseline)
+        assert "-original" in diff_text and "+changed" in diff_text
+        assert "new file (untracked): b.txt" in diff_text
+        assert "brand new file" in diff_text
+
+    # ------------------------------------------------------------
+    # 7. invoke_engineer's review_request plumbing: default None (every
+    #    existing call site unaffected), and the flag is only appended
+    #    to the spawned command when explicitly given.
+    # ------------------------------------------------------------
+    assert "review_request" in inspect.signature(invoke_engineer).parameters
+    assert inspect.signature(invoke_engineer).parameters["review_request"].default is None
+    invoke_source = inspect.getsource(invoke_engineer)
+    assert '"--review-request"' in invoke_source
+    assert "if review_request is not None:" in invoke_source
+
+    # ------------------------------------------------------------
+    # 8. "No plan -> zero behavior change": the review sub-loop and the
+    #    gates/architectReviews manifest keys are both gated behind the
+    #    same `architecture_plan is not None` condition C1 already uses
+    #    for architectPlan/candidate_evidence — a run without
+    #    --architect-first (architecture_plan always None) can never
+    #    reach any of this code.
+    # ------------------------------------------------------------
+    main_source = inspect.getsource(main)
+    assert main_source.count("if architecture_plan is not None:") >= 2, (
+        "both the gates/architectReviews manifest init and the review "
+        "sub-loop must be gated behind architecture_plan is not None"
+    )
+
+    # ------------------------------------------------------------
+    # 9. Revise rounds must never touch the outer repair-loop's
+    #    iteration variable or --max-repairs -- the revise invoke_
+    #    engineer() call must not be inside a construct that reassigns
+    #    `iteration` (it lives inside the `while True:` review loop,
+    #    nested under the `for iteration in range(...)` loop, but never
+    #    itself advances `iteration`).
+    # ------------------------------------------------------------
+    assert "iteration += 1" not in main_source
+    assert "iteration = iteration" not in main_source
+
+    print("architect review self-check: PASS")
+
+
 def _visual_selfcheck() -> None:
     """C4 (glimmer-v7): proves the vision-verification plumbing without a
     live browser or a live model call.
@@ -2509,6 +2995,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-first-selfcheck"]:
         _architect_first_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-review-selfcheck"]:
+        _architect_review_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--visual-selfcheck"]:
         _visual_selfcheck()
