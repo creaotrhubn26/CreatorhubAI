@@ -126,6 +126,12 @@ const FETCH_TIMEOUT_MS = 120_000;
 // holding the global inFlight lock, so a hang here (stale lock file, wedged
 // filesystem) would 409 every other caller forever. Bound it too.
 const WORKTREE_ADD_TIMEOUT_MS = 60_000;
+// "invalid reference" can also come from a bad CONFIG.worktreeBase (a
+// commit-ish that doesn't resolve), not just a taskName-derived branch name.
+// That's unreachable today only because `rev-parse CONFIG.worktreeBase`
+// (below, under the same inFlight lock) already validates the base and
+// throws first -- if that ordering ever changes, this regex would
+// misattribute a bad-base failure to the taskName as a 400.
 const REF_NAME_REJECTION = /not a valid (branch|ref) name|invalid reference/i;
 
 // The slug is the ONLY fragment of this flow derived from user input, and it
@@ -255,8 +261,12 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   const branch = `glimmer/${slug}-${stamp}`;
   const workspace = path.join(CONFIG.worktreeRoot, `glimmer-${slug}-${stamp}`);
 
+  // Guards CONFIG.worktreeRoot (server config), not taskName — the slug's
+  // closed charset already forbids "/", so nothing user-supplied can trip
+  // this. A trip here means worktreeRoot itself is misconfigured -> 500,
+  // not 400.
   if (!resolvesWithinRoot(CONFIG.worktreeRoot, workspace)) {
-    throw new WorkspaceCreateError(`refusing to create a worktree outside worktreeRoot: ${workspace}`, 400);
+    throw new WorkspaceCreateError(`refusing to create a worktree outside worktreeRoot: ${workspace}`, 500);
   }
 
   if (await refExists(sourceRepo, `refs/heads/${branch}`)) {
