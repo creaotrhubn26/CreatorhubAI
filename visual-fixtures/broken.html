@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broken fixture</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #ffffff;
+    color: #111111;
+  }
+  /* Deliberately tall so the primary button below sits far past any
+     reasonable viewport fold (V7 §22.2: "components rendering outside
+     viewport" / "hidden primary actions"). */
+  .stage {
+    position: relative;
+    height: 2200px;
+  }
+  h1 {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    margin: 0;
+    font-size: 26px;
+  }
+  /* Two paragraphs deliberately stacked at the identical position, same
+     size, opaque dark text -- an unambiguous overlapping-elements /
+     unreadable-text defect (V7 §22.2). */
+  .overlap-a, .overlap-b {
+    position: absolute;
+    top: 90px;
+    left: 20px;
+    width: 320px;
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.3;
+    margin: 0;
+  }
+  .overlap-a { color: #1a1a1a; }
+  .overlap-b { color: #d11; }
+
+  /* Primary action, pushed almost 2000px down the page -- fully below
+     the fold at both the 390x844 mobile viewport and the 1440x900
+     desktop viewport this repo captures by default. */
+  .primary-button {
+    position: absolute;
+    top: 2050px;
+    left: 20px;
+    padding: 16px 32px;
+    font-size: 20px;
+    font-weight: 600;
+    color: #ffffff;
+    background: #2563eb;
+    border: none;
+    border-radius: 8px;
+  }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <h1>Broken fixture</h1>
+    <p class="overlap-a">This paragraph collides directly with another block of text rendered at the exact same position.</p>
+    <p class="overlap-b">SECOND BLOCK OF TEXT PRINTED ON TOP OF THE FIRST, MAKING BOTH ILLEGIBLE.</p>
+    <button type="button" class="primary-button">Submit Order</button>
+  </div>
+</body>
+</html>

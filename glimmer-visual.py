@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""glimmer-visual.py -- C4 (glimmer-v7) capture script for Vision Verification.
+"""glimmer-visual.py -- C4 (glimmer-v7) capture + vision-review script.
 
-Plumbing-only pass (V7 §22; reconciliation doc §9 C4): this script launches a
-browser via Playwright, navigates to --url, captures one screenshot per
---viewport, and writes sessions/<id>/visual/visual-manifest.json +
-findings.json in the real V7 §22.4 / §22.14 shapes. It does NOT call a
-multimodal model in this pass -- see run_vision_model() below for the
-documented extension point a future pass wires up.
+This script launches a browser via Playwright, navigates to --url, captures
+one screenshot per --viewport, and writes sessions/<id>/visual/
+visual-manifest.json + findings.json in the real V7 §22.4 / §22.14 shapes.
+Capture always runs. With --vision (opt-in), each captured screenshot is
+also sent to the multimodal llama-server (--model-url) for a real V7 §22.2/
+22.3 review -- see run_vision_model() below. Without --vision, behavior is
+capture-only: findings.json status stays honestly NOT_RUN.
 
 Read-only w.r.t. the target application/workspace (V7 §22.19 -- Vision
 Verifier must be read-only: observe, classify, report; never edit). This
@@ -37,12 +38,52 @@ classify_visual_check_result in glimmer-v2.py, which reads this script's
 JSON output instead.
 """
 import argparse
+import base64
 import json
+import re
 import sys
 import traceback
 from pathlib import Path
+from urllib import error, request
 
 DEFAULT_VIEWPORTS = ("1440x900", "390x844")  # V7 §22.6 desktop+mobile minimum
+DEFAULT_MODEL_URL = "http://127.0.0.1:8080"
+DEFAULT_VISION_TIMEOUT_S = 120
+
+# Same convention as glimmer-engineer.py's API_KEY_FILE/api_key() (mirrored,
+# not imported -- this script stays standalone, per the module docstring):
+# llama-server is started with --api-key reading this same file
+# (start-glimmer-agent.sh), so vision calls need the identical
+# Authorization: Bearer <key> header engineer's http_json already sends.
+DEFAULT_API_KEY_FILE = Path.home() / "AI/muse-glimmer/config/api-key.txt"
+
+# V7 §22.2 basics -- used only when the caller doesn't pass --check at all.
+DEFAULT_CHECKS = (
+    "no clipped or cut-off elements",
+    "no unexpected overlapping elements",
+    "all visible text is readable",
+    "no elements rendered outside the viewport",
+    "no horizontal overflow",
+)
+
+SEVERITY_VALUES = ("low", "medium", "high", "critical")
+
+VISION_SYSTEM_PROMPT = (
+    "You are a read-only visual verifier for a web UI screenshot. You "
+    "observe; you never edit, and you never invent implementation defects "
+    "that are not visible in the image (V7 §22.2). Judge only what is "
+    "actually visible in the screenshot: clipping, overflow, overlapping "
+    "elements, unreadable/illegible text, elements rendered outside the "
+    "viewport, broken layout, hidden or obscured primary actions. Do not "
+    "speculate about code, data, or behavior you cannot see.\n\n"
+    "Respond with ONLY a single JSON object, no prose, no markdown fence:\n"
+    '{"findings": [{"severity": "low|medium|high|critical", "category": '
+    '"<short category>", "element": "<what>", "description": "<what is '
+    'wrong, in one sentence>"}]}\n\n'
+    "findings MUST be [] when every check passes and nothing else is "
+    "visibly wrong -- an empty list is a valid, common, correct answer. "
+    "Never pad findings to have something to say."
+)
 
 
 def parse_viewport(spec):
@@ -72,19 +113,222 @@ def _default_capture(url, width, height, out_path, timeout_ms=30000):
             browser.close()
 
 
-def run_vision_model(screenshot_names, viewports, contract=None):
-    """Extension point for a future pass, deliberately NOT implemented here
-    (out of scope for C4-plumbing-only, per the reconciliation doc: no live
-    model call in this pass). A future pass would send the captured
-    screenshots in `screenshot_names` (filenames under --output-dir) to the
-    existing multimodal llama-server, using `contract` (V7 §22.3's
-    visual_verification contract -- route/state/viewport/checks) to scope
-    the review, and return a findings[] list in the exact V7 §22.4 shape
-    (id/severity/category/element/description/region), severity classified
-    per V7 §22.5. Always returns [] today -- this is what makes today's
-    findings.json honestly say "nothing was inspected" rather than
-    fabricating a clean bill of health."""
-    return []
+def _extract_json_object(text):
+    """Best-effort extraction of a single JSON object from the model's
+    reply text. Mirrors glimmer-engineer.py's _extract_json_object (not
+    imported -- this script is standalone/zero-heavy-deps by design, see
+    module docstring): the system prompt asks for bare JSON, but models
+    sometimes wrap it in prose or a ```json fence anyway."""
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except ValueError:
+            pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except ValueError:
+            pass
+    raise ValueError("no parseable JSON object found in vision model reply")
+
+
+def _build_vision_payload(image_b64, route, viewport_slug, checks):
+    """Pure request-builder (mirrors glimmer-engineer.py's
+    _build_delivery_review_payload split) so a self-check can assert the
+    constructed payload has no "tools" key -- omission of that key IS the
+    structural, not merely instructed, tool-free guarantee (same
+    discipline as C6/the Session Assistant). The image travels as an
+    OpenAI-style content part alongside the text contract, per the
+    multimodal llama-server's (--mmproj) expected request shape."""
+    checks_text = "\n".join(f"- {c}" for c in checks)
+    contract_text = (
+        f"ROUTE: {route}\n"
+        f"VIEWPORT: {viewport_slug}\n"
+        f"CHECKS:\n{checks_text}\n\n"
+        "Inspect the attached screenshot against the checks above. Report "
+        "only what is actually visible in the image."
+    )
+    return {
+        "model": "muse-glimmer",
+        "messages": [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": contract_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ],
+            },
+        ],
+        "max_tokens": 1024,
+    }
+    # No "tools"/"tool_choice"/"parallel_tool_calls" key is ever added above.
+
+
+def _read_api_key(path):
+    """Never raises. '' when the file is missing/unreadable/blank -- a
+    server started with no --api-key must still work, so a missing key
+    file degrades to "send no Authorization header", not a crash."""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _auth_headers(api_key_text):
+    """{'Authorization': 'Bearer <key>'} when api_key_text is non-empty,
+    else {} -- same header glimmer-engineer.py's http_json always sends
+    (API_KEY_FILE / api_key()), applied here only when a key was actually
+    found."""
+    if api_key_text:
+        return {"Authorization": f"Bearer {api_key_text}"}
+    return {}
+
+
+def _http_post_json(url, payload, timeout_s, headers=None):
+    """glimmer-visual's own minimal stdlib POST helper -- mirrors
+    glimmer-engineer.py's http_json in spirit but is not imported from it
+    (this script stays standalone, per its module docstring)."""
+    data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = request.Request(url, data=data, headers=req_headers, method="POST")
+    with request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return json.loads(raw)
+
+
+def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
+                       timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None):
+    """One chat-completions call for one screenshot. Returns the model's
+    raw (untrusted) findings list. Raises on any failure -- network error,
+    timeout, non-2xx (401 included -- a missing/wrong Authorization header
+    against a --api-key server fails here like any other bad call), unparseable
+    JSON, missing/malformed 'findings' key -- so the caller (run_vision_model)
+    can mark that one viewport BLOCKED instead of silently treating a
+    broken call as "reviewed, nothing found"."""
+    post_fn = post_fn or _http_post_json
+    # ponytail: no size guard on the base64-encoded PNG here -- a
+    # pathologically large screenshot just makes a slow/failing HTTP POST,
+    # which already degrades honestly to that viewport's report being
+    # "blocked" (see the except below), same as any other call failure.
+    # Add an explicit size cap before base64-encoding if a real capture
+    # ever produces multi-tens-of-MB screenshots in practice.
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload = _build_vision_payload(image_b64, route, viewport_slug, checks)
+    endpoint = model_url.rstrip("/") + "/v1/chat/completions"
+    response = post_fn(endpoint, payload, timeout_s, _auth_headers(api_key_text))
+    content = response["choices"][0]["message"].get("content") or ""
+    data = _extract_json_object(content)
+    if not isinstance(data, dict):
+        raise ValueError("vision model reply is not a JSON object")
+    raw_findings = data.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ValueError("vision model reply missing a 'findings' list")
+    return raw_findings
+
+
+def _coerce_finding(raw, viewport_slug):
+    """Tolerant validation of one raw finding dict (mirrors
+    validate_delivery_review's coercion conventions in glimmer-engineer.py):
+    unknown/missing severity coerces to "low" (never silently escalate);
+    a finding with no real (non-empty string) description is dropped
+    entirely -- a finding's only substance IS its description, same "don't
+    invent dissatisfaction" principle applied to a live model's own
+    output. region is optional and dropped (not defaulted/fabricated)
+    unless it is present and well-shaped. Returns None for a finding that
+    should be dropped."""
+    if not isinstance(raw, dict):
+        return None
+    description = raw.get("description")
+    if not isinstance(description, str) or not description.strip():
+        return None
+    severity = raw.get("severity")
+    severity = severity.lower() if isinstance(severity, str) else ""
+    if severity not in SEVERITY_VALUES:
+        severity = "low"
+    category = raw.get("category")
+    category = category if isinstance(category, str) and category.strip() else "general"
+    element = raw.get("element")
+    element = element if isinstance(element, str) else ""
+    finding = {
+        "severity": severity,
+        "category": category,
+        "element": element,
+        "description": description.strip(),
+        "viewport": viewport_slug,
+    }
+    region = raw.get("region")
+    if isinstance(region, dict) and all(
+        isinstance(region.get(k), (int, float)) for k in ("x", "y", "width", "height")
+    ):
+        finding["region"] = {k: region[k] for k in ("x", "y", "width", "height")}
+    return finding
+
+
+def run_vision_model(captures, output_dir, route, checks, model_url,
+                      timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None):
+    """Real implementation of the extension point C4-plumbing left
+    documented-but-stubbed. One chat-completions call per successfully
+    captured viewport (a viewport that failed to capture has nothing to
+    inspect and is skipped here -- its absence already surfaces via
+    visual-manifest.json). Never raises and never fabricates findings on
+    failure: any call failure for a viewport (network error, timeout,
+    unparseable reply) is caught here and recorded as that viewport being
+    "blocked" in the returned reports list, with zero findings contributed
+    -- the honest alternative to guessing.
+
+    Returns (findings, reports):
+      findings -- flat list across all viewports, V7 §22.4 shape, each
+        tagged with its viewport and a sequential "visual_NNN" id assigned
+        AFTER aggregation (ids are a property of the combined report, not
+        of a single viewport's call).
+      reports -- one {"viewport", "status": "reviewed"|"blocked", ["error"]}
+        per attempted (captured) viewport, consumed by build_findings to
+        compute the overall status.
+    """
+    findings = []
+    reports = []
+    output_dir = Path(output_dir)
+    for c in captures:
+        if c["status"] != "captured":
+            continue
+        viewport_slug = c["viewport"]
+        try:
+            image_bytes = (output_dir / c["screenshot"]).read_bytes()
+            raw_findings = call_vision_model(
+                image_bytes, route, viewport_slug, checks, model_url,
+                timeout_s=timeout_s, post_fn=post_fn, api_key_text=api_key_text,
+            )
+        except Exception as exc:  # noqa: BLE001 -- one viewport's model call must never crash the run or fabricate findings
+            reports.append({
+                "viewport": viewport_slug,
+                "status": "blocked",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            continue
+        for raw in raw_findings:
+            coerced = _coerce_finding(raw, viewport_slug)
+            if coerced is not None:
+                findings.append(coerced)
+        reports.append({"viewport": viewport_slug, "status": "reviewed"})
+
+    for i, f in enumerate(findings, start=1):
+        f["id"] = f"visual_{i:03d}"
+
+    return findings, reports
 
 
 def capture_viewport(url, viewport_spec, output_dir, capture_fn=_default_capture):
@@ -130,43 +374,79 @@ def build_manifest(url, captures, states=("initial",)):
     }
 
 
-def build_findings(captures, findings=None):
+def build_findings(captures, findings=None, reports=None):
     """V7 §22.4 findings.json shape: {status, viewport, findings[]}.
 
-    `status` here reflects ONLY capture success/failure, since no model
-    inspection ran in this pass (run_vision_model is not wired up yet):
+    `reports=None` (the default) is the exact pre-C4-live-vision behavior
+    -- --vision was never passed, run_vision_model never ran, and this
+    function's logic is byte-for-byte what it was before this pass:
       - "NOT_RUN" when every viewport was captured cleanly. "Capture
         succeeded" and "review passed" are two different facts -- `PASS`
         would tell a downstream reader "this UI was visually inspected,
-        found fine," which is false: findings[] is always [] because no
-        semantic review ever ran, not because one ran and found nothing.
-        "Capture succeeded" already has its own honest home in
-        visual-manifest.json's status; NOT_RUN is the real, V7
-        §22.4-sanctioned value for "not reviewed" as distinct from
-        "reviewed, fine." PASS/FAIL are reserved for once run_vision_model
-        is actually wired up and produces real findings.
+        found fine," which is false when findings[] is empty because
+        nothing looked, not because something looked and found nothing.
       - "FAIL" when capture failed for every viewport -- there is nothing
-        for even a future model step to inspect, so this cannot honestly
-        be anything else.
+        for even a model step to inspect, so this cannot honestly be
+        anything else.
+    This is the zero-behavior-change guarantee for every existing caller
+    that doesn't pass --vision: identical inputs, identical output.
+
+    `reports` (a list from run_vision_model, one entry per attempted
+    viewport) means vision WAS run; status is now real, per V7 §22.4/22.5:
+      - no reports at all (vision opted in, but nothing was even
+        capture-successful enough to attempt) -> "BLOCKED": nothing was
+        reviewed, which is not the same fact as "reviewed, clean."
+      - any critical/high finding -> "FAIL" (checked first: a confirmed
+        real defect is more actionable than an infra gap elsewhere).
+      - else, any viewport whose model call itself failed -> "BLOCKED"
+        (honest "couldn't tell," never silently dropped).
+      - else, any low/medium finding -> "PASS_WITH_WARNINGS".
+      - else (every viewport reviewed, no findings at all) -> "PASS".
+
     `viewport` is "multi" (rather than V7 §22.4's single-viewport string
     example) because this script captures the full requested viewport set
     per run; `viewports` carries the real list.
-    `findings` is always [] in this pass -- see run_vision_model.
     """
+    if reports is None:
+        findings = findings if findings is not None else []
+        ok = [c for c in captures if c["status"] == "captured"]
+        status = "NOT_RUN" if (captures and ok) else "FAIL"
+        return {
+            "status": status,
+            "viewport": "multi",
+            "viewports": [c["viewport"] for c in captures],
+            "findings": findings,
+        }
+
     findings = findings if findings is not None else []
-    ok = [c for c in captures if c["status"] == "captured"]
-    status = "NOT_RUN" if (captures and ok) else "FAIL"
+    severities = {f.get("severity") for f in findings}
+    blocked_viewports = [r["viewport"] for r in reports if r["status"] == "blocked"]
+    reviewed_viewports = [r["viewport"] for r in reports if r["status"] == "reviewed"]
+
+    if not reports:
+        status = "BLOCKED"
+    elif severities & {"critical", "high"}:
+        status = "FAIL"
+    elif blocked_viewports:
+        status = "BLOCKED"
+    elif severities & {"low", "medium"}:
+        status = "PASS_WITH_WARNINGS"
+    else:
+        status = "PASS"
+
     return {
         "status": status,
         "viewport": "multi",
         "viewports": [c["viewport"] for c in captures],
+        "reviewed": reviewed_viewports,
+        "blocked": blocked_viewports,
         "findings": findings,
     }
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Glimmer C4 visual capture (plumbing-only: capture + manifest, no live model call yet)"
+        description="Glimmer C4 visual capture + review (capture always runs; --vision opts in a real multimodal model review)"
     )
     ap.add_argument("--url", required=True, help="URL Playwright navigates to")
     ap.add_argument("--viewport", action="append", default=None,
@@ -174,6 +454,24 @@ def main(argv=None):
                           f"{'+'.join(DEFAULT_VIEWPORTS)} (V7 §22.6 desktop+mobile minimum) if omitted.")
     ap.add_argument("--output-dir", required=True,
                      help="Directory this script writes to. Never reads or writes anything outside it.")
+    ap.add_argument("--vision", action="store_true",
+                     help="Opt-in: after capture, send each screenshot to the multimodal "
+                          "model for real review. Without this flag, behavior is exactly "
+                          "as before -- capture-only, findings.json status NOT_RUN.")
+    ap.add_argument("--model-url", default=DEFAULT_MODEL_URL,
+                     help=f"Base URL of the multimodal llama-server. Default {DEFAULT_MODEL_URL}.")
+    ap.add_argument("--check", action="append", default=None,
+                     help="A V7 §22.3 contract check, e.g. "
+                          '"primary button fully visible". Repeatable. Defaults to a small '
+                          "set covering V7 §22.2 basics (clipping/overlap/unreadable text/"
+                          "off-viewport elements/horizontal overflow) if omitted.")
+    ap.add_argument("--vision-timeout", type=float, default=DEFAULT_VISION_TIMEOUT_S,
+                     help=f"Per-viewport model call timeout in seconds. Default {DEFAULT_VISION_TIMEOUT_S}.")
+    ap.add_argument("--api-key-file", default=str(DEFAULT_API_KEY_FILE),
+                     help="Path to the llama-server API key (same convention as "
+                          f"glimmer-engineer.py's API_KEY_FILE). Default {DEFAULT_API_KEY_FILE}. "
+                          "Missing/unreadable -> vision calls go out with no Authorization "
+                          "header (a server started with no --api-key still works).")
     args = ap.parse_args(argv)
 
     viewports = args.viewport or list(DEFAULT_VIEWPORTS)
@@ -185,14 +483,22 @@ def main(argv=None):
     manifest = build_manifest(args.url, captures)
     (output_dir / "visual-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    shot_names = [c["screenshot"] for c in captures if c["screenshot"]]
-    findings_doc = build_findings(captures, run_vision_model(shot_names, viewports))
+    if args.vision:
+        checks = args.check or list(DEFAULT_CHECKS)
+        findings, reports = run_vision_model(
+            captures, output_dir, args.url, checks, args.model_url,
+            timeout_s=args.vision_timeout,
+            api_key_text=_read_api_key(args.api_key_file),
+        )
+        findings_doc = build_findings(captures, findings, reports)
+    else:
+        findings_doc = build_findings(captures)
     (output_dir / "findings.json").write_text(json.dumps(findings_doc, indent=2), encoding="utf-8")
 
     ok_count = sum(1 for c in captures if c["status"] == "captured")
     print(f"[glimmer-visual] captured {ok_count}/{len(captures)} viewport(s)")
     print(f"[glimmer-visual] manifest: {output_dir / 'visual-manifest.json'}")
-    print(f"[glimmer-visual] findings: {output_dir / 'findings.json'}")
+    print(f"[glimmer-visual] findings ({findings_doc['status']}): {output_dir / 'findings.json'}")
     return 0
 
 
@@ -260,7 +566,149 @@ def _selfcheck() -> None:
         findings_fail = build_findings([c_fail])
         assert findings_fail["status"] == "FAIL"
 
-        assert run_vision_model(["1440x900.png"], ["1440x900"]) == []
+        # --- zero-behavior-change proof: --vision absent means main() calls
+        # build_findings(captures) with no findings/reports args at all, the
+        # exact same call shape as findings_pass/findings_fail above. This
+        # IS the whole proof -- no other codepath exists for --vision absent.
+        assert build_findings([c_ok])["status"] == "NOT_RUN"
+        assert build_findings([c_fail])["status"] == "FAIL"
+
+        # --- request construction: toolless, image part + checks text present ---
+        payload = _build_vision_payload("QkFTRTY0", "http://x/route", "1440x900", DEFAULT_CHECKS)
+        assert "tools" not in payload and "tool_choice" not in payload
+        user_content = payload["messages"][1]["content"]
+        assert user_content[0]["type"] == "text"
+        assert "1440x900" in user_content[0]["text"]
+        assert all(c in user_content[0]["text"] for c in DEFAULT_CHECKS)
+        assert user_content[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QkFTRTY0"},
+        }
+        assert payload["messages"][0]["role"] == "system"
+
+        # --- llama-server auth (--api-key): request construction includes
+        # Authorization: Bearer <key> when a key file resolves, and omits
+        # the header entirely when it doesn't (server with no --api-key
+        # must still work; missing/unreadable file must never crash). Same
+        # convention as glimmer-engineer.py's API_KEY_FILE/api_key(). ---
+        assert str(DEFAULT_API_KEY_FILE).endswith("AI/muse-glimmer/config/api-key.txt")
+        assert _read_api_key("/definitely/does/not/exist.txt") == ""
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as kf:
+            kf.write("  sekrit-123  \n")
+            key_path = kf.name
+        assert _read_api_key(key_path) == "sekrit-123"
+        Path(key_path).unlink()
+
+        assert _auth_headers("sekrit-123") == {"Authorization": "Bearer sekrit-123"}
+        assert _auth_headers("") == {}
+        assert _auth_headers(None) == {}
+
+        seen_headers = []
+
+        def fake_post_spy(url, payload, timeout_s, headers=None):
+            seen_headers.append(headers)
+            return {"choices": [{"message": {"content": '{"findings": []}'}}]}
+
+        call_vision_model(b"png", "http://x/route", "1440x900", DEFAULT_CHECKS,
+                           "http://model", post_fn=fake_post_spy, api_key_text="sekrit-123")
+        call_vision_model(b"png", "http://x/route", "1440x900", DEFAULT_CHECKS,
+                           "http://model", post_fn=fake_post_spy, api_key_text=None)
+        assert seen_headers[0] == {"Authorization": "Bearer sekrit-123"}
+        assert seen_headers[1] == {}, "no key resolved -> no Authorization header, not a crash"
+
+        # --- finding coercion (mirrors validate_delivery_review's tolerant
+        # conventions): unknown severity -> "low", missing/blank description
+        # dropped, well-shaped region kept, malformed region dropped. ---
+        good = _coerce_finding(
+            {"severity": "high", "category": "clipping", "element": "btn", "description": "cut off"},
+            "1440x900",
+        )
+        assert good["severity"] == "high" and good["viewport"] == "1440x900" and "id" not in good
+
+        unknown_sev = _coerce_finding({"severity": "nonsense", "description": "weird"}, "1440x900")
+        assert unknown_sev["severity"] == "low"
+
+        assert _coerce_finding({"severity": "high"}, "1440x900") is None, "no description -> dropped"
+        assert _coerce_finding({"severity": "high", "description": "   "}, "1440x900") is None
+        assert _coerce_finding("not-a-dict", "1440x900") is None
+
+        with_region = _coerce_finding(
+            {"description": "x", "region": {"x": 1, "y": 2, "width": 3, "height": 4}}, "1440x900"
+        )
+        assert with_region["region"] == {"x": 1, "y": 2, "width": 3, "height": 4}
+
+        bad_region = _coerce_finding(
+            {"description": "x", "region": {"x": 1, "y": "not-a-number"}}, "1440x900"
+        )
+        assert "region" not in bad_region, "malformed region must be dropped, not fabricated"
+
+        # --- run_vision_model: good reply, malformed reply, call failure --
+        # (synthetic post_fn, no live model / network call).
+        def fake_post_good(url, payload, timeout_s, headers=None):
+            body = json.dumps({"findings": [
+                {"severity": "critical", "category": "clipping", "element": "cta",
+                 "description": "primary button below the fold"},
+                {"severity": "weird", "description": "unknown severity coerces"},
+                {"severity": "low", "description": "   "},  # blank -> dropped
+            ]})
+            return {"choices": [{"message": {"content": body}}]}
+
+        def fake_post_malformed(url, payload, timeout_s, headers=None):
+            return {"choices": [{"message": {"content": "not json at all, sorry"}}]}
+
+        def fake_post_error(url, payload, timeout_s, headers=None):
+            raise TimeoutError("simulated model call timeout")
+
+        findings_good, reports_good = run_vision_model(
+            [c_ok], out, "http://x/route", DEFAULT_CHECKS, "http://model",
+            post_fn=fake_post_good,
+        )
+        assert len(findings_good) == 2, "the blank-description finding must be dropped"
+        assert findings_good[0]["id"] == "visual_001" and findings_good[1]["id"] == "visual_002"
+        assert findings_good[0]["severity"] == "critical"
+        assert findings_good[1]["severity"] == "low", "unknown severity coerces to low"
+        assert all(f["viewport"] == "1440x900" for f in findings_good)
+        assert reports_good == [{"viewport": "1440x900", "status": "reviewed"}]
+
+        findings_bad, reports_bad = run_vision_model(
+            [c_ok], out, "http://x/route", DEFAULT_CHECKS, "http://model",
+            post_fn=fake_post_malformed,
+        )
+        assert findings_bad == [], "an unparseable reply must never fabricate findings"
+        assert reports_bad[0]["status"] == "blocked" and "error" in reports_bad[0]
+
+        findings_err, reports_err = run_vision_model(
+            [c_ok], out, "http://x/route", DEFAULT_CHECKS, "http://model",
+            post_fn=fake_post_error,
+        )
+        assert findings_err == []
+        assert reports_err[0]["status"] == "blocked"
+        assert "TimeoutError" in reports_err[0]["error"]
+
+        # A viewport that never captured is skipped entirely (nothing to
+        # send the model), never reported as blocked.
+        findings_skip, reports_skip = run_vision_model(
+            [c_fail], out, "http://x/route", DEFAULT_CHECKS, "http://model",
+            post_fn=fake_post_good,
+        )
+        assert findings_skip == [] and reports_skip == []
+
+        # --- status aggregation (build_findings with reports=vision-ran) --
+        reviewed = [{"viewport": "1440x900", "status": "reviewed"}]
+        blocked = [{"viewport": "390x844", "status": "blocked", "error": "x"}]
+
+        assert build_findings([c_ok], [], reviewed)["status"] == "PASS"
+        assert build_findings([c_ok], [{"severity": "low", "description": "x", "viewport": "1440x900"}], reviewed)["status"] == "PASS_WITH_WARNINGS"
+        assert build_findings([c_ok], [{"severity": "medium", "description": "x", "viewport": "1440x900"}], reviewed)["status"] == "PASS_WITH_WARNINGS"
+        assert build_findings([c_ok], [{"severity": "high", "description": "x", "viewport": "1440x900"}], reviewed)["status"] == "FAIL"
+        assert build_findings([c_ok], [{"severity": "critical", "description": "x", "viewport": "1440x900"}], reviewed)["status"] == "FAIL"
+        assert build_findings([c_ok, c_fail], [], reviewed + blocked)["status"] == "BLOCKED"
+        assert build_findings(
+            [c_ok, c_fail],
+            [{"severity": "critical", "description": "x", "viewport": "1440x900"}],
+            reviewed + blocked,
+        )["status"] == "FAIL", "a confirmed real defect outranks an unrelated infra gap"
+        assert build_findings([], [], [])["status"] == "BLOCKED", "vision opted in but nothing reviewable"
 
     print("glimmer-visual.py self-check: PASS")
 
