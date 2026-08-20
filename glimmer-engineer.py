@@ -79,6 +79,19 @@ def _emit_architect_started() -> None:
     )
 
 
+# C2 (glimmer-v7): distinct lifecycle marker for the pre-verification
+# architect REVIEW step (V7 SS5.9), as opposed to the pre-iteration-0
+# PLANNING step marked by _emit_architect_started above. Same real
+# "agent_state_changed" EVENT_TYPES member (no new event types, per
+# project rule) with its own distinct state value so review activity is
+# segmentable from planning activity in events.jsonl.
+def _emit_architect_review_started() -> None:
+    _emit(
+        "agent_state_changed",
+        state="architect_review",
+    )
+
+
 API_BASE = os.environ.get(
     "GLIMMER_URL",
     "http://127.0.0.1:8080",
@@ -1982,6 +1995,171 @@ def _architect_mode_selfcheck() -> None:
     print("architect mode self-check: PASS")
 
 
+def _architect_review_selfcheck() -> None:
+    """C2 (glimmer-v7): proves the pre-verification review's core
+    invariants without a live llama-server. Run with:
+    python3 glimmer-engineer.py --architect-review-selfcheck
+    """
+    import inspect
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    # ------------------------------------------------------------
+    # 1. Critical safety property: review reuses the SAME mode="architect"
+    #    execute_tool call site as planning — there is exactly one call
+    #    site in run_architect's source, unconditionally passing
+    #    mode="architect", so review cannot diverge from planning's
+    #    read-only enforcement (ARCHITECT_TOOL_NAMES, the WRITE_TOOLS
+    #    hard-block, architect_shell_policy) by construction.
+    # ------------------------------------------------------------
+    import ast
+
+    architect_tree = ast.parse(inspect.getsource(run_architect))
+    execute_tool_calls = [
+        node
+        for node in ast.walk(architect_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "execute_tool"
+    ]
+    assert len(execute_tool_calls) == 1, (
+        "run_architect must have exactly ONE execute_tool call site, "
+        "shared by planning and review — two call sites could drift apart"
+    )
+    call_kwargs = {kw.arg: kw.value for kw in execute_tool_calls[0].keywords}
+    assert isinstance(call_kwargs.get("mode"), ast.Constant) and call_kwargs["mode"].value == "architect", (
+        "run_architect's one execute_tool call site must pass mode=\"architect\" unconditionally"
+    )
+    # main()'s --mode choices must still be exactly engineer/architect —
+    # C2's review capability is a sub-mode of "architect", not a third
+    # --mode value.
+    assert 'choices=("engineer", "architect")' in inspect.getsource(main), (
+        "C2 must not add a new --mode value; review is a sub-mode of architect"
+    )
+
+    # ------------------------------------------------------------
+    # 2. Valid ArchitectReview JSON: parses, validates, arrays default
+    #    empty when the model omits them.
+    # ------------------------------------------------------------
+    valid = {
+        "decision": "APPROVED_WITH_CONDITIONS",
+        "confidence": 0.91,
+        "findings": ["reuses the existing persistence boundary"],
+        "constraints": ["do not move persistence into component state"],
+    }
+    ok, normalized = validate_architect_review(valid)
+    assert ok, normalized
+    assert normalized["decision"] == "APPROVED_WITH_CONDITIONS"
+    assert normalized["confidence"] == 0.91
+    assert normalized["findings"] == ["reuses the existing persistence boundary"]
+    assert normalized["requiredChanges"] == []
+    assert normalized["verificationAdjustments"] == []
+
+    # ------------------------------------------------------------
+    # 3. Malformed/missing decision or confidence -> rejected; every
+    #    real decision value in isolation validates.
+    # ------------------------------------------------------------
+    for bad in (
+        {"confidence": 0.5},  # no decision
+        {"decision": "MAYBE", "confidence": 0.5},  # bad enum
+        {"decision": "APPROVED"},  # no confidence
+        {"decision": "APPROVED", "confidence": "high"},  # wrong type
+        {"decision": "APPROVED", "confidence": True},  # bool must not pass as number
+        "not a dict",
+    ):
+        ok_bad, reason = validate_architect_review(bad)
+        assert ok_bad is False, f"must reject: {bad!r}"
+
+    for decision in ARCHITECT_REVIEW_DECISIONS:
+        ok_d, norm_d = validate_architect_review({"decision": decision, "confidence": 0.5})
+        assert ok_d, f"{decision} must validate on its own"
+        assert norm_d["decision"] == decision
+
+    # ------------------------------------------------------------
+    # 4. Malformed model output -> reviewFailed fallback, never a crash;
+    #    fallback decision is itself a real enum member (never acted on,
+    #    but must stay schema-valid).
+    # ------------------------------------------------------------
+    fallback = _fallback_architect_review("model never produced valid JSON")
+    assert fallback["reviewFailed"] is True
+    assert fallback["decision"] in ARCHITECT_REVIEW_DECISIONS
+    for field in ARCHITECT_REVIEW_ARRAY_FIELDS:
+        assert fallback[field] == []
+
+    # ------------------------------------------------------------
+    # 5. Review-request file read failure (missing file) degrades to a
+    #    fallback without ever reaching the model loop — exercised via
+    #    _load_review_request directly (run_architect's own guard calls
+    #    this before spending a single turn).
+    # ------------------------------------------------------------
+    missing, reason = _load_review_request("/nonexistent/review-request.json")
+    assert missing is None
+    assert reason is not None
+
+    with tempfile.TemporaryDirectory() as td:
+        bad_json_path = Path(td) / "bad.json"
+        bad_json_path.write_text("not json{{{", encoding="utf-8")
+        bad, bad_reason = _load_review_request(bad_json_path)
+        assert bad is None and bad_reason is not None
+
+        not_obj_path = Path(td) / "not_obj.json"
+        not_obj_path.write_text("[1, 2, 3]", encoding="utf-8")
+        not_obj, not_obj_reason = _load_review_request(not_obj_path)
+        assert not_obj is None and not_obj_reason is not None
+
+    # ------------------------------------------------------------
+    # 6. File naming (architect-review-NN-MM.json), lifecycle emit, and
+    #    a full write/read round trip.
+    # ------------------------------------------------------------
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+
+    captured = []
+    real_emit_fn = globals()["_emit"]
+    globals()["_emit"] = lambda event_type, **fields: captured.append((event_type, fields))
+    try:
+        _emit_architect_review_started()
+    finally:
+        globals()["_emit"] = real_emit_fn
+    assert captured == [("agent_state_changed", {"state": "architect_review"})], captured
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-architect-review-selfcheck"
+
+            written = _write_architect_review_file(normalized, 1, 2)
+            assert written is not None
+            assert written.name == "architect-review-01-02.json"
+            on_disk = json.loads(written.read_text(encoding="utf-8"))
+            assert on_disk["decision"] == "APPROVED_WITH_CONDITIONS"
+
+            # No session dir configured -> must not crash, must not write.
+            GLIMMER_EVENTS_PATH = None
+            GLIMMER_SESSION_ID = None
+            assert _write_architect_review_file(normalized, 1, 1) is None
+    finally:
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+
+    # ------------------------------------------------------------
+    # 7. _build_review_task_message never raises on a sparse/malformed
+    #    review-request and includes the plan/diff/changed-files it IS
+    #    given.
+    # ------------------------------------------------------------
+    msg = _build_review_task_message({
+        "architecturePlan": {"risk": "medium"},
+        "changedFiles": [{"path": "a.ts", "changeType": "modified"}],
+        "diff": "--- a/a.ts\n+++ b/a.ts\n",
+    })
+    assert "a.ts" in msg and "medium" in msg and "--- a/a.ts" in msg
+    assert _build_review_task_message({}) is not None  # never raises on empty input
+
+    print("architect review self-check: PASS")
+
+
 def _delivery_review_selfcheck() -> None:
     """C6 (glimmer-v7): proves DeliveryReview's core invariants without a
     live llama-server. Run with:
@@ -2849,8 +3027,219 @@ def _extract_json_object(text):
     raise ValueError("no parseable JSON object found in final answer")
 
 
-def run_architect(task, workspace, max_turns):
-    """C1 (glimmer-v7): read-only architecture-planning loop.
+# ============================================================
+# ARCHITECT REVIEW (C2, glimmer-v7 — V7 §§5.6-5.13)
+# ============================================================
+#
+# Pre-verification review: glimmer-v2.py invokes THIS SAME mode="architect"
+# invocation (via --review-request, wired into run_architect below) after
+# the engineer subprocess returns with a non-empty changed-files set and
+# BEFORE verify() runs. Deliberately reuses mode == "architect" rather than
+# a new mode string: ARCHITECT_TOOL_NAMES, execute_tool's write-tool hard-
+# block, and architect_shell_policy all key off that exact string, so
+# review gets every read-only guarantee C1's planning mode already has, by
+# construction — see _architect_review_selfcheck below.
+
+ARCHITECT_REVIEW_DECISIONS = {
+    "APPROVED",
+    "APPROVED_WITH_CONDITIONS",
+    "REVISE_IMPLEMENTATION",
+    "REPLAN_REQUIRED",
+    "HUMAN_REVIEW_REQUIRED",
+}
+
+# V7 §5.7's optional array fields — same tolerant-but-honest default-to-
+# empty treatment as ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS.
+ARCHITECT_REVIEW_ARRAY_FIELDS = (
+    "findings",
+    "requiredChanges",
+    "constraints",
+    "verificationAdjustments",
+)
+
+ARCHITECT_REVIEW_SYSTEM_PROMPT = (
+    "Reasoning strength: high. "
+    "You are Glimmer Architect performing a PRE-VERIFICATION REVIEW "
+    "(V7 §5.9) of an implementation an engineer just produced, before "
+    "the trusted verifier runs. You have the SAME read-only access as "
+    "architecture planning: no write_file/edit_file, exec_shell_command "
+    "restricted to read-only git. You cannot install dependencies, run "
+    "tests or builds, commit, push, or deploy.\n\n"
+
+    "You are not a rubber stamp (V7 §5.8). Using the ArchitecturePlan, "
+    "the actual diff/changed files given to you, and repository "
+    "evidence you inspect yourself, ask: Is the existing architecture "
+    "being reused? Is state/data ownership still correct? Was "
+    "unnecessary complexity introduced? Did scope expand without "
+    "justification? Are new abstractions actually necessary? Are "
+    "project conventions preserved? Is the verification plan still "
+    "sufficient? Are there hidden cross-system effects? Is the "
+    "solution minimal for the objective? Is the engineer solving the "
+    "real problem, not just a symptom?\n\n"
+
+    "Respond with EXACTLY one JSON object and nothing else — no prose, "
+    "no markdown fence — matching this shape:\n\n"
+    "{\n"
+    '  "decision": "APPROVED|APPROVED_WITH_CONDITIONS|'
+    'REVISE_IMPLEMENTATION|REPLAN_REQUIRED|HUMAN_REVIEW_REQUIRED '
+    '(REQUIRED)",\n'
+    '  "confidence": 0.0-1.0 (number, REQUIRED),\n'
+    '  "findings": ["what you actually verified, evidence-based"],\n'
+    '  "requiredChanges": ["only when decision is REVISE_IMPLEMENTATION"],\n'
+    '  "constraints": ["conditions the engineer must respect if '
+    'APPROVED_WITH_CONDITIONS"],\n'
+    '  "verificationAdjustments": ["extra checks the verifier should '
+    'run, if any"]\n'
+    "}\n\n"
+    "decision and confidence are REQUIRED. Other fields may be empty "
+    "arrays if you have nothing to report, but must still be present. "
+    "Use REPLAN_REQUIRED when the implementation contradicts the "
+    "plan's architecture and a new plan is needed; HUMAN_REVIEW_"
+    "REQUIRED when you cannot make a confident call at all."
+)
+
+
+def validate_architect_review(data):
+    """Validate a parsed JSON object against V7 §5.7's ArchitectReview
+    shape. Same tolerant-but-honest bar as validate_architecture_plan /
+    validate_delivery_review: decision + confidence are required and
+    well-typed; every array field defaults to [] when missing/malformed
+    rather than rejecting the whole review.
+
+    Returns (True, normalized_review_dict) or (False, reason_string).
+    """
+    if not isinstance(data, dict):
+        return False, "response is not a JSON object"
+
+    decision = data.get("decision")
+    if decision not in ARCHITECT_REVIEW_DECISIONS:
+        return False, (
+            "missing/invalid 'decision' (must be one of: "
+            + ", ".join(sorted(ARCHITECT_REVIEW_DECISIONS))
+            + ")"
+        )
+
+    confidence = data.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        return False, "missing/invalid 'confidence' (must be a number)"
+
+    normalized = {
+        "decision": decision,
+        "confidence": confidence,
+    }
+    for field in ARCHITECT_REVIEW_ARRAY_FIELDS:
+        value = data.get(field, [])
+        normalized[field] = value if isinstance(value, list) else []
+
+    return True, normalized
+
+
+def _fallback_architect_review(reason):
+    """Minimal, always-valid-JSON degradation target — same shape as a
+    successful review (same keys, "reviewFailed" only ADDED, never a
+    different schema), mirroring _fallback_architecture_plan /
+    _fallback_delivery_review. glimmer-v2.py's loader treats
+    reviewFailed=True as "review never happened" and fails open — the
+    decision value here is never acted on.
+    """
+    review = {
+        "decision": "HUMAN_REVIEW_REQUIRED",
+        "confidence": 0.0,
+        "reviewFailed": True,
+        "reviewFailureReason": reason,
+    }
+    for field in ARCHITECT_REVIEW_ARRAY_FIELDS:
+        review[field] = []
+    return review
+
+
+def _architect_review_file_path(iteration, review_round):
+    """Same session-dir-derivation convention as
+    _architecture_plan_file_path() — the parent of GLIMMER_EVENTS_PATH.
+    Numbered architect-review-NN-MM.json (NN=iteration, MM=review round
+    within that iteration) — same two-part convention as glimmer-v2.py's
+    verify-NN-MM.json, since one iteration can run more than one review
+    round (a REVISE_IMPLEMENTATION decision is followed by another
+    review, budget permitting). Returns None when no session dir is
+    available, same no-op guarantee as the rest of this file.
+    """
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return None
+    return Path(GLIMMER_EVENTS_PATH).parent / f"architect-review-{iteration:02d}-{review_round:02d}.json"
+
+
+def _write_architect_review_file(output, iteration, review_round):
+    """Write architect-review-NN-MM.json (real review or the reviewFailed
+    marker). Never raises. Returns the path written, or None when no
+    session dir is available or the write failed.
+    """
+    path = _architect_review_file_path(iteration, review_round)
+    if path is None:
+        print(
+            "[glimmer-engineer] no session dir available (standalone "
+            "invocation); architect-review file not written."
+        )
+        return None
+    try:
+        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Wrote: {path}")
+        return path
+    except OSError as exc:
+        print(f"[glimmer-engineer] failed to write architect-review file: {exc}")
+        return None
+
+
+def _load_review_request(path):
+    """C2: read+parse glimmer-v2.py's review-request JSON file (the
+    ArchitecturePlan, real changed-files list, and real `git diff` text
+    it computed — see glimmer-v2.py's make_review_request/
+    git_diff_text). Returns (dict, None) on success or (None,
+    reason_string) on any failure — missing, unreadable, not valid
+    JSON, not an object. Never raises; split out from run_architect so
+    the fail-open path is exercised directly by the self-check without
+    spinning up the model loop.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        return None, f"could not read/parse review-request file: {exc}"
+    if not isinstance(data, dict):
+        return None, "review-request file is not a JSON object"
+    return data, None
+
+
+def _build_review_task_message(review_request):
+    """Build the review turn's user message from glimmer-v2.py's already-
+    trusted review-request dict (the ArchitecturePlan it used, the real
+    changed-files list, and the real `git diff` text). Read directly by
+    this trusted Python process at startup, not by a model tool call, so
+    the review always sees the same evidence v2 computed regardless of
+    what the model does with its own read-only tools this turn.
+    """
+    plan = review_request.get("architecturePlan") or {}
+    changed_files = review_request.get("changedFiles") or []
+    diff_text = review_request.get("diff") or ""
+
+    files_text = "\n".join(
+        f"  - {f.get('path')} ({f.get('changeType', 'modified')})"
+        for f in changed_files
+        if isinstance(f, dict) and f.get("path")
+    ) or "  (none)"
+
+    return (
+        "ARCHITECTURE PLAN (produced before implementation began):\n"
+        + json.dumps(plan, indent=2) + "\n\n"
+        "CHANGED FILES:\n" + files_text + "\n\n"
+        "DIFF (git diff against the task baseline; new/untracked files "
+        "have no tracked diff to show — use your own read-only tools "
+        "if you need their full content):\n" + diff_text
+    )
+
+
+def run_architect(task, workspace, max_turns, review_request_path=None):
+    """C1/C2 (glimmer-v7): read-only architecture-planning loop, and (C2)
+    the SAME loop reused for pre-verification review when
+    review_request_path is given.
 
     Structurally simpler than run_engineer's write-oriented state machine
     (engineer_phase, discovery/post-gate budgets, write-freeze, diff/
@@ -2862,6 +3251,13 @@ def run_architect(task, workspace, max_turns):
     git_local, parse_arguments, compact_tool_result_for_model) so nothing
     about tool dispatch, shell policy, or HTTP plumbing is duplicated or
     can drift from the engineer path.
+
+    C2 review mode does NOT branch the tool-call loop or the
+    mode="architect" execute_tool call at all — only the system prompt,
+    the seed user message, the final-answer validator, and where the
+    result is written differ. This is deliberate: review must get
+    EXACTLY the same read-only enforcement as planning, by sharing the
+    one call site rather than adding a second one that could drift.
     """
     workspace = workspace.expanduser().resolve()
 
@@ -2879,7 +3275,33 @@ def run_architect(task, workspace, max_turns):
             f"Git root:  {git_root}"
         )
 
-    _emit_architect_started()
+    review_mode = review_request_path is not None
+    review_request = None
+    review_iteration, review_round = 0, 1
+
+    if review_mode:
+        # Read v2's review-request file BEFORE spending a single model
+        # turn — a bad/missing file degrades straight to a reviewFailed
+        # fallback, exactly like every other fail-open path in this file.
+        review_request, load_error = _load_review_request(review_request_path)
+        if review_request is None:
+            _write_architect_review_file(
+                _fallback_architect_review(load_error), review_iteration, review_round,
+            )
+            return
+        try:
+            review_iteration = int(review_request.get("iteration", 0))
+        except (TypeError, ValueError):
+            review_iteration = 0
+        try:
+            review_round = int(review_request.get("reviewRound", 1))
+        except (TypeError, ValueError):
+            review_round = 1
+
+    if review_mode:
+        _emit_architect_review_started()
+    else:
+        _emit_architect_started()
 
     metadata, tools = get_tools()
 
@@ -2889,27 +3311,33 @@ def run_architect(task, workspace, max_turns):
         if (tool.get("function") or {}).get("name") in ARCHITECT_TOOL_NAMES
     ]
 
-    print("Glimmer Architect Mode (C1, read-only)")
+    print("Glimmer Architect Mode (C1/C2, read-only)")
     print(f"Workspace: {workspace}")
     print(f"Tools:     {len(architect_tools)} (read-only)")
     print("Writes:    STRUCTURALLY BLOCKED")
+    print(f"Sub-mode:  {'review' if review_mode else 'planning'}")
     print()
 
+    system_prompt = ARCHITECT_REVIEW_SYSTEM_PROMPT if review_mode else ARCHITECT_SYSTEM_PROMPT
+    user_content = _build_review_task_message(review_request) if review_mode else task
+    validate_fn = validate_architect_review if review_mode else validate_architecture_plan
+    answer_label = "ArchitectReview" if review_mode else "ArchitecturePlan"
+
     messages = [
-        {"role": "system", "content": ARCHITECT_SYSTEM_PROMPT},
-        {"role": "user", "content": task},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
     ]
 
-    # No approval path (C1 scoping): this runs unattended as a subprocess
-    # with no interactive terminal, so approve() must never block on
-    # input(). Forced True here regardless of any caller-supplied flag —
-    # this is architect mode's own structural property, not something a
-    # caller opts into.
+    # No approval path (C1/C2 scoping): this runs unattended as a
+    # subprocess with no interactive terminal, so approve() must never
+    # block on input(). Forced True here regardless of any caller-
+    # supplied flag — this is architect mode's own structural property,
+    # not something a caller opts into.
     approvals = {"approve_all": True}
     cache = {}
     ledger = []  # kept for execute_tool's signature; never persisted (see execute_tool's mode == "architect" guard)
 
-    plan = None
+    final_result = None
     failure_reason = None
 
     try:
@@ -2936,7 +3364,7 @@ def run_architect(task, workspace, max_turns):
                         "content": (
                             "Tool budget is exhausted. Do not request "
                             "tools. Produce your final answer now: the "
-                            "single ArchitecturePlan JSON object "
+                            f"single {answer_label} JSON object "
                             "described earlier, and nothing else."
                         ),
                     }
@@ -2968,7 +3396,7 @@ def run_architect(task, workspace, max_turns):
                             "role": "user",
                             "content": (
                                 "Your response must be exactly one JSON "
-                                "object matching the ArchitecturePlan "
+                                f"object matching the {answer_label} "
                                 "shape given earlier — nothing else. "
                                 "Try again."
                             ),
@@ -2976,10 +3404,10 @@ def run_architect(task, workspace, max_turns):
                     )
                     continue
 
-                ok, result = validate_architecture_plan(data)
+                ok, validated = validate_fn(data)
                 if not ok:
                     if final_turn:
-                        failure_reason = f"plan failed validation: {result}"
+                        failure_reason = f"{answer_label.lower()} failed validation: {validated}"
                         break
 
                     messages.append({"role": "assistant", "content": content})
@@ -2987,18 +3415,23 @@ def run_architect(task, workspace, max_turns):
                         {
                             "role": "user",
                             "content": (
-                                f"Invalid plan: {result}. Re-send the "
-                                "corrected single JSON object."
+                                f"Invalid {answer_label.lower()}: {validated}. "
+                                "Re-send the corrected single JSON object."
                             ),
                         }
                     )
                     continue
 
-                plan = result
+                final_result = validated
                 break
 
             # ------------------------------------------------
-            # EXECUTE TOOL CALLS (read-only tool set only)
+            # EXECUTE TOOL CALLS (read-only tool set only) — identical
+            # dispatch for planning and review: mode="architect" is
+            # passed unconditionally below, so every existing read-only
+            # guard (execute_tool's WRITE_TOOLS hard-block,
+            # architect_shell_policy) applies to review turns exactly as
+            # it does to planning turns.
             # ------------------------------------------------
 
             for index, call in enumerate(tool_calls):
@@ -3018,11 +3451,11 @@ def run_architect(task, workspace, max_turns):
                 tool_name = function.get("name") or ""
 
                 if tool_name not in metadata:
-                    result = "Unknown/unavailable tool: " + tool_name
+                    tool_result = "Unknown/unavailable tool: " + tool_name
                 else:
                     try:
                         arguments = parse_arguments(function.get("arguments"))
-                        result, _changed = execute_tool(
+                        tool_result, _changed = execute_tool(
                             tool_name,
                             arguments,
                             workspace,
@@ -3033,27 +3466,44 @@ def run_architect(task, workspace, max_turns):
                             mode="architect",
                         )
                     except Exception as exc:
-                        result = "TOOL BLOCKED/ERROR: " + str(exc)
+                        tool_result = "TOOL BLOCKED/ERROR: " + str(exc)
                         print()
-                        print("✗ " + result)
+                        print("✗ " + tool_result)
 
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call["id"],
-                        "content": compact_tool_result_for_model(tool_name, result),
+                        "content": compact_tool_result_for_model(tool_name, tool_result),
                     }
                 )
         else:
-            # Loop exhausted max_turns without break (plan or failure_reason).
-            if plan is None and failure_reason is None:
-                failure_reason = f"reached max turns ({max_turns}) without a final plan"
+            # Loop exhausted max_turns without break (result or failure_reason).
+            if final_result is None and failure_reason is None:
+                failure_reason = f"reached max turns ({max_turns}) without a final {answer_label.lower()}"
 
     except Exception as exc:  # noqa: BLE001 - architect failure must degrade, never crash the caller
         failure_reason = f"{type(exc).__name__}: {exc}"
 
-    if plan is not None:
-        output = plan
+    if review_mode:
+        if final_result is not None:
+            output = final_result
+            print()
+            print("════════════════════════════════════")
+            print("ARCHITECT REVIEW")
+            print("════════════════════════════════════")
+            print(f"Decision:   {output['decision']}")
+            print(f"Confidence: {output['confidence']}")
+        else:
+            output = _fallback_architect_review(failure_reason or "unknown failure")
+            print()
+            print(f"⚠ Architect review failed: {failure_reason or 'unknown failure'}")
+            print("Writing fallback architect-review file (reviewFailed=true).")
+        _write_architect_review_file(output, review_iteration, review_round)
+        return
+
+    if final_result is not None:
+        output = final_result
         print()
         print("════════════════════════════════════")
         print("ARCHITECTURE PLAN")
@@ -4535,6 +4985,21 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--review-request",
+        type=Path,
+        default=None,
+        help=(
+            "C2 (glimmer-v7): only meaningful with --mode architect. "
+            "Path to a review-request JSON file (written by "
+            "glimmer-v2.py: the ArchitecturePlan, changed files, and "
+            "diff) — switches architect mode from planning to "
+            "reviewing an implementation (V7 §§5.6-5.13), writing "
+            "architect-review-NN-MM.json instead of "
+            "architecture-plan.json. Ignored in engineer mode."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.mode == "architect":
@@ -4547,6 +5012,7 @@ def main():
             " ".join(args.prompt),
             args.workspace,
             max_turns,
+            review_request_path=args.review_request,
         )
     else:
         max_turns = (
@@ -4573,6 +5039,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--architect-mode-selfcheck"]:
         _architect_mode_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--architect-review-selfcheck"]:
+        _architect_review_selfcheck()
         sys.exit(0)
 
     if sys.argv[1:] == ["--delivery-review-selfcheck"]:

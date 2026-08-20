@@ -91,6 +91,12 @@ def canonical_session_state(raw_status: str) -> str:
         return "verified"
     if raw_status == "no-change-unverified":
         return "needs_review"
+    # C2 (glimmer-v7): terminal status when the architect review gate
+    # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
+    # or the review budget is exhausted — V7 §5.10's rule: a session in
+    # this state must never be promoted to "verified".
+    if raw_status == "needs-architect-review":
+        return "needs_review"
     if raw_status.startswith("blocked-"):
         return "blocked"
     if raw_status.startswith("failed-"):
@@ -178,6 +184,8 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "CODE_FAIL", "detail": "repair budget exhausted with failing checks remaining", "evidenceIds": []}
     if raw == "failed-verifier-mutated-repo":
         return {"class": "POLICY_BLOCK", "detail": "verifier command mutated the repository", "evidenceIds": []}
+    if raw == "needs-architect-review":
+        return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation or the review budget was exhausted (V7 §5.10/§5.13)", "evidenceIds": []}
     if raw == "failed-aborted":
         return {"class": "ORCHESTRATION_ABORTED",
                 "detail": "orchestration raised an error before completing any attempt "
@@ -379,6 +387,28 @@ def diff_hash(ws, baseline):
             pass
         h.update(b"\0")
     return h.hexdigest()
+
+
+def git_diff_text(ws, baseline):
+    """C2 (glimmer-v7): the actual (not just hashed) diff v2 hands to the
+    architect review — same underlying git plumbing as diff_hash/
+    file_change_types above (tracked diff via `git diff`, untracked files
+    enumerated via `git ls-files --others`), just rendered as readable
+    text instead of a hash, and not a new discovery pass over the
+    workspace. Untracked files have no tracked diff to show, so each is
+    represented as a synthetic "new file" block; unreadable/binary/non-
+    utf8 content is noted and skipped, never raised.
+    """
+    parts = [run(["git", "diff", baseline, "--"], ws).stdout or ""]
+    for rel in lines(git(ws, "ls-files", "--others", "--exclude-standard")):
+        p = ws / rel
+        try:
+            content = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            parts.append(f"\n--- new file (untracked): {rel} (binary or unreadable; content omitted) ---\n")
+            continue
+        parts.append(f"\n--- new file (untracked): {rel} ---\n{content}")
+    return "".join(parts)
 
 
 def walk_files(ws, max_depth=5):
@@ -1289,8 +1319,15 @@ def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None,
         constraint_lines.append(f"Do not {', '.join(banned)}, change Git configuration.")
     constraint_text = "\n".join(f"    - {line}" for line in constraint_lines)
 
+    # Fix round 1 (Minor 5): gate on `failure is not None`, not `iteration`
+    # truthiness — a C2 architect-revise round always has failure text but
+    # can legitimately happen at outer iteration 0 (before any verify()-
+    # driven repair), and the two calls used to coincide only because the
+    # pre-C2 repair loop never called this with iteration==0 and a real
+    # failure at the same time. This keeps every pre-existing call site
+    # byte-identical (there, iteration>0 <=> failure is not None already).
     repair = ""
-    if iteration:
+    if failure is not None:
         repair = f"""
 AUTHORITATIVE V2 VERIFICATION FAILURE:
 {failure}
@@ -1387,13 +1424,20 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
-                     plan_candidate_count=0):
+                     plan_candidate_count=0, review_request=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
         # sets this — reuses this same spawn shape (same env plumbing,
         # same stdout/log tee) instead of a second subprocess helper.
         cmd += ["--mode", mode]
+    if review_request is not None:
+        # C2 (glimmer-v7): only ever set alongside mode="architect" —
+        # switches that SAME read-only invocation from planning to
+        # reviewing an implementation (glimmer-engineer.py's run_architect
+        # branches on this flag's presence). No new mode string, so every
+        # existing architect read-only guard still applies unchanged.
+        cmd += ["--review-request", str(review_request)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     # Architect mode has no approval path (C1 scoping): it runs unattended
@@ -1521,6 +1565,378 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
     return plan
+
+
+# ============================================================
+# C2 (glimmer-v7): Architect consultation + review budget — V7 §§5.6-5.13
+# ============================================================
+# Active only when --architect-first produced a usable plan; the review
+# sits BEFORE verify() each iteration; REVISE_IMPLEMENTATION runs one
+# bounded revise pass outside the outer repair loop (never touches
+# --max-repairs). Full loop structure documented at the call site in main().
+
+# V7 §5.13: budgets Architect<->Engineer disagreement (REVISE_IMPLEMENTATION
+# rounds), not plain reviews — see the main() call site and Important 1/2
+# of the round-1 review. Shared across the whole session.
+ARCHITECT_REVIEW_BUDGET = 3
+
+# Same order of magnitude as PLAN_EVIDENCE_MAX_TOTAL_CHARS above — bounds
+# how much of a (potentially large) diff gets embedded in the review
+# request/prompt, purely a token-budget cap (the diff text itself is
+# v2-computed, not model output, so this isn't a security boundary like
+# PLAN_EVIDENCE_MAX_* is).
+ARCHITECT_REVIEW_DIFF_MAX_CHARS = 48 * 1024
+
+# Mirrors glimmer-engineer.py's ARCHITECT_REVIEW_DECISIONS. v2 is the
+# trusted layer and this decision string drives whether verify() runs at
+# all, so it re-checks the enum itself rather than blindly trusting that
+# glimmer-engineer.py's own validate_architect_review already did —
+# defense in depth on a safety-relevant branch, same spirit as C1's
+# read_candidate_evidence treating model output as untrusted.
+ARCHITECT_REVIEW_DECISIONS = {
+    "APPROVED",
+    "APPROVED_WITH_CONDITIONS",
+    "REVISE_IMPLEMENTATION",
+    "REPLAN_REQUIRED",
+    "HUMAN_REVIEW_REQUIRED",
+}
+
+
+def make_review_request(plan, files, change_types, diff_text, iteration, review_round):
+    """C2: the review-request payload v2 (trusted layer) writes to disk
+    for the architect-review subprocess to read directly (glimmer-
+    engineer.py's _load_review_request) — V7 §5.6's shape, scoped down
+    per the C2 task entry to what a pre-verification review actually
+    needs: the plan it's checking against, the real changed-files list,
+    and the real diff (git_diff_text — same underlying git plumbing as
+    diff_hash/file_change_types, not a new discovery pass).
+    """
+    return {
+        "type": "architect_review_request",
+        "iteration": iteration,
+        "reviewRound": review_round,
+        "architecturePlan": plan,
+        "changedFiles": [
+            {"path": f, "changeType": change_types.get(f, "modified")} for f in files
+        ],
+        "diff": diff_text,
+    }
+
+
+def load_architect_review(session_dir, iteration, review_round):
+    """C2: load architect-review-NN-MM.json, mirroring load_architecture_
+    plan's uniform-None-on-any-degraded-case contract — file missing,
+    unreadable, not valid JSON, not an object, explicitly marked
+    reviewFailed, or carrying a decision outside the 5-value enum all
+    return None uniformly. Callers never need to distinguish these
+    cases: None always means "this review did not produce a usable
+    result," which main()'s loop treats as fail-open (proceed exactly as
+    if no review had run).
+    """
+    path = Path(session_dir) / f"architect-review-{iteration:02d}-{review_round:02d}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("reviewFailed"):
+        return None
+    if data.get("decision") not in ARCHITECT_REVIEW_DECISIONS:
+        return None
+
+    normalized = {"decision": data["decision"], "confidence": data.get("confidence")}
+    for field in ("findings", "requiredChanges", "constraints", "verificationAdjustments"):
+        value = data.get(field, [])
+        normalized[field] = value if isinstance(value, list) else []
+    return normalized
+
+
+def classify_architect_review_decision(decision):
+    """Maps one ArchitectReview decision (V7 §5.7) to what main()'s
+    review sub-loop does next. Pure/deterministic — exercised directly
+    by --architect-review-selfcheck without a live model or session."""
+    if decision in ("APPROVED", "APPROVED_WITH_CONDITIONS"):
+        return "approved"
+    if decision == "REVISE_IMPLEMENTATION":
+        return "revise"
+    if decision in ("REPLAN_REQUIRED", "HUMAN_REVIEW_REQUIRED"):
+        return "rejected"
+    return "rejected"  # unrecognized decision must never silently proceed to verify()
+
+
+def architect_gates_value(outcome):
+    """Maps the review sub-loop's terminal outcome to gates.
+    architectureApproved (True/False/None) per the C2 gates contract:
+    True on approved, False on rejected/budget-exhausted, None when the
+    review never ran or failed open."""
+    if outcome == "approved":
+        return True
+    if outcome in ("rejected", "budget_exhausted"):
+        return False
+    return None  # outcome is None (never ran) or "fail_open"
+
+
+def architect_review_failure_text(review):
+    """C2: format an ArchitectReview's requiredChanges + findings into
+    the SAME "failure text" shape make_prompt's repair branch already
+    expects (failure_text(results), built for verify() failures) — a
+    REVISE_IMPLEMENTATION round is a repair round driven by architect
+    judgment instead of a failing verification command, so it reuses
+    that exact prompt slot rather than inventing a second one."""
+    out = []
+    if review.get("requiredChanges"):
+        out.append("Architect-required changes:")
+        out.extend(f"  - {c}" for c in review["requiredChanges"])
+    if review.get("findings"):
+        out.append("Architect findings:")
+        out.extend(f"  - {c}" for c in review["findings"])
+    if not out:
+        out.append("Architect review returned REVISE_IMPLEMENTATION with no specific findings/requiredChanges.")
+    return "\n".join(out)
+
+
+def run_architect_review(engineer, ws, plan, files, change_types, baseline, session, events_path, sid,
+                          iteration, review_round):
+    """C2 (glimmer-v7): pre-verification architect review (V7 §5.9),
+    invoked from main()'s per-iteration loop only when a plan exists.
+    Reuses invoke_engineer's SAME mode="architect" spawn path as C1's
+    planning step (glimmer-engineer.py's read-only enforcement —
+    ARCHITECT_TOOL_NAMES, the execute_tool hard-block, architect_shell_
+    policy — all key off mode == "architect"; --review-request only
+    changes what the architect subprocess DOES inside that same mode,
+    never widens what it's allowed to touch — see
+    _architect_review_selfcheck on the engineer side). Must never raise:
+    any failure (spawn error, missing/invalid output) degrades to None,
+    identical in meaning to "review never happened" — see load_
+    architect_review's uniform degradation contract.
+    """
+    print("\n" + "=" * 72)
+    print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
+    print("=" * 72)
+
+    request_path = session / f"review-request-{iteration:02d}-{review_round:02d}.json"
+
+    try:
+        # Fix round 1 (Minor 4): git_diff_text used to run OUTSIDE this
+        # try, contradicting this function's own never-raises contract —
+        # a git failure (e.g. baseline no longer resolvable) would have
+        # propagated straight to main() instead of degrading to None.
+        diff_text = git_diff_text(ws, baseline)
+        if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
+            diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
+
+        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round)
+        request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
+
+        rc = invoke_engineer(
+            engineer, ws,
+            "Perform the pre-verification architect review described in --review-request.",
+            True,  # auto_approve forced regardless, same as run_architect_first
+            None,  # architect mode's own smaller default turn budget applies
+            session / f"architect-review-{iteration:02d}-{review_round:02d}.log",
+            events_path, sid, mode="architect", review_request=request_path,
+        )
+        print(f"[V2] Architect review subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - review failure must never block the run
+        print(f"[V2] WARN: architect review subprocess failed to run: {exc}")
+
+    return load_architect_review(session, iteration, review_round)
+
+
+# ============================================================
+# C3 (glimmer-v7): Task Graph (tasks.json) — reconciliation doc C3 entry.
+# ============================================================
+# Active only when --architect-first produced a usable plan. Flat list,
+# sequential dependsOn only (deliberately not a DAG/priority model — see
+# evaluate_implementation_tasks for why implementation tasks transition
+# as one group, not per-step).
+
+
+def derive_tasks(plan: dict) -> list:
+    """C3: derive the flat task list from plan["implementationPlan"] +
+    plan["verificationPlan"] (V7's structured-task-model fields, scoped
+    down to id/description/kind/dependsOn/status per the C3 task
+    entry). Sequential dependsOn chain within implementation tasks
+    (t2 depends on t1, etc.); every verification task depends on the
+    LAST implementation task (or has no dependency when there were no
+    implementation steps at all). ids are simple/stable: t1, t2, ... in
+    derivation order (implementation first, then verification).
+    Never raises: `plan` is already a validated dict by the time this
+    is called (load_architecture_plan's contract guarantees that), and
+    missing/non-list implementationPlan/verificationPlan fields degrade
+    to [] rather than erroring."""
+    tasks = []
+    impl_steps = plan.get("implementationPlan")
+    if not isinstance(impl_steps, list):
+        impl_steps = []
+    verify_steps = plan.get("verificationPlan")
+    if not isinstance(verify_steps, list):
+        verify_steps = []
+
+    prev_id = None
+    for step in impl_steps:
+        tid = f"t{len(tasks) + 1}"
+        tasks.append({
+            "id": tid,
+            "description": str(step),
+            "kind": "implementation",
+            "dependsOn": [prev_id] if prev_id else [],
+            "status": "pending",
+        })
+        prev_id = tid
+
+    last_impl_id = prev_id
+    for step in verify_steps:
+        tid = f"t{len(tasks) + 1}"
+        tasks.append({
+            "id": tid,
+            "description": str(step),
+            "kind": "verification",
+            "dependsOn": [last_impl_id] if last_impl_id else [],
+            "status": "pending",
+        })
+    return tasks
+
+
+def save_tasks(session_dir, tasks) -> None:
+    """C3: full-file rewrite at every transition point (spawn, engineer-
+    return, post-verify) — tasks.json is small, so a full rewrite is
+    simplest and cheapest. Never raises: same never-crash-the-session
+    discipline as C1/C6 — a disk write failure here (permissions, full
+    disk) must degrade to a log line, never take down an otherwise-
+    successful engineering session."""
+    try:
+        (Path(session_dir) / "tasks.json").write_text(
+            json.dumps(tasks, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[V2] WARN: failed to write tasks.json: {exc}")
+
+
+def set_implementation_tasks_status(tasks, status: str) -> None:
+    """C3: flip every kind=='implementation' task to `status`, in place.
+    Called at each engineer spawn (-> in_progress) — including the C2
+    revise-round re-spawn, which re-invokes the engineer directly
+    outside the outer repair loop: implementation tasks go back to
+    in_progress for that re-spawn and are re-evaluated after it
+    returns, exactly like the main spawn/return pair. No-op when
+    `tasks` is None (no plan, C3 inactive)."""
+    if tasks is None:
+        return
+    for t in tasks:
+        if t.get("kind") == "implementation":
+            t["status"] = status
+
+
+def reset_verification_tasks_status(tasks) -> None:
+    """Fix round 1 (Minor 6): flip every kind=='verification' task back to
+    `pending`, in place. Called at the C2 revise-round re-spawn (alongside
+    set_implementation_tasks_status(tasks, "in_progress")) — a verification
+    task marked "complete" against the PRE-revise diff must not survive
+    unchanged once the revise round produces a different diff; it is
+    re-evaluated honestly by evaluate_verification_tasks after the next
+    real verify() call. No-op when `tasks` is None."""
+    if tasks is None:
+        return
+    for t in tasks:
+        if t.get("kind") == "verification":
+            t["status"] = "pending"
+
+
+def evaluate_implementation_tasks(tasks, files: list, engineer_rc) -> None:
+    """C3: the ONLY evidence source for implementation task status —
+    never a model claim. Per-step granularity is not honestly
+    evidencable (one engineer run executes every implementationPlan
+    step at once), so the whole implementation group is marked
+    together, by the same evidence: complete iff the session's changed-
+    files set is non-empty AND the engineer subprocess exited 0;
+    failed otherwise (engineer errored, or ran and touched nothing).
+    No-op when `tasks` is None."""
+    if tasks is None:
+        return
+    outcome = "complete" if (files and engineer_rc == 0) else "failed"
+    set_implementation_tasks_status(tasks, outcome)
+
+
+# Tokens of 3+ alnum chars — long enough to skip noise, short enough to
+# still match single-word plan entries like "lint".
+_TASK_VERIFY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Fix round 1 (Important 3): runner/stopword tokens that appear in nearly
+# every npm command AND nearly every prose verificationPlan sentence —
+# left in, a first-match-on-any-shared-token scheme treats "run"/"npm"
+# (present in every `npm run X` command) as if they were meaningful
+# signal, so prose like "Run the typecheck..." could match ANY npm
+# command, not the one it names.
+_TASK_VERIFY_STOPWORDS = {"run", "npm", "yarn", "pnpm", "exec", "npx", "the", "and", "all", "for", "to", "no"}
+
+
+def _match_verify_result(description: str, results: list):
+    """C3: token-set argmax match, case-insensitive — a verificationPlan
+    entry (which may be a single word like "typecheck" OR a full prose
+    sentence like "Run the typecheck to confirm no type errors") maps to
+    the real verify() command whose command string shares the MOST
+    tokens with it, after stripping runner names and stopwords
+    (_TASK_VERIFY_STOPWORDS) from both sides — not the first result that
+    shares ANY token. Fix round 1 (Important 3): the prior first-match
+    scheme let a shared stopword-ish token (e.g. "run", present in every
+    `npm run X` command) match the wrong command; reproduced live with
+    "Run the typecheck to confirm no type errors" matching `npm run
+    lint` before `npm run typecheck` even existed in the token
+    intersection. Tokens are compared whole-word (set intersection), not
+    raw substring-of-string containment — a naive `tok in cmd_string`
+    check would let a short token like "check" spuriously match inside
+    the unrelated word "typecheck".
+
+    Returns the single result whose (post-stopword) token overlap with
+    `description` is strictly larger than every other result's; returns
+    None — leaving the task `pending`, never fabricating completion —
+    when no token survives stopword-stripping, no result shares any
+    token, or two or more results tie for the best (nonzero) overlap
+    (ambiguous is honest, not a guess)."""
+    tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(description.lower()) if len(t) >= 3}
+    tokens -= _TASK_VERIFY_STOPWORDS
+    if not tokens:
+        return None
+
+    scored = []
+    for r in results:
+        cmd = (r.get("command") or "").lower()
+        cmd_tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(cmd) if len(t) >= 3} - _TASK_VERIFY_STOPWORDS
+        score = len(tokens & cmd_tokens)
+        if score > 0:
+            scored.append((score, r))
+
+    if not scored:
+        return None
+    best_score = max(score for score, _ in scored)
+    winners = [r for score, r in scored if score == best_score]
+    if len(winners) != 1:
+        return None  # tie -- ambiguous, stays pending
+    return winners[0]
+
+
+def evaluate_verification_tasks(tasks, results: list) -> None:
+    """C3: map each verification task to a real verify() result where a
+    deterministic mapping exists (see _match_verify_result). Matched ->
+    complete on PASS/PASS_BASELINE, failed on CODE_FAIL. Unmatched
+    entries (the plan named a check verify() never ran) stay `pending`
+    — HONEST, never fabricate completion. INFRA_BLOCKED/TIMEOUT matches
+    also stay `pending` (the check never really ran to a pass/fail
+    verdict). No-op when `tasks` is None."""
+    if tasks is None:
+        return
+    for t in tasks:
+        if t.get("kind") != "verification":
+            continue
+        match = _match_verify_result(t["description"], results)
+        if match is None:
+            continue  # plan named a check that never ran -- stays pending
+        status_name = match.get("status")
+        if status_name in ("PASS", "PASS_BASELINE"):
+            t["status"] = "complete"
+        elif status_name == "CODE_FAIL":
+            t["status"] = "failed"
+        # INFRA_BLOCKED / TIMEOUT / anything else: leave pending -- the
+        # check never really produced a pass/fail verdict.
 
 
 def main():
@@ -1724,12 +2140,33 @@ def main():
         # so plan_candidate_count below is 0 and the prompt/env are
         # unaffected in every degraded case.
         candidate_evidence = []
+        # C3: tasks stays None (no tasks.json ever written) in every
+        # degraded case, same uniform-None-on-no-plan contract as
+        # architecture_plan/candidate_evidence just above.
+        tasks = None
         if args.architect_first:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
             )
             manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
             candidate_evidence = read_candidate_evidence(architecture_plan, ws)
+            # C2: gates/architectReviews are only ever added to the
+            # manifest when a usable plan exists — with no plan there is
+            # nothing to review against, so C2 never runs and these keys
+            # would otherwise be pure clutter on a --architect-first run
+            # that didn't even get a usable plan (mirrors architectPlan's
+            # own architect_first-only gating just above).
+            if architecture_plan is not None:
+                manifest["gates"] = {"architectureApproved": None}
+                manifest["architectReviews"] = {"max": ARCHITECT_REVIEW_BUDGET, "used": 0}
+                # C3: same gate as the two lines above -- tasks derive from
+                # the plan's implementationPlan/verificationPlan only when
+                # a usable plan exists. manifest["tasksFile"] mirrors the
+                # existing "eventsFile" precedent (a plain filename inside
+                # the session dir, no schema change beyond that one key).
+                tasks = derive_tasks(architecture_plan)
+                manifest["tasksFile"] = "tasks.json"
+                save_tasks(session, tasks)
             save()
 
         for iteration in range(args.max_repairs + 1):
@@ -1738,6 +2175,13 @@ def main():
             prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
                                  plan=architecture_plan, evidence=candidate_evidence)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
+            # C3: spawn -- deterministic evidence point 1/3. The engineer
+            # subprocess is about to execute the whole implementationPlan
+            # in one run (no per-task pointer, see the C3 module docstring
+            # above), so every implementation task flips together.
+            if tasks is not None:
+                set_implementation_tasks_status(tasks, "in_progress")
+                save_tasks(session, tasks)
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
                                  plan_candidate_count=len(candidate_evidence))
@@ -1746,6 +2190,10 @@ def main():
             for f in files:
                 emit_event(events_path, "file_changed", sid, path=f,
                            changeType=change_types.get(f, "modified"))
+            # C3: engineer-return -- deterministic evidence point 2/3.
+            if tasks is not None:
+                evaluate_implementation_tasks(tasks, files, rc)
+                save_tasks(session, tasks)
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
@@ -1772,6 +2220,12 @@ def main():
                                          events_path, sid)
                     attempt["verificationCommands"] = [shlex.join(c) for c in commands]
                     attempt["verificationResults"] = results
+                    # C3: post-verify -- deterministic evidence point 3/3,
+                    # applies here too so tasks.json stays honest even on
+                    # the no-changed-files path.
+                    if tasks is not None:
+                        evaluate_verification_tasks(tasks, results)
+                        save_tasks(session, tasks)
                     if ok:
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
@@ -1794,6 +2248,123 @@ def main():
             for f in files:
                 print(f"  - {f}")
 
+            # C2 (glimmer-v7): pre-verification architect review (V7 §5.9)
+            # -- ONLY when --architect-first produced a usable plan. Sits
+            # strictly BEFORE verify(). A REVISE_IMPLEMENTATION round
+            # re-invokes the engineer directly, never through the outer
+            # `for iteration` loop, so it never advances `iteration` or
+            # consumes --max-repairs.
+            #
+            # Fix round 1 (Important 1+2): the budget (§5.13) bounds
+            # Architect<->Engineer DISAGREEMENT, not review count. A plain
+            # review call -- whether it comes back APPROVED/
+            # APPROVED_WITH_CONDITIONS or fails open (no usable output) --
+            # never increments `used`; it is free every time. `used` only
+            # increments when a REVISE_IMPLEMENTATION decision is about to
+            # trigger another revise+re-review round, and the budget check
+            # runs BEFORE that increment, so the Nth allowed revise still
+            # gets its follow-up review. This also fixes fail-open (never
+            # counted) degrading into fail-closed (never blocks) under
+            # sustained review-machinery failure.
+            if architecture_plan is not None:
+                review_round = 0
+                architect_outcome = None
+                while True:
+                    review_round += 1
+                    emit_event(events_path, "agent_state_changed", sid, state="architect_review")
+                    review = run_architect_review(
+                        engineer, ws, architecture_plan, files, change_types, baseline,
+                        session, events_path, sid, iteration, review_round,
+                    )
+                    attempt.setdefault("architectReviews", []).append(
+                        {"round": review_round, "review": review}
+                    )
+                    if review is None:
+                        print("[V2] Architect review produced no usable output; "
+                              "failing open (proceeding as if no review had run).")
+                        architect_outcome = "fail_open"
+                        break
+
+                    decision_outcome = classify_architect_review_decision(review["decision"])
+                    if decision_outcome in ("approved", "rejected"):
+                        architect_outcome = decision_outcome
+                        break
+
+                    # decision_outcome == "revise": this IS the disagreement
+                    # V7 §5.13 budgets. Check budget before spending it -- a
+                    # revise round that would exceed it never runs.
+                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
+                        architect_outcome = "budget_exhausted"
+                        break
+                    manifest["architectReviews"]["used"] += 1
+                    save()
+                    print(f"[V2] Architect review requested REVISE_IMPLEMENTATION "
+                          f"(iteration={iteration}, round={review_round}); running one bounded revise pass.")
+                    # Fix round 1 (Minor 5): the real outer `iteration` and
+                    # the real `checkpoint_sha` (whatever the repair loop
+                    # last set, possibly still None on iteration 0) --
+                    # previously `review_round` was passed as `iteration`
+                    # (wrong REPAIR N label once the outer loop had already
+                    # advanced) and checkpoint_sha was hardcoded None
+                    # (dropping real checkpoint context on later
+                    # iterations). make_prompt's repair block now gates on
+                    # `failure is not None`, not `iteration` truthiness, so
+                    # this stays correct even when iteration == 0.
+                    revise_prompt = make_prompt(
+                        contract, summary, iteration,
+                        failure=architect_review_failure_text(review),
+                        checkpoint_sha=checkpoint_sha, plan=architecture_plan, evidence=candidate_evidence,
+                    )
+                    (session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt").write_text(
+                        revise_prompt, encoding="utf-8")
+                    # C3: a REVISE_IMPLEMENTATION round re-invokes the
+                    # engineer directly (outside the outer repair loop) --
+                    # implementation tasks go back to in_progress for this
+                    # re-spawn and are re-evaluated after it returns,
+                    # exactly like the main spawn/return pair above.
+                    # Fix round 1 (Minor 6): verification tasks reset to
+                    # pending too -- a stale "complete" from a PRE-revise
+                    # verify() result must not survive against a changed
+                    # diff; it is re-evaluated after the NEXT real verify().
+                    if tasks is not None:
+                        set_implementation_tasks_status(tasks, "in_progress")
+                        reset_verification_tasks_status(tasks)
+                        save_tasks(session, tasks)
+                    revise_rc = invoke_engineer(
+                        engineer, ws, revise_prompt, args.auto_approve, args.max_turns,
+                        session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
+                        events_path, sid, plan_candidate_count=len(candidate_evidence),
+                    )
+                    files = changed_files(ws, baseline)
+                    change_types = file_change_types(ws, baseline)
+                    for f in files:
+                        emit_event(events_path, "file_changed", sid, path=f,
+                                   changeType=change_types.get(f, "modified"))
+                    if tasks is not None:
+                        evaluate_implementation_tasks(tasks, files, revise_rc)
+                        save_tasks(session, tasks)
+                    attempt["changedFiles"] = files
+                    attempt["diffHashBeforeVerify"] = diff_hash(ws, baseline)
+                    scope_result = compute_scope_guard(files, manifest.get("contract", {}))
+                    attempt["scopeGuard"] = scope_result
+
+                manifest["gates"] = {"architectureApproved": architect_gates_value(architect_outcome)}
+                save()
+
+                if architect_outcome in ("rejected", "budget_exhausted"):
+                    # V7 §5.10: tests-pass + architect-rejects must never be
+                    # promoted to "verified" -- stop the whole loop here,
+                    # before verify() ever runs for this iteration.
+                    attempt["status"] = "needs-architect-review"
+                    manifest["attempts"].append(attempt)
+                    manifest["status"] = "needs-architect-review"
+                    manifest["state"] = canonical_session_state(manifest["status"])
+                    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                    save()
+                    final_label = "ARCHITECTURE REVIEW REQUIRED — NOT VERIFIED"
+                    print(f"\n[V2] {architect_outcome}: architecture review gate blocks promotion to verified.")
+                    break
+
             commands = verifier_commands(repo, files, args.verification_level)
             commands = expand_verify_entries(commands, args.verify, session, args.visual_url)
             attempt["verificationCommands"] = [shlex.join(c) for c in commands]
@@ -1805,6 +2376,10 @@ def main():
             after = diff_hash(ws, baseline)
             attempt["verificationResults"] = results
             attempt["diffHashAfterVerify"] = after
+            # C3: post-verify -- deterministic evidence point 3/3.
+            if tasks is not None:
+                evaluate_verification_tasks(tasks, results)
+                save_tasks(session, tasks)
             if before != after:
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
@@ -2321,6 +2896,373 @@ def _architect_first_selfcheck() -> None:
     print("architect-first self-check: PASS")
 
 
+def _architect_review_selfcheck() -> None:
+    """C2 (glimmer-v7): proves the pre-verification review's core
+    invariants without a live model or a full main() run — decision
+    routing, budget/gates mapping, fail-open on malformed/missing
+    output, and the "no plan -> zero behavior change" contract.
+    Run with: python3 glimmer-v2.py --architect-review-selfcheck
+    """
+    import inspect
+
+    # ------------------------------------------------------------
+    # 1. Decision routing (V7 §5.7) — pure, exercised without a session.
+    # ------------------------------------------------------------
+    assert classify_architect_review_decision("APPROVED") == "approved"
+    assert classify_architect_review_decision("APPROVED_WITH_CONDITIONS") == "approved"
+    assert classify_architect_review_decision("REVISE_IMPLEMENTATION") == "revise"
+    assert classify_architect_review_decision("REPLAN_REQUIRED") == "rejected"
+    assert classify_architect_review_decision("HUMAN_REVIEW_REQUIRED") == "rejected"
+    assert classify_architect_review_decision("NOT_A_REAL_DECISION") == "rejected"  # never silently proceed
+
+    # ------------------------------------------------------------
+    # 2. gates.architectureApproved mapping (True/False/None).
+    # ------------------------------------------------------------
+    assert architect_gates_value("approved") is True
+    assert architect_gates_value("rejected") is False
+    assert architect_gates_value("budget_exhausted") is False
+    assert architect_gates_value("fail_open") is None
+    assert architect_gates_value(None) is None
+
+    # ------------------------------------------------------------
+    # 3. Terminal status maps to canonical "needs_review", session never
+    #    promoted to "verified" (V7 §5.10).
+    # ------------------------------------------------------------
+    assert canonical_session_state("needs-architect-review") == "needs_review"
+    failure = classify_failure({"status": "needs-architect-review"}, [])
+    assert failure is not None and failure["class"] == "POLICY_BLOCK"
+
+    # ------------------------------------------------------------
+    # 4. make_review_request shape + architect_review_failure_text.
+    # ------------------------------------------------------------
+    plan = {"objective": "x", "packages": [], "risk": "low"}
+    request = make_review_request(
+        plan, ["a.ts", "b.ts"], {"a.ts": "modified", "b.ts": "added"},
+        "diff text here", iteration=1, review_round=2,
+    )
+    assert request["type"] == "architect_review_request"
+    assert request["iteration"] == 1 and request["reviewRound"] == 2
+    assert request["architecturePlan"] == plan
+    assert request["changedFiles"] == [
+        {"path": "a.ts", "changeType": "modified"},
+        {"path": "b.ts", "changeType": "added"},
+    ]
+    assert request["diff"] == "diff text here"
+
+    revise_text = architect_review_failure_text({
+        "requiredChanges": ["reuse existing store"],
+        "findings": ["duplicate state introduced"],
+    })
+    assert "reuse existing store" in revise_text
+    assert "duplicate state introduced" in revise_text
+    assert architect_review_failure_text({}) != ""  # never empty, never raises
+
+    # ------------------------------------------------------------
+    # 5. load_architect_review: uniform None on every degraded case;
+    #    real values pass through on a genuinely valid file.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+
+        # Missing file entirely.
+        assert load_architect_review(session_dir, 0, 1) is None
+
+        # Present but not valid JSON.
+        bad_path = session_dir / "architect-review-00-01.json"
+        bad_path.write_text("not json{{{", encoding="utf-8")
+        assert load_architect_review(session_dir, 0, 1) is None
+
+        # Present, valid JSON, but explicitly marked failed (fail-open).
+        bad_path.write_text(
+            json.dumps({"reviewFailed": True, "decision": "HUMAN_REVIEW_REQUIRED", "confidence": 0.0}),
+            encoding="utf-8",
+        )
+        assert load_architect_review(session_dir, 0, 1) is None
+
+        # Present, valid JSON, decision outside the 5-value enum (v2's
+        # own defense-in-depth check, not just glimmer-engineer.py's).
+        bad_decision_path = session_dir / "architect-review-00-02.json"
+        bad_decision_path.write_text(
+            json.dumps({"decision": "MAYBE", "confidence": 0.5}), encoding="utf-8",
+        )
+        assert load_architect_review(session_dir, 0, 2) is None
+
+        # A genuinely valid review, correct NN-MM file naming.
+        good_path = session_dir / "architect-review-01-02.json"
+        good_path.write_text(
+            json.dumps({
+                "decision": "APPROVED_WITH_CONDITIONS",
+                "confidence": 0.9,
+                "constraints": ["do not move persistence into component state"],
+            }),
+            encoding="utf-8",
+        )
+        loaded = load_architect_review(session_dir, 1, 2)
+        assert loaded is not None
+        assert loaded["decision"] == "APPROVED_WITH_CONDITIONS"
+        assert loaded["confidence"] == 0.9
+        assert loaded["constraints"] == ["do not move persistence into component state"]
+        assert loaded["findings"] == []  # arrays default empty
+
+    # ------------------------------------------------------------
+    # 6. git_diff_text: tracked modification AND untracked new file both
+    #    show up (untracked files have no `git diff` entry by default —
+    #    represented as a synthetic "new file" block instead).
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        run(["git", "init", "-q"], ws)
+        run(["git", "config", "user.email", "test@example.com"], ws)
+        run(["git", "config", "user.name", "Test"], ws)
+        (ws / "a.txt").write_text("original\n", encoding="utf-8")
+        run(["git", "add", "-A"], ws)
+        run(["git", "commit", "-q", "-m", "init"], ws)
+        baseline = head(ws)
+
+        (ws / "a.txt").write_text("changed\n", encoding="utf-8")
+        (ws / "b.txt").write_text("brand new file\n", encoding="utf-8")
+
+        diff_text = git_diff_text(ws, baseline)
+        assert "-original" in diff_text and "+changed" in diff_text
+        assert "new file (untracked): b.txt" in diff_text
+        assert "brand new file" in diff_text
+
+    # ------------------------------------------------------------
+    # 7. invoke_engineer's review_request plumbing: default None (every
+    #    existing call site unaffected), and the flag is only appended
+    #    to the spawned command when explicitly given.
+    # ------------------------------------------------------------
+    assert "review_request" in inspect.signature(invoke_engineer).parameters
+    assert inspect.signature(invoke_engineer).parameters["review_request"].default is None
+    invoke_source = inspect.getsource(invoke_engineer)
+    assert '"--review-request"' in invoke_source
+    assert "if review_request is not None:" in invoke_source
+
+    # ------------------------------------------------------------
+    # 8. "No plan -> zero behavior change": the review sub-loop and the
+    #    gates/architectReviews manifest keys are both gated behind the
+    #    same `architecture_plan is not None` condition C1 already uses
+    #    for architectPlan/candidate_evidence — a run without
+    #    --architect-first (architecture_plan always None) can never
+    #    reach any of this code.
+    # ------------------------------------------------------------
+    main_source = inspect.getsource(main)
+    assert main_source.count("if architecture_plan is not None:") >= 2, (
+        "both the gates/architectReviews manifest init and the review "
+        "sub-loop must be gated behind architecture_plan is not None"
+    )
+
+    # ------------------------------------------------------------
+    # 9. Revise rounds must never touch the outer repair-loop's
+    #    iteration variable or --max-repairs -- the revise invoke_
+    #    engineer() call must not be inside a construct that reassigns
+    #    `iteration` (it lives inside the `while True:` review loop,
+    #    nested under the `for iteration in range(...)` loop, but never
+    #    itself advances `iteration`).
+    # ------------------------------------------------------------
+    assert "iteration += 1" not in main_source
+    assert "iteration = iteration" not in main_source
+
+    # ------------------------------------------------------------
+    # 10. Fix round 1 (Important 1+2): budget increments ONLY on a
+    #     REVISE_IMPLEMENTATION disagreement round -- a plain APPROVED/
+    #     APPROVED_WITH_CONDITIONS review, and a fail-open (no usable
+    #     review output) round, must both be free. Otherwise repeated
+    #     approvals across repair iterations pre-block later iterations
+    #     (Important 1), and persistent review-machinery failure burns
+    #     budget until fail-open degrades into fail-closed (Important 2).
+    #     Structural proof via source ordering: the ONE increment site
+    #     is only reachable after the review call AND after both the
+    #     fail-open break and the approved/rejected break have already
+    #     had their chance to fire -- i.e. only on the remaining case,
+    #     "revise".
+    # ------------------------------------------------------------
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1, (
+        "budget must increment in exactly one place"
+    )
+    increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
+    review_call_idx = main_source.index("review = run_architect_review(")
+    fail_open_idx = main_source.index('architect_outcome = "fail_open"')
+    approved_rejected_idx = main_source.index("architect_outcome = decision_outcome")
+    assert review_call_idx < increment_idx, "increment must happen after the review actually runs"
+    assert fail_open_idx < increment_idx, "increment must be unreachable from the fail-open branch"
+    assert approved_rejected_idx < increment_idx, "increment must be unreachable from the approved/rejected branch"
+
+    print("architect review self-check: PASS")
+
+
+def _tasks_selfcheck() -> None:
+    """C3 (glimmer-v7): task graph self-check -- no live model needed.
+    Covers derivation from a synthetic plan (ids/kinds/dependsOn chain),
+    evidence-driven transitions (engineer success -> complete, engineer
+    fail -> failed, matched verify PASS/PASS_BASELINE -> complete,
+    matched CODE_FAIL -> failed, unmatched verificationPlan entry stays
+    pending, INFRA_BLOCKED/TIMEOUT stay pending), never-raises on a
+    write failure, and zero-behavior-change without a plan (no
+    tasks.json file). Run with: python3 glimmer-v2.py --tasks-selfcheck
+    """
+    plan = {
+        "implementationPlan": ["inspect hydration path", "add restoration hook"],
+        "verificationPlan": ["frontend_typecheck", "lint", "nonexistent_check"],
+    }
+
+    # ------------------------------------------------------------
+    # 1. Derivation: ids, kinds, sequential dependsOn chain.
+    # ------------------------------------------------------------
+    tasks = derive_tasks(plan)
+    assert [t["id"] for t in tasks] == ["t1", "t2", "t3", "t4", "t5"]
+    assert tasks[0]["kind"] == "implementation" and tasks[0]["dependsOn"] == []
+    assert tasks[1]["kind"] == "implementation" and tasks[1]["dependsOn"] == ["t1"]
+    assert tasks[2]["kind"] == "verification" and tasks[2]["dependsOn"] == ["t2"]
+    assert tasks[3]["kind"] == "verification" and tasks[3]["dependsOn"] == ["t2"]
+    assert tasks[4]["kind"] == "verification" and tasks[4]["dependsOn"] == ["t2"]
+    assert all(t["status"] == "pending" for t in tasks)
+    assert tasks[0]["description"] == "inspect hydration path"
+    assert tasks[2]["description"] == "frontend_typecheck"
+
+    # No implementation steps: verification tasks have no dependency.
+    tasks_no_impl = derive_tasks({"verificationPlan": ["typecheck"]})
+    assert tasks_no_impl[0]["id"] == "t1" and tasks_no_impl[0]["dependsOn"] == []
+
+    # Malformed plan fields degrade to [] rather than raising.
+    assert derive_tasks({}) == []
+    assert derive_tasks({"implementationPlan": "not a list"}) == []
+
+    # ------------------------------------------------------------
+    # 2. Spawn -> in_progress (implementation only; verification untouched).
+    # ------------------------------------------------------------
+    tasks = derive_tasks(plan)
+    set_implementation_tasks_status(tasks, "in_progress")
+    assert tasks[0]["status"] == "in_progress" and tasks[1]["status"] == "in_progress"
+    assert tasks[2]["status"] == "pending"
+
+    # ------------------------------------------------------------
+    # 3. Engineer-return: deterministic evidence only, never a model claim.
+    # ------------------------------------------------------------
+    evaluate_implementation_tasks(tasks, ["frontend/a.ts"], 0)  # changed files + rc==0
+    assert tasks[0]["status"] == "complete" and tasks[1]["status"] == "complete"
+
+    tasks_no_files = derive_tasks(plan)
+    set_implementation_tasks_status(tasks_no_files, "in_progress")
+    evaluate_implementation_tasks(tasks_no_files, [], 0)  # ran, touched nothing
+    assert all(t["status"] == "failed" for t in tasks_no_files if t["kind"] == "implementation")
+
+    tasks_engineer_err = derive_tasks(plan)
+    evaluate_implementation_tasks(tasks_engineer_err, ["frontend/a.ts"], 1)  # non-zero rc
+    assert all(t["status"] == "failed" for t in tasks_engineer_err if t["kind"] == "implementation")
+
+    # ------------------------------------------------------------
+    # 4. Verification: matched PASS/PASS_BASELINE/CODE_FAIL, unmatched
+    #    stays pending, INFRA_BLOCKED/TIMEOUT stay pending.
+    # ------------------------------------------------------------
+    results = [
+        {"command": "npm --prefix frontend run typecheck", "status": "PASS"},
+        {"command": "npm --prefix frontend run lint", "status": "CODE_FAIL"},
+    ]
+    evaluate_verification_tasks(tasks, results)
+    assert tasks[2]["status"] == "complete"   # "frontend_typecheck" matched, PASS
+    assert tasks[3]["status"] == "failed"     # "lint" matched, CODE_FAIL
+    assert tasks[4]["status"] == "pending"    # "nonexistent_check": no match -- honest
+
+    tasks_pb = derive_tasks({"verificationPlan": ["typecheck"]})
+    evaluate_verification_tasks(
+        tasks_pb, [{"command": "npm run typecheck", "status": "PASS_BASELINE"}])
+    assert tasks_pb[0]["status"] == "complete"
+
+    tasks_infra = derive_tasks({"verificationPlan": ["typecheck"]})
+    evaluate_verification_tasks(
+        tasks_infra, [{"command": "npm run typecheck", "status": "INFRA_BLOCKED"}])
+    assert tasks_infra[0]["status"] == "pending"  # check never really ran
+
+    tasks_timeout = derive_tasks({"verificationPlan": ["typecheck"]})
+    evaluate_verification_tasks(
+        tasks_timeout, [{"command": "npm run typecheck", "status": "TIMEOUT"}])
+    assert tasks_timeout[0]["status"] == "pending"
+
+    # ------------------------------------------------------------
+    # 4b. Fix round 1 (Important 3): reviewer's exact reproduction --
+    #     "run"/"npm" are tokens of EVERY npm command, so the old
+    #     first-match-on-any-shared-token scheme matched a prose plan
+    #     entry to the wrong command whenever the wrong one came first
+    #     in `results`. The fix (stopword-stripped token-set argmax)
+    #     must pick "npm run typecheck", never "npm run lint", and must
+    #     do so regardless of result order.
+    # ------------------------------------------------------------
+    prose_description = "Run the typecheck to confirm no type errors"
+    lint_first = [
+        {"command": "npm run lint", "status": "CODE_FAIL"},
+        {"command": "npm run typecheck", "status": "PASS"},
+    ]
+    match = _match_verify_result(prose_description, lint_first)
+    assert match is not None and match["command"] == "npm run typecheck", (
+        f"prose entry must match the typecheck command, got: {match!r}"
+    )
+    # Order must not matter -- same result either way.
+    typecheck_first = list(reversed(lint_first))
+    match2 = _match_verify_result(prose_description, typecheck_first)
+    assert match2 is not None and match2["command"] == "npm run typecheck"
+
+    # Reproduce the OLD (first-match-on-any-token) bug directly, so this
+    # regression test fails if anyone reverts to that scheme: the naive
+    # any-shared-token check (no stopword stripping, first hit wins)
+    # picks "npm run lint" first purely because "run" is shared.
+    def _old_first_match(description, results):
+        old_tokens = {t for t in _TASK_VERIFY_TOKEN_RE.findall(description.lower()) if len(t) >= 3}
+        for r in results:
+            cmd_tokens = set(_TASK_VERIFY_TOKEN_RE.findall((r.get("command") or "").lower()))
+            if old_tokens & cmd_tokens:
+                return r
+        return None
+    assert _old_first_match(prose_description, lint_first)["command"] == "npm run lint", (
+        "sanity check: the OLD matcher must reproduce the reviewer's bug on this input"
+    )
+
+    # Tie (two results with equal, nonzero overlap) -> unmatched, honest.
+    tie_results = [
+        {"command": "npm run build", "status": "PASS"},
+        {"command": "npm run app", "status": "CODE_FAIL"},
+    ]
+    assert _match_verify_result("build the app", tie_results) is None, (
+        "a genuine tie in token overlap must stay unmatched, never guess"
+    )
+
+    # evaluate_*/set_* are no-ops on tasks=None (mirrors main()'s no-plan gate).
+    set_implementation_tasks_status(None, "in_progress")
+    evaluate_implementation_tasks(None, ["x"], 0)
+    evaluate_verification_tasks(None, results)
+
+    # ------------------------------------------------------------
+    # 5. Never-raises: a tasks.json write failure must not propagate --
+    #    same never-crash-the-session discipline as C1/C6.
+    # ------------------------------------------------------------
+    real_write_text = Path.write_text
+
+    def _boom(self, *a, **kw):
+        raise OSError("disk full (simulated)")
+
+    Path.write_text = _boom
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            save_tasks(Path(td), tasks)  # must not raise
+    finally:
+        Path.write_text = real_write_text
+
+    # ------------------------------------------------------------
+    # 6. Zero behavior change without a plan: no tasks.json is ever
+    #    written -- mirrors main()'s `tasks = None` / no-derive gate.
+    # ------------------------------------------------------------
+    architecture_plan = None
+    tasks_none = derive_tasks(architecture_plan) if architecture_plan is not None else None
+    assert tasks_none is None
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+        if tasks_none is not None:
+            save_tasks(session_dir, tasks_none)
+        assert not (session_dir / "tasks.json").exists()
+
+    print("task graph (C3) self-check: PASS")
+
+
 def _visual_selfcheck() -> None:
     """C4 (glimmer-v7): proves the vision-verification plumbing without a
     live browser or a live model call.
@@ -2509,6 +3451,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-first-selfcheck"]:
         _architect_first_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-review-selfcheck"]:
+        _architect_review_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--tasks-selfcheck"]:
+        _tasks_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--visual-selfcheck"]:
         _visual_selfcheck()
