@@ -49,6 +49,47 @@ describe("glimmerApi", () => {
     expect(result.riskScore).toBe("HIGH");
   });
 
+  it("getArchitecturePlan calls GET /api/sessions/:id/plan", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ objective: "Add whisper()", packages: ["p"], risk: "low" }), { status: 200 })
+    );
+    const result = await glimmerApi.getArchitecturePlan("s1");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/plan`, expect.anything());
+    expect(result.objective).toBe("Add whisper()");
+  });
+
+  it("getArchitecturePlan rejects on a 404 (artifact absent)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404 }));
+    await expect(glimmerApi.getArchitecturePlan("s1")).rejects.toThrow();
+  });
+
+  it("getArchitectReviews calls GET /api/sessions/:id/architect-reviews and returns an array", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify([{ decision: "APPROVED", confidence: 0.9 }]), { status: 200 })
+    );
+    const result = await glimmerApi.getArchitectReviews("s1");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/architect-reviews`, expect.anything());
+    expect(result[0].decision).toBe("APPROVED");
+  });
+
+  it("getDeliveryReview calls GET /api/sessions/:id/delivery-review", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ summary: "s", customerReadiness: "ready_to_ship", confidence: { level: "high", reason: "r" } }), { status: 200 })
+    );
+    const result = await glimmerApi.getDeliveryReview("s1");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/delivery-review`, expect.anything());
+    expect(result.customerReadiness).toBe("ready_to_ship");
+  });
+
+  it("getSessionTasks calls GET /api/sessions/:id/tasks and returns the flat task list", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify([{ id: "t1", description: "d", kind: "implementation", dependsOn: [], status: "pending" }]), { status: 200 })
+    );
+    const result = await glimmerApi.getSessionTasks("s1");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/tasks`, expect.anything());
+    expect(result[0].id).toBe("t1");
+  });
+
   it("askSession POSTs the question and returns the model's answer", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ answer: "It owns the parser state.", provenance: "model-output" }), { status: 200 })

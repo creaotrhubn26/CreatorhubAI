@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus,
 } from "./sessions.js";
+import type { ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask } from "@glimmer/shared";
 import type { TaskContract } from "@glimmer/shared";
 
 const REAL_MANIFEST = {
@@ -81,6 +82,38 @@ describe("parseManifest", () => {
     );
     expect(session.verification.overall).toBe("FAILED");
   });
+
+  it("passes through gates/architectPlan/failure when the manifest carries them (C2/C3)", () => {
+    const session = parseManifest(
+      {
+        ...REAL_MANIFEST,
+        gates: { architectureApproved: true },
+        architectPlan: { used: true, risk: "low" },
+        failure: null,
+      },
+      "sid-4"
+    );
+    expect(session.gates).toEqual({ architectureApproved: true });
+    expect(session.architectPlan).toEqual({ used: true, risk: "low" });
+    // "failure": null in a real manifest (no failure occurred) must not turn
+    // into a truthy `{}` on the session.
+    expect(session.failure).toBeUndefined();
+  });
+
+  it("leaves gates/architectPlan/failure undefined for a pre-architect-mode manifest", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-5");
+    expect(session.gates).toBeUndefined();
+    expect(session.architectPlan).toBeUndefined();
+    expect(session.failure).toBeUndefined();
+  });
+
+  it("passes through a real failure object", () => {
+    const session = parseManifest(
+      { ...REAL_MANIFEST, failure: { class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] } },
+      "sid-6"
+    );
+    expect(session.failure).toEqual({ class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] });
+  });
 });
 
 describe("mapManifestStatus", () => {
@@ -96,6 +129,9 @@ describe("mapManifestStatus", () => {
     ["blocked-no-changes", "blocked"],
     ["failed-verifier-mutated-repo", "failed"],
     ["failed-repair-budget-exhausted", "failed"],
+    ["failed-aborted", "failed"],
+    ["cancelled-sigterm", "cancelled"],
+    ["needs-architect-review", "needs_review"],
     ["something-nobody-has-seen", "needs_review"],
   ])("maps %s -> %s", (raw, expected) => {
     expect(mapManifestStatus(raw)).toBe(expected);
@@ -202,5 +238,142 @@ describe("readSession populates taskContract", () => {
     await sessionsIsolated.writeGatewayContract(dir, REAL_CONTRACT);
     const session = await sessionsIsolated.readSession(id);
     expect(session?.taskContract).toEqual(REAL_CONTRACT);
+  });
+});
+
+// Ground truth for these fixtures: real artifacts from a VERIFIED session
+// with an APPROVED_WITH_CONDITIONS review, read from
+// ~/.muse-glimmer/sessions/20260820-230811-glimmer-smoke-test-r1/.
+const REAL_PLAN: ArchitecturePlan = {
+  objective: "Add a whisper(name) function to src/greet.js.",
+  packages: ["glimmer-smoke-test"],
+  risk: "low",
+  area: "src/greet.js",
+  existingPatterns: [{ name: "CommonJS named export object", evidence: ["src/greet.js"] }],
+  candidateFiles: [{ path: "src/greet.js", reason: "target for adding whisper", confidence: 0.95 }],
+  constraints: ["minimalChange true"],
+  implementationPlan: ["Add function whisper(name)"],
+  verificationPlan: ["Run npm run typecheck"],
+  uncertainties: ["No tests found in repository"],
+  expectedScope: { minFiles: 1, maxFiles: 1 },
+};
+
+const REAL_REVIEW: ArchitectReview = {
+  decision: "APPROVED_WITH_CONDITIONS",
+  confidence: 0.88,
+  findings: ["src/greet.js now contains whisper(name)"],
+  requiredChanges: [],
+  constraints: ["Keep change minimal to src/greet.js only"],
+  verificationAdjustments: ["Run npm run typecheck"],
+};
+
+const REAL_DELIVERY_REVIEW: DeliveryReview = {
+  summary: "src/greet.js now defines whisper(name).",
+  customerReadiness: "ready_with_known_limitations",
+  confidence: { level: "medium", reason: "File content confirmed by read-back." },
+  approachRationale: ["Added whisper as a minimal additive function."],
+  strengths: ["Implementation matches required signature."],
+  concerns: [{ severity: "medium", category: "verification", description: "No non-destructive validation ran.", evidenceIds: ["ev-1"] }],
+  unresolvedItems: ["Runtime validation not performed."],
+  intentionallyNotChanged: ["greet function implementation."],
+  nextSteps: [{ priority: "recommended_next", action: "Run a quick node sanity check." }],
+};
+
+const REAL_TASKS: GlimmerTask[] = [
+  { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },
+  { id: "t2", description: "Add whisper", kind: "implementation", dependsOn: ["t1"], status: "complete" },
+  { id: "t3", description: "Manual smoke test", kind: "verification", dependsOn: ["t2"], status: "pending" },
+];
+
+describe("opt-in orchestrator artifact reads", () => {
+  it("readArchitecturePlan returns the parsed plan when present", async () => {
+    const id = "20260817-000030-glimmer-plan";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architecture-plan.json"), JSON.stringify(REAL_PLAN));
+    expect(await sessionsIsolated.readArchitecturePlan(id)).toEqual(REAL_PLAN);
+  });
+
+  it("readArchitecturePlan returns null when the file is absent (normal, opt-in)", async () => {
+    const id = "20260817-000031-glimmer-no-plan";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readArchitecturePlan(id)).toBeNull();
+  });
+
+  it("readArchitecturePlan returns null (not throws) on malformed JSON", async () => {
+    const id = "20260817-000032-glimmer-bad-plan";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architecture-plan.json"), "not json {{{");
+    expect(await sessionsIsolated.readArchitecturePlan(id)).toBeNull();
+  });
+
+  it("readArchitecturePlan rejects a path-traversal id as not-found", async () => {
+    expect(await sessionsIsolated.readArchitecturePlan("../../evil")).toBeNull();
+  });
+
+  it("readDeliveryReview returns the parsed review when present", async () => {
+    const id = "20260817-000033-glimmer-delivery-review";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(REAL_DELIVERY_REVIEW));
+    expect(await sessionsIsolated.readDeliveryReview(id)).toEqual(REAL_DELIVERY_REVIEW);
+  });
+
+  it("readDeliveryReview returns null when absent", async () => {
+    const id = "20260817-000034-glimmer-no-delivery-review";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readDeliveryReview(id)).toBeNull();
+  });
+
+  it("readSessionTasks returns the parsed task list when present", async () => {
+    const id = "20260817-000035-glimmer-tasks";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(REAL_TASKS));
+    expect(await sessionsIsolated.readSessionTasks(id)).toEqual(REAL_TASKS);
+  });
+
+  it("readSessionTasks returns null when absent", async () => {
+    const id = "20260817-000036-glimmer-no-tasks";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readSessionTasks(id)).toBeNull();
+  });
+
+  it("readArchitectReviews globs and sorts architect-review-NN-MM.json", async () => {
+    const id = "20260817-000037-glimmer-reviews";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const round2 = { ...REAL_REVIEW, decision: "REVISE_IMPLEMENTATION" as const };
+    await fs.writeFile(path.join(dir, "architect-review-00-02.json"), JSON.stringify(round2));
+    await fs.writeFile(path.join(dir, "architect-review-00-01.json"), JSON.stringify(REAL_REVIEW));
+    await fs.writeFile(path.join(dir, "not-a-review.json"), JSON.stringify({ unrelated: true }));
+
+    const reviews = await sessionsIsolated.readArchitectReviews(id);
+    expect(reviews).toEqual([REAL_REVIEW, round2]);
+  });
+
+  it("readArchitectReviews skips a malformed individual review file instead of failing the whole batch", async () => {
+    const id = "20260817-000038-glimmer-reviews-malformed";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architect-review-00-01.json"), JSON.stringify(REAL_REVIEW));
+    await fs.writeFile(path.join(dir, "architect-review-00-02.json"), "not json {{{");
+
+    expect(await sessionsIsolated.readArchitectReviews(id)).toEqual([REAL_REVIEW]);
+  });
+
+  it("readArchitectReviews returns null when no review files exist (normal, opt-in)", async () => {
+    const id = "20260817-000039-glimmer-no-reviews";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readArchitectReviews(id)).toBeNull();
+  });
+
+  it("readArchitectReviews returns null when every matching file is malformed", async () => {
+    const id = "20260817-000040-glimmer-reviews-all-malformed";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architect-review-00-01.json"), "not json {{{");
+    expect(await sessionsIsolated.readArchitectReviews(id)).toBeNull();
   });
 });

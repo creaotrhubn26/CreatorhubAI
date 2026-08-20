@@ -7,6 +7,10 @@ import { AgentStateStepper } from "./AgentStateStepper";
 import { AgentTimeline } from "./AgentTimeline";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 import { SessionAssistant } from "./SessionAssistant";
+import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
+import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
+import { TasksPanel } from "./TasksPanel";
+import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
@@ -45,6 +49,11 @@ export function ActiveSessionScreen() {
       </button>
       {cancelMutation.isError && <div>Unavailable — could not cancel this session.</div>}
       <AgentStateStepper current={state} />
+      {session.failure && (
+        <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          Failure: {session.failure.class} — {session.failure.detail}
+        </p>
+      )}
       <dl>
         <dt>Changed files</dt>
         <dd>{session.changedFiles.length}</dd>
@@ -52,6 +61,10 @@ export function ActiveSessionScreen() {
         <dd>{session.repairsUsed} / {session.repairBudget}</dd>
       </dl>
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
+      {id && <ArchitecturePlanPanel sessionId={id} />}
+      {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
+      {id && <TasksPanel sessionId={id} />}
+      {id && <DeliveryReviewPanel sessionId={id} />}
       <AgentTimeline events={events} />
       {id && <SessionAssistant sessionId={id} />}
     </div>

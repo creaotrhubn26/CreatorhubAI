@@ -6,6 +6,7 @@ import { CONFIG, sessionsDir } from "../config.js";
 import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
+  readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs } from "../lib/runner.js";
@@ -200,6 +201,51 @@ sessionsRouter.get("/sessions/:id/analysis", async (req, res) => {
     // scopeGuard are derived from it.
     const body: SessionAnalysis = { riskScore, scopeGuard, provenance: "git-derived" };
     res.json(body);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Opt-in architect-mode artifacts (C2/C3, glimmer-v7). Read-only, fixed
+// filenames within the resolved session dir only — no arbitrary file
+// serving. Absence is normal (most sessions never opt into architect mode),
+// so it 404s the same way a missing/malformed manifest.json does; a real fs
+// fault (permissions, EISDIR, ...) is a gateway bug and 500s.
+sessionsRouter.get("/sessions/:id/plan", async (req, res) => {
+  try {
+    const plan = await readArchitecturePlan(req.params.id);
+    if (!plan) return res.status(404).json({ error: "not found" });
+    res.json(plan);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.get("/sessions/:id/architect-reviews", async (req, res) => {
+  try {
+    const reviews = await readArchitectReviews(req.params.id);
+    if (!reviews) return res.status(404).json({ error: "not found" });
+    res.json(reviews);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.get("/sessions/:id/delivery-review", async (req, res) => {
+  try {
+    const review = await readDeliveryReview(req.params.id);
+    if (!review) return res.status(404).json({ error: "not found" });
+    res.json(review);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.get("/sessions/:id/tasks", async (req, res) => {
+  try {
+    const tasks = await readSessionTasks(req.params.id);
+    if (!tasks) return res.status(404).json({ error: "not found" });
+    res.json(tasks);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

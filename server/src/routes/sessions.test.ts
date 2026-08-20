@@ -284,6 +284,205 @@ describe("GET /api/sessions/:id/analysis", () => {
   });
 });
 
+describe("GET /api/sessions/:id/plan", () => {
+  const plan = {
+    objective: "Add a whisper(name) function.",
+    packages: ["glimmer-smoke-test"],
+    risk: "low",
+  };
+
+  it("returns the parsed architecture-plan.json when present", async () => {
+    const id = "20260818-000001-glimmer-plan-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architecture-plan.json"), JSON.stringify(plan));
+
+    const res = await request(app).get(`/api/sessions/${id}/plan`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(plan);
+  });
+
+  it("returns 404 when no plan was ever written (opt-in artifact)", async () => {
+    const id = "20260818-000002-glimmer-plan-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/plan`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404, not a crash, for malformed JSON", async () => {
+    const id = "20260818-000003-glimmer-plan-malformed";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architecture-plan.json"), "not json {{{");
+
+    const res = await request(app).get(`/api/sessions/${id}/plan`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260818-000004-glimmer-plan-fserror";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    // A directory named architecture-plan.json, not a file: fs.readFile fails
+    // with EISDIR, a genuine gateway fault distinct from "no artifact".
+    await fs.mkdir(path.join(dir, "architecture-plan.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/plan`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("GET /api/sessions/:id/architect-reviews", () => {
+  const review = { decision: "APPROVED_WITH_CONDITIONS", confidence: 0.88 };
+
+  it("returns the sorted array of architect-review-NN-MM.json files", async () => {
+    const id = "20260818-000005-glimmer-reviews-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architect-review-00-02.json"), JSON.stringify({ ...review, decision: "REVISE_IMPLEMENTATION" }));
+    await fs.writeFile(path.join(dir, "architect-review-00-01.json"), JSON.stringify(review));
+
+    const res = await request(app).get(`/api/sessions/${id}/architect-reviews`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([review, { ...review, decision: "REVISE_IMPLEMENTATION" }]);
+  });
+
+  it("returns 404 when no review files exist (opt-in artifact)", async () => {
+    const id = "20260818-000006-glimmer-reviews-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/architect-reviews`);
+    expect(res.status).toBe(404);
+  });
+
+  it("skips a malformed individual review file and returns the rest", async () => {
+    const id = "20260818-000007-glimmer-reviews-malformed";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "architect-review-00-01.json"), JSON.stringify(review));
+    await fs.writeFile(path.join(dir, "architect-review-00-02.json"), "not json {{{");
+
+    const res = await request(app).get(`/api/sessions/${id}/architect-reviews`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([review]);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const fileId = "20260818-000008-not-a-directory";
+    await fs.writeFile(path.join(stateRoot, "sessions", fileId), "not a session dir");
+
+    const res = await request(app).get(`/api/sessions/${fileId}/architect-reviews`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("GET /api/sessions/:id/delivery-review", () => {
+  const deliveryReview = {
+    summary: "src/greet.js now defines whisper(name).",
+    customerReadiness: "ready_with_known_limitations",
+    confidence: { level: "medium", reason: "File content confirmed by read-back." },
+  };
+
+  it("returns the parsed delivery-review.json when present", async () => {
+    const id = "20260818-000009-glimmer-delivery-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(deliveryReview));
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(deliveryReview);
+  });
+
+  it("returns 404 when no delivery review was ever written (opt-in artifact)", async () => {
+    const id = "20260818-000010-glimmer-delivery-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404, not a crash, for malformed JSON", async () => {
+    const id = "20260818-000011-glimmer-delivery-malformed";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), "not json {{{");
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260818-000012-glimmer-delivery-fserror";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(path.join(dir, "delivery-review.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("GET /api/sessions/:id/tasks", () => {
+  const tasks = [
+    { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },
+  ];
+
+  it("returns the parsed tasks.json when present", async () => {
+    const id = "20260818-000013-glimmer-tasks-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(tasks);
+  });
+
+  it("returns 404 when no tasks.json was ever written (opt-in artifact)", async () => {
+    const id = "20260818-000014-glimmer-tasks-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404, not a crash, for malformed JSON", async () => {
+    const id = "20260818-000015-glimmer-tasks-malformed";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), "not json {{{");
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260818-000016-glimmer-tasks-fserror";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(path.join(dir, "tasks.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("opt-in artifact routes reject path-traversal ids", () => {
+  it.each(["plan", "architect-reviews", "delivery-review", "tasks"])(
+    "GET /api/sessions/:id/%s returns 404 for a traversal id",
+    async (routeName) => {
+      const res = await request(app).get(`/api/sessions/..%2F..%2Fevil/${routeName}`);
+      expect(res.status).toBe(404);
+    }
+  );
+});
+
 describe("POST /api/sessions/:id/ask", () => {
   it("returns 400 without a question", async () => {
     const res = await request(app).post("/api/sessions/some-id/ask").send({});
