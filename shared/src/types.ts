@@ -410,3 +410,10 @@ export interface SessionAssistantAnswer {
   answer: string;
   provenance: "model-output";
 }
+
+// §27/§4.1 workspace creation — POST /api/workspaces response.
+export interface CreateWorkspaceResult {
+  workspace: string;
+  branch: string;
+  baselineSha: string;
+}

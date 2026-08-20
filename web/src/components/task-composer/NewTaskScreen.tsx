@@ -16,7 +16,18 @@ const PATH_SCOPED_PACKAGES = new Set(["directory", "files"]);
 export function NewTaskScreen() {
   const [form, setForm] = useState(DEFAULT_FORM);
   const [workspace, setWorkspace] = useState("");
+  const [newTaskName, setNewTaskName] = useState("");
   const navigate = useNavigate();
+
+  // §27/§4.1 — "New worktree" affordance: cuts a fresh git worktree+branch
+  // off the source repo and adopts it as the workspace path above, the same
+  // field POST /sessions already reads. Fetch can take ~10s+ (git fetch
+  // over the network), so this is its own pending state, separate from
+  // runMutation.
+  const createWorkspaceMutation = useMutation({
+    mutationFn: (taskName: string) => glimmerApi.createWorkspace(taskName),
+    onSuccess: (result) => setWorkspace(result.workspace),
+  });
   // F5: "directory"/"files" scope claims to be bounded to a concrete path —
   // without one, the backend's scope guard has nothing to check against and
   // silently reports every change as in-scope. Require the path here so that
@@ -46,6 +57,29 @@ export function NewTaskScreen() {
         Workspace path
         <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
       </label>
+
+      <fieldset>
+        <legend>New worktree</legend>
+        <label>
+          Task name
+          <input
+            value={newTaskName}
+            onChange={(e) => setNewTaskName(e.target.value)}
+            placeholder="e.g. role-room-story-logic"
+            disabled={createWorkspaceMutation.isPending}
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() => createWorkspaceMutation.mutate(newTaskName)}
+          disabled={!newTaskName.trim() || createWorkspaceMutation.isPending}
+        >
+          {createWorkspaceMutation.isPending ? "Creating worktree…" : "Create"}
+        </button>
+        {createWorkspaceMutation.isError && (
+          <span role="alert"> {(createWorkspaceMutation.error as Error).message}</span>
+        )}
+      </fieldset>
 
       <fieldset>
         <legend>Scope</legend>

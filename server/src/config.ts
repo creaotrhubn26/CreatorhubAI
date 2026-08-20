@@ -11,6 +11,12 @@ export const CONFIG = {
     path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-engineer.py"),
   modelBaseUrl: process.env.GLIMMER_MODEL_URL ?? "http://127.0.0.1:8080",
   port: Number(process.env.PORT ?? 4317),
+  // §27/§4.1 workspace creation: the real source repo new worktrees are cut
+  // from, where new worktrees/branches live, and the ref they're based on.
+  // Mirrors new-glimmer-task.sh's REPO/WORKTREE_ROOT/BASE exactly.
+  sourceRepo: process.env.GLIMMER_SOURCE_REPO ?? "/Users/danielqazi/Creatorhubn-monorepo",
+  worktreeRoot: process.env.GLIMMER_WORKTREE_ROOT ?? "/Users/danielqazi",
+  worktreeBase: process.env.GLIMMER_WORKTREE_BASE ?? "origin/main",
 } as const;
 
 export const sessionsDir = () => path.join(CONFIG.stateRoot, "sessions");
