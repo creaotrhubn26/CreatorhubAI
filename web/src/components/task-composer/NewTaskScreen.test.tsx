@@ -93,4 +93,66 @@ describe("NewTaskScreen", () => {
     });
     expect(screen.getByLabelText(/scope path/i)).toBeInTheDocument();
   });
+
+  // §7 Advanced controls: collapsed by default, typed inputs only, submits
+  // omitted-when-empty so an untouched composer changes nothing behaviorally.
+  describe("Advanced controls", () => {
+    it("renders the Advanced section collapsed by default", () => {
+      render(withQuery(<NewTaskScreen />));
+      const details = screen.getByText("Advanced").closest("details") as HTMLDetailsElement;
+      expect(details).toBeInTheDocument();
+      expect(details.open).toBe(false);
+    });
+
+    it("shows max turns, timeout, toolchain mode, model readiness URL, and architect-first controls", () => {
+      render(withQuery(<NewTaskScreen />));
+      expect(screen.getByLabelText("Max turns")).toBeInTheDocument();
+      expect(screen.getByLabelText("Timeout (seconds)")).toBeInTheDocument();
+      expect(screen.getByLabelText("Toolchain mode")).toBeInTheDocument();
+      expect(screen.getByLabelText("Model readiness URL")).toBeInTheDocument();
+      expect(screen.getByLabelText("Architect first")).toBeInTheDocument();
+    });
+
+    it("defaults toolchain mode to 'path' and architect-first to off, with helper text explaining it", () => {
+      render(withQuery(<NewTaskScreen />));
+      expect((screen.getByLabelText("Toolchain mode") as HTMLSelectElement).value).toBe("path");
+      expect((screen.getByLabelText("Architect first") as HTMLInputElement).checked).toBe(false);
+      expect(screen.getByText(/runs a read-only planning pass first/i)).toBeInTheDocument();
+    });
+
+    it("submits a contract with no `advanced` key when the section is left untouched", async () => {
+      const createSpy = vi
+        .spyOn(client.glimmerApi, "createSession")
+        .mockResolvedValue({ id: "s1" } as any);
+      vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), { target: { value: "Fix the dialog" } });
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+      await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+      const [contract] = createSpy.mock.calls[0];
+      expect(contract.advanced).toBeUndefined();
+    });
+
+    it("submits only the advanced fields the user actually set", async () => {
+      const createSpy = vi
+        .spyOn(client.glimmerApi, "createSession")
+        .mockResolvedValue({ id: "s2" } as any);
+      vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), { target: { value: "Fix the dialog" } });
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.change(screen.getByLabelText("Timeout (seconds)"), { target: { value: "300" } });
+      fireEvent.change(screen.getByLabelText("Toolchain mode"), { target: { value: "linked" } });
+      fireEvent.click(screen.getByLabelText("Architect first"));
+      fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+      await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+      const [contract] = createSpy.mock.calls[0];
+      expect(contract.advanced).toEqual({ timeoutSeconds: 300, toolchainMode: "linked", architectFirst: true });
+    });
+  });
 });

@@ -8,6 +8,7 @@ import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 const DEFAULT_FORM: TaskComposerFormState = {
   objective: "", scopePackage: "repository", scopeArea: "", mode: "implement",
   verification: [], repairBudget: 2, maxTurns: undefined,
+  timeoutSeconds: undefined, toolchainMode: "path", modelReadinessUrl: "", architectFirst: false,
 };
 
 const PATH_SCOPED_PACKAGES = new Set(["directory", "files"]);
@@ -132,6 +133,55 @@ export function NewTaskScreen() {
         <label><input type="checkbox" checked={false} disabled /> Deploy</label>
         <label><input type="checkbox" checked={false} disabled /> Install dependencies</label>
       </fieldset>
+
+      <details>
+        <summary>Advanced</summary>
+        <label>
+          Max turns
+          <input
+            type="number" min={1} max={64}
+            value={form.maxTurns ?? ""}
+            onChange={(e) => setForm({ ...form, maxTurns: e.target.value === "" ? undefined : Number(e.target.value) })}
+          />
+        </label>
+        <label>
+          Timeout (seconds)
+          <input
+            type="number" min={60} max={3600}
+            value={form.timeoutSeconds ?? ""}
+            onChange={(e) => setForm({ ...form, timeoutSeconds: e.target.value === "" ? undefined : Number(e.target.value) })}
+          />
+        </label>
+        <label>
+          Toolchain mode
+          <select
+            value={form.toolchainMode}
+            onChange={(e) => setForm({ ...form, toolchainMode: e.target.value as TaskComposerFormState["toolchainMode"] })}
+          >
+            <option value="path">path</option>
+            <option value="linked">linked</option>
+            <option value="none">none</option>
+          </select>
+        </label>
+        <label>
+          Model readiness URL
+          <input
+            type="url"
+            value={form.modelReadinessUrl ?? ""}
+            onChange={(e) => setForm({ ...form, modelReadinessUrl: e.target.value })}
+            placeholder="https://..."
+          />
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={form.architectFirst ?? false}
+            onChange={(e) => setForm({ ...form, architectFirst: e.target.checked })}
+          />
+          Architect first
+        </label>
+        <p>Runs a read-only planning pass first.</p>
+      </details>
 
       <button
         onClick={() => runMutation.mutate()}

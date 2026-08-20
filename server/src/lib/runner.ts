@@ -12,6 +12,54 @@ const VERIFICATION_COMMANDS: Record<string, string> = {
   "targeted-test": "npm --prefix frontend run test:unit",
 };
 
+// §7 Advanced controls. Closed enum for toolchainMode — same discipline as
+// VERIFICATION_COMMANDS above: a value outside this set is dropped, never
+// forwarded. Ranges match the route-level 400 boundary in validateAdvanced.
+const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
+const MAX_TURNS_RANGE = { min: 1, max: 64 };
+const TIMEOUT_RANGE = { min: 60, max: 3600 };
+
+function isValidModelReadinessUrl(value: string): boolean {
+  // modelReadinessUrl becomes a single argv element after its flag — it is
+  // never shell-interpolated — but we still validate it parses as an
+  // http/https URL so nothing free-form reaches glimmer-v2.py's argv.
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isInRange(n: unknown, range: { min: number; max: number }): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n >= range.min && n <= range.max;
+}
+
+// Server-side boundary for the §7 advanced composer fields: the UI is not
+// the boundary, so a client posting straight to the API must be rejected the
+// same as an out-of-range composer submission would be. Returns an error
+// message, or null when the contract's advanced fields are all valid.
+export function validateAdvanced(contract: TaskContract): string | null {
+  if (contract.maxTurns !== undefined && !isInRange(contract.maxTurns, MAX_TURNS_RANGE)) {
+    return `maxTurns must be an integer between ${MAX_TURNS_RANGE.min} and ${MAX_TURNS_RANGE.max}`;
+  }
+  const advanced = contract.advanced;
+  if (!advanced) return null;
+  if (advanced.timeoutSeconds !== undefined && !isInRange(advanced.timeoutSeconds, TIMEOUT_RANGE)) {
+    return `timeoutSeconds must be an integer between ${TIMEOUT_RANGE.min} and ${TIMEOUT_RANGE.max}`;
+  }
+  if (advanced.toolchainMode !== undefined && !TOOLCHAIN_MODES.has(advanced.toolchainMode)) {
+    return `toolchainMode must be one of ${[...TOOLCHAIN_MODES].join(", ")}`;
+  }
+  if (advanced.modelReadinessUrl !== undefined && !isValidModelReadinessUrl(advanced.modelReadinessUrl)) {
+    return "modelReadinessUrl must be a valid http(s) URL";
+  }
+  if (advanced.architectFirst !== undefined && typeof advanced.architectFirst !== "boolean") {
+    return "architectFirst must be a boolean";
+  }
+  return null;
+}
+
 export function buildArgs(contract: TaskContract, workspace: string): string[] {
   const args = ["--workspace", workspace];
   args.push("--max-repairs", String(contract.repairBudget));
@@ -25,6 +73,25 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
     }
   }
   if (contract.maxTurns) args.push("--max-turns", String(contract.maxTurns));
+
+  // §7 Advanced controls: typed-only, closed-enum mapping. Every check here
+  // duplicates validateAdvanced's boundary (defense in depth) — an invalid
+  // value is dropped silently rather than forwarded, the same posture as
+  // VERIFICATION_COMMANDS above.
+  const advanced = contract.advanced;
+  if (advanced?.timeoutSeconds !== undefined && isInRange(advanced.timeoutSeconds, TIMEOUT_RANGE)) {
+    args.push("--timeout", String(advanced.timeoutSeconds));
+  }
+  if (advanced?.toolchainMode !== undefined && TOOLCHAIN_MODES.has(advanced.toolchainMode)) {
+    args.push("--toolchain-mode", advanced.toolchainMode);
+  }
+  if (advanced?.modelReadinessUrl !== undefined && isValidModelReadinessUrl(advanced.modelReadinessUrl)) {
+    args.push("--model-readiness-url", advanced.modelReadinessUrl);
+  }
+  if (advanced?.architectFirst === true) {
+    args.push("--architect-first");
+  }
+
   // Deliberately closed set: no --auto-approve, no flag path can request commit/push/deploy/install.
   // "--" forces argparse to treat the objective as the positional `task`, never as a flag,
   // even if a client submits an objective like "--auto-approve" or "--engineer=...".

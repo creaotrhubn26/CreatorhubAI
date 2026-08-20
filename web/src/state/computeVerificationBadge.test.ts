@@ -29,4 +29,11 @@ describe("computeVerificationBadge", () => {
       elapsedSeconds: 1, outputTail: "", baselineAware: false, newErrorSignatures: [],
     })).toEqual({ label: "FAIL", tone: "fail" });
   });
+
+  it("labels NOT_RUN as not-run, never as a pass or a failure", () => {
+    expect(computeVerificationBadge({
+      command: "e2e", status: "NOT_RUN", ok: false, returncode: 0,
+      elapsedSeconds: 0, outputTail: "", baselineAware: false, newErrorSignatures: [],
+    })).toEqual({ label: "NOT RUN", tone: "not-run" });
+  });
 });

@@ -10,7 +10,7 @@ import {
   writeHumanAcceptance,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
-import { runGlimmer, buildArgs } from "../lib/runner.js";
+import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
 import { askSessionAssistant } from "../lib/sessionAssistant.js";
@@ -144,6 +144,11 @@ sessionsRouter.post("/sessions", async (req, res) => {
   ) {
     return res.status(400).json({ error: "invalid taskContract or workspace" });
   }
+  // §7 Advanced controls: server is the validation boundary, not the
+  // composer UI — a client posting an out-of-range/wrong-type value directly
+  // to the API must 400 the same way a malformed core field does.
+  const advancedError = validateAdvanced(contract);
+  if (advancedError) return res.status(400).json({ error: advancedError });
 
   const id = `pending-${randomUUID()}`;
   pendingContracts.set(id, { contract, workspace });
