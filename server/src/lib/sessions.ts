@@ -4,6 +4,7 @@ import { sessionsDir } from "../config.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
+  ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask,
 } from "@glimmer/shared";
 
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
@@ -12,17 +13,25 @@ const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
 
 // glimmer-v2.py's real manifest["status"] values: initialized, repo-map-only,
 // no-change-verified, no-change-unverified, verified, blocked-<reason>,
-// failed-verifier-mutated-repo, failed-repair-budget-exhausted.
+// failed-verifier-mutated-repo, failed-repair-budget-exhausted, and (R6/C2)
+// cancelled-sigterm, failed-aborted, needs-architect-review.
 export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   if (raw === "initialized") return "preflight";
   if (raw === "verified" || raw === "no-change-verified") return "verified";
   if (raw === "no-change-unverified") return "needs_review";
+  // C2 (glimmer-v7): terminal status when the architect review gate rejects
+  // the implementation or the review budget is exhausted — must never be
+  // promoted to "verified".
+  if (raw === "needs-architect-review") return "needs_review";
   if (raw.startsWith("blocked-")) return "blocked";
   if (raw.startsWith("failed-")) return "failed";
   // repo-map-only is TERMINAL (glimmer-v2.py writes it and exits immediately,
   // no engineering work attempted) — must not map to an IN_FLIGHT_STATUSES
   // member or the session shows as the live "Active session" forever.
   if (raw === "repo-map-only") return "cancelled";
+  // R6: SIGTERM/Ctrl-C writes "cancelled-sigterm" instead of leaving whatever
+  // status was last saved before the interrupt.
+  if (raw.startsWith("cancelled")) return "cancelled";
   // Any status this map doesn't recognize: never default to in-flight — an
   // unknown terminal status from a future orchestrator version would be
   // misreported as live. Surface it for a human to look at instead.
@@ -65,7 +74,7 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   const verification: VerificationSummary = { overall: overallFromManifest(m), checks };
   const status = mapManifestStatus(String(m.status ?? ""));
 
-  return {
+  const session: GlimmerSession = {
     id: sessionId,
     task: m.task,
     status,
@@ -80,6 +89,13 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
     repairsUsed: Math.max(0, attempts.length - 1),
     repairBudget: m.maxRepairs ?? 0,
   };
+  // C2/C3 (glimmer-v7): pass these through only when the manifest actually
+  // carries them — older sessions predating architect mode have none of these
+  // keys, and GlimmerSession leaves them optional for exactly that reason.
+  if (m.gates) session.gates = m.gates;
+  if (m.architectPlan) session.architectPlan = m.architectPlan;
+  if (m.failure) session.failure = m.failure;
+  return session;
 }
 
 const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/;
@@ -116,6 +132,73 @@ export async function readManifestRaw(id: string): Promise<unknown | null> {
     }
     return null;
   }
+}
+
+// --- opt-in orchestrator-artifact reads ------------------------------------
+// architecture-plan.json / delivery-review.json / tasks.json are each a
+// single JSON document, written at most once per session by glimmer-engineer/
+// glimmer-v2 when architect mode is on. Absence is normal (most sessions
+// never opt in), so ENOENT and malformed JSON both resolve to null — the same
+// "no readable artifact" treatment readManifestRaw gives a torn manifest.json.
+// Any OTHER read failure (permissions, EISDIR, ...) is a real gateway fault
+// and is left to propagate so the calling route can 500 on it.
+async function readSessionJsonFile<T>(id: string, filename: string): Promise<T | null> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) return null;
+  let raw: string;
+  try {
+    raw = await fs.readFile(path.join(sessionsDir(), real, filename), "utf-8");
+  } catch (err: any) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function readArchitecturePlan(id: string): Promise<ArchitecturePlan | null> {
+  return readSessionJsonFile<ArchitecturePlan>(id, "architecture-plan.json");
+}
+
+export function readDeliveryReview(id: string): Promise<DeliveryReview | null> {
+  return readSessionJsonFile<DeliveryReview>(id, "delivery-review.json");
+}
+
+export function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
+  return readSessionJsonFile<GlimmerTask[]>(id, "tasks.json");
+}
+
+const ARCHITECT_REVIEW_FILE_RE = /^architect-review-\d+-\d+\.json$/;
+
+// architect-review-NN-MM.json is a collection (one file per review round), so
+// this follows readSessionEventsBatch's convention instead: a malformed
+// individual file is skipped rather than failing the whole request. Zero
+// matching files (dir absent, or present but no reviews written) is still
+// "no artifact" -> null, consistent with the single-file reads above.
+export async function readArchitectReviews(id: string): Promise<ArchitectReview[] | null> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) return null;
+  let entries: string[];
+  try {
+    entries = await fs.readdir(path.join(sessionsDir(), real));
+  } catch (err: any) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+  const files = entries.filter((f) => ARCHITECT_REVIEW_FILE_RE.test(f)).sort();
+  const reviews: ArchitectReview[] = [];
+  for (const file of files) {
+    try {
+      const raw = await fs.readFile(path.join(sessionsDir(), real, file), "utf-8");
+      reviews.push(JSON.parse(raw) as ArchitectReview);
+    } catch {
+      // Torn/malformed individual review file — skip it, not a request error.
+    }
+  }
+  return reviews.length > 0 ? reviews : null;
 }
 
 export async function writeGatewayContract(dir: string, contract: TaskContract): Promise<void> {
