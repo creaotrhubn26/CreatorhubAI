@@ -84,3 +84,49 @@ expensive calls against a 23KB repo map, eliminating main-run discovery should
 win outright. C1 stays opt-in until that large-repo run confirms it; C2/C3 remain
 gated on the same. The floor-case evidence now supports, rather than refutes,
 proceeding to that test.
+
+---
+
+# Large-repo runs (2026-08-18 → 2026-08-20, real Creatorhubn-monorepo worktree)
+
+Create-new-file task ("add frontend/client/src/utils/shortDuration.ts following neighboring
+conventions") against an isolated worktree of the production monorepo. Two structural bugs
+found and fixed along the way, both live-reproduced:
+
+1. **Tool-router gate never offered `write_file`** (latent pre-R3 bug): both initial runs
+   ended `no-change-unverified` — post-gate, create-file tasks were structurally impossible
+   and the model correctly refused. Fixed (PR #13): both narrowed sets now include write_file.
+2. **Handoff was a no-op for create-tasks**: the plan's only candidateFile is the not-yet-
+   existing target, so nothing embedded and the budget stayed 8. The architect's plan already
+   named the right convention files in `existingPatterns[].evidence` — a field the handoff
+   ignored. Fixed (PR #14): both sources merge through the same security pipeline.
+
+## Final results (same task, fixed gate)
+
+| | Baseline | Architect (pre-#14) | Architect (final) |
+|---|---|---|---|
+| Session | 20260818-132048 | 20260818-132833 | 20260820-221240 |
+| Outcome | VERIFIED | VERIFIED | VERIFIED |
+| Architect calls | — | 9 | 10 |
+| Main-run discovery before write | 10 | 10 | **4** |
+| Main-run total | 12 | 12 | **9** |
+| Total incl. architect | 12 | 21 | 19 |
+
+## Gate verdict
+
+**The doc's gate metric — measured discovery-call reduction — is now demonstrated on both
+scales and both task types:** 10→4 on the large repo (create-task, this run) and 4-5→0 on
+the small repo (edit-task, earlier). The plan handoff is code-enforced and provably narrows
+the engineer's exploration.
+
+Total cost including the architect segment is still higher than baseline on tasks this
+small (19 vs 12) — the architect's ~10-call fixed cost only pays off on tasks whose
+baseline discovery is deeper than the architect's own. Policy: **C1 stays opt-in**
+(`--architect-first`), recommended for complex/multi-file/unfamiliar-area tasks and
+skipped for trivially-scoped ones. **C2/C3's evidence gate is formally satisfied** —
+they may now be built when wanted, with the same opt-in discipline.
+
+Experiment infrastructure note: two runs on 2026-08-18 stalled/died purely from host
+memory starvation (131-205MB free, model at 38-77 tok/s); the successful final run
+completed in ~8 min under identical code. Worktree preserved at
+~/glimmer-gate-large-repo-20260818-112450 for inspection.
