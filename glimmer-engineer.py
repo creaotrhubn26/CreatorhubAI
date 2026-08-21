@@ -130,12 +130,35 @@ WRITE_TOOLS = {
     "edit_file",
 }
 
+# O4 (glimmer-v7 reconciliation doc, §3.11): find_symbol / find_references /
+# find_related_tests — served CLIENT-SIDE in this Python process, never a
+# llama.cpp/C++ change (the doc's explicit rationale: the 1200s exec_shell_
+# command timeout patch is already one maintenance burden against upstream;
+# a second C++ tool doubles it). get_tools() below appends their schemas to
+# whatever the live /tools endpoint returns; execute_tool() intercepts these
+# three names and runs them in-process, BEFORE the point where a real tool
+# call would otherwise reach http_json's POST /tools — everything downstream
+# of that (caching, evidence, events, compact_tool_result_for_model) is
+# unmodified and applies identically to a real HTTP tool result. All three
+# are read-only, lexical/regex-based (not a real language server/AST/LSP) —
+# see their definitions' descriptions and docstrings below.
+SEMANTIC_TOOL_NAMES = {
+    "find_symbol",
+    "find_references",
+    "find_related_tests",
+}
+
 PATH_TOOLS = {
     "read_file",
     "file_glob_search",
     "grep_search",
     "write_file",
     "edit_file",
+    # find_related_tests takes a "path" arg and must be contained inside the
+    # workspace exactly like read_file/write_file/edit_file — reusing
+    # secure_tool_arguments/resolve_workspace_path here is the ONLY path-
+    # containment scheme O4 uses; no second scheme was introduced.
+    "find_related_tests",
 }
 
 REQUIRED_ENGINEERING_TOOLS = {
@@ -154,7 +177,12 @@ REQUIRED_ENGINEERING_TOOLS = {
 # execute_tool() below additionally hard-blocks WRITE_TOOLS by tool name
 # (not merely by omission) whenever mode == "architect", so a model that
 # calls an unoffered write tool anyway still cannot execute it.
-ARCHITECT_TOOL_NAMES = READ_TOOLS | {"exec_shell_command"}
+#
+# O4: the semantic tools are read-only discovery aids exactly like
+# READ_TOOLS, so Architect mode (which is itself entirely read-only) gets
+# them too — deliberate, not an oversight (see reconciliation doc O4 /
+# §3.11's "available in architect mode" requirement).
+ARCHITECT_TOOL_NAMES = READ_TOOLS | {"exec_shell_command"} | SEMANTIC_TOOL_NAMES
 
 # C1 fix round 1 (Minor finding): engineer mode's existing default,
 # preserved exactly (was a bare literal `default=32` in main()'s argparse
@@ -961,6 +989,19 @@ def get_tools():
         f"{runtime_max_timeout}s (PASS)"
     )
 
+    # O4: append the client-side semantic tool schemas — identical shape to
+    # what the loop above just built from the live /tools response
+    # (metadata[name] = the raw item, definitions += the OpenAI-function
+    # "definition" block) so every downstream consumer of get_tools()'s
+    # return value (the `tools` list sent to the model, the `tool_name not
+    # in metadata` unknown-tool check) treats these exactly like real
+    # server tools. See SEMANTIC_TOOL_DEFINITIONS and execute_tool's
+    # SEMANTIC_TOOL_NAMES dispatch branch below for the actual
+    # implementations.
+    for item in SEMANTIC_TOOL_DEFINITIONS:
+        metadata[item["tool"]] = item
+        definitions.append(item["definition"])
+
     return metadata, definitions
 
 
@@ -1086,7 +1127,7 @@ def add_evidence(
         "exec_shell_command",
         "write_file",
         "edit_file",
-    }
+    } | SEMANTIC_TOOL_NAMES  # O4: discovery calls, evidence-worthy like grep/read
 
     if tool_name not in interesting:
         return
@@ -1252,6 +1293,419 @@ def is_post_write_validation_command(command):
 
 
 # ============================================================
+# SEMANTIC CODE TOOLS (O4, glimmer-v7 reconciliation §3.11)
+# ============================================================
+#
+# find_symbol / find_references / find_related_tests, served client-side
+# (see the SEMANTIC_TOOL_NAMES comment above for the rationale). All three
+# are deterministic, lexical/regex-based scans over workspace files — NOT
+# a real language server, parser, or AST — and say so in their own
+# `description` field (SEMANTIC_TOOL_DEFINITIONS below) so the model
+# doesn't over-trust the results.
+#
+# Ignore-directory discipline: glimmer-v2.py already has this exact
+# convention (IGNORE_DIRS / walk_files, glimmer-v2.py line ~43). The two
+# Python files are kept independent by existing project convention
+# (glimmer-engineer.py never imports glimmer-v2.py or vice versa — only
+# the shared glimmer_events.py module crosses that boundary), so this is a
+# deliberate, documented duplication of the same ignore set rather than a
+# new import — keep the two lists in sync if either changes.
+_SEMANTIC_IGNORE_DIRS = {
+    ".git", "node_modules", ".next", ".turbo", ".cache", "coverage",
+    "dist", "build", "out", ".output", ".venv", "venv", "__pycache__",
+}
+
+_SEMANTIC_MAX_NAME_LEN = 200
+_SEMANTIC_MAX_MATCHES = 50
+_SEMANTIC_MAX_FILE_BYTES = 1024 * 1024  # 1MB per-file read cap — skip huge files
+
+
+def _semantic_walk_files(workspace):
+    """Yield every non-ignored file under workspace. Dirs are pruned
+    in-place during os.walk (same technique as glimmer-v2.py's walk_files)
+    so an ignored subtree (node_modules, .git, dist, ...) is never
+    descended into at all, not merely filtered out after listing."""
+    for current, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in _SEMANTIC_IGNORE_DIRS]
+        for name in files:
+            yield Path(current) / name
+
+
+def _semantic_read_text(path):
+    """Read a file for lexical scanning. Never raises — skips (returns
+    None for) anything too large or undecodable, so one bad/binary file
+    can never abort a whole-workspace scan, matching the fail-soft
+    convention glimmer-v2.py's safe_json already uses."""
+    try:
+        if path.stat().st_size > _SEMANTIC_MAX_FILE_BYTES:
+            return None
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def _validate_semantic_name(name):
+    """Shared input guard for find_symbol/find_references: a hostile name
+    (regex metacharacters, pathologically long strings) must never reach
+    re.compile as raw regex source. Every use below builds patterns with
+    re.escape(name), so this only needs to bound length/emptiness — the
+    escaping itself is what defeats a ReDoS/wildcard attempt like
+    name=".*" or name="(?:a+)+"."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name must be a non-empty string")
+    name = name.strip()
+    if len(name) > _SEMANTIC_MAX_NAME_LEN:
+        raise ValueError(
+            f"name too long ({len(name)} chars, max {_SEMANTIC_MAX_NAME_LEN})"
+        )
+    return name
+
+
+_JS_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+_PY_EXTS = {".py"}
+
+
+def _symbol_patterns(escaped_name):
+    """One compiled pattern per definition "kind". `escaped_name` must
+    already be re.escape()'d by the caller. Deliberately lexical: matches
+    the keyword + name shape regardless of an `export`/`export default`
+    prefix (e.g. `export function X` still matches `\\bfunction\\s+X\\b`),
+    but will miss more exotic declaration syntax — that is the documented
+    honesty trade-off (grep-shaped, not a parser)."""
+    return {
+        "function": re.compile(r"\bfunction\s+" + escaped_name + r"\b"),
+        "const": re.compile(r"\bconst\s+" + escaped_name + r"\b\s*="),
+        "class": re.compile(r"\bclass\s+" + escaped_name + r"\b"),
+        "interface": re.compile(r"\binterface\s+" + escaped_name + r"\b"),
+        "type": re.compile(r"\btype\s+" + escaped_name + r"\b\s*="),
+        "def": re.compile(r"\bdef\s+" + escaped_name + r"\b"),
+    }
+
+
+def find_symbol(name, kind, workspace):
+    """Locate definition(s) of `name` across the workspace. TS/JS:
+    function/const/class/interface/type declarations. Python: def/class.
+    `kind` optionally narrows to one of those (kind="function" also
+    matches Python `def`, since callers rarely distinguish the two).
+    Capped at _SEMANTIC_MAX_MATCHES; returns "file:line: <matched line>"
+    per hit."""
+    name = _validate_semantic_name(name)
+    patterns = _symbol_patterns(re.escape(name))
+
+    if kind:
+        kind = str(kind).strip().lower()
+        wanted = {"function", "def"} if kind == "function" else {kind}
+        patterns = {k: v for k, v in patterns.items() if k in wanted}
+
+    matches = []
+    for path in _semantic_walk_files(workspace):
+        ext = path.suffix
+        if ext in _JS_TS_EXTS:
+            active = {k: v for k, v in patterns.items() if k != "def"}
+        elif ext in _PY_EXTS:
+            active = {k: v for k, v in patterns.items() if k in ("def", "class")}
+        else:
+            continue
+        if not active:
+            continue
+
+        text = _semantic_read_text(path)
+        if text is None:
+            continue
+
+        rel = path.relative_to(workspace).as_posix()
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if any(pat.search(line) for pat in active.values()):
+                matches.append(f"{rel}:{lineno}: {line.strip()}")
+                if len(matches) >= _SEMANTIC_MAX_MATCHES:
+                    break
+        if len(matches) >= _SEMANTIC_MAX_MATCHES:
+            break
+
+    if not matches:
+        return (
+            f"No definitions of '{name}' found (lexical regex scan for "
+            "function/const/class/interface/type in TS/JS and def/class "
+            "in Python — this is NOT a real language server; unusual "
+            "declaration syntax may be missed)."
+        )
+
+    suffix = " [match limit reached, results truncated]" if len(matches) >= _SEMANTIC_MAX_MATCHES else ""
+    header = f"Found {len(matches)} definition-shaped match(es) for '{name}'{suffix}:\n"
+    return header + "\n".join(matches)
+
+
+def find_references(name, workspace):
+    """All usages of `name` across the workspace, word-boundary matched
+    (so searching "foo" will never match inside "foobar") and grouped by
+    file. Definition lines are NOT excluded from the results — they
+    contain the bare word too, so they will appear here as well as in
+    find_symbol's output. This is a deliberate honesty-over-cleverness
+    choice: distinguishing "this line defines X" from "this line merely
+    mentions X" would require real parsing, which this lexical tool does
+    not do. Capped at _SEMANTIC_MAX_MATCHES total matches."""
+    name = _validate_semantic_name(name)
+    pattern = re.compile(r"\b" + re.escape(name) + r"\b")
+
+    by_file = {}
+    total = 0
+    for path in _semantic_walk_files(workspace):
+        text = _semantic_read_text(path)
+        if text is None:
+            continue
+
+        file_matches = []
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if pattern.search(line):
+                file_matches.append(f"{lineno}: {line.strip()}")
+                total += 1
+                if total >= _SEMANTIC_MAX_MATCHES:
+                    break
+
+        if file_matches:
+            by_file[path.relative_to(workspace).as_posix()] = file_matches
+        if total >= _SEMANTIC_MAX_MATCHES:
+            break
+
+    if not by_file:
+        return (
+            f"No references to '{name}' found (word-boundary lexical "
+            "search across the workspace)."
+        )
+
+    lines = [
+        f"Found {total} reference(s) to '{name}' across {len(by_file)} "
+        "file(s) (word-boundary match; definition lines are included, "
+        "not excluded — see find_symbol to specifically locate "
+        "definitions):"
+    ]
+    for rel, file_matches in by_file.items():
+        lines.append(f"\n{rel}:")
+        lines.extend(f"  {m}" for m in file_matches)
+    return "\n".join(lines)
+
+
+def _semantic_test_core_name(filename):
+    """If `filename` matches one of the four same-basename test patterns
+    (X.test.*, X.spec.*, test_X.*, X_test.*), return the "X" it names a
+    test for. Otherwise None. Used both to detect "is this a test file at
+    all" (via _semantic_is_test_filename) and to check "is it a test file
+    FOR this specific basename"."""
+    stem = Path(filename).stem
+    if not Path(filename).suffix:
+        return None
+    if stem.endswith(".test") or stem.endswith(".spec"):
+        return stem.rsplit(".", 1)[0]
+    if filename.startswith("test_") and stem.startswith("test_"):
+        return stem[len("test_"):]
+    if stem.endswith("_test"):
+        return stem[: -len("_test")]
+    return None
+
+
+def _semantic_is_test_filename(filename):
+    return _semantic_test_core_name(filename) is not None
+
+
+def find_related_tests(path, workspace):
+    """Given a source file path, find its likely test file(s):
+    same-basename patterns (X.test.*, X.spec.*, test_X.*, X_test.*)
+    anywhere in the workspace, PLUS any test-shaped file whose content
+    imports/requires this file's basename (catches e.g. a test file named
+    after the feature it exercises, not the module under test).
+
+    `path` has already been resolved and workspace-contained by
+    secure_tool_arguments (find_related_tests is in PATH_TOOLS, so it goes
+    through the exact same resolve_workspace_path containment check as
+    read_file/write_file/edit_file — no second scheme)."""
+    source = Path(path)
+    base = source.stem
+
+    # A test file that imports/requires this basename rather than being
+    # named after it — deliberately simple substring-in-quotes-near-an-
+    # import-keyword check, not a real import-graph analysis.
+    import_pattern = re.compile(
+        r"""(?:from|require|import)\b[^\n'"]*['"][^'"]*\b"""
+        + re.escape(base)
+        + r"""\b[^'"]*['"]"""
+    )
+
+    matches = []
+    for candidate in _semantic_walk_files(workspace):
+        try:
+            if candidate.resolve() == source.resolve():
+                continue
+        except OSError:
+            pass
+
+        name = candidate.name
+        core = _semantic_test_core_name(name)
+        rel = candidate.relative_to(workspace).as_posix()
+
+        if core == base:
+            matches.append(rel)
+        elif _semantic_is_test_filename(name):
+            text = _semantic_read_text(candidate)
+            if text and import_pattern.search(text):
+                matches.append(rel)
+
+        if len(matches) >= _SEMANTIC_MAX_MATCHES:
+            break
+
+    if not matches:
+        return (
+            f"No related test files found for '{source.name}' (checked "
+            "same-basename patterns X.test.*/X.spec.*/test_X.*/X_test.* "
+            "plus test-shaped files importing/requiring this basename)."
+        )
+
+    return (
+        f"Found {len(matches)} likely test file(s) for '{source.name}':\n"
+        + "\n".join(matches)
+    )
+
+
+def _execute_semantic_tool(tool_name, arguments, workspace):
+    """Single dispatch point execute_tool() calls for SEMANTIC_TOOL_NAMES.
+    Shaped as {"plain_text_response": ...} — the SAME shape a real /tools
+    HTTP response uses — so the caller's existing result_text() (28000-char
+    cap) needs no special-casing for these tools."""
+    if tool_name == "find_symbol":
+        text = find_symbol(
+            arguments.get("name", ""),
+            arguments.get("kind"),
+            workspace,
+        )
+    elif tool_name == "find_references":
+        text = find_references(arguments.get("name", ""), workspace)
+    elif tool_name == "find_related_tests":
+        text = find_related_tests(arguments.get("path", ""), workspace)
+    else:
+        raise ValueError(f"unknown semantic tool: {tool_name}")
+    return {"plain_text_response": text}
+
+
+# OpenAI-function-shaped definitions, matching exactly what the live
+# /tools endpoint returns per item (server_tool::to_json() in
+# llama.cpp/tools/server/server-tools.cpp: display_name/tool/type/
+# permissions/uses_cwd/definition) — see get_tools() above, which appends
+# these to the real server's list. permissions.write is always False:
+# every one of these is read-only by construction (see
+# _execute_semantic_tool above, which never touches the filesystem beyond
+# reading).
+SEMANTIC_TOOL_DEFINITIONS = [
+    {
+        "display_name": "Find symbol",
+        "tool": "find_symbol",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "find_symbol",
+                "description": (
+                    "Locate where a symbol (function, class, const, "
+                    "interface, or type) is DEFINED across the workspace. "
+                    "Prefer this over grep_search when you know a "
+                    "symbol's name and want its definition site(s), not "
+                    "every mention — use find_references for that. "
+                    "Lexical/regex-based (function X / const X = / "
+                    "class X / interface X / type X = in TS/JS; def X / "
+                    "class X in Python) — not a real language server; "
+                    "unusual declaration syntax may be missed."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact symbol name to find definitions of.",
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": (
+                                "Optional filter: function, const, class, "
+                                "interface, or type. Omit to search all kinds."
+                            ),
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+    },
+    {
+        "display_name": "Find references",
+        "tool": "find_references",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "find_references",
+                "description": (
+                    "Find all usages of an identifier across the "
+                    "workspace (word-boundary match, grouped by file). "
+                    "Prefer this over grep_search for 'where is X used' "
+                    "questions — unlike a plain grep, it will not match "
+                    "the name as a substring of a longer identifier (e.g. "
+                    "searching 'foo' will not match 'foobar'). Lexical, "
+                    "not a real language server: the definition line(s) "
+                    "are NOT excluded from the results (they contain the "
+                    "bare word too), so this tool's output may overlap "
+                    "with find_symbol's."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact identifier to search for (word-boundary match).",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+    },
+    {
+        "display_name": "Find related tests",
+        "tool": "find_related_tests",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "find_related_tests",
+                "description": (
+                    "Given a source file path, find its likely test "
+                    "file(s): same-basename patterns (X.test.*, X.spec.*, "
+                    "test_X.*, X_test.*) anywhere in the workspace, plus "
+                    "test-shaped files that import/require this file's "
+                    "basename. Prefer this over grep_search once you've "
+                    "changed a file and need to find what to run/update "
+                    "to verify it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative or absolute path to the source file.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+    },
+]
+
+
+# ============================================================
 # TOOL EXECUTION
 # ============================================================
 
@@ -1300,11 +1754,15 @@ def execute_tool(
 
     cache_key = None
 
+    # O4: the three semantic tools are idempotent/read-only exactly like
+    # read_file/file_glob_search/grep_search, so they share the same
+    # (tool, args)-keyed cache — including its existing invalidation
+    # (cache.clear() on every successful write in run_engineer's loop).
     if tool_name in {
         "read_file",
         "file_glob_search",
         "grep_search",
-    }:
+    } | SEMANTIC_TOOL_NAMES:
         cache_key = json.dumps(
             [
                 tool_name,
@@ -1480,18 +1938,32 @@ def execute_tool(
         args=_capped_display_args(display_args),
     )
 
-    result = http_json(
-        "POST",
-        "/tools",
-        {
-            "tool": tool_name,
-            "params": arguments,
-        },
-        {
-            "x-tool-cwd":
-                str(workspace),
-        },
-    )
+    # O4: the semantic tools never reach llama-server at all — they are
+    # computed entirely in this process. This is the ONE interception
+    # point; everything below (result_text/MAX_TOOL_RESULT truncation,
+    # tool_completed event, cache write, add_evidence, `changed` verdict)
+    # is unmodified and runs identically for both branches, so a semantic-
+    # tool result is handled exactly like a real HTTP tool result from
+    # here on.
+    if tool_name in SEMANTIC_TOOL_NAMES:
+        result = _execute_semantic_tool(
+            tool_name,
+            arguments,
+            workspace,
+        )
+    else:
+        result = http_json(
+            "POST",
+            "/tools",
+            {
+                "tool": tool_name,
+                "params": arguments,
+            },
+            {
+                "x-tool-cwd":
+                    str(workspace),
+            },
+        )
 
     content = result_text(result)
 
@@ -1752,7 +2224,9 @@ def _architect_mode_selfcheck() -> None:
     #    could ever widen it mid-session), one assertion here covers
     #    every turn/phase by construction.
     # ------------------------------------------------------------
-    all_tool_names = READ_TOOLS | WRITE_TOOLS | {"exec_shell_command", "get_datetime"}
+    all_tool_names = (
+        READ_TOOLS | WRITE_TOOLS | {"exec_shell_command", "get_datetime"} | SEMANTIC_TOOL_NAMES
+    )
     synthetic_tools = [
         {"type": "function", "function": {"name": name}}
         for name in sorted(all_tool_names)
@@ -4086,6 +4560,269 @@ def _gate_allow_write_file_selfcheck() -> None:
     print("gate-allow-write-file self-check: PASS")
 
 
+def _semantic_tools_selfcheck() -> None:
+    """O4 (glimmer-v7 reconciliation §3.11): find_symbol / find_references /
+    find_related_tests. Builds a real scratch workspace on disk (no live
+    llama-server needed — these tools never call http_json at all) and
+    proves:
+      1. find_symbol finds a planted TS function and a planted Python class.
+      2. find_references is word-boundary correct (name "foo" does not
+         match a line whose only occurrence is "foobar").
+      3. find_related_tests finds both a same-basename X.test.ts and an
+         indirectly-related file that imports the basename.
+      4. Hostile inputs: regex metacharacters are escaped (name=".*" finds
+         nothing, not everything); a 500-char name is rejected; a path
+         outside the workspace is rejected via the existing containment
+         (resolve_workspace_path/secure_tool_arguments — no new scheme).
+      5. Ignore-directory discipline: a planted file under node_modules is
+         never found.
+      6. Results flow through the NORMAL dispatch path in execute_tool:
+         a repeat call is served from the existing (tool, args) cache
+         (never re-executes the underlying scan), and a real evidence
+         entry is persisted via the existing add_evidence/evidence-NN.jsonl
+         machinery.
+    Run with: python3 glimmer-engineer.py --semantic-tools-selfcheck
+    """
+    import inspect
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td).resolve()
+
+        (ws / "src").mkdir()
+        (ws / "node_modules" / "ignored").mkdir(parents=True)
+
+        (ws / "src" / "widget.ts").write_text(
+            "export function createWidget(name: string) {\n"
+            "  return { name };\n"
+            "}\n"
+        )
+        (ws / "src" / "models.py").write_text(
+            "class UserModel:\n"
+            "    pass\n"
+        )
+        (ws / "src" / "widget.test.ts").write_text(
+            'import { createWidget } from "./widget";\n'
+            'test("creates widget", () => { createWidget("x"); });\n'
+        )
+        # Indirectly related: test-shaped (matches *.spec.*) but its own
+        # basename ("widget_helpers") is not "widget" — only found via the
+        # content-import check, not the same-basename check.
+        (ws / "src" / "widget_helpers.spec.ts").write_text(
+            'import { createWidget } from "../widget";\n'
+            'test("helper uses widget", () => {});\n'
+        )
+        (ws / "src" / "refs.ts").write_text(
+            "const foo = 1;\n"
+            "const foobar = 2;\n"
+            "function useFoobarOnly() {\n"
+            "  return foobar;\n"
+            "}\n"
+            "console.log(foo);\n"
+        )
+        # Planted inside an ignored directory: must never surface in any
+        # semantic tool result, exactly like glimmer-v2.py's walk_files
+        # never descends into node_modules.
+        (ws / "node_modules" / "ignored" / "widget.ts").write_text(
+            "export function createWidget() { return 'should be ignored'; }\n"
+        )
+
+        # ------------------------------------------------------------
+        # 1. find_symbol: TS function + Python class.
+        # ------------------------------------------------------------
+        symbol_result = find_symbol("createWidget", None, ws)
+        assert "src/widget.ts:1:" in symbol_result, symbol_result
+        assert "node_modules" not in symbol_result, (
+            "find_symbol must never surface matches from an ignored directory"
+        )
+
+        class_result = find_symbol("UserModel", "class", ws)
+        assert "src/models.py:1:" in class_result, class_result
+
+        # kind filter narrows correctly: a "class" search must not also
+        # return the (nonexistent) function-shaped hit.
+        no_such_kind = find_symbol("UserModel", "function", ws)
+        assert "No definitions" in no_such_kind, no_such_kind
+
+        # ------------------------------------------------------------
+        # 2. find_references: word-boundary correctness.
+        # ------------------------------------------------------------
+        refs_result = find_references("foo", ws)
+        assert "Found 2 reference(s)" in refs_result, refs_result
+        assert "const foo = 1;" in refs_result
+        assert "console.log(foo);" in refs_result
+        assert "const foobar = 2;" not in refs_result, (
+            "'foo' must not match inside 'foobar' (word-boundary correctness)"
+        )
+        assert "return foobar;" not in refs_result
+
+        # ------------------------------------------------------------
+        # 3. find_related_tests: same-basename + content-import match.
+        # ------------------------------------------------------------
+        tests_result = find_related_tests(str(ws / "src" / "widget.ts"), ws)
+        assert "src/widget.test.ts" in tests_result, tests_result
+        assert "src/widget_helpers.spec.ts" in tests_result, tests_result
+        assert "node_modules" not in tests_result
+
+        # ------------------------------------------------------------
+        # 4. Hostile inputs.
+        # ------------------------------------------------------------
+        # Regex metacharacters escaped: a literal ".*" search must find
+        # nothing (proving re.escape is applied), not match every line the
+        # way an unescaped ".*" would.
+        wildcard_symbol = find_symbol(".*", None, ws)
+        assert "No definitions" in wildcard_symbol, (
+            f"'.*' must be escaped to a literal, inert pattern, got: {wildcard_symbol!r}"
+        )
+        wildcard_refs = find_references(".*", ws)
+        assert "No references" in wildcard_refs, (
+            f"'.*' must be escaped to a literal, inert pattern, got: {wildcard_refs!r}"
+        )
+
+        # Over-length name rejected.
+        too_long = "x" * 500
+        try:
+            find_symbol(too_long, None, ws)
+            raise AssertionError("500-char name must be rejected")
+        except ValueError:
+            pass
+        try:
+            find_references(too_long, ws)
+            raise AssertionError("500-char name must be rejected")
+        except ValueError:
+            pass
+
+        # Empty name rejected.
+        try:
+            find_references("", ws)
+            raise AssertionError("empty name must be rejected")
+        except ValueError:
+            pass
+
+        # Path outside the workspace rejected via the EXISTING containment
+        # mechanism (resolve_workspace_path via secure_tool_arguments,
+        # since find_related_tests is in PATH_TOOLS) — exercised through
+        # execute_tool, the real dispatch entry point, not a hand-rolled
+        # check.
+        try:
+            execute_tool(
+                "find_related_tests",
+                {"path": "../../../etc/passwd"},
+                ws,
+                {"approve_all": True},
+                {},
+                [],
+            )
+            raise AssertionError("path escaping the workspace must be rejected")
+        except PermissionError as exc:
+            assert "escapes repository" in str(exc), str(exc)
+
+        # ------------------------------------------------------------
+        # 5. Normal dispatch path: cache hit + evidence persistence.
+        # ------------------------------------------------------------
+        global _execute_semantic_tool
+        real_dispatch = _execute_semantic_tool
+        calls = []
+
+        def _counting_dispatch(tool_name, arguments, workspace):
+            calls.append(tool_name)
+            return real_dispatch(tool_name, arguments, workspace)
+
+        _execute_semantic_tool = _counting_dispatch
+
+        real_events_path = GLIMMER_EVENTS_PATH
+        real_session_id = GLIMMER_SESSION_ID
+
+        try:
+            session_dir = Path(td) / "_session"
+            session_dir.mkdir()
+            (session_dir / "prompt-00.txt").write_text("iteration 0")
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-semantic-selfcheck"
+            _evidence_file_path.cache_clear()
+
+            cache = {}
+            ledger = []
+
+            result1, changed1 = execute_tool(
+                "find_symbol",
+                {"name": "createWidget"},
+                ws,
+                {"approve_all": True},
+                cache,
+                ledger,
+            )
+            assert changed1 is False, "semantic tools are read-only; must never report a change"
+            assert len(calls) == 1, "first call must actually execute the scan"
+
+            result2, changed2 = execute_tool(
+                "find_symbol",
+                {"name": "createWidget"},
+                ws,
+                {"approve_all": True},
+                cache,
+                ledger,
+            )
+            assert result2 == result1
+            assert changed2 is False
+            assert len(calls) == 1, (
+                "repeat call with identical (tool, args) must be served "
+                "from the existing read-tool cache, not re-executed"
+            )
+
+            evidence_path = session_dir / "evidence-00.jsonl"
+            assert evidence_path.exists(), (
+                "a semantic tool call must persist to evidence-NN.jsonl "
+                "exactly like read_file/grep_search"
+            )
+            records = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+            assert any(r["tool"] == "find_symbol" for r in records), records
+            assert any(ln.startswith("TOOL: find_symbol") for ln in ledger), ledger
+        finally:
+            _execute_semantic_tool = real_dispatch
+            GLIMMER_EVENTS_PATH = real_events_path
+            GLIMMER_SESSION_ID = real_session_id
+            _evidence_file_path.cache_clear()
+
+        # ------------------------------------------------------------
+        # 6. Tool router wiring: available in architect mode, in the
+        #    engineer discovery/narrowed-to-read-edit tool sets, excluded
+        #    from narrowed_to_edit_only, and counted in discovery_tools.
+        # ------------------------------------------------------------
+        assert SEMANTIC_TOOL_NAMES <= ARCHITECT_TOOL_NAMES, (
+            "semantic tools must be offered in architect mode (read-only, "
+            "same as READ_TOOLS)"
+        )
+
+        engineer_source = inspect.getsource(run_engineer)
+        # discovery_tools / post_gate_inspection_tools: must union in
+        # SEMANTIC_TOOL_NAMES so calls count against both budgets.
+        assert engineer_source.count("| SEMANTIC_TOOL_NAMES") >= 3, (
+            "expected SEMANTIC_TOOL_NAMES unioned into discovery_tools, "
+            "post_gate_inspection_tools, and narrowed_to_read_edit's "
+            "allowed_before_edit"
+        )
+        # narrowed_to_edit_only's literal set must stay exactly
+        # {edit_file, write_file} — no union, semantic tools withdrawn
+        # once that budget is exhausted (deliberate, documented choice).
+        edit_only_idx = engineer_source.index('if engineer_phase == "narrowed_to_edit_only":')
+        edit_only_window = engineer_source[edit_only_idx:edit_only_idx + 400]
+        assert "| SEMANTIC_TOOL_NAMES" not in edit_only_window, (
+            "narrowed_to_edit_only must NOT offer the semantic tools"
+        )
+
+        # get_tools()'s metadata dict must carry these three names so the
+        # `tool_name not in metadata` unknown-tool check (both run_engineer
+        # and run_architect) never rejects them, exactly as it would a
+        # real server tool.
+        definition_names = {item["tool"] for item in SEMANTIC_TOOL_DEFINITIONS}
+        assert definition_names == SEMANTIC_TOOL_NAMES
+
+    print("semantic tools (O4) self-check: PASS")
+
+
 def run_engineer(
     task,
     workspace,
@@ -4332,16 +5069,21 @@ def run_engineer(
     engineer_phase = "discovering"
     _emit_engineer_phase(engineer_phase)
 
+    # O4: find_symbol/find_references/find_related_tests are discovery
+    # calls exactly like file_glob_search/grep_search/read_file, so they
+    # count against the SAME discovery_tool_budget and (once narrowed)
+    # the SAME post_gate_inspection_budget — a model couldn't otherwise
+    # dodge either budget by switching to a semantic tool mid-exploration.
     discovery_tools = {
         "file_glob_search",
         "grep_search",
         "read_file",
-    }
+    } | SEMANTIC_TOOL_NAMES
 
     post_gate_inspection_tools = {
         "read_file",
         "grep_search",
-    }
+    } | SEMANTIC_TOOL_NAMES
 
     # C6 (glimmer-v7): tracks whether THIS turn's response came from
     # final_synthesis (the deterministic no-model fallback) rather than
@@ -4392,12 +5134,21 @@ def run_engineer(
             ]
 
         elif engineer_phase == "narrowed_to_read_edit":
+            # O4: the semantic tools are discovery aids alongside
+            # read_file/grep_search, so they stay available here — unioned
+            # onto the literal (rather than added inside it) so
+            # _gate_allow_write_file_selfcheck's source-level extraction of
+            # this exact set (read_file/grep_search/edit_file/write_file)
+            # keeps proving the property it names. Deliberately NOT carried
+            # into narrowed_to_edit_only below: once even that smaller
+            # budget is exhausted, every non-edit tool — semantic ones
+            # included — is withdrawn.
             allowed_before_edit = {
                 "read_file",
                 "grep_search",
                 "edit_file",
                 "write_file",
-            }
+            } | SEMANTIC_TOOL_NAMES
 
             active_tools = [
                 tool
@@ -4854,8 +5605,9 @@ def run_engineer(
                         "Repository discovery budget is exhausted. "
                         "Stop broad searching now. Based on the evidence "
                         "already collected, choose exactly one concrete, "
-                        "small, low-risk candidate. You may use read_file "
-                        "or grep_search only to verify that selected "
+                        "small, low-risk candidate. You may use read_file, "
+                        "grep_search, find_symbol, find_references, or "
+                        "find_related_tests only to verify that selected "
                         "candidate. Then call edit_file (for an existing "
                         "file) or write_file (only for a new file) with "
                         "the smallest behavior-preserving change, or "
@@ -5055,6 +5807,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--gate-allow-write-file-selfcheck"]:
         _gate_allow_write_file_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--semantic-tools-selfcheck"]:
+        _semantic_tools_selfcheck()
         sys.exit(0)
 
     try:
