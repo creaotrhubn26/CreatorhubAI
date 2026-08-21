@@ -42,7 +42,7 @@ export function DashboardScreen() {
         <h2>Recent sessions</h2>
         <ul>
           {data.recentSessions.map((s) => (
-            <li key={s.id}>
+            <li key={s.id} className="row">
               {s.task} <StatusBadge status={s.status} /> {s.changedFiles.length} files
             </li>
           ))}

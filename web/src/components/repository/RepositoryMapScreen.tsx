@@ -11,7 +11,7 @@ export function RepositoryMapScreen() {
       <h1>Repository Map</h1>
       <ul>
         {data.packages.map((p) => (
-          <li key={p.path}>
+          <li key={p.path} className="row">
             {p.name} — {p.frameworks.join(", ") || "Unavailable"}
           </li>
         ))}

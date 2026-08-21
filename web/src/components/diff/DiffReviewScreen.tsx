@@ -34,14 +34,14 @@ export function DiffReviewScreen() {
           : "Not yet accepted"}
       </p>
       {!humanAcceptance?.accepted && (
-        <button onClick={() => acceptMutation.mutate()} disabled={acceptMutation.isPending}>
+        <button className="btn-primary" onClick={() => acceptMutation.mutate()} disabled={acceptMutation.isPending}>
           Accept for review
         </button>
       )}
       {acceptMutation.isError && <div>Unavailable — could not accept this session.</div>}
       <ul>
         {session?.changedFiles.map((f) => (
-          <li key={f.path}>
+          <li key={f.path} className="row">
             M {f.path}{" "}
             <button onClick={() => revertMutation.mutate(f.path)} disabled={revertMutation.isPending}>
               Revert

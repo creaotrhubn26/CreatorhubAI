@@ -29,7 +29,7 @@ export function TasksPanel({ sessionId }: { sessionId: string }) {
         {tasks.map((t) => {
           const color = STATUS_COLOR[t.status] ?? "var(--gray)";
           return (
-            <li key={t.id}>
+            <li key={t.id} className="row">
               <span style={{ color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "2px 6px", fontSize: 12 }}>
                 {t.status}
               </span>{" "}
