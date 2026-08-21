@@ -1320,27 +1320,38 @@ _SEMANTIC_MAX_MATCHES = 50
 _SEMANTIC_MAX_FILE_BYTES = 1024 * 1024  # 1MB per-file read cap — skip huge files
 
 
-def _semantic_walk_files(workspace):
+def _semantic_walk_files(workspace, max_depth=5):
     """Yield every non-ignored file under workspace. Dirs are pruned
     in-place during os.walk (same technique as glimmer-v2.py's walk_files)
     so an ignored subtree (node_modules, .git, dist, ...) is never
-    descended into at all, not merely filtered out after listing."""
+    descended into at all, not merely filtered out after listing.
+    Same max_depth convention/default as glimmer-v2.py's walk_files — an
+    unbounded walk over a huge/deeply-nested repo is the same cost that
+    function already caps."""
+    base_depth = len(Path(workspace).parts)
     for current, dirs, files in os.walk(workspace):
+        cp = Path(current)
+        depth = len(cp.parts) - base_depth
         dirs[:] = [d for d in dirs if d not in _SEMANTIC_IGNORE_DIRS]
+        if depth >= max_depth:
+            dirs[:] = []
         for name in files:
-            yield Path(current) / name
+            yield cp / name
 
 
 def _semantic_read_text(path):
     """Read a file for lexical scanning. Never raises — skips (returns
-    None for) anything too large or undecodable, so one bad/binary file
-    can never abort a whole-workspace scan, matching the fail-soft
-    convention glimmer-v2.py's safe_json already uses."""
+    None for) anything too large, unreadable, or non-UTF-8 (binary), so
+    one bad/binary file can never abort a whole-workspace scan, matching
+    the fail-soft convention glimmer-v2.py's safe_json/changed_files_text
+    already use (see glimmer-v2.py's `except (OSError, UnicodeDecodeError)`
+    around untracked-file reads). Deliberately no errors="ignore": that
+    would silently decode binary files instead of skipping them."""
     try:
         if path.stat().st_size > _SEMANTIC_MAX_FILE_BYTES:
             return None
-        return path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -4628,6 +4639,21 @@ def _semantic_tools_selfcheck() -> None:
         (ws / "node_modules" / "ignored" / "widget.ts").write_text(
             "export function createWidget() { return 'should be ignored'; }\n"
         )
+        # Binary file: must be skipped outright (no errors="ignore" decode-
+        # and-scan), not crash the walk. Content includes a "foo" byte
+        # sequence so a wrongly-lenient decode would have made it match
+        # find_references("foo") below.
+        (ws / "src" / "binary.bin").write_bytes(b"\xff\xfe\x00foo\x00\xff")
+
+        # Deeply nested file (depth 6) — same max_depth=5 default/
+        # convention as glimmer-v2.py's walk_files; must never be found.
+        deep_dir = ws
+        for part in ("d1", "d2", "d3", "d4", "d5", "d6"):
+            deep_dir = deep_dir / part
+        deep_dir.mkdir(parents=True)
+        (deep_dir / "deepWidget.ts").write_text(
+            "export function deepWidget() { return 'too deep'; }\n"
+        )
 
         # ------------------------------------------------------------
         # 1. find_symbol: TS function + Python class.
@@ -4645,6 +4671,19 @@ def _semantic_tools_selfcheck() -> None:
         # return the (nonexistent) function-shaped hit.
         no_such_kind = find_symbol("UserModel", "function", ws)
         assert "No definitions" in no_such_kind, no_such_kind
+
+        # Binary file skipped outright: _semantic_read_text must return
+        # None (never a garbage-decoded string via errors="ignore").
+        assert _semantic_read_text(ws / "src" / "binary.bin") is None, (
+            "binary files must be skipped, not decoded with errors='ignore'"
+        )
+
+        # Depth-6 file never found: same max_depth=5 convention as
+        # glimmer-v2.py's walk_files.
+        deep_result = find_symbol("deepWidget", None, ws)
+        assert "No definitions" in deep_result, (
+            f"a file 6 directories deep must not be walked (max_depth=5), got: {deep_result!r}"
+        )
 
         # ------------------------------------------------------------
         # 2. find_references: word-boundary correctness.
