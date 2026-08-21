@@ -223,18 +223,15 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   }, [rightPanelCollapsed]);
 
   // Command palette (cmd+K) / session switcher (cmd+P). A single global
-  // keydown listener drives both plus the `[`/`]` panel-toggle shortcuts —
-  // ignored while typing in a field, except the palette's own input
-  // (marked with data-palette-input so Escape/etc still reach it).
+  // keydown listener drives both plus the `[`/`]` panel-toggle shortcuts.
+  // cmd+K/cmd+P are chords (not plain text a user would type), so they fire
+  // regardless of focus — including from inside an input/textarea/
+  // contenteditable. The bare `[`/`]` (and Escape) ARE plain keys, so they
+  // stay guarded: ignored while typing in a field, except the palette's own
+  // input (marked with data-palette-input so Escape still reaches it there).
   const [palette, setPalette] = useState<{ open: boolean; mode: PaletteMode }>({ open: false, mode: "command" });
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      const target = e.target as HTMLElement | null;
-      const isPaletteInput = target?.dataset.paletteInput === "true";
-      const isTypingElsewhere = !!target && !isPaletteInput &&
-        (/^(input|textarea)$/i.test(target.tagName) || target.isContentEditable);
-      if (isTypingElsewhere) return;
-
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
@@ -246,6 +243,13 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
         setPalette({ open: true, mode: "session" });
         return;
       }
+
+      const target = e.target as HTMLElement | null;
+      const isPaletteInput = target?.dataset.paletteInput === "true";
+      const isTypingElsewhere = !!target && !isPaletteInput &&
+        (/^(input|textarea)$/i.test(target.tagName) || target.isContentEditable);
+      if (isTypingElsewhere) return;
+
       if (e.key === "Escape") {
         setPalette((p) => (p.open ? { ...p, open: false } : p));
         return;

@@ -7,11 +7,25 @@ export function CommandPalette({
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   const filtered = useMemo(() => filterCommands(commands, query), [commands, query]);
 
-  useEffect(() => { inputRef.current?.focus(); }, []);
-  useEffect(() => { setSelected(0); }, [query]);
+  // Focus the input on open, restore whatever had focus before on close —
+  // the palette is the only focusable element inside it (Tab is trapped
+  // below), so there's nowhere else focus could meaningfully land.
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    inputRef.current?.focus();
+    return () => previousFocusRef.current?.focus();
+  }, []);
+
+  // Clamp rather than reset-to-0 on every keystroke: keeps the highlight
+  // stable while the list is merely re-filtered, only snapping it back
+  // when a shrinking list would otherwise leave it pointing past the end.
+  useEffect(() => {
+    setSelected((s) => Math.min(s, Math.max(filtered.length - 1, 0)));
+  }, [filtered.length]);
 
   function run(index: number) {
     const cmd = filtered[index];
@@ -36,6 +50,7 @@ export function CommandPalette({
             else if (e.key === "ArrowUp") { e.preventDefault(); setSelected((s) => Math.max(s - 1, 0)); }
             else if (e.key === "Enter") { e.preventDefault(); run(selected); }
             else if (e.key === "Escape") { e.preventDefault(); onClose(); }
+            else if (e.key === "Tab") { e.preventDefault(); }
           }}
         />
         <ul className="ide-palette__list" role="listbox" aria-label="Commands">

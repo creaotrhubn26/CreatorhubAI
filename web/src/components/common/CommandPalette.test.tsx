@@ -73,4 +73,40 @@ describe("CommandPalette", () => {
     fireEvent.mouseDown(container.querySelector(".ide-palette-overlay")!);
     expect(onClose).toHaveBeenCalled();
   });
+
+  it("restores focus to whatever was focused before it opened, on unmount", () => {
+    const trigger = document.createElement("button");
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+
+    const { unmount } = render(<CommandPalette commands={commands()} onClose={vi.fn()} />);
+    expect(document.activeElement).toHaveAttribute("aria-label", "Command palette");
+
+    unmount();
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+
+  it("traps Tab inside the palette instead of letting focus leave", () => {
+    render(<CommandPalette commands={commands()} onClose={vi.fn()} />);
+    const input = screen.getByRole("textbox", { name: "Command palette" });
+    const notCanceled = fireEvent.keyDown(input, { key: "Tab" });
+    expect(notCanceled).toBe(false); // false means preventDefault() was called
+  });
+
+  it("clamps the highlighted index when filtering shrinks the list below it", () => {
+    const run = vi.fn();
+    const onClose = vi.fn();
+    render(<CommandPalette commands={commands({ c: run })} onClose={onClose} />);
+    const input = screen.getByRole("textbox", { name: "Command palette" });
+    // highlight the 3rd row ("New Task")
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    // filter down to just one match, which used to leave the highlight
+    // pointing past the end of the list
+    fireEvent.change(input, { target: { value: "New Task" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(run).toHaveBeenCalled();
+  });
 });

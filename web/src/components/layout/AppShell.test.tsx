@@ -105,6 +105,21 @@ describe("AppShell", () => {
     expect(doneRow?.querySelector(".ide-status-dot")).not.toHaveClass("ide-status-dot--pulse");
   });
 
+  it("opens the command palette on cmd+K even when focus is inside an input", async () => {
+    render(withProviders(<AppShell repoContext={null}>content</AppShell>));
+    const searchInput = screen.getByPlaceholderText("Search sessions…");
+    searchInput.focus();
+    fireEvent.keyDown(searchInput, { key: "k", metaKey: true });
+    expect(await screen.findByRole("textbox", { name: "Command palette" })).toBeInTheDocument();
+  });
+
+  it("does not toggle the sidebar on a bare `[` while typing in a field", async () => {
+    render(withProviders(<AppShell repoContext={null}>content</AppShell>));
+    const searchInput = screen.getByPlaceholderText("Search sessions…");
+    fireEvent.keyDown(searchInput, { key: "[" });
+    expect(document.querySelector(".ide-leftpanel")).not.toHaveClass("is-collapsed");
+  });
+
   describe("session event stream", () => {
     const realEventSource = globalThis.EventSource;
     afterEach(() => {
