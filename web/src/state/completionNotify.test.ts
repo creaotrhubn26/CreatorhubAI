@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { completionTitle, newlyCompleted } from "./completionNotify";
+import { completionTitle, isUnseenCompletion, newlyCompleted } from "./completionNotify";
 
 describe("completionTitle", () => {
   it("returns the base title when there are no unseen completions", () => {
@@ -36,5 +36,23 @@ describe("newlyCompleted", () => {
     const prev = { s1: "implementing", s2: "verifying", s3: "verified" };
     const next = { s1: "verified", s2: "verifying", s3: "verified" };
     expect(newlyCompleted(prev, next)).toEqual(["s1"]);
+  });
+});
+
+describe("isUnseenCompletion", () => {
+  it("is unseen when a different session is currently active", () => {
+    expect(isUnseenCompletion("s1", "s2", false)).toBe(true);
+  });
+
+  it("is unseen when the window is hidden, even for the active session", () => {
+    expect(isUnseenCompletion("s1", "s1", true)).toBe(true);
+  });
+
+  it("is NOT unseen when it's the active session and the window is visible (shared gate for badge + notification)", () => {
+    expect(isUnseenCompletion("s1", "s1", false)).toBe(false);
+  });
+
+  it("is unseen when there is no active session at all", () => {
+    expect(isUnseenCompletion("s1", undefined, false)).toBe(true);
   });
 });

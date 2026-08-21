@@ -11,7 +11,7 @@ import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
 import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
-import { completionTitle, newlyCompleted } from "../../state/completionNotify";
+import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
@@ -238,22 +238,21 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     prevStatusRef.current = nextStatus;
     if (completed.length === 0) return;
 
-    // System notification fires for every transition to terminal,
-    // regardless of whether the tab is focused — permission is opt-in via
-    // Settings and never requested here.
+    // One gate — isUnseenCompletion — drives both the title badge and the
+    // system notification, so a session finishing while its own tab is
+    // open and the window is focused triggers neither.
+    const unseen = completed.filter((id) => isUnseenCompletion(id, activeSessionId, document.hidden));
+    if (unseen.length === 0) return;
+
     if ("Notification" in window && Notification.permission === "granted") {
-      for (const id of completed) {
+      for (const id of unseen) {
         new Notification("Glimmer", { body: `${shortSessionId(id)} finished: ${nextStatus[id]}` });
       }
     }
 
-    // A completion only counts as "unseen" (title badge) when the user
-    // wasn't looking at that exact session at the moment it finished.
     setUnseenIds((prev) => {
       const next = new Set(prev);
-      for (const id of completed) {
-        if (id !== activeSessionId || document.hidden) next.add(id);
-      }
+      for (const id of unseen) next.add(id);
       return next;
     });
   }, [sessions, activeSessionId]);

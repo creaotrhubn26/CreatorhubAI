@@ -20,3 +20,10 @@ export function newlyCompleted(prev: Record<string, string>, next: Record<string
   }
   return ids;
 }
+
+// Single gate for "does this completion count as unseen" — shared by both
+// the title badge and the system notification, so a session finishing
+// while its own tab is open and the window is focused triggers neither.
+export function isUnseenCompletion(id: string, activeSessionId: string | undefined, hidden: boolean): boolean {
+  return id !== activeSessionId || hidden;
+}

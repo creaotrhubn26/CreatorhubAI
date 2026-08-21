@@ -164,4 +164,50 @@ describe("AppShell", () => {
       await waitFor(() => expect(screen.getByText(/last activity/i)).toBeInTheDocument());
     });
   });
+
+  describe("completion notification gating", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("does not fire a system Notification for the session currently being viewed (shares the title-badge's unseen gate)", async () => {
+      const realNotification = (globalThis as any).Notification;
+      const ctorSpy = vi.fn();
+      (globalThis as any).Notification = Object.assign(ctorSpy, { permission: "granted" });
+
+      const runningSession = {
+        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2,
+      };
+      const doneSession = { ...runningSession, status: "verified", verification: { overall: "VERIFIED", checks: [] } };
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const listSpy = vi.spyOn(client.glimmerApi, "listSessions")
+        .mockResolvedValueOnce([runningSession] as any)
+        .mockResolvedValue([doneSession] as any);
+      vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(runningSession as any);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <AppShell repoContext={null}>session content</AppShell>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      // First poll sees it running; advancing to the next 5000ms poll (the
+      // sessions query's refetchInterval) sees it terminal — s1 is both the
+      // completing session and the one currently routed to.
+      await vi.waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      await vi.waitFor(() => expect(listSpy).toHaveBeenCalledTimes(2));
+
+      expect(ctorSpy).not.toHaveBeenCalled();
+
+      if (realNotification === undefined) delete (globalThis as any).Notification;
+      else (globalThis as any).Notification = realNotification;
+    });
+  });
 });
