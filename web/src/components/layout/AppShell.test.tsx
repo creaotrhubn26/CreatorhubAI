@@ -1,10 +1,18 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, within, waitFor, fireEvent, act } from "@testing-library/react";
-import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { MemoryRouter, Routes, Route, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "./AppShell";
 import { ActiveSessionScreen } from "../session/ActiveSessionScreen";
 import * as client from "../../api/client";
+
+// Renders alongside AppShell (both share the same MemoryRouter context) so
+// a click that calls navigate() can be asserted on without a full Routes
+// tree — AppShell's own children slot isn't a route outlet.
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-probe">{location.pathname}</div>;
+}
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -47,6 +55,24 @@ describe("AppShell", () => {
   it("shows the status bar with a model status field", async () => {
     render(withProviders(<AppShell repoContext={null}>content</AppShell>));
     expect(await screen.findByText(/model: OFFLINE/)).toBeInTheDocument();
+  });
+
+  it("clicking the model status bar item navigates to the Model Status screen", async () => {
+    vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppShell repoContext={null}>content</AppShell>
+          <LocationProbe />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    const modelItem = await screen.findByRole("button", { name: /model: OFFLINE/ });
+    fireEvent.click(modelItem);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/model");
   });
 
   it("opens a tab for a visited session and closes it via its close button", async () => {

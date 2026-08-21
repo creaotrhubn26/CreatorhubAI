@@ -104,6 +104,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const sessionMatch = location.pathname.match(/^\/sessions\/([^/]+)/);
   const activeSessionId = sessionMatch?.[1];
   const activePage = activePageOf(location.pathname);
+  // Status bar's session-status/verification items: the open session's own
+  // verification view, or the Verification Center when nothing is open.
+  const verificationTarget = activeSessionId ? `/sessions/${activeSessionId}/verification` : "/verification";
 
   const { data: rawSessions } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions, refetchInterval: 5000 });
   // pending-* rows are transient adopted-workspace placeholders — once the
@@ -613,8 +616,12 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
       <footer className="ide-statusbar">
         <div className="ide-statusbar__group">
-          <span className="mono">⎇ {repoContext?.worktree ?? "no branch"}</span>
-          {activeSession && <span>{activeSession.status}</span>}
+          <button className="statusbar-item mono" onClick={() => navigate("/repository")}>
+            ⎇ {repoContext?.worktree ?? "no branch"}
+          </button>
+          {activeSession && (
+            <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>{activeSession.status}</button>
+          )}
           {activeSession?.gates && (
             <span>
               gate: {activeSession.gates.architectureApproved === true ? "approved" : activeSession.gates.architectureApproved === false ? "rejected" : "not reviewed"}
@@ -623,8 +630,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
         </div>
         <div className="ide-statusbar__spacer" />
         <div className="ide-statusbar__group">
-          <span>model: {modelStatus?.status ?? "UNKNOWN"}</span>
-          <span>verification: {activeSession?.verification.overall ?? "—"}</span>
+          <button className="statusbar-item" onClick={() => navigate("/model")}>model: {modelStatus?.status ?? "UNKNOWN"}</button>
+          <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>
+            verification: {activeSession?.verification.overall ?? "—"}
+          </button>
           {activeSessionId && <span>{events.length} events</span>}
         </div>
       </footer>
