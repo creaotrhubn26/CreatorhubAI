@@ -1,6 +1,13 @@
 import { useState } from "react";
+import { getTheme, setTheme, type ThemePreference } from "../../state/themePreference";
 
 type PermissionState = "granted" | "denied" | "not asked";
+
+const THEME_OPTIONS: Array<{ value: ThemePreference; label: string }> = [
+  { value: "dark", label: "Dark" },
+  { value: "light", label: "Light" },
+  { value: "system", label: "System" },
+];
 
 // Deterministic fact only — never inferred, never auto-requested.
 // Notification is absent in some webviews/tests, so "not asked" also
@@ -15,6 +22,12 @@ function currentPermission(): PermissionState {
 export function SettingsScreen() {
   const [permission, setPermission] = useState<PermissionState>(currentPermission);
   const supported = "Notification" in window;
+  const [theme, setThemeState] = useState<ThemePreference>(getTheme);
+
+  function chooseTheme(t: ThemePreference) {
+    setTheme(t);
+    setThemeState(t);
+  }
 
   async function enableNotifications() {
     if (!supported) return;
@@ -31,6 +44,17 @@ export function SettingsScreen() {
         <li>Yellow — dependency modifications, migrations, external network, broad scope expansion</li>
         <li>Red — git push, deploy, force reset, repository deletion, credential extraction (blocked by default)</li>
       </ul>
+
+      <h2 style={{ fontSize: "var(--fs-h1)", fontWeight: 600, textTransform: "none", letterSpacing: "-0.01em", color: "inherit" }}>
+        Appearance
+      </h2>
+      <div role="tablist" aria-label="Theme">
+        {THEME_OPTIONS.map(({ value, label }) => (
+          <button key={value} aria-pressed={theme === value} onClick={() => chooseTheme(value)}>
+            {label}
+          </button>
+        ))}
+      </div>
 
       <h2 style={{ fontSize: "var(--fs-h1)", fontWeight: 600, textTransform: "none", letterSpacing: "-0.01em", color: "inherit" }}>
         Notifications
