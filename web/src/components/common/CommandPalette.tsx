@@ -34,13 +34,19 @@ export function CommandPalette({
     onClose();
   }
 
+  const selectedId = filtered[selected] ? `palette-opt-${filtered[selected].id}` : undefined;
+
   return (
     <div className="ide-palette-overlay" onMouseDown={onClose}>
-      <div className="ide-palette" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="ide-palette" role="dialog" aria-modal="true" onMouseDown={(e) => e.stopPropagation()}>
         <input
           ref={inputRef}
           className="ide-palette__input"
+          role="combobox"
           aria-label="Command palette"
+          aria-controls="ide-palette-listbox"
+          aria-expanded="true"
+          aria-activedescendant={selectedId}
           placeholder={placeholder}
           value={query}
           data-palette-input="true"
@@ -53,11 +59,12 @@ export function CommandPalette({
             else if (e.key === "Tab") { e.preventDefault(); }
           }}
         />
-        <ul className="ide-palette__list" role="listbox" aria-label="Commands">
+        <ul id="ide-palette-listbox" className="ide-palette__list" role="listbox" aria-label="Commands">
           {filtered.length === 0 && <li className="ide-palette__empty">No matches</li>}
           {filtered.map((c, i) => (
             <li
               key={c.id}
+              id={`palette-opt-${c.id}`}
               role="option"
               aria-selected={i === selected}
               className={`ide-palette__option${i === selected ? " is-selected" : ""}`}

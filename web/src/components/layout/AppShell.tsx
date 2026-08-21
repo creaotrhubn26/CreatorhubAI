@@ -235,33 +235,47 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const [palette, setPalette] = useState<{ open: boolean; mode: PaletteMode }>({ open: false, mode: "command" });
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key.toLowerCase() === "k") {
+      // Palette invocation: Ctrl+K/Ctrl+P are Cocoa text-editing bindings on
+      // mac (delete-to-line-start / previous-line), so ctrlKey must not open
+      // the palette there — only metaKey (Cmd) does. Elsewhere ctrlKey is the
+      // right chord. navigator.platform is deprecated but synchronous; when
+      // it's unavailable, default to mac (metaKey-only) since that's the
+      // safer/no-op-elsewhere assumption.
+      const isMac = navigator.platform ? navigator.platform.toUpperCase().startsWith("MAC") : true;
+      const paletteMod = isMac ? e.metaKey : e.ctrlKey;
+      if (paletteMod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPalette({ open: true, mode: "command" });
         return;
       }
-      if (mod && e.key.toLowerCase() === "p") {
+      if (paletteMod && e.key.toLowerCase() === "p") {
         e.preventDefault();
         setPalette({ open: true, mode: "session" });
         return;
       }
 
-      const target = e.target as HTMLElement | null;
+      const target = e.target instanceof HTMLElement ? e.target : null;
       const isPaletteInput = target?.dataset.paletteInput === "true";
       const isTypingElsewhere = !!target && !isPaletteInput &&
         (/^(input|textarea)$/i.test(target.tagName) || target.isContentEditable);
-      if (isTypingElsewhere) return;
+      // The palette-input exemption only ever covers Escape (so the palette
+      // can close itself while focused) — typing a literal `[`/`]` into the
+      // palette's own search box must never toggle a side panel.
+      if (isTypingElsewhere || (isPaletteInput && e.key !== "Escape")) return;
 
       if (e.key === "Escape") {
         setPalette((p) => (p.open ? { ...p, open: false } : p));
         return;
       }
-      if (e.key === "[") {
+      // `mod`/altKey guard: Cmd+[ and Cmd+] are the browser's Back/Forward
+      // chords and Alt+[/Alt+] are common editor bindings — none of those
+      // should also toggle a panel as a side effect.
+      const mod = e.metaKey || e.ctrlKey;
+      if (e.key === "[" && !mod && !e.altKey) {
         setLeftPanelCollapsed((c) => !c);
         return;
       }
-      if (e.key === "]") {
+      if (e.key === "]" && !mod && !e.altKey) {
         setRightPanelCollapsed((c) => !c);
         return;
       }

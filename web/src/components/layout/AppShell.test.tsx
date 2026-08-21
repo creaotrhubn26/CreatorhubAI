@@ -136,7 +136,7 @@ describe("AppShell", () => {
     const searchInput = screen.getByPlaceholderText("Search sessions…");
     searchInput.focus();
     fireEvent.keyDown(searchInput, { key: "k", metaKey: true });
-    expect(await screen.findByRole("textbox", { name: "Command palette" })).toBeInTheDocument();
+    expect(await screen.findByRole("combobox", { name: "Command palette" })).toBeInTheDocument();
   });
 
   it("does not toggle the sidebar on a bare `[` while typing in a field", async () => {
@@ -144,6 +144,30 @@ describe("AppShell", () => {
     const searchInput = screen.getByPlaceholderText("Search sessions…");
     fireEvent.keyDown(searchInput, { key: "[" });
     expect(document.querySelector(".ide-leftpanel")).not.toHaveClass("is-collapsed");
+  });
+
+  it("does not toggle the sidebar on Cmd+[ (the browser Back/Forward chord)", async () => {
+    render(withProviders(<AppShell repoContext={null}>content</AppShell>));
+    fireEvent.keyDown(window, { key: "[", metaKey: true });
+    expect(document.querySelector(".ide-leftpanel")).not.toHaveClass("is-collapsed");
+  });
+
+  it("does not toggle the AI Assistant panel on Cmd+] (the browser Back/Forward chord)", async () => {
+    render(withProviders(<AppShell repoContext={null}>content</AppShell>));
+    fireEvent.keyDown(window, { key: "]", metaKey: true });
+    expect(document.querySelector(".ide-rightpanel")).not.toHaveClass("is-collapsed");
+  });
+
+  it("typing `[` or `]` inside the palette's own input never toggles a panel", async () => {
+    render(withProviders(<AppShell repoContext={null}>content</AppShell>));
+    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    const paletteInput = await screen.findByRole("combobox", { name: "Command palette" });
+
+    fireEvent.keyDown(paletteInput, { key: "[" });
+    expect(document.querySelector(".ide-leftpanel")).not.toHaveClass("is-collapsed");
+
+    fireEvent.keyDown(paletteInput, { key: "]" });
+    expect(document.querySelector(".ide-rightpanel")).not.toHaveClass("is-collapsed");
   });
 
   describe("session event stream", () => {

@@ -14,7 +14,7 @@ function commands(overrides: Partial<Record<string, () => void>> = {}): PaletteC
 describe("CommandPalette", () => {
   it("renders every command and exposes the required a11y roles", () => {
     render(<CommandPalette commands={commands()} onClose={vi.fn()} />);
-    expect(screen.getByRole("textbox", { name: "Command palette" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Command palette" })).toBeInTheDocument();
     expect(screen.getByRole("listbox")).toBeInTheDocument();
     expect(screen.getAllByRole("option")).toHaveLength(3);
     expect(screen.getByText("Go to Dashboard")).toBeInTheDocument();
@@ -22,7 +22,7 @@ describe("CommandPalette", () => {
 
   it("filters the list as the user types", () => {
     render(<CommandPalette commands={commands()} onClose={vi.fn()} />);
-    fireEvent.change(screen.getByRole("textbox", { name: "Command palette" }), { target: { value: "dash" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Command palette" }), { target: { value: "dash" } });
     expect(screen.getAllByRole("option")).toHaveLength(1);
     expect(screen.getByText("Go to Dashboard")).toBeInTheDocument();
   });
@@ -31,7 +31,7 @@ describe("CommandPalette", () => {
     const run = vi.fn();
     const onClose = vi.fn();
     render(<CommandPalette commands={commands({ a: run })} onClose={onClose} />);
-    const input = screen.getByRole("textbox", { name: "Command palette" });
+    const input = screen.getByRole("combobox", { name: "Command palette" });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(run).toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();
@@ -41,7 +41,7 @@ describe("CommandPalette", () => {
     const run = vi.fn();
     const onClose = vi.fn();
     render(<CommandPalette commands={commands({ b: run })} onClose={onClose} />);
-    const input = screen.getByRole("textbox", { name: "Command palette" });
+    const input = screen.getByRole("combobox", { name: "Command palette" });
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(run).toHaveBeenCalled();
@@ -60,7 +60,7 @@ describe("CommandPalette", () => {
     const run = vi.fn();
     const onClose = vi.fn();
     render(<CommandPalette commands={commands({ a: run })} onClose={onClose} />);
-    fireEvent.keyDown(screen.getByRole("textbox", { name: "Command palette" }), { key: "Escape" });
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Command palette" }), { key: "Escape" });
     expect(run).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();
   });
@@ -90,7 +90,7 @@ describe("CommandPalette", () => {
 
   it("traps Tab inside the palette instead of letting focus leave", () => {
     render(<CommandPalette commands={commands()} onClose={vi.fn()} />);
-    const input = screen.getByRole("textbox", { name: "Command palette" });
+    const input = screen.getByRole("combobox", { name: "Command palette" });
     const notCanceled = fireEvent.keyDown(input, { key: "Tab" });
     expect(notCanceled).toBe(false); // false means preventDefault() was called
   });
@@ -99,7 +99,7 @@ describe("CommandPalette", () => {
     const run = vi.fn();
     const onClose = vi.fn();
     render(<CommandPalette commands={commands({ c: run })} onClose={onClose} />);
-    const input = screen.getByRole("textbox", { name: "Command palette" });
+    const input = screen.getByRole("combobox", { name: "Command palette" });
     // highlight the 3rd row ("New Task")
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "ArrowDown" });

@@ -3,7 +3,12 @@
 // ponytail: a /* ... */ block comment spanning multiple lines will mis-render
 // (each line is tokenized independently) — acceptable ceiling; a real fix
 // needs a multi-line lexer that threads "inside block comment" state through
-// DiffView's line list, not worth it for a diff viewer.
+// DiffView's line list, not worth it for a diff viewer. Same ceiling covers:
+// CSS pseudo-selectors (`:hover`, `::before`) mislexed as a property/value
+// pair by tokenizeCss's `prop:` regex; apostrophes inside prose strings
+// (e.g. a comment reading "it's fine") throwing off the ts/rs `'` quote
+// scanner; and identifiers like `123abc` being split into a number token
+// plus a trailing word rather than lexed as one identifier.
 
 export type TokenKind = "code" | "keyword" | "string" | "comment" | "number" | "type";
 export interface Token {

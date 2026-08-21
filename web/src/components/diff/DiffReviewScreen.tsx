@@ -96,6 +96,10 @@ function groupLinesByFile(lines: DiffLine[]): DiffFileGroup[] {
 // Renders one line's content through the hand-rolled tokenizer — used by
 // both unified and split modes so highlighting stays consistent everywhere.
 const HighlightedText = memo(function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
+  // ponytail: bail to plain text past 400 chars — an extra-long single line
+  // (minified bundle, huge JSON blob) would turn into hundreds of tok-*
+  // spans for a line no one reads token-by-token anyway.
+  if (text.length > 400) return <>{text}</>;
   return (
     <>
       {highlightLine(text, lang).map((t, i) => (
@@ -171,7 +175,10 @@ function DiffView({ diff, mode, wrap }: { diff: string; mode: "unified" | "split
   return (
     <div className={className}>
       {groups.map((g, gi) => {
-        const lang = langFromPath(g.path);
+        // ponytail: skip highlighting entirely for a giant generated/lockfile
+        // dump — tokenizing 2000+ lines just to render them all in the same
+        // muted color is wasted work, so treat the whole file group as plain.
+        const lang = g.lines.length > 2000 ? "plain" : langFromPath(g.path);
         return (
           <div className="diff-view__filegroup" key={gi}>
             <div className="diff-view__file-header">
