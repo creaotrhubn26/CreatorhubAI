@@ -11,7 +11,7 @@ export function SessionHistoryScreen() {
       <h1>Sessions</h1>
       <ul>
         {(data ?? []).map((s) => (
-          <li key={s.id}>
+          <li key={s.id} className="row">
             <Link to={`/sessions/${s.id}`}>{s.task}</Link> <StatusBadge status={s.status} /> {s.changedFiles.length} files
             {s.humanAcceptance?.accepted && (
               <span style={{ fontSize: 12, color: "var(--text-muted)" }}> · Accepted</span>

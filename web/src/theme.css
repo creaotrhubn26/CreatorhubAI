@@ -1,19 +1,331 @@
 :root {
+  /* surface ladder */
   --bg: #0a0a0c;
-  --surface: #131317;
-  --surface-raised: #1a1a20;
+  --surface-1: #131317;
+  --surface-2: #1a1a20;
+  --surface-raised: #1a1a20; /* kept for back-compat */
   --border: #26262e;
+  --border-strong: #34343e;
+
+  /* text ladder */
   --text: #e6e6ea;
+  --text-primary: #e6e6ea;
+  --text-secondary: #b4b4c0;
   --text-muted: #8b8b96;
-  --mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
-  --sans: -apple-system, "Inter", system-ui, sans-serif;
-  --radius: 4px;
+
+  /* accent — restrained desaturated teal */
+  --accent: #5fb3ad;
+  --accent-strong: #7dc6c1;
+  --on-accent: #06201e;
+
+  /* semantic status (unchanged) */
   --green: #3fb950;
   --amber: #d29922;
   --red: #f85149;
   --blue: #58a6ff;
   --gray: #6e7681;
+
+  /* type */
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+  --sans: -apple-system, "Inter", system-ui, sans-serif;
+  --fs-base: 13px;
+  --fs-sm: 12px;
+  --fs-xs: 11px;
+  --fs-h1: 20px;
+  --fs-h2: 12px;
+  --fs-h3: 12px;
+
+  /* spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* radius */
+  --radius: 5px;
+  --radius-sm: 3px;
 }
+
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--sans);
+  font-size: var(--fs-base);
+  line-height: 1.5;
+}
+
+#root { min-height: 100vh; }
+
 code, .mono { font-family: var(--mono); }
+
+/* ---- links: kill browser defaults app-wide ---- */
+a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+a:hover { text-decoration: underline; }
+
+/* ---- focus (accessible, visible, not removed) ---- */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- headings / type scale ---- */
+h1 {
+  font-size: var(--fs-h1);
+  font-weight: 600;
+  margin: 0 0 var(--space-4);
+  letter-spacing: -0.01em;
+}
+h2 {
+  font-size: var(--fs-h2);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  margin: 0 0 var(--space-2);
+}
+h3, h4 {
+  font-size: var(--fs-h3);
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: var(--space-3) 0 var(--space-1);
+}
+p { margin: 0 0 var(--space-2); color: var(--text-primary); }
+
+/* ---- form fields: dark, never white ---- */
+input, select, textarea {
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+}
+textarea { width: 100%; min-height: 84px; resize: vertical; }
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 0;
+}
+input[type="checkbox"], input[type="radio"] {
+  width: auto;
+  accent-color: var(--accent);
+}
+input[type="range"] { accent-color: var(--accent); width: 100%; max-width: 280px; }
+input:disabled, select:disabled, textarea:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* one field per row by default — the browser's inline label flow is what
+   crammed "Workspace path" onto the same line as the objective textarea */
+label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  margin: var(--space-1) 0;
+}
+label > input, label > select { margin-left: 0; }
+label > input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+label > select {
+  flex: 1;
+  min-width: 120px;
+}
+
+/* ---- buttons ---- */
+button {
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 14px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-strong); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); color: var(--on-accent); }
+.btn-primary:disabled { background: var(--surface-2); border-color: var(--border-strong); color: var(--text-muted); }
+
+/* ---- card ---- */
+.card, section, fieldset {
+  background: var(--surface-1);
+  border: none;
+  box-shadow: inset 0 0 0 1px var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  margin: 0;
+}
+legend, section > h2:first-child {
+  padding: 0;
+}
+legend {
+  display: block;
+  width: 100%;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+/* space out the contents of cards/fieldsets/sections/details consistently */
+.card > * + *, section > * + *, fieldset > * + *, details > * + * {
+  margin-top: var(--space-3);
+}
+
+/* details/summary as a subtle disclosure, not the default triangle box */
+details {
+  background: var(--surface-1);
+  box-shadow: inset 0 0 0 1px var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+}
+summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "\25B8  "; color: var(--text-muted); }
+details[open] summary::before { content: "\25BE  "; }
+details[open] summary { margin-bottom: var(--space-3); }
+
+/* ---- definition lists ---- */
+dl { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-1) var(--space-3); margin: 0; }
+dt { color: var(--text-muted); font-size: var(--fs-sm); }
+dd { margin: 0; }
+
+/* ---- lists: flat rows by default, not bullet clutter ---- */
+ul, ol { list-style: none; margin: 0; padding: 0; }
+ol { counter-reset: item; }
+ol > li { counter-increment: item; }
+ol > li::before {
+  content: counters(item, ".") ". ";
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+li { padding: var(--space-1) 0; }
+
+/* ---- pre / mono blocks: scrollable, never overflow the page ---- */
+pre {
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  overflow-x: auto;
+  max-width: 100%;
+  font-size: var(--fs-sm);
+}
+
+/* ---- app shell layout ---- */
+.app-shell { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+.app-shell__sidebar {
+  box-shadow: inset -1px 0 0 var(--border);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+}
+.app-shell__title {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  margin-bottom: var(--space-4);
+}
+.app-shell__nav { display: flex; flex-direction: column; gap: 2px; margin-bottom: var(--space-5); }
+.nav-link {
+  display: block;
+  padding: 6px var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: var(--fs-base);
+}
+.nav-link:hover { background: var(--surface-2); color: var(--text-primary); text-decoration: none; }
+.nav-link.active { background: var(--surface-2); color: var(--accent-strong); font-weight: 600; }
+.app-shell__repo-context { margin-top: auto; font-size: var(--fs-xs); color: var(--text-muted); }
+.app-shell__repo-context div { padding: 1px 0; }
+.app-shell__main {
+  padding: var(--space-5) var(--space-6);
+  min-width: 0;
+  overflow-x: hidden;
+}
+/* every screen renders a single root element under <main> — space its
+   direct children consistently without doubling up on card margins, and
+   without forcing display:flex onto inline toolbars (links/buttons in a row) */
+.app-shell__main > * { min-width: 0; }
+.app-shell__main > * > * + * { margin-top: var(--space-4); }
+
+/* ---- row: a list item styled as a compact table row ---- */
+.row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+.row:last-child { box-shadow: none; }
+.row > a { font-weight: 500; }
+
+/* ---- toolbar: an inline row of links/buttons ---- */
+.toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); }
+
+/* ---- timeline ---- */
+.timeline-row { box-shadow: inset 0 -1px 0 var(--border); padding: var(--space-1) 0; }
+.timeline-row:last-child { box-shadow: none; }
+.timeline-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: var(--space-1) 0;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+.timeline-toggle:hover:not(:disabled) { color: var(--accent-strong); border-color: transparent; }
+
+/* ---- misc ---- */
+[role="tablist"] { display: flex; flex-wrap: wrap; gap: var(--space-1); box-shadow: none; background: none; padding: 0; }
+[role="tablist"] button { padding: 4px 10px; font-size: var(--fs-sm); }
+[role="tablist"] button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+
+@media (max-width: 720px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .app-shell__sidebar {
+    box-shadow: inset 0 -1px 0 var(--border);
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .app-shell__nav { flex-direction: row; flex-wrap: wrap; margin-bottom: 0; gap: var(--space-1); }
+  .app-shell__repo-context { display: none; }
+  .app-shell__main { padding: var(--space-4); }
+}

@@ -21,16 +21,22 @@ export interface RepoContext {
 
 export function AppShell({ repoContext, children }: { repoContext: RepoContext | null; children: ReactNode }) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", minHeight: "100vh" }}>
-      <aside style={{ borderRight: "1px solid var(--border)", padding: 16 }}>
-        <nav style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 24 }}>
+    <div className="app-shell">
+      <aside className="app-shell__sidebar">
+        <div className="app-shell__title">Glimmer</div>
+        <nav className="app-shell__nav">
           {NAV.map((item) => (
-            <NavLink key={item.to} to={item.to} end={item.to === "/"}>
+            <NavLink
+              key={item.to}
+              to={item.to}
+              end={item.to === "/"}
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
               {item.label}
             </NavLink>
           ))}
         </nav>
-        <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        <div className="app-shell__repo-context mono">
           {repoContext ? (
             <>
               <div>{repoContext.repository}</div>
@@ -46,7 +52,7 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           )}
         </div>
       </aside>
-      <main style={{ padding: 24 }}>{children}</main>
+      <main className="app-shell__main">{children}</main>
     </div>
   );
 }

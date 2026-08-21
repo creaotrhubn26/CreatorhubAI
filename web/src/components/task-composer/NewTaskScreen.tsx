@@ -218,6 +218,7 @@ export function NewTaskScreen() {
       </details>
 
       <button
+        className="btn-primary"
         onClick={() => runMutation.mutate()}
         disabled={!form.objective || !workspace || scopePathMissing || runMutation.isPending}
       >

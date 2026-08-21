@@ -57,7 +57,7 @@ export function AgentTimeline({ events }: { events: GlimmerEvent[] }) {
   const visible = events.filter((e) => matchesFilter(e, filter));
 
   return (
-    <div>
+    <div className="card">
       <div role="tablist">
         {FILTERS.map((f) => (
           <button key={f} aria-pressed={f === filter} onClick={() => setFilter(f)}>{f}</button>
@@ -90,12 +90,15 @@ export function AgentTimeline({ events }: { events: GlimmerEvent[] }) {
             );
           }
           return (
-            <li key={e.id}>
-              <button onClick={() => setExpanded((prev) => {
-                const next = new Set(prev);
-                next.has(e.id) ? next.delete(e.id) : next.add(e.id);
-                return next;
-              })}>
+            <li key={e.id} className="timeline-row">
+              <button
+                className="timeline-toggle"
+                onClick={() => setExpanded((prev) => {
+                  const next = new Set(prev);
+                  next.has(e.id) ? next.delete(e.id) : next.add(e.id);
+                  return next;
+                })}
+              >
                 {describe(e)}
               </button>
               {isOpen && (
