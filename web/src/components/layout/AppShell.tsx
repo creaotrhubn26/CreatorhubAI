@@ -3,7 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import type { GlimmerEvent, GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
-import { useSessionEvents } from "../../api/useSessionEvents";
+import { SessionEventsContext, useSessionEvents } from "../../api/useSessionEvents";
 import { statusColor } from "../common/StatusBadge";
 import { AgentTimeline } from "../session/AgentTimeline";
 import { TasksPanel } from "../session/TasksPanel";
@@ -327,7 +327,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
             </div>
           )}
 
-          <div className="ide-content">{children}</div>
+          <div className="ide-content">
+            <SessionEventsContext.Provider value={events}>{children}</SessionEventsContext.Provider>
+          </div>
 
           <div className="ide-bottompanel">
             <div className="ide-bottompanel__tabs">

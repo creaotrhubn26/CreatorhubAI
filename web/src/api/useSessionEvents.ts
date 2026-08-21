@@ -1,7 +1,16 @@
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import type { GlimmerEvent } from "@glimmer/shared";
 import { isGlimmerEvent } from "@glimmer/shared";
 import { API_BASE } from "./client";
+
+// AppShell is the single mount point for this hook (one EventSource per
+// active session). Routed screens read the same stream via this context
+// instead of calling useSessionEvents again, which would open a second
+// connection to the same /api/sessions/:id/events endpoint.
+export const SessionEventsContext = createContext<GlimmerEvent[]>([]);
+export function useSharedSessionEvents(): GlimmerEvent[] {
+  return useContext(SessionEventsContext);
+}
 
 export function useSessionEvents(sessionId: string): GlimmerEvent[] {
   const [events, setEvents] = useState<GlimmerEvent[]>([]);

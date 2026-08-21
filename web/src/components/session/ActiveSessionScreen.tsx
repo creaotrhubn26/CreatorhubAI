@@ -1,7 +1,7 @@
 import { useParams, Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
-import { useSessionEvents } from "../../api/useSessionEvents";
+import { useSharedSessionEvents } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
 import { AgentStateStepper } from "./AgentStateStepper";
 import { RepairCycleStepper } from "./RepairCycleStepper";
@@ -32,7 +32,7 @@ export function ActiveSessionScreen() {
     enabled: !!id,
     refetchInterval: 4000,
   });
-  const events = useSessionEvents(id ?? "");
+  const events = useSharedSessionEvents();
 
   if (!session) return <div>Loading session…</div>;
 

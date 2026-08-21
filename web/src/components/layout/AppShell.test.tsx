@@ -1,9 +1,17 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, within, waitFor, fireEvent } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "./AppShell";
+import { ActiveSessionScreen } from "../session/ActiveSessionScreen";
 import * as client from "../../api/client";
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  onmessage: ((ev: MessageEvent) => void) | null = null;
+  constructor(public url: string) { FakeEventSource.instances.push(this); }
+  close() {}
+}
 
 function withProviders(ui: React.ReactElement, initialEntries = ["/"]) {
   vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
@@ -53,5 +61,37 @@ describe("AppShell", () => {
 
     fireEvent.click(closeBtn);
     await waitFor(() => expect(screen.queryByRole("button", { name: "Close s1" })).not.toBeInTheDocument());
+  });
+
+  describe("session event stream", () => {
+    const realEventSource = globalThis.EventSource;
+    afterEach(() => {
+      FakeEventSource.instances.length = 0;
+      (globalThis as any).EventSource = realEventSource;
+    });
+
+    it("opens only one EventSource when a session route renders, shared with the routed screen", async () => {
+      (globalThis as any).EventSource = FakeEventSource;
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "PARTIAL", checks: [] },
+        repairsUsed: 0, repairBudget: 2,
+      } as any);
+
+      render(
+        withProviders(
+          <AppShell repoContext={null}>
+            <Routes>
+              <Route path="/sessions/:id" element={<ActiveSessionScreen />} />
+            </Routes>
+          </AppShell>,
+          ["/sessions/s1"]
+        )
+      );
+
+      await waitFor(() => expect(screen.getByText(/Fix dialog parser/)).toBeInTheDocument());
+      expect(FakeEventSource.instances).toHaveLength(1);
+      expect(FakeEventSource.instances[0].url).toContain("/api/sessions/s1/events");
+    });
   });
 });
