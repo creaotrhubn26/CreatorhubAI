@@ -129,11 +129,17 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   // sessions.ts), and EventSource auto-reconnects on blips/sleep/route
   // return — receipt-time would show "just now" for a genuinely stalled
   // session. Deterministic and replay-immune; null when there are no events.
+  // Events are append-ordered (replay preserves that order), so the last
+  // parseable timestamp is the max — scan from the end and stop at the
+  // first one, rather than scanning the whole array.
   const sessionEventsValue = useMemo(() => {
     let lastEventAt: number | null = null;
-    for (const e of events) {
-      const t = new Date(e.timestamp).getTime();
-      if (!Number.isNaN(t) && (lastEventAt === null || t > lastEventAt)) lastEventAt = t;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const t = new Date(events[i].timestamp).getTime();
+      if (!Number.isNaN(t)) {
+        lastEventAt = t;
+        break;
+      }
     }
     return { events, lastEventAt };
   }, [events]);
@@ -230,6 +236,14 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const prevStatusRef = useRef<Record<string, string>>({});
   const baseTitleRef = useRef<string>(document.title);
   const [unseenIds, setUnseenIds] = useState<Set<string>>(new Set());
+
+  // Restore the real page title on unmount — this component may have left
+  // it rewritten with a "(N) " unseen-completion badge.
+  useEffect(() => {
+    return () => {
+      document.title = baseTitleRef.current;
+    };
+  }, []);
 
   useEffect(() => {
     const nextStatus: Record<string, string> = {};

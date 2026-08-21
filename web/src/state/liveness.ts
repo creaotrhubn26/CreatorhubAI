@@ -1,7 +1,8 @@
 // Running-session liveness: elapsed time, last-activity label, and the
 // stalled check that turns the label amber. Every value here derives ONLY
-// from deterministic inputs (session startedAt, SSE receipt times) — never
-// fabricated. Missing input means the caller omits the line, not a guess.
+// from deterministic inputs (session startedAt, and events' own `timestamp`
+// fields — never SSE receipt time) — never fabricated. Missing input means
+// the caller omits the line, not a guess.
 
 function formatDuration(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds));

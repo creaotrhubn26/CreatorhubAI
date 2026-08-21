@@ -168,9 +168,55 @@ describe("ActiveSessionScreen", () => {
       </QueryClientProvider>
     );
 
-    await waitFor(() => expect(screen.getByText("Blocked: Code fail")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Failed: Code fail")).toBeInTheDocument());
     expect(screen.getByText("repair budget exhausted")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /see verification/i })).toHaveAttribute("href", "/sessions/s1/verification");
+  });
+
+  it("renders a gray USER_CANCELLED banner for a cancelled session carrying a failure", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Fix dialog parser", status: "cancelled", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+      repairsUsed: 0, repairBudget: 2,
+      failure: { class: "USER_CANCELLED", detail: "cancelled by user", evidenceIds: [] },
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    const title = await screen.findByText("Cancelled: User cancelled");
+    expect(title).toBeInTheDocument();
+    const banner = title.closest(".failure-banner") as HTMLElement;
+    expect(banner.style.getPropertyValue("--badge-color")).toBe("var(--gray)");
+  });
+
+  it("falls back to the session id's embedded timestamp for elapsed when startedAt is absent", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "20260821-000000-glimmer-fixture", task: "Fix dialog parser", status: "implementing",
+      workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [],
+      verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2,
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/20260821-000000-glimmer-fixture"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    // No startedAt on the fixture — elapsed must come from the parseable
+    // session-id timestamp instead of being omitted.
+    await waitFor(() => expect(screen.getByText(/\d+[hms]/)).toBeInTheDocument());
   });
 
   it("renders no failure banner when failure is absent, even for a non-success terminal state", async () => {

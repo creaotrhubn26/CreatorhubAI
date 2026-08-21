@@ -32,7 +32,9 @@ export function SettingsScreen() {
         <li>Red — git push, deploy, force reset, repository deletion, credential extraction (blocked by default)</li>
       </ul>
 
-      <h1>Notifications</h1>
+      <h2 style={{ fontSize: "var(--fs-h1)", fontWeight: 600, textTransform: "none", letterSpacing: "-0.01em", color: "inherit" }}>
+        Notifications
+      </h2>
       <p>
         Completion notifications: {permission}
         {!supported && " (unsupported in this environment)"}

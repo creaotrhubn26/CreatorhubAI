@@ -141,7 +141,7 @@ describe("AppShell", () => {
       vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
         id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
         baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
-        repairsUsed: 0, repairBudget: 2, startedAt: "2026-08-21T00:00:00.000Z",
+        repairsUsed: 0, repairBudget: 2,
       } as any);
 
       render(
