@@ -7,9 +7,21 @@ import { API_BASE } from "./client";
 // active session). Routed screens read the same stream via this context
 // instead of calling useSessionEvents again, which would open a second
 // connection to the same /api/sessions/:id/events endpoint.
-export const SessionEventsContext = createContext<GlimmerEvent[]>([]);
+//
+// lastEventAt is Date.now() captured when AppShell observes a new event on
+// the shared array — a real wall-clock receipt time, never a guess. null
+// until the first event lands for the current session.
+export interface SessionEventsState {
+  events: GlimmerEvent[];
+  lastEventAt: number | null;
+}
+
+export const SessionEventsContext = createContext<SessionEventsState>({ events: [], lastEventAt: null });
 export function useSharedSessionEvents(): GlimmerEvent[] {
-  return useContext(SessionEventsContext);
+  return useContext(SessionEventsContext).events;
+}
+export function useSharedLastEventAt(): number | null {
+  return useContext(SessionEventsContext).lastEventAt;
 }
 
 export function useSessionEvents(sessionId: string): GlimmerEvent[] {

@@ -11,6 +11,7 @@ import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
 import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
+import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
   IconNewTask, IconRepository, IconSearch, IconSessions, IconSettings, IconVerification,
@@ -37,6 +38,13 @@ function shortSessionId(id: string): string {
   const stamp = id.slice(0, idx);
   const slug = id.slice(idx + marker.length);
   return `${stamp}…${slug.length > 12 ? slug.slice(-12) : slug}`;
+}
+
+// A running/active session pulses its status dot and gets the elapsed +
+// last-activity line in ActiveSessionScreen. Reuses AgentStateStepper's own
+// in-flight-states list so "is this running" is defined in exactly one place.
+function isRunningStatus(status: GlimmerSession["status"]): boolean {
+  return (RUNNING_STATES as readonly string[]).includes(status);
 }
 
 type ActivityKey = "dashboard" | "sessions" | "new-task" | "verification" | "repository" | "model" | "settings";
@@ -114,6 +122,15 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     refetchInterval: 4000,
   });
   const events = useSessionEvents(activeSessionId ?? "");
+  // lastEventAt: real wall-clock receipt time for the shared context, so any
+  // consumer (ActiveSessionScreen's liveness line) can read it. The events
+  // array only gets a new reference when useSessionEvents' onmessage handler
+  // fires (a real SSE receipt) or when it resets to [] on session switch —
+  // so this effect fires exactly on those two occasions, never fabricated.
+  const [lastEventAt, setLastEventAt] = useState<number | null>(null);
+  useEffect(() => {
+    setLastEventAt(events.length > 0 ? Date.now() : null);
+  }, [events]);
 
   // §5 open-session tabs: which sessions the user has looked at this app
   // session, capped and persisted — real navigation state, not a fabricated
@@ -285,7 +302,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                       className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
                       onClick={() => openSession(s.id)}
                     >
-                      <span className="ide-status-dot" style={{ color: statusColor(s.status) }} />
+                      <span
+                        className={`ide-status-dot${isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
+                        style={{ color: statusColor(s.status) }}
+                      />
                       <span className="ide-session-row__main">
                         <span className="ide-session-row__task">{s.task}</span>
                         <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
@@ -335,7 +355,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
               return (
                 <div key={id} className={`ide-tab${isActive ? " is-active" : ""}`}>
                   <button className="ide-tab__select" onClick={() => navigate(`/sessions/${id}`)}>
-                    <span className="ide-status-dot" style={{ color: statusColor(s?.status ?? "created") }} />
+                    <span
+                      className={`ide-status-dot${s && isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
+                      style={{ color: statusColor(s?.status ?? "created") }}
+                    />
                     <span className="mono">{shortSessionId(id)}</span>
                   </button>
                   <button className="ide-tab__close" aria-label={`Close ${shortSessionId(id)}`} onClick={() => closeTab(id)}>
@@ -361,7 +384,7 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           )}
 
           <div className="ide-content">
-            <SessionEventsContext.Provider value={events}>{children}</SessionEventsContext.Provider>
+            <SessionEventsContext.Provider value={{ events, lastEventAt }}>{children}</SessionEventsContext.Provider>
           </div>
 
           <div className="ide-bottompanel">

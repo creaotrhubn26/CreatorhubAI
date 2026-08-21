@@ -1,9 +1,11 @@
+import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
-import { useSharedSessionEvents } from "../../api/useSessionEvents";
+import { useSharedSessionEvents, useSharedLastEventAt } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
-import { AgentStateStepper } from "./AgentStateStepper";
+import { formatElapsed, lastActivityLabel, isStalled } from "../../state/liveness";
+import { AgentStateStepper, STATES as RUNNING_STATES } from "./AgentStateStepper";
 import { RepairCycleStepper } from "./RepairCycleStepper";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
@@ -33,14 +35,41 @@ export function ActiveSessionScreen() {
     refetchInterval: 4000,
   });
   const events = useSharedSessionEvents();
+  const lastEventAt = useSharedLastEventAt();
 
-  if (!session) return <div>Loading session…</div>;
+  // Liveness: elapsed + last-activity, ticking once a second — single
+  // interval, only while this session is actually running, cleared on
+  // unmount/status change.
+  const state = session ? deriveSessionState(events, session.status) : null;
+  const isRunning = state !== null && (RUNNING_STATES as readonly string[]).includes(state);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!isRunning) return;
+    const interval = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [isRunning]);
 
-  const state = deriveSessionState(events, session.status);
+  if (!session || !state) return <div>Loading session…</div>;
+
+  const elapsed = isRunning && session.startedAt ? formatElapsed(session.startedAt, nowMs) : null;
+  const activityLabel = isRunning ? lastActivityLabel(lastEventAt, nowMs) : null;
+  const stalled = isRunning && isStalled(lastEventAt, nowMs);
 
   return (
     <div>
       <h1>{session.task}</h1>
+      {isRunning && (elapsed || activityLabel) && (
+        <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          {elapsed}
+          {elapsed && activityLabel && " · "}
+          {activityLabel && (
+            <span style={stalled ? { color: "var(--amber)" } : undefined}>
+              {activityLabel}
+              {stalled ? " — possibly stalled" : ""}
+            </span>
+          )}
+        </p>
+      )}
       <div className="toolbar">
         <Link to={`/sessions/${id}/diff`}>View diff</Link>
         <Link to={`/sessions/${id}/verification`}>Verification Center</Link>
