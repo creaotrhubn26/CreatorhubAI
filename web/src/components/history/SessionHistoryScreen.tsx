@@ -6,7 +6,7 @@ import { EmptyState } from "../common/EmptyState";
 import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
 
 export function SessionHistoryScreen() {
-  const { data } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions });
+  const { data, isError } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions });
   const navigate = useNavigate();
 
   // pending-* rows are transient adopted-workspace placeholders — a
@@ -17,13 +17,18 @@ export function SessionHistoryScreen() {
   return (
     <div>
       <h1>Sessions</h1>
-      {sessions.length === 0 && (
+      {/* "Unavailable" is reserved for a failed/absent fetch (honesty rule);
+          a successful fetch with zero sessions is a genuinely empty list and
+          the only state where offering "New Task" makes sense. */}
+      {sessions.length === 0 && (data === undefined || isError ? (
+        <EmptyState icon="○" text="Unavailable" />
+      ) : (
         <EmptyState
           icon="○"
-          text="Unavailable"
+          text="No sessions yet"
           action={{ label: "New Task", onAction: () => navigate("/tasks/new") }}
         />
-      )}
+      ))}
       {groups.map((group) => (
         <div className="session-list-group" key={group.label}>
           <h2 className="session-list-group__label">{group.label}</h2>
