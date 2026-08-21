@@ -5,12 +5,9 @@ import { useSessionEvents } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
 import { AgentStateStepper } from "./AgentStateStepper";
 import { RepairCycleStepper } from "./RepairCycleStepper";
-import { AgentTimeline } from "./AgentTimeline";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
-import { SessionAssistant } from "./SessionAssistant";
 import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
 import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
-import { TasksPanel } from "./TasksPanel";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 
 export function ActiveSessionScreen() {
@@ -72,10 +69,7 @@ export function ActiveSessionScreen() {
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
-      {id && <TasksPanel sessionId={id} />}
       {id && <DeliveryReviewPanel sessionId={id} />}
-      <AgentTimeline events={events} />
-      {id && <SessionAssistant sessionId={id} />}
     </div>
   );
 }
