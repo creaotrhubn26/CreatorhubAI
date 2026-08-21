@@ -6,7 +6,9 @@
     "build": "npm run build -ws --if-present",
     "test": "npm run test -ws --if-present",
     "dev:server": "npm run dev -w server",
-    "dev:web": "npm run dev -w web"
+    "dev:web": "npm run dev -w web",
+    "tauri:dev": "npx @tauri-apps/cli dev",
+    "tauri:build": "npx @tauri-apps/cli build"
   },
   "devDependencies": {
     "typescript": "^5.5.4"
