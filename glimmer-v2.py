@@ -24,6 +24,12 @@ from glimmer_events import emit as emit_event
 
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
 STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
+# O1 (glimmer-v7 reconciliation doc, OPTIONAL tier -- "a directory of
+# markdown selected by area is enough; don't build a registry service").
+# User-space, NOT this repo: install a starter skill by copying one of
+# this repo's skills-examples/*.md files here. See build_skills_block
+# below for the full selection/cap contract.
+SKILLS_ROOT = Path.home() / ".muse-glimmer/skills"
 # C7 (glimmer-v7): cross-session repo-map cache, keyed by HEAD SHA. Separate
 # from STATE_ROOT's per-session repo-map.json (that per-session artifact is
 # unchanged by this cache; it's just a copy of whatever build_repo_map returns).
@@ -1333,6 +1339,221 @@ def read_candidate_evidence(plan, ws):
     return evidence
 
 
+# O1 (glimmer-v7 reconciliation doc, last OPTIONAL-tier item; V7 spec
+# Section 10 / Skills chapter): "a directory of markdown selected by area
+# is enough; don't build a registry service" -- "only worth it once >=3
+# real skills exist" (this repo ships exactly 3, see skills-examples/).
+#
+# Mechanism: SKILLS_ROOT (~/.muse-glimmer/skills/*.md, user-space, NOT
+# this repo -- install a skill by copying one of skills-examples/*.md
+# there). Each file is one skill: YAML-ish frontmatter between "---"
+# lines (name:/areas:/filetypes:, comma-separated lists) parsed by the
+# tiny hand-rolled parser below (no new dependency -- this is 3 flat
+# key: value lines, not nested structure, a real YAML lib would be
+# overkill), followed by a markdown body.
+#
+# Selection is 100% deterministic, per V7: by repo area + changed file
+# types -- never the model. A skill matches when ANY of its areas is a
+# case-insensitive segment match against the contract's scope
+# (package/area/paths) OR any of its filetypes matches an extension
+# found in the plan's candidateFiles / the scope's own paths.
+#
+# Injection is hard-capped (reconciliation doc Section 12, risk 6: prompt
+# space is contested by the contract/plan/evidence blocks already built
+# above) -- at most MAX_SKILLS_INJECTED skills (most-specific first: a
+# filetype match is more specific than an area-only match, ties break on
+# filename), each body capped at MAX_SKILL_BODY_BYTES, the whole block
+# capped at MAX_SKILLS_TOTAL_BYTES. A missing dir, no matches, or
+# malformed frontmatter all degrade to "" -- zero change to make_prompt's
+# output in every one of those cases, same never-raises discipline as
+# the rest of this module.
+MAX_SKILLS_INJECTED = 3
+MAX_SKILL_BODY_BYTES = 1536       # ~1.5KB per skill body
+MAX_SKILLS_TOTAL_BYTES = 4096     # ~4KB for the whole injected block
+
+
+def _parse_skill_file(path: Path):
+    """Lenient hand-rolled frontmatter parser. Returns None (skip this
+    file) on any malformed shape: missing opening/closing '---' fence, no
+    body left after the fence, or an unreadable/non-utf8 file. Unknown
+    frontmatter keys are ignored; name:/areas:/filetypes: are matched
+    case-insensitively on the key only."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+
+    meta = {}
+    body_start = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            body_start = i + 1
+            break
+        if ":" in lines[i]:
+            key, _, val = lines[i].partition(":")
+            meta[key.strip().lower()] = val.strip()
+    if body_start is None:
+        return None
+
+    body = "\n".join(lines[body_start:]).strip()
+    if not body:
+        return None
+
+    def _split_list(raw):
+        return [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+    filetypes = [
+        ft if ft.startswith(".") else f".{ft}"
+        for ft in _split_list(meta.get("filetypes", ""))
+    ]
+
+    return {
+        "name": meta.get("name") or path.stem,
+        "areas": _split_list(meta.get("areas", "")),
+        "filetypes": filetypes,
+        "body": body,
+        "filename": path.name,
+    }
+
+
+def load_skills(skills_dir=None) -> list:
+    """Load every *.md skill file from skills_dir (default SKILLS_ROOT),
+    sorted by filename for a stable base ordering (specificity sorting
+    happens later, in select_skills). Never raises: a missing/unreadable
+    dir, or any single unreadable/malformed file, is skipped -- worst
+    case this returns []."""
+    d = Path(skills_dir) if skills_dir is not None else SKILLS_ROOT
+    try:
+        if not d.is_dir():
+            return []
+        files = sorted(d.glob("*.md"))
+    except OSError:
+        return []
+
+    skills = []
+    for f in files:
+        try:
+            parsed = _parse_skill_file(f)
+        except Exception:
+            parsed = None
+        if parsed:
+            skills.append(parsed)
+    return skills
+
+
+def _skills_scope_text(contract) -> str:
+    """package/area/paths from the contract, flattened into one string
+    for area matching. Built defensively (never indexes contract["scope"]
+    directly) so a partial/malformed contract can't raise here."""
+    scope = (contract or {}).get("scope") or {}
+    bits = [str(scope.get("package", ""))]
+    if scope.get("area"):
+        bits.append(str(scope["area"]))
+    for p in scope.get("paths") or []:
+        bits.append(str(p))
+    return " ".join(bits)
+
+
+def _segment_tokens(text: str) -> list:
+    """Split on any run of non-alphanumeric characters so path separators
+    and punctuation act as segment boundaries -- same boundary idea O2's
+    detect_documentation_impact uses, minus its camelCase-edge handling
+    (area keywords here are plain words like "frontend"/"typescript", not
+    compound identifiers that need case-transition awareness)."""
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+
+def _candidate_extensions(contract, plan) -> set:
+    """Extensions to match skill filetypes against: the plan's
+    candidateFiles paths (when a plan exists) unioned with the contract
+    scope's own paths -- either can carry a real file extension."""
+    paths = []
+    if plan and plan.get("candidateFiles"):
+        paths.extend(
+            c.get("path", "") for c in plan["candidateFiles"] if isinstance(c, dict)
+        )
+    scope = (contract or {}).get("scope") or {}
+    paths.extend(str(p) for p in (scope.get("paths") or []))
+
+    exts = set()
+    for p in paths:
+        ext = os.path.splitext(str(p))[1].lower()
+        if ext:
+            exts.add(ext)
+    return exts
+
+
+def select_skills(contract, plan, skills=None, skills_dir=None) -> list:
+    """Deterministic skill selection -- no model involvement. A skill
+    matches when ANY of its areas is a case-insensitive segment-substring
+    of the contract's scope (package/area/paths) OR any of its filetypes
+    matches an extension found in the plan's candidateFiles / the scope
+    paths. Matched skills are ordered most-specific-first (filetype match
+    beats area-only match; ties break on filename) and hard-capped to
+    MAX_SKILLS_INJECTED."""
+    if skills is None:
+        skills = load_skills(skills_dir)
+    if not skills:
+        return []
+
+    scope_tokens = _segment_tokens(_skills_scope_text(contract))
+    exts = _candidate_extensions(contract, plan)
+
+    matched = []
+    for sk in skills:
+        filetype_hit = any(ft in exts for ft in sk["filetypes"])
+        area_hit = any(
+            area and any(area in tok for tok in scope_tokens)
+            for area in sk["areas"]
+        )
+        if filetype_hit or area_hit:
+            matched.append((sk, filetype_hit))
+
+    matched.sort(key=lambda pair: (0 if pair[1] else 1, pair[0]["filename"]))
+    return [sk for sk, _ in matched[:MAX_SKILLS_INJECTED]]
+
+
+def _truncate_bytes(text: str, limit: int, marker: str) -> str:
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    cut = max(limit - len(marker.encode("utf-8")), 0)
+    # Cut on encoded bytes (not str indices) so the result can't exceed
+    # `limit` because of a multi-byte character; errors="ignore" simply
+    # drops a character split in half by the cut.
+    return text.encode("utf-8")[:cut].decode("utf-8", errors="ignore") + marker
+
+
+def build_skills_block(contract, plan, skills=None, skills_dir=None) -> str:
+    """The "REPOSITORY SKILLS" block make_prompt appends -- "" (byte-for-
+    byte no change to the prompt) whenever nothing matches, the skills
+    dir doesn't exist, or anything at all goes wrong. Never raises."""
+    try:
+        matched = select_skills(contract, plan, skills=skills, skills_dir=skills_dir)
+    except Exception:
+        return ""
+    if not matched:
+        return ""
+
+    parts = []
+    for sk in matched:
+        body = _truncate_bytes(sk["body"], MAX_SKILL_BODY_BYTES, "\n...[truncated]")
+        parts.append(f"--- SKILL: {sk['name']} ---\n{body}")
+    block = "\n\n".join(parts)
+    block = _truncate_bytes(
+        block, MAX_SKILLS_TOTAL_BYTES, "\n...[SKILLS BLOCK TRUNCATED -- total cap reached]"
+    )
+    return (
+        "\n\nREPOSITORY SKILLS — conventions for this codebase (selected "
+        "deterministically by area/filetype match, not model judgment; at "
+        "most 3, most-specific first -- a hint, not a substitute for "
+        "reading the actual code):\n" + block
+    )
+
+
 def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None, evidence=None):
     # R2: the contract dict (same shape as manifest["contract"]) is the sole
     # source of truth for scope/mode/constraints — derive the human-readable
@@ -1466,7 +1687,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
     - Narrow diagnostic commands are allowed when needed.
     - Inspect the exact diff before finishing.
     - If the task cannot safely be completed, do not make speculative changes.
-    """).strip() + plan_block
+    """).strip() + plan_block + build_skills_block(contract, plan)
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
@@ -3800,6 +4021,163 @@ def _visual_selfcheck() -> None:
     print("visual (C4) self-check: PASS")
 
 
+def _skills_selfcheck() -> None:
+    """O1 (glimmer-v7 reconciliation doc): proves frontmatter parsing
+    (good/malformed/missing dir), deterministic area+filetype selection,
+    specificity ordering, all three hard caps (3 skills / 1.5KB per body
+    / 4KB total), zero-injection when nothing matches, and that nothing
+    here ever raises -- including on an unreadable file. Run with:
+    python3 glimmer-v2.py --skills-selfcheck
+    """
+    # --- missing dir -> [] ---
+    assert load_skills(skills_dir="/no/such/glimmer/skills/dir") == []
+
+    # --- frontmatter parsing: good, malformed variants all skipped ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "a-frontend.md").write_text(
+            "---\nname: a-frontend\nareas: frontend, ui\nfiletypes: .tsx\n---\n"
+            "# Frontend convention\nUse the shared Button component.\n",
+            encoding="utf-8",
+        )
+        (d / "b-no-close.md").write_text("---\nname: broken\nno closing fence\n", encoding="utf-8")
+        (d / "c-no-open.md").write_text("just a markdown file, no frontmatter\n", encoding="utf-8")
+        (d / "d-empty-body.md").write_text("---\nname: empty\nareas: frontend\n---\n\n", encoding="utf-8")
+        # "Unreadable" file -- a directory named *.md; read_text() raises
+        # IsADirectoryError (an OSError subclass). Must be skipped, not raise.
+        (d / "e-unreadable.md").mkdir()
+
+        skills = load_skills(skills_dir=d)
+        assert [s["name"] for s in skills] == ["a-frontend"], skills
+
+        parsed = skills[0]
+        assert parsed["areas"] == ["frontend", "ui"]
+        assert parsed["filetypes"] == [".tsx"]
+        assert "Button component" in parsed["body"]
+
+    # --- selection matrix: area match / filetype match / no match ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "area-only.md").write_text(
+            "---\nname: area-only\nareas: frontend\nfiletypes:\n---\nArea-matched body.\n",
+            encoding="utf-8",
+        )
+        (d / "filetype-only.md").write_text(
+            "---\nname: filetype-only\nareas: nomatch\nfiletypes: .ts\n---\nFiletype body.\n",
+            encoding="utf-8",
+        )
+        (d / "no-match.md").write_text(
+            "---\nname: no-match\nareas: backend\nfiletypes: .go\n---\nUnrelated body.\n",
+            encoding="utf-8",
+        )
+        skills = load_skills(skills_dir=d)
+        assert len(skills) == 3
+
+        contract = {"scope": {"package": "frontend", "paths": ["frontend/client/src/App.ts"]}}
+        selected = select_skills(contract, plan=None, skills=skills)
+        assert {s["name"] for s in selected} == {"area-only", "filetype-only"}
+
+        # No overlap at all -- unrelated scope, no plan -> no match.
+        no_match_contract = {"scope": {"package": "unrelated-service"}}
+        assert select_skills(no_match_contract, plan=None, skills=skills) == []
+
+        # Filetype match sourced from plan.candidateFiles when a plan exists.
+        plan = {"candidateFiles": [{"path": "src/thing.ts"}]}
+        neutral_contract = {"scope": {"package": "zzz"}}
+        selected2 = select_skills(neutral_contract, plan=plan, skills=skills)
+        assert {s["name"] for s in selected2} == {"filetype-only"}
+
+        # --- specificity ordering: filetype match ranks before area-only ---
+        both_contract = {"scope": {"package": "frontend"}}
+        both_plan = {"candidateFiles": [{"path": "x.ts"}]}
+        ordered = select_skills(both_contract, plan=both_plan, skills=skills)
+        assert [s["name"] for s in ordered] == ["filetype-only", "area-only"], ordered
+
+    # --- cap: 4 matching skills -> only 3 injected, filename order among ties ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        for n in ("s1", "s2", "s3", "s4"):
+            (d / f"{n}.md").write_text(
+                f"---\nname: {n}\nareas: frontend\nfiletypes:\n---\nBody for {n}.\n",
+                encoding="utf-8",
+            )
+        skills = load_skills(skills_dir=d)
+        assert len(skills) == 4
+        selected = select_skills({"scope": {"package": "frontend"}}, plan=None, skills=skills)
+        assert len(selected) == MAX_SKILLS_INJECTED == 3
+        assert [s["name"] for s in selected] == ["s1", "s2", "s3"]
+
+    # --- cap: oversized single body truncated with its own marker ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        big_body = "X" * (MAX_SKILL_BODY_BYTES * 2)
+        (d / "big.md").write_text(
+            f"---\nname: big\nareas: frontend\nfiletypes:\n---\n{big_body}\n", encoding="utf-8",
+        )
+        skills = load_skills(skills_dir=d)
+        assert len(skills[0]["body"].encode("utf-8")) == MAX_SKILL_BODY_BYTES * 2
+        block = build_skills_block({"scope": {"package": "frontend"}}, plan=None, skills=skills)
+        assert "[truncated]" in block
+        assert len(block.encode("utf-8")) <= MAX_SKILLS_TOTAL_BYTES + 512  # header prose isn't capped, body is
+
+    # --- cap: several under-body-cap skills still trip the total cap ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        body = "Y" * 1400  # under MAX_SKILL_BODY_BYTES -- no per-body truncation
+        for n in ("t1", "t2", "t3"):
+            (d / f"{n}.md").write_text(
+                f"---\nname: {n}\nareas: frontend\nfiletypes:\n---\n{body}\n", encoding="utf-8",
+            )
+        skills = load_skills(skills_dir=d)
+        for sk in skills:
+            assert len(sk["body"].encode("utf-8")) < MAX_SKILL_BODY_BYTES
+        block = build_skills_block({"scope": {"package": "frontend"}}, plan=None, skills=skills)
+        assert "[truncated]" not in block, "no single body should hit the per-body cap here"
+        assert "[SKILLS BLOCK TRUNCATED" in block
+
+    # --- zero injection when nothing matches: "" exactly, make_prompt unaffected ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "unrelated.md").write_text(
+            "---\nname: unrelated\nareas: backend\nfiletypes: .go\n---\nBody.\n", encoding="utf-8",
+        )
+        contract = {
+            "objective": "do the thing", "mode": "code", "constraints": {},
+            "scope": {"package": "frontend"},
+        }
+        assert build_skills_block(contract, plan=None, skills_dir=d) == ""
+
+    # make_prompt byte-identical whether SKILLS_ROOT is empty or has zero
+    # matches for this contract -- proves zero behavior change end to end,
+    # not just at build_skills_block. Module-global swapped back in `finally`
+    # (same pattern as _repomap_cache_selfcheck's REPO_MAP_CACHE_ROOT swap).
+    global SKILLS_ROOT
+    real_skills_root = SKILLS_ROOT
+    contract = {
+        "objective": "do the thing", "mode": "code", "constraints": {},
+        "scope": {"package": "frontend"},
+    }
+    try:
+        with tempfile.TemporaryDirectory() as empty_td:
+            SKILLS_ROOT = Path(empty_td)
+            baseline = make_prompt(contract, "repo summary", 0)
+        with tempfile.TemporaryDirectory() as unrelated_td:
+            (Path(unrelated_td) / "unrelated.md").write_text(
+                "---\nname: unrelated\nareas: backend\nfiletypes: .go\n---\nBody.\n",
+                encoding="utf-8",
+            )
+            SKILLS_ROOT = Path(unrelated_td)
+            unaffected = make_prompt(contract, "repo summary", 0)
+        assert unaffected == baseline
+    finally:
+        SKILLS_ROOT = real_skills_root
+
+    # --- never raises: missing dir passed straight through the whole pipeline ---
+    assert build_skills_block({"scope": {}}, None, skills_dir="/no/such/dir/at/all") == ""
+
+    print("skills (O1) self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
@@ -3824,6 +4202,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--doc-impact-selfcheck"]:
         _doc_impact_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--skills-selfcheck"]:
+        _skills_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
