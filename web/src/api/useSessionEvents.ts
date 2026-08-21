@@ -8,9 +8,9 @@ import { API_BASE } from "./client";
 // instead of calling useSessionEvents again, which would open a second
 // connection to the same /api/sessions/:id/events endpoint.
 //
-// lastEventAt is Date.now() captured when AppShell observes a new event on
-// the shared array — a real wall-clock receipt time, never a guess. null
-// until the first event lands for the current session.
+// lastEventAt is the max of the events' own `timestamp` fields (epoch ms),
+// computed in AppShell — deterministic and immune to SSE backlog replay on
+// reconnect, never a receipt-time guess. null until the first event lands.
 export interface SessionEventsState {
   events: GlimmerEvent[];
   lastEventAt: number | null;
