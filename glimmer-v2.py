@@ -1489,27 +1489,30 @@ def _candidate_extensions(contract, plan) -> set:
 
 def select_skills(contract, plan, skills=None, skills_dir=None) -> list:
     """Deterministic skill selection -- no model involvement. A skill
-    matches when ANY of its areas is a case-insensitive segment-substring
-    of the contract's scope (package/area/paths) OR any of its filetypes
-    matches an extension found in the plan's candidateFiles / the scope
-    paths. Matched skills are ordered most-specific-first (filetype match
-    beats area-only match; ties break on filename) and hard-capped to
+    matches when ANY of its areas is an exact, case-insensitive match
+    against one whole segment/token of the contract's scope
+    (package/area/paths, split on non-alphanumeric boundaries -- e.g.
+    "frontend/ui/App.tsx" tokenizes to {"frontend", "ui", "app", "tsx"})
+    OR any of its filetypes matches an extension found in the plan's
+    candidateFiles / the scope paths. Deliberately exact-token, not
+    raw substring -- a raw substring test would let a short area like
+    "ui" match unrelated tokens that merely contain those letters (e.g.
+    "build"), which isn't what a scope keyword match should mean.
+    Matched skills are ordered most-specific-first (filetype match beats
+    area-only match; ties break on filename) and hard-capped to
     MAX_SKILLS_INJECTED."""
     if skills is None:
         skills = load_skills(skills_dir)
     if not skills:
         return []
 
-    scope_tokens = _segment_tokens(_skills_scope_text(contract))
+    scope_tokens = set(_segment_tokens(_skills_scope_text(contract)))
     exts = _candidate_extensions(contract, plan)
 
     matched = []
     for sk in skills:
         filetype_hit = any(ft in exts for ft in sk["filetypes"])
-        area_hit = any(
-            area and any(area in tok for tok in scope_tokens)
-            for area in sk["areas"]
-        )
+        area_hit = any(area and area in scope_tokens for area in sk["areas"])
         if filetype_hit or area_hit:
             matched.append((sk, filetype_hit))
 
@@ -4092,6 +4095,24 @@ def _skills_selfcheck() -> None:
         both_plan = {"candidateFiles": [{"path": "x.ts"}]}
         ordered = select_skills(both_contract, plan=both_plan, skills=skills)
         assert [s["name"] for s in ordered] == ["filetype-only", "area-only"], ordered
+
+    # --- area match is exact-segment, not raw substring: "ui" must NOT
+    #     match a token that merely contains those letters ("build"), but
+    #     MUST match when "ui" is its own path segment ("frontend/ui/..."). ---
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "ui-skill.md").write_text(
+            "---\nname: ui-skill\nareas: ui\nfiletypes:\n---\nUI body.\n", encoding="utf-8",
+        )
+        skills = load_skills(skills_dir=d)
+        no_hit_contract = {"scope": {"package": "build"}}
+        assert select_skills(no_hit_contract, plan=None, skills=skills) == [], (
+            "\"ui\" must not substring-match the unrelated token \"build\""
+        )
+        hit_contract = {"scope": {"package": "app", "paths": ["frontend/ui/Button.tsx"]}}
+        assert [s["name"] for s in select_skills(hit_contract, plan=None, skills=skills)] == ["ui-skill"], (
+            "\"ui\" must match its own path segment"
+        )
 
     # --- cap: 4 matching skills -> only 3 injected, filename order among ties ---
     with tempfile.TemporaryDirectory() as td:

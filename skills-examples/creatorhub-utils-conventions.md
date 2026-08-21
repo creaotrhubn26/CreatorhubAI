@@ -14,11 +14,15 @@ Observed pattern across this directory's known-good files
   listing). `lazyWithRetry.ts`'s header explains the *why*
   (stale-chunk-on-deploy failures), not just the *what*.
 - Named exports are the norm: `export function`/`const`/`interface`/
-  `type`. A single `export default` alongside them shows up sometimes
-  (`errorMessages.ts`), but named exports carry the actual API.
-- Types/interfaces are declared before the logic that uses them, with
-  real field-level types (no `any` observed) — `errorMessages.ts`'s
-  `ErrorContext`/`ErrorMessage`/`ErrorSeverity` sit up top.
+  `type`. A single `export default` alongside them is common (3 of the
+  5 files here — `errorMessages.ts`, `accessibilityUtils.ts`,
+  `auditLogger.ts` — have one), but named exports carry the actual API.
+- Types/interfaces declared before the logic that uses them —
+  `errorMessages.ts`'s `ErrorContext`/`ErrorMessage`/`ErrorSeverity` sit
+  up top. `any`/casts still appear for real edge cases, not banned
+  outright: `lazyWithRetry.ts`'s `ComponentType<any>`, `auditLogger.ts`'s
+  `(x as any)` casts around `performance`/dynamic sort keys/CSV export —
+  sparing use, not a default escape hatch.
 - Runtime code wraps browser API access (`sessionStorage`/`window`) in
   `try/catch`, degrading quietly — see `lazyWithRetry.ts`'s
   `getReloadCount`/`setReloadCount`.
