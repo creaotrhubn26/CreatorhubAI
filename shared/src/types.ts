@@ -103,7 +103,14 @@ export interface GlimmerSession {
   // C2/C3 (glimmer-v7): opt-in architect-mode gate/plan summary and the
   // terminal-failure classifier, mirrored from manifest.json's own
   // "gates" / "architectPlan" / "failure" fields when present.
-  gates?: { architectureApproved: boolean | null };
+  gates?: {
+    architectureApproved: boolean | null;
+    // O2 (glimmer-v7): False when the deterministic change-impact detector
+    // found doc-relevant changes (routes/schema/api/config/auth); null when
+    // no impact or detector didn't run. Never true — phase 1 cannot verify
+    // documentation currency, only flag the need.
+    documentationCurrent?: boolean | null;
+  };
   architectPlan?: { used: boolean; risk: string | null };
   failure?: { class: string; detail: string; evidenceIds: string[] };
   // §14 Diff Review — human "accept for review" fact. Written ONLY by the
@@ -224,10 +231,19 @@ export interface DeliveryReview {
 }
 
 // C3 (glimmer-v7): flat evidence-driven task list, written to tasks.json.
+// kind vocabulary: "implementation" and "verification" transition on real
+// evidence (engineer return code + changed files / a matched verify()
+// result -- see evaluate_implementation_tasks / evaluate_verification_tasks
+// in glimmer-v2.py). O2 (glimmer-v7 reconciliation) adds "documentation":
+// an honest, permanently-pending kind appended only when the deterministic
+// change-impact detector finds routes/schema/api/config/auth touched --
+// nothing in glimmer-v2.py's task writers ever flips it to complete/failed,
+// because phase 1 has no way to verify documentation currency. A human
+// closes it out of band.
 export interface GlimmerTask {
   id: string;
   description: string;
-  kind: "implementation" | "verification";
+  kind: "implementation" | "verification" | "documentation";
   dependsOn: string[];
   status: "pending" | "in_progress" | "complete" | "failed";
 }
