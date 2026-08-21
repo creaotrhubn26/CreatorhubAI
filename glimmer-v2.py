@@ -1998,14 +1998,55 @@ def evaluate_verification_tasks(tasks, results: list) -> None:
 # Category -> standalone words checked with boundary-safe matching (see
 # detect_documentation_impact). "routes"/"router" both catch the plain-
 # word and plural-directory forms ("routes/user.ts", "router.ts",
-# "user.routes.ts") without a separate glob branch.
+# "user.routes.ts") without a separate glob branch. "authentication" is
+# listed explicitly (not derived from "auth") because it's a real distinct
+# word, separator-bounded on its own in filenames like
+# "authentication.ts" -- no camel-boundary logic needed for it.
 _DOC_IMPACT_WORDS = {
     "routes": ("routes", "router"),
     "schema": ("schema", "schemas", "migration", "migrations", "prisma"),
     "api": ("api", "openapi", "swagger"),
     "config": ("config",),
-    "auth": ("auth", "session", "sessions", "permission", "permissions", "token", "tokens"),
+    "auth": ("auth", "authentication", "session", "sessions", "permission",
+              "permissions", "token", "tokens"),
 }
+
+# Review round 1: idiomatic TS/JS identifiers -- AuthService.ts,
+# authMiddleware.ts, SessionManager.ts -- are a real practical miss under
+# plain non-alnum-only boundaries, since camelCase/PascalCase segments
+# aren't separated by any non-alnum character at all. Scoped to
+# auth/session/token only (not routes/schema/api/config): routes in
+# particular has an explicit existing self-check requiring "userRouter.ts"
+# to keep NOT matching "router", so the stricter non-alnum-only boundary
+# stays the default everywhere except here.
+_CAMEL_AWARE_CATEGORIES = {"auth"}
+
+
+def _word_hits(word: str, path: str, camel_aware: bool) -> bool:
+    """Case-insensitive search for `word` in `path` (original case, NOT
+    lowercased -- camel-awareness needs the real casing) with a boundary
+    on both sides. Boundary = start/end of string or a non-alnum
+    separator. When camel_aware, ALSO accepts a camelCase/PascalCase
+    segment edge: the character immediately after the match is uppercase
+    (e.g. "auth" in "authMiddleware"), or the character immediately
+    before the match is lowercase while the match itself starts uppercase
+    (e.g. "Auth" in a hypothetical "userAuthService" -- a lower-to-upper
+    transition marks a new segment; "AuthService" itself is already
+    covered by start-of-string). This still rejects "author"/
+    "possession": both are a plain lowercase continuation with no
+    separator and no case transition, so neither boundary rule fires."""
+    for m in re.finditer(re.escape(word), path, re.IGNORECASE):
+        start, end = m.start(), m.end()
+        before_ok = start == 0 or not path[start - 1].isalnum()
+        after_ok = end == len(path) or not path[end].isalnum()
+        if camel_aware:
+            if not before_ok and path[start - 1].islower() and path[start].isupper():
+                before_ok = True
+            if not after_ok and path[end].isupper():
+                after_ok = True
+        if before_ok and after_ok:
+            return True
+    return False
 
 
 def detect_documentation_impact(changed_files) -> list:
@@ -2015,28 +2056,34 @@ def detect_documentation_impact(changed_files) -> list:
     returns the SORTED list of categories hit across all changed files
     (empty list == no documentation impact).
 
-    Boundary-sane by construction: every standalone-word check uses
-    (?<![a-z0-9])word(?![a-z0-9]) rather than bare substring matching, so
-    a compound identifier does NOT false-positive just because it
-    contains a keyword as a substring -- e.g. "author.ts" does NOT match
-    "auth" (no non-alnum separator between "auth" and the following "or"),
-    and "userRouter.ts" does NOT match "router" (no separator between
-    "user" and "Router"). Path/extension separators ("/", ".", "-", "_")
-    all count as boundaries, so "routes/user.ts", "user_auth.py" and
-    "webpack.config.js" DO match. Case-insensitive throughout.
+    Boundary-sane by construction (see _word_hits): a compound identifier
+    does NOT false-positive just because it contains a keyword as a
+    substring -- e.g. "author.ts" does NOT match "auth" (no separator and
+    no case transition between "auth" and the following "or"), and
+    "userRouter.ts" does NOT match "router" (routes/schema/api/config use
+    the stricter non-alnum-only boundary). Path/extension separators
+    ("/", ".", "-", "_") all count as boundaries, so "routes/user.ts",
+    "user_auth.py" and "webpack.config.js" DO match. The auth/session/
+    token words additionally accept a camelCase/PascalCase segment edge,
+    so "AuthService.ts", "authMiddleware.ts" and "SessionManager.ts" DO
+    match while "Authors.tsx"/"possession.ts" still do NOT (plain
+    lowercase continuation, no case transition). Case-insensitive
+    throughout.
 
     Never raises: any non-string entry is coerced with str(); an empty/
     None input returns [] immediately.
     """
     impacts = set()
     for raw in (changed_files or []):
-        path = str(raw).replace("\\", "/").lower()
-        segments = [s for s in path.split("/") if s]
-        basename = segments[-1] if segments else path
+        path = str(raw).replace("\\", "/")
+        lower = path.lower()
+        segments = [s for s in lower.split("/") if s]
+        basename = segments[-1] if segments else lower
 
         for category, words in _DOC_IMPACT_WORDS.items():
+            camel_aware = category in _CAMEL_AWARE_CATEGORIES
             for word in words:
-                if re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", path):
+                if _word_hits(word, path, camel_aware):
                     impacts.add(category)
                     break
 
@@ -2289,10 +2336,10 @@ def main():
         # so plan_candidate_count below is 0 and the prompt/env are
         # unaffected in every degraded case.
         candidate_evidence = []
-        # C3: tasks stays None (no tasks.json ever written) in every
-        # degraded case, same uniform-None-on-no-plan contract as
+        # C3: tasks (initialized above the try, before O2 needed it in
+        # `finally` too -- see that comment) stays None in every degraded
+        # case, same uniform-None-on-no-plan contract as
         # architecture_plan/candidate_evidence just above.
-        tasks = None
         if args.architect_first:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
@@ -3470,6 +3517,21 @@ def _doc_impact_selfcheck() -> None:
     assert detect_documentation_impact(["src/session.ts"]) == ["auth"]
     assert detect_documentation_impact(["src/permissions/check.ts"]) == ["auth"]
     assert detect_documentation_impact(["src/token.ts"]) == ["auth"]
+
+    # Review round 1: camelCase/PascalCase auth/session/token identifiers
+    # -- a real practical miss under plain non-alnum-only boundaries,
+    # since these compound names have no separator at all between
+    # segments.
+    assert detect_documentation_impact(["src/AuthService.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/authMiddleware.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/authentication.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/SessionManager.ts"]) == ["auth"]
+    # ...but still not author/possession -- plain lowercase continuation,
+    # no separator and no case transition either.
+    assert detect_documentation_impact(["src/author.ts"]) == []
+    assert detect_documentation_impact(["src/Authors.tsx"]) == []
+    assert detect_documentation_impact(["src/possession.ts"]) == []
+
     # Multiple files, multiple categories, deduped + sorted.
     assert detect_documentation_impact(
         ["src/routes/user.ts", "src/api/users.ts", "src/routes/other.ts"]
