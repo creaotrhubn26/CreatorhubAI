@@ -1,11 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { formatElapsed, lastActivityLabel, isStalled } from "../../state/liveness";
 
 const START = "2026-08-22T12:00:00.000Z";
 const START_MS = new Date(START).getTime();
-
-beforeEach(() => vi.useFakeTimers());
-afterEach(() => vi.useRealTimers());
 
 describe("formatElapsed", () => {
   it("renders minutes and seconds once a minute has passed", () => {

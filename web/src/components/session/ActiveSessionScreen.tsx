@@ -41,7 +41,7 @@ export function ActiveSessionScreen() {
   // interval, only while this session is actually running, cleared on
   // unmount/status change.
   const state = session ? deriveSessionState(events, session.status) : null;
-  const isRunning = state !== null && (RUNNING_STATES as readonly string[]).includes(state);
+  const isRunning = state !== null && RUNNING_STATES.includes(state);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!isRunning) return;

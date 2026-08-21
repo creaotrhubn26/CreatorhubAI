@@ -639,6 +639,7 @@ pre {
   width: 100%; height: 100%; min-height: 40px; background: none; border: none; color: var(--text-muted);
   display: flex; align-items: flex-start; justify-content: center; padding-top: var(--space-3); font-size: 14px;
 }
+.ide-rightpanel__reopen:hover { color: var(--text-primary); }
 
 /* ---- running-session liveness: pulsing status dot ---- */
 @keyframes ide-status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -646,4 +647,3 @@ pre {
 @media (prefers-reduced-motion: reduce) {
   .ide-status-dot--pulse { animation: none; }
 }
-.ide-rightpanel__reopen:hover { color: var(--text-primary); }

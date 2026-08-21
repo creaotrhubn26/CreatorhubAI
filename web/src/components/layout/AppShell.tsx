@@ -44,7 +44,7 @@ function shortSessionId(id: string): string {
 // last-activity line in ActiveSessionScreen. Reuses AgentStateStepper's own
 // in-flight-states list so "is this running" is defined in exactly one place.
 function isRunningStatus(status: GlimmerSession["status"]): boolean {
-  return (RUNNING_STATES as readonly string[]).includes(status);
+  return RUNNING_STATES.includes(status);
 }
 
 type ActivityKey = "dashboard" | "sessions" | "new-task" | "verification" | "repository" | "model" | "settings";
@@ -122,14 +122,19 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     refetchInterval: 4000,
   });
   const events = useSessionEvents(activeSessionId ?? "");
-  // lastEventAt: real wall-clock receipt time for the shared context, so any
-  // consumer (ActiveSessionScreen's liveness line) can read it. The events
-  // array only gets a new reference when useSessionEvents' onmessage handler
-  // fires (a real SSE receipt) or when it resets to [] on session switch —
-  // so this effect fires exactly on those two occasions, never fabricated.
-  const [lastEventAt, setLastEventAt] = useState<number | null>(null);
-  useEffect(() => {
-    setLastEventAt(events.length > 0 ? Date.now() : null);
+  // lastEventAt must be the max of the events' own `timestamp` field, not
+  // Date.now() at receipt: the SSE route replays the whole events.jsonl
+  // backlog from lastCount=0 on every reconnect (server/src/routes/
+  // sessions.ts), and EventSource auto-reconnects on blips/sleep/route
+  // return — receipt-time would show "just now" for a genuinely stalled
+  // session. Deterministic and replay-immune; null when there are no events.
+  const sessionEventsValue = useMemo(() => {
+    let lastEventAt: number | null = null;
+    for (const e of events) {
+      const t = new Date(e.timestamp).getTime();
+      if (!Number.isNaN(t) && (lastEventAt === null || t > lastEventAt)) lastEventAt = t;
+    }
+    return { events, lastEventAt };
   }, [events]);
 
   // §5 open-session tabs: which sessions the user has looked at this app
@@ -384,7 +389,7 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           )}
 
           <div className="ide-content">
-            <SessionEventsContext.Provider value={{ events, lastEventAt }}>{children}</SessionEventsContext.Provider>
+            <SessionEventsContext.Provider value={sessionEventsValue}>{children}</SessionEventsContext.Provider>
           </div>
 
           <div className="ide-bottompanel">
