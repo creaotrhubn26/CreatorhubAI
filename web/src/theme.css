@@ -46,6 +46,14 @@
   /* radius */
   --radius: 5px;
   --radius-sm: 3px;
+
+  /* diff syntax highlighting tokens — muted IDE palette; Task 9 (light
+     theme) re-maps these, code should only ever reference the variables */
+  --tok-keyword: #c586c0;
+  --tok-string: #ce9178;
+  --tok-comment: var(--text-muted);
+  --tok-number: #b5cea8;
+  --tok-type: #4ec9b0;
 }
 
 * { box-sizing: border-box; }
@@ -399,6 +407,14 @@ pre {
 .ide-statusbar__group { display: flex; align-items: center; gap: var(--space-3); }
 .ide-statusbar__spacer { flex: 1; }
 .ide-statusbar span.mono { font-size: 11px; }
+.statusbar-item {
+  background: none; border: none; font: inherit; color: inherit; padding: 0; margin: 0; cursor: pointer;
+}
+.statusbar-item:hover { background: var(--surface-2); }
+/* .statusbar-item's `font: inherit` shorthand resets font-family too, which
+   otherwise wins over (and defeats) `.mono` on the same element regardless
+   of source order since both are single-class selectors. */
+.statusbar-item.mono { font-family: var(--mono); }
 
 @media (max-width: 900px) {
   .ide-leftpanel, .ide-rightpanel { display: none; }
@@ -417,6 +433,11 @@ pre {
 .diff-view__line.add .diff-view__marker { color: var(--green); }
 .diff-view__line.del .diff-view__marker { color: var(--red); }
 .diff-view__text { padding-right: var(--space-3); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-string { color: var(--tok-string); }
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-number { color: var(--tok-number); }
+.tok-type { color: var(--tok-type); }
 
 /* ---- AI assistant chat ---- */
 .chat-greeting { font-size: var(--fs-base); color: var(--text-primary); }
@@ -650,6 +671,41 @@ pre {
   display: flex; align-items: flex-start; justify-content: center; padding-top: var(--space-3); font-size: 14px;
 }
 .ide-rightpanel__reopen:hover { color: var(--text-primary); }
+
+/* ---- left panel (sidebar) collapse ---- */
+.ide-leftpanel.is-collapsed { width: 32px; }
+.ide-leftpanel__header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.ide-leftpanel__collapse { background: none; border: none; color: var(--text-muted); padding: 2px 4px; flex-shrink: 0; }
+.ide-leftpanel__collapse:hover { color: var(--text-primary); }
+.ide-leftpanel__reopen {
+  width: 100%; height: 100%; min-height: 40px; background: none; border: none; color: var(--text-muted);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: var(--space-3); font-size: 14px;
+}
+.ide-leftpanel__reopen:hover { color: var(--text-primary); }
+
+/* ---- command palette (cmd+K / cmd+P) ---- */
+.ide-palette-overlay {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, 0.5);
+  display: flex; justify-content: center; padding-top: 14vh;
+}
+.ide-palette {
+  width: 100%; max-width: 480px; max-height: 60vh; background: var(--surface-2);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; overflow: hidden;
+}
+.ide-palette__input {
+  flex-shrink: 0; width: 100%; background: none; border: none; box-shadow: inset 0 -1px 0 var(--border);
+  padding: var(--space-3); font-size: var(--fs-base); color: var(--text-primary);
+}
+.ide-palette__input:focus { outline: none; }
+.ide-palette__list { list-style: none; margin: 0; padding: var(--space-1) 0; overflow-y: auto; }
+.ide-palette__empty { padding: var(--space-3); font-size: var(--fs-sm); color: var(--text-muted); }
+.ide-palette__option {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  padding: 6px var(--space-3); font-size: var(--fs-sm); color: var(--text-primary); cursor: pointer;
+}
+.ide-palette__option.is-selected { background: var(--surface-raised); box-shadow: inset 2px 0 0 var(--accent); }
+.ide-palette__option-hint { font-size: var(--fs-xs); color: var(--text-muted); flex-shrink: 0; }
 
 /* ---- running-session liveness: pulsing status dot ---- */
 @keyframes ide-status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }

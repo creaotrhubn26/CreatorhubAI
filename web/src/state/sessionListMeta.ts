@@ -54,6 +54,18 @@ export function dayLabel(date: Date | null, now: Date = new Date()): string {
   });
 }
 
+// Session ids are `YYYYMMDD-HHMMSS-glimmer-<task-slug>` — long enough that
+// showing them in full would blow out a tab, breadcrumb, or palette row.
+// Keep the timestamp (which sorts/identifies) and a short slug tail.
+export function shortSessionId(id: string): string {
+  const marker = "-glimmer-";
+  const idx = id.indexOf(marker);
+  if (idx === -1) return id.length > 18 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
+  const stamp = id.slice(0, idx);
+  const slug = id.slice(idx + marker.length);
+  return `${stamp}…${slug.length > 12 ? slug.slice(-12) : slug}`;
+}
+
 export function groupSessionsByDay<T extends { id: string; completedAt?: string }>(
   sessions: T[],
   now: Date = new Date()

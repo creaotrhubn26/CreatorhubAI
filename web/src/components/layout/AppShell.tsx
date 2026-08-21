@@ -10,7 +10,9 @@ import { AgentTimeline } from "../session/AgentTimeline";
 import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
-import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
+import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp, shortSessionId } from "../../state/sessionListMeta";
+import { buildCommands, type PaletteMode } from "../../state/paletteCommands";
+import { CommandPalette } from "../common/CommandPalette";
 import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
@@ -26,20 +28,13 @@ export interface RepoContext {
 }
 
 const OPEN_TABS_KEY = "glimmer.openTabs";
+const LEFT_PANEL_COLLAPSED_KEY = "glimmer.leftPanelCollapsed";
 const RIGHT_PANEL_COLLAPSED_KEY = "glimmer.rightPanelCollapsed";
 const MAX_TABS = 6;
 
-// Session ids are `YYYYMMDD-HHMMSS-glimmer-<task-slug>` — long enough that
-// showing them in full would blow out a tab or breadcrumb. Keep the
-// timestamp (which sorts/identifies) and a short slug tail.
-export function shortSessionId(id: string): string {
-  const marker = "-glimmer-";
-  const idx = id.indexOf(marker);
-  if (idx === -1) return id.length > 18 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
-  const stamp = id.slice(0, idx);
-  const slug = id.slice(idx + marker.length);
-  return `${stamp}…${slug.length > 12 ? slug.slice(-12) : slug}`;
-}
+// Re-exported for back-compat — logic now lives in state/sessionListMeta.ts
+// alongside the rest of the session-row formatting helpers.
+export { shortSessionId };
 
 // A running/active session pulses its status dot and gets the elapsed +
 // last-activity line in ActiveSessionScreen. Reuses AgentStateStepper's own
@@ -109,6 +104,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const sessionMatch = location.pathname.match(/^\/sessions\/([^/]+)/);
   const activeSessionId = sessionMatch?.[1];
   const activePage = activePageOf(location.pathname);
+  // Status bar's session-status/verification items: the open session's own
+  // verification view, or the Verification Center when nothing is open.
+  const verificationTarget = activeSessionId ? `/sessions/${activeSessionId}/verification` : "/verification";
 
   const { data: rawSessions } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions, refetchInterval: 5000 });
   // pending-* rows are transient adopted-workspace placeholders — once the
@@ -193,6 +191,23 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const [bottomTab, setBottomTab] = useState<"timeline" | "verification" | "tasks" | "events">("timeline");
   const [bottomCollapsed, setBottomCollapsed] = useState(false);
 
+  // Sidebar collapses the same way the assistant panel does (below) —
+  // persisted, toggled by its own header button or the `[` shortcut.
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() => {
+    try {
+      return window.localStorage?.getItem(LEFT_PANEL_COLLAPSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(LEFT_PANEL_COLLAPSED_KEY, leftPanelCollapsed ? "1" : "0");
+    } catch {
+      /* storage unavailable — collapse state just won't persist */
+    }
+  }, [leftPanelCollapsed]);
+
   // §10: AI Assistant panel collapses like the bottom panel — persisted so
   // it stays out of the way across reloads once the user closes it.
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => {
@@ -209,6 +224,76 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
       /* storage unavailable — collapse state just won't persist */
     }
   }, [rightPanelCollapsed]);
+
+  // Command palette (cmd+K) / session switcher (cmd+P). A single global
+  // keydown listener drives both plus the `[`/`]` panel-toggle shortcuts.
+  // cmd+K/cmd+P are chords (not plain text a user would type), so they fire
+  // regardless of focus — including from inside an input/textarea/
+  // contenteditable. The bare `[`/`]` (and Escape) ARE plain keys, so they
+  // stay guarded: ignored while typing in a field, except the palette's own
+  // input (marked with data-palette-input so Escape still reaches it there).
+  const [palette, setPalette] = useState<{ open: boolean; mode: PaletteMode }>({ open: false, mode: "command" });
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      // Palette invocation: Ctrl+K/Ctrl+P are Cocoa text-editing bindings on
+      // mac (delete-to-line-start / previous-line), so ctrlKey must not open
+      // the palette there — only metaKey (Cmd) does. Elsewhere ctrlKey is the
+      // right chord. navigator.platform is deprecated but synchronous; when
+      // it's unavailable, default to mac (metaKey-only) since that's the
+      // safer/no-op-elsewhere assumption.
+      const isMac = navigator.platform ? navigator.platform.toUpperCase().startsWith("MAC") : true;
+      const paletteMod = isMac ? e.metaKey : e.ctrlKey;
+      if (paletteMod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette({ open: true, mode: "command" });
+        return;
+      }
+      if (paletteMod && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPalette({ open: true, mode: "session" });
+        return;
+      }
+
+      const target = e.target instanceof HTMLElement ? e.target : null;
+      const isPaletteInput = target?.dataset.paletteInput === "true";
+      const isTypingElsewhere = !!target && !isPaletteInput &&
+        (/^(input|textarea)$/i.test(target.tagName) || target.isContentEditable);
+      // The palette-input exemption only ever covers Escape (so the palette
+      // can close itself while focused) — typing a literal `[`/`]` into the
+      // palette's own search box must never toggle a side panel.
+      if (isTypingElsewhere || (isPaletteInput && e.key !== "Escape")) return;
+
+      if (e.key === "Escape") {
+        setPalette((p) => (p.open ? { ...p, open: false } : p));
+        return;
+      }
+      // `mod`/altKey guard: Cmd+[ and Cmd+] are the browser's Back/Forward
+      // chords and Alt+[/Alt+] are common editor bindings — none of those
+      // should also toggle a panel as a side effect.
+      const mod = e.metaKey || e.ctrlKey;
+      if (e.key === "[" && !mod && !e.altKey) {
+        setLeftPanelCollapsed((c) => !c);
+        return;
+      }
+      if (e.key === "]" && !mod && !e.altKey) {
+        setRightPanelCollapsed((c) => !c);
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const paletteCommands = useMemo(
+    () => buildCommands({
+      mode: palette.mode,
+      sessions,
+      navigate,
+      toggleLeftPanel: () => setLeftPanelCollapsed((c) => !c),
+      toggleAssistantPanel: () => setRightPanelCollapsed((c) => !c),
+    }),
+    [palette.mode, sessions, navigate]
+  );
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
@@ -366,66 +451,81 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           </button>
         </nav>
 
-        <aside className="ide-leftpanel">
-          <div className="ide-leftpanel__header">
-            GLIMMER
-            <span className="ide-leftpanel__workspace">{repoContext?.repository ?? "Not connected"}</span>
-          </div>
-          <div className="ide-leftpanel__body">
-            <Section title="Sessions" collapsed={collapsedSections.has("sessions")} onToggle={() => toggleSection("sessions")}>
-              {visibleSessions.length === 0 && <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>Unavailable</div>}
-              {sidebarGroups.map((group) => (
-                <div key={group.label}>
-                  <div className="ide-session-daygroup">{group.label}</div>
-                  {group.sessions.map((s) => (
-                    <button
-                      key={s.id}
-                      className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
-                      onClick={() => openSession(s.id)}
-                    >
-                      <span
-                        className={`ide-status-dot${isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
-                        style={{ color: statusColor(s.status) }}
-                      />
-                      <span className="ide-session-row__main">
-                        <span className="ide-session-row__task">{s.task}</span>
-                        <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              ))}
-              {sessions.length > visibleSessions.length && (
-                <Link className="ide-section__link" to="/sessions">View all sessions →</Link>
-              )}
-            </Section>
-
-            <Section title="Model" collapsed={collapsedSections.has("model")} onToggle={() => toggleSection("model")}>
-              <div className="ide-model-row">
-                <span className="ide-status-dot" style={{ color: statusColor(modelStatus?.status ?? "UNKNOWN") }} />
-                <span className="ide-model-row__name">Muse Glimmer</span>
-                {modelStatus && <span className="mono" style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}>{modelStatus.status}</span>}
+        <aside className={`ide-leftpanel${leftPanelCollapsed ? " is-collapsed" : ""}`}>
+          {leftPanelCollapsed ? (
+            <button className="ide-leftpanel__reopen" aria-label="Expand sidebar" onClick={() => setLeftPanelCollapsed(false)}>
+              ›
+            </button>
+          ) : (
+            <>
+              <div className="ide-leftpanel__header">
+                GLIMMER
+                <span className="ide-leftpanel__workspace">{repoContext?.repository ?? "Not connected"}</span>
+                <button
+                  className="ide-leftpanel__collapse"
+                  aria-label="Collapse sidebar"
+                  onClick={() => setLeftPanelCollapsed(true)}
+                >
+                  <IconChevron open={false} />
+                </button>
               </div>
-              {modelStatus?.contextSize && (
-                <div className="ide-model-row" style={{ color: "var(--text-muted)", fontSize: "var(--fs-xs)" }}>
-                  {modelStatus.contextSize.toLocaleString()} ctx
-                </div>
-              )}
-              <Link className="ide-section__link" to="/model">Model Settings</Link>
-            </Section>
-          </div>
+              <div className="ide-leftpanel__body">
+                <Section title="Sessions" collapsed={collapsedSections.has("sessions")} onToggle={() => toggleSection("sessions")}>
+                  {visibleSessions.length === 0 && <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>Unavailable</div>}
+                  {sidebarGroups.map((group) => (
+                    <div key={group.label}>
+                      <div className="ide-session-daygroup">{group.label}</div>
+                      {group.sessions.map((s) => (
+                        <button
+                          key={s.id}
+                          className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
+                          onClick={() => openSession(s.id)}
+                        >
+                          <span
+                            className={`ide-status-dot${isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
+                            style={{ color: statusColor(s.status) }}
+                          />
+                          <span className="ide-session-row__main">
+                            <span className="ide-session-row__task">{s.task}</span>
+                            <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                  {sessions.length > visibleSessions.length && (
+                    <Link className="ide-section__link" to="/sessions">View all sessions →</Link>
+                  )}
+                </Section>
 
-          <div className="ide-leftpanel__repo">
-            {repoContext ? (
-              <dl>
-                <dt>Worktree</dt><dd className="mono">{repoContext.worktree}</dd>
-                <dt>Baseline</dt><dd className="mono">{repoContext.baseline}</dd>
-                <dt>Status</dt><dd>{repoContext.status}</dd>
-              </dl>
-            ) : (
-              <div>Not connected</div>
-            )}
-          </div>
+                <Section title="Model" collapsed={collapsedSections.has("model")} onToggle={() => toggleSection("model")}>
+                  <div className="ide-model-row">
+                    <span className="ide-status-dot" style={{ color: statusColor(modelStatus?.status ?? "UNKNOWN") }} />
+                    <span className="ide-model-row__name">Muse Glimmer</span>
+                    {modelStatus && <span className="mono" style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}>{modelStatus.status}</span>}
+                  </div>
+                  {modelStatus?.contextSize && (
+                    <div className="ide-model-row" style={{ color: "var(--text-muted)", fontSize: "var(--fs-xs)" }}>
+                      {modelStatus.contextSize.toLocaleString()} ctx
+                    </div>
+                  )}
+                  <Link className="ide-section__link" to="/model">Model Settings</Link>
+                </Section>
+              </div>
+
+              <div className="ide-leftpanel__repo">
+                {repoContext ? (
+                  <dl>
+                    <dt>Worktree</dt><dd className="mono">{repoContext.worktree}</dd>
+                    <dt>Baseline</dt><dd className="mono">{repoContext.baseline}</dd>
+                    <dt>Status</dt><dd>{repoContext.status}</dd>
+                  </dl>
+                ) : (
+                  <div>Not connected</div>
+                )}
+              </div>
+            </>
+          )}
         </aside>
 
         <div className="ide-editor">
@@ -530,8 +630,12 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
       <footer className="ide-statusbar">
         <div className="ide-statusbar__group">
-          <span className="mono">⎇ {repoContext?.worktree ?? "no branch"}</span>
-          {activeSession && <span>{activeSession.status}</span>}
+          <button className="statusbar-item mono" onClick={() => navigate("/repository")}>
+            ⎇ {repoContext?.worktree ?? "no branch"}
+          </button>
+          {activeSession && (
+            <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>{activeSession.status}</button>
+          )}
           {activeSession?.gates && (
             <span>
               gate: {activeSession.gates.architectureApproved === true ? "approved" : activeSession.gates.architectureApproved === false ? "rejected" : "not reviewed"}
@@ -540,11 +644,21 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
         </div>
         <div className="ide-statusbar__spacer" />
         <div className="ide-statusbar__group">
-          <span>model: {modelStatus?.status ?? "UNKNOWN"}</span>
-          <span>verification: {activeSession?.verification.overall ?? "—"}</span>
+          <button className="statusbar-item" onClick={() => navigate("/model")}>model: {modelStatus?.status ?? "UNKNOWN"}</button>
+          <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>
+            verification: {activeSession?.verification.overall ?? "—"}
+          </button>
           {activeSessionId && <span>{events.length} events</span>}
         </div>
       </footer>
+
+      {palette.open && (
+        <CommandPalette
+          commands={paletteCommands}
+          placeholder={palette.mode === "session" ? "Jump to a session…" : "Type a command…"}
+          onClose={() => setPalette((p) => ({ ...p, open: false }))}
+        />
+      )}
     </div>
   );
 }
