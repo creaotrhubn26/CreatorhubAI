@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import type { GlimmerEvent, GlimmerSession } from "@glimmer/shared";
@@ -11,6 +11,7 @@ import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
 import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
+import { completionTitle, newlyCompleted } from "../../state/completionNotify";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
@@ -31,7 +32,7 @@ const MAX_TABS = 6;
 // Session ids are `YYYYMMDD-HHMMSS-glimmer-<task-slug>` — long enough that
 // showing them in full would blow out a tab or breadcrumb. Keep the
 // timestamp (which sorts/identifies) and a short slug tail.
-function shortSessionId(id: string): string {
+export function shortSessionId(id: string): string {
   const marker = "-glimmer-";
   const idx = id.indexOf(marker);
   if (idx === -1) return id.length > 18 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
@@ -219,6 +220,68 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
   const visibleSessions = sessions.slice(0, 12);
   const sidebarGroups = useMemo(() => groupSessionsByDay(visibleSessions), [visibleSessions]);
+
+  // Completion notifications: title badge + optional system notification.
+  // prevStatusRef holds the last-seen status per session id so transitions
+  // can be detected across polls without re-deriving them from history.
+  // baseTitleRef captures the document's real title once, before this
+  // component ever rewrites it, so the "(N) " prefix always has a clean
+  // base to reapply onto.
+  const prevStatusRef = useRef<Record<string, string>>({});
+  const baseTitleRef = useRef<string>(document.title);
+  const [unseenIds, setUnseenIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const nextStatus: Record<string, string> = {};
+    for (const s of sessions) nextStatus[s.id] = s.status;
+    const completed = newlyCompleted(prevStatusRef.current, nextStatus);
+    prevStatusRef.current = nextStatus;
+    if (completed.length === 0) return;
+
+    // System notification fires for every transition to terminal,
+    // regardless of whether the tab is focused — permission is opt-in via
+    // Settings and never requested here.
+    if ("Notification" in window && Notification.permission === "granted") {
+      for (const id of completed) {
+        new Notification("Glimmer", { body: `${shortSessionId(id)} finished: ${nextStatus[id]}` });
+      }
+    }
+
+    // A completion only counts as "unseen" (title badge) when the user
+    // wasn't looking at that exact session at the moment it finished.
+    setUnseenIds((prev) => {
+      const next = new Set(prev);
+      for (const id of completed) {
+        if (id !== activeSessionId || document.hidden) next.add(id);
+      }
+      return next;
+    });
+  }, [sessions, activeSessionId]);
+
+  // Clear the unseen mark for whichever session the user is now viewing —
+  // both on navigating to it and on refocusing a tab already parked on it.
+  useEffect(() => {
+    function clearActiveUnseen() {
+      if (!activeSessionId) return;
+      setUnseenIds((prev) => {
+        if (!prev.has(activeSessionId)) return prev;
+        const next = new Set(prev);
+        next.delete(activeSessionId);
+        return next;
+      });
+    }
+    clearActiveUnseen();
+    window.addEventListener("focus", clearActiveUnseen);
+    document.addEventListener("visibilitychange", clearActiveUnseen);
+    return () => {
+      window.removeEventListener("focus", clearActiveUnseen);
+      document.removeEventListener("visibilitychange", clearActiveUnseen);
+    };
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    document.title = completionTitle(baseTitleRef.current, unseenIds.size);
+  }, [unseenIds]);
 
   return (
     <div className="ide">
