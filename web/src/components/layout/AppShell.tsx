@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import type { GlimmerEvent, GlimmerSession } from "@glimmer/shared";
@@ -11,6 +11,8 @@ import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
 import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
+import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
+import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
   IconNewTask, IconRepository, IconSearch, IconSessions, IconSettings, IconVerification,
@@ -30,13 +32,20 @@ const MAX_TABS = 6;
 // Session ids are `YYYYMMDD-HHMMSS-glimmer-<task-slug>` — long enough that
 // showing them in full would blow out a tab or breadcrumb. Keep the
 // timestamp (which sorts/identifies) and a short slug tail.
-function shortSessionId(id: string): string {
+export function shortSessionId(id: string): string {
   const marker = "-glimmer-";
   const idx = id.indexOf(marker);
   if (idx === -1) return id.length > 18 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
   const stamp = id.slice(0, idx);
   const slug = id.slice(idx + marker.length);
   return `${stamp}…${slug.length > 12 ? slug.slice(-12) : slug}`;
+}
+
+// A running/active session pulses its status dot and gets the elapsed +
+// last-activity line in ActiveSessionScreen. Reuses AgentStateStepper's own
+// in-flight-states list so "is this running" is defined in exactly one place.
+function isRunningStatus(status: GlimmerSession["status"]): boolean {
+  return RUNNING_STATES.includes(status);
 }
 
 type ActivityKey = "dashboard" | "sessions" | "new-task" | "verification" | "repository" | "model" | "settings";
@@ -114,6 +123,26 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     refetchInterval: 4000,
   });
   const events = useSessionEvents(activeSessionId ?? "");
+  // lastEventAt must be the max of the events' own `timestamp` field, not
+  // Date.now() at receipt: the SSE route replays the whole events.jsonl
+  // backlog from lastCount=0 on every reconnect (server/src/routes/
+  // sessions.ts), and EventSource auto-reconnects on blips/sleep/route
+  // return — receipt-time would show "just now" for a genuinely stalled
+  // session. Deterministic and replay-immune; null when there are no events.
+  // Events are append-ordered (replay preserves that order), so the last
+  // parseable timestamp is the max — scan from the end and stop at the
+  // first one, rather than scanning the whole array.
+  const sessionEventsValue = useMemo(() => {
+    let lastEventAt: number | null = null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const t = new Date(events[i].timestamp).getTime();
+      if (!Number.isNaN(t)) {
+        lastEventAt = t;
+        break;
+      }
+    }
+    return { events, lastEventAt };
+  }, [events]);
 
   // §5 open-session tabs: which sessions the user has looked at this app
   // session, capped and persisted — real navigation state, not a fabricated
@@ -197,6 +226,75 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
   const visibleSessions = sessions.slice(0, 12);
   const sidebarGroups = useMemo(() => groupSessionsByDay(visibleSessions), [visibleSessions]);
+
+  // Completion notifications: title badge + optional system notification.
+  // prevStatusRef holds the last-seen status per session id so transitions
+  // can be detected across polls without re-deriving them from history.
+  // baseTitleRef captures the document's real title once, before this
+  // component ever rewrites it, so the "(N) " prefix always has a clean
+  // base to reapply onto.
+  const prevStatusRef = useRef<Record<string, string>>({});
+  const baseTitleRef = useRef<string>(document.title);
+  const [unseenIds, setUnseenIds] = useState<Set<string>>(new Set());
+
+  // Restore the real page title on unmount — this component may have left
+  // it rewritten with a "(N) " unseen-completion badge.
+  useEffect(() => {
+    return () => {
+      document.title = baseTitleRef.current;
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextStatus: Record<string, string> = {};
+    for (const s of sessions) nextStatus[s.id] = s.status;
+    const completed = newlyCompleted(prevStatusRef.current, nextStatus);
+    prevStatusRef.current = nextStatus;
+    if (completed.length === 0) return;
+
+    // One gate — isUnseenCompletion — drives both the title badge and the
+    // system notification, so a session finishing while its own tab is
+    // open and the window is focused triggers neither.
+    const unseen = completed.filter((id) => isUnseenCompletion(id, activeSessionId, document.hidden));
+    if (unseen.length === 0) return;
+
+    if ("Notification" in window && Notification.permission === "granted") {
+      for (const id of unseen) {
+        new Notification("Glimmer", { body: `${shortSessionId(id)} finished: ${nextStatus[id]}` });
+      }
+    }
+
+    setUnseenIds((prev) => {
+      const next = new Set(prev);
+      for (const id of unseen) next.add(id);
+      return next;
+    });
+  }, [sessions, activeSessionId]);
+
+  // Clear the unseen mark for whichever session the user is now viewing —
+  // both on navigating to it and on refocusing a tab already parked on it.
+  useEffect(() => {
+    function clearActiveUnseen() {
+      if (!activeSessionId) return;
+      setUnseenIds((prev) => {
+        if (!prev.has(activeSessionId)) return prev;
+        const next = new Set(prev);
+        next.delete(activeSessionId);
+        return next;
+      });
+    }
+    clearActiveUnseen();
+    window.addEventListener("focus", clearActiveUnseen);
+    document.addEventListener("visibilitychange", clearActiveUnseen);
+    return () => {
+      window.removeEventListener("focus", clearActiveUnseen);
+      document.removeEventListener("visibilitychange", clearActiveUnseen);
+    };
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    document.title = completionTitle(baseTitleRef.current, unseenIds.size);
+  }, [unseenIds]);
 
   return (
     <div className="ide">
@@ -285,7 +383,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                       className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
                       onClick={() => openSession(s.id)}
                     >
-                      <span className="ide-status-dot" style={{ color: statusColor(s.status) }} />
+                      <span
+                        className={`ide-status-dot${isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
+                        style={{ color: statusColor(s.status) }}
+                      />
                       <span className="ide-session-row__main">
                         <span className="ide-session-row__task">{s.task}</span>
                         <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
@@ -335,7 +436,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
               return (
                 <div key={id} className={`ide-tab${isActive ? " is-active" : ""}`}>
                   <button className="ide-tab__select" onClick={() => navigate(`/sessions/${id}`)}>
-                    <span className="ide-status-dot" style={{ color: statusColor(s?.status ?? "created") }} />
+                    <span
+                      className={`ide-status-dot${s && isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
+                      style={{ color: statusColor(s?.status ?? "created") }}
+                    />
                     <span className="mono">{shortSessionId(id)}</span>
                   </button>
                   <button className="ide-tab__close" aria-label={`Close ${shortSessionId(id)}`} onClick={() => closeTab(id)}>
@@ -361,7 +465,7 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           )}
 
           <div className="ide-content">
-            <SessionEventsContext.Provider value={events}>{children}</SessionEventsContext.Provider>
+            <SessionEventsContext.Provider value={sessionEventsValue}>{children}</SessionEventsContext.Provider>
           </div>
 
           <div className="ide-bottompanel">

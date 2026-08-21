@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, within, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, within, waitFor, fireEvent, act } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AppShell } from "./AppShell";
@@ -11,6 +11,7 @@ class FakeEventSource {
   onmessage: ((ev: MessageEvent) => void) | null = null;
   constructor(public url: string) { FakeEventSource.instances.push(this); }
   close() {}
+  emit(data: unknown) { this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent); }
 }
 
 function withProviders(ui: React.ReactElement, initialEntries = ["/"]) {
@@ -83,6 +84,27 @@ describe("AppShell", () => {
     await waitFor(() => expect(screen.getAllByText("Fix dialog parser")).toHaveLength(1));
   });
 
+  it("pulses the status dot for a running session's sidebar row and tab, not for a terminal one", async () => {
+    vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([
+      { id: "20260821-221803-glimmer-running", task: "Running task", status: "implementing", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2 },
+      { id: "20260821-221804-glimmer-done", task: "Done task", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2 },
+    ] as any);
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppShell repoContext={null}>content</AppShell>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    const runningRow = (await screen.findByText("Running task")).closest(".ide-session-row");
+    const doneRow = (await screen.findByText("Done task")).closest(".ide-session-row");
+    expect(runningRow?.querySelector(".ide-status-dot")).toHaveClass("ide-status-dot--pulse");
+    expect(doneRow?.querySelector(".ide-status-dot")).not.toHaveClass("ide-status-dot--pulse");
+  });
+
   describe("session event stream", () => {
     const realEventSource = globalThis.EventSource;
     afterEach(() => {
@@ -112,6 +134,80 @@ describe("AppShell", () => {
       await waitFor(() => expect(screen.getByText(/Fix dialog parser/)).toBeInTheDocument());
       expect(FakeEventSource.instances).toHaveLength(1);
       expect(FakeEventSource.instances[0].url).toContain("/api/sessions/s1/events");
+    });
+
+    it("propagates an SSE event's own timestamp through the shared context so the liveness line renders", async () => {
+      (globalThis as any).EventSource = FakeEventSource;
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2,
+      } as any);
+
+      render(
+        withProviders(
+          <AppShell repoContext={null}>
+            <Routes>
+              <Route path="/sessions/:id" element={<ActiveSessionScreen />} />
+            </Routes>
+          </AppShell>,
+          ["/sessions/s1"]
+        )
+      );
+
+      await waitFor(() => expect(screen.getByText(/Fix dialog parser/)).toBeInTheDocument());
+      const es = FakeEventSource.instances[0];
+      act(() => {
+        es.emit({ id: "e1", sessionId: "s1", timestamp: new Date().toISOString(), type: "tool_started", tool: "read_file", args: {} });
+      });
+
+      await waitFor(() => expect(screen.getByText(/last activity/i)).toBeInTheDocument());
+    });
+  });
+
+  describe("completion notification gating", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("does not fire a system Notification for the session currently being viewed (shares the title-badge's unseen gate)", async () => {
+      const realNotification = (globalThis as any).Notification;
+      const ctorSpy = vi.fn();
+      (globalThis as any).Notification = Object.assign(ctorSpy, { permission: "granted" });
+
+      const runningSession = {
+        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2,
+      };
+      const doneSession = { ...runningSession, status: "verified", verification: { overall: "VERIFIED", checks: [] } };
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const listSpy = vi.spyOn(client.glimmerApi, "listSessions")
+        .mockResolvedValueOnce([runningSession] as any)
+        .mockResolvedValue([doneSession] as any);
+      vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(runningSession as any);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <AppShell repoContext={null}>session content</AppShell>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      // First poll sees it running; advancing to the next 5000ms poll (the
+      // sessions query's refetchInterval) sees it terminal — s1 is both the
+      // completing session and the one currently routed to.
+      await vi.waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      await vi.waitFor(() => expect(listSpy).toHaveBeenCalledTimes(2));
+
+      expect(ctorSpy).not.toHaveBeenCalled();
+
+      if (realNotification === undefined) delete (globalThis as any).Notification;
+      else (globalThis as any).Notification = realNotification;
     });
   });
 });

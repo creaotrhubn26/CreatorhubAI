@@ -3,8 +3,10 @@ import { StatusBadge } from "../common/StatusBadge";
 
 // The in-flight flow only. Terminal states (verified/failed/blocked/
 // needs_review/cancelled) are not steps — they replace the stepper, so a
-// finished session never renders as if it were mid-flow.
-const STATES: GlimmerSessionStatus[] = [
+// finished session never renders as if it were mid-flow. Exported as the
+// single source of truth for "is this session running/active" (liveness
+// line, pulsing status dot) so that check can't drift from the stepper.
+export const STATES: GlimmerSessionStatus[] = [
   "created", "preflight", "understanding", "discovery", "candidate_selection",
   "implementing", "verifying", "repairing", "waiting_for_approval",
 ];
