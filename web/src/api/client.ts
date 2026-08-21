@@ -27,6 +27,53 @@ export const glimmerApi = {
   getSessionTasks: (id: string) => request<GlimmerTask[]>(`/api/sessions/${id}/tasks`),
   askSession: (id: string, question: string) =>
     request<SessionAssistantAnswer>(`/api/sessions/${id}/ask`, { method: "POST", body: JSON.stringify({ question }) }),
+  // Streaming variant: no EventSource (a POST body is required), so this
+  // reads the SSE body by hand via fetch + a stream reader, parsing `data: `
+  // lines and buffering a trailing partial line across chunk boundaries.
+  // Resolves with the full concatenated answer once the server's `done`
+  // frame arrives; throws on connection failure or the server's error frame
+  // so the caller can fall back to the non-streaming askSession.
+  askSessionStream: async (id: string, question: string, onDelta: (delta: string) => void): Promise<string> => {
+    const res = await fetch(`${API_BASE}/api/sessions/${id}/ask?stream=1`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok || !res.body) throw new Error(`POST /api/sessions/${id}/ask?stream=1 failed: ${res.status}`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let full = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? ""; // last entry may be a partial line split across chunks
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (!data) continue;
+        let parsed: any;
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          continue; // malformed/torn SSE chunk — skip rather than crash the stream
+        }
+        if (typeof parsed.delta === "string") {
+          full += parsed.delta;
+          onDelta(parsed.delta);
+        } else if (parsed.done) {
+          if (typeof parsed.answer === "string") full = parsed.answer;
+        } else if (parsed.error) {
+          throw new Error(parsed.error);
+        }
+      }
+    }
+    return full;
+  },
   getRepositoryMap: () => request<RepoMap>("/api/repository/map"),
   listWorkspaces: () => request<WorkspaceInfo[]>("/api/workspaces"),
   // §27/§4.1 — creates a fresh git worktree+branch off the source repo.

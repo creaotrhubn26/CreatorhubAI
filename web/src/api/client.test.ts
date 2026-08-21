@@ -108,4 +108,51 @@ describe("glimmerApi", () => {
     expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({ question: "Why was this file chosen?" });
     expect(result.answer).toBe("It owns the parser state.");
   });
+
+  function sseResponse(frames: string[]): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  }
+
+  it("askSessionStream POSTs to the ?stream=1 endpoint, reports each delta, and resolves with the full answer", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      sseResponse([
+        `data: ${JSON.stringify({ delta: "It owns " })}\n\n`,
+        `data: ${JSON.stringify({ delta: "the parser state." })}\n\n`,
+        `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}\n\n`,
+      ])
+    );
+    const deltas: string[] = [];
+    const answer = await glimmerApi.askSessionStream("s1", "Why?", (delta) => deltas.push(delta));
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/ask?stream=1`, expect.objectContaining({ method: "POST" }));
+    expect(deltas).toEqual(["It owns ", "the parser state."]);
+    expect(answer).toBe("It owns the parser state.");
+  });
+
+  it("askSessionStream buffers a frame split across chunk boundaries instead of dropping it", async () => {
+    const wholeFrame = `data: ${JSON.stringify({ delta: "It owns the parser state." })}\n\n`;
+    const splitPoint = Math.floor(wholeFrame.length / 2);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      sseResponse([wholeFrame.slice(0, splitPoint), wholeFrame.slice(splitPoint)])
+    );
+    const deltas: string[] = [];
+    await glimmerApi.askSessionStream("s1", "Why?", (delta) => deltas.push(delta));
+    expect(deltas).toEqual(["It owns the parser state."]);
+  });
+
+  it("askSessionStream rejects when the server sends an error frame", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(sseResponse([`data: ${JSON.stringify({ error: "unavailable" })}\n\n`]));
+    await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toThrow("unavailable");
+  });
+
+  it("askSessionStream rejects on a non-2xx response instead of hanging", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 502 }));
+    await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toThrow();
+  });
 });

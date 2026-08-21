@@ -1,8 +1,8 @@
-import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
+import { loadTurns, saveTurns, type Turn } from "../../state/assistantHistory";
 
 const SUGGESTIONS = [
   "Why was this file chosen?",
@@ -11,14 +11,7 @@ const SUGGESTIONS = [
   "What risks remain?",
 ];
 
-interface Turn {
-  id: number;
-  question: string;
-  askedAt: string;
-  answer?: string;
-  error?: string;
-  answeredAt?: string;
-}
+const UNAVAILABLE_MESSAGE = "Unavailable — the assistant could not answer that.";
 
 function timeLabel(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -26,24 +19,58 @@ function timeLabel(iso: string): string {
 
 export function SessionAssistant({ sessionId, session }: { sessionId: string; session?: GlimmerSession }) {
   const [question, setQuestion] = useState("");
-  const [turns, setTurns] = useState<Turn[]>([]);
-  const askMutation = useMutation({
-    mutationFn: (q: string) => glimmerApi.askSession(sessionId, q),
-  });
+  const [turns, setTurns] = useState<Turn[]>(() => loadTurns(sessionId));
+  const [pending, setPending] = useState(false);
 
-  function ask(q: string) {
-    if (!q || askMutation.isPending) return;
+  // The panel can be reused across sessions without unmounting, so history
+  // is (re)loaded whenever the session id changes, not just on first mount.
+  useEffect(() => {
+    setTurns(loadTurns(sessionId));
+  }, [sessionId]);
+
+  // Persist on every turn change, including pending/errored turns — never
+  // just the successful ones, so a reload mid-question doesn't silently drop
+  // or fabricate what actually happened.
+  useEffect(() => {
+    saveTurns(sessionId, turns);
+  }, [sessionId, turns]);
+
+  function patchTurn(id: number, patch: Partial<Turn>) {
+    setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  }
+
+  async function ask(q: string) {
+    if (!q || pending) return;
     const id = Date.now();
     setTurns((prev) => [...prev, { id, question: q, askedAt: new Date().toISOString() }]);
     setQuestion("");
-    askMutation.mutate(q, {
-      onSuccess: (data) => {
-        setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() } : t)));
-      },
-      onError: () => {
-        setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, error: "Unavailable — the assistant could not answer that." } : t)));
-      },
-    });
+    setPending(true);
+    let streamedAnyDelta = false;
+    try {
+      const answer = await glimmerApi.askSessionStream(sessionId, q, (delta) => {
+        streamedAnyDelta = true;
+        setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t)));
+      });
+      patchTurn(id, { answer, answeredAt: new Date().toISOString() });
+    } catch {
+      if (streamedAnyDelta) {
+        // Mid-stream failure (server already sent partial output, then an
+        // error frame): show the same Unavailable copy as any other failure,
+        // not a half-finished answer.
+        patchTurn(id, { answer: undefined, error: UNAVAILABLE_MESSAGE });
+      } else {
+        // Streaming never got off the ground (connection-time failure) —
+        // fall back once to the non-streaming endpoint before giving up.
+        try {
+          const data = await glimmerApi.askSession(sessionId, q);
+          patchTurn(id, { answer: data.answer, answeredAt: new Date().toISOString() });
+        } catch {
+          patchTurn(id, { error: UNAVAILABLE_MESSAGE });
+        }
+      }
+    } finally {
+      setPending(false);
+    }
   }
 
   const hasChanges = !!session?.changedFiles.length;
@@ -65,7 +92,7 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
       <div className="chat-suggestions">
         <div className="chat-suggestions__label">Try these</div>
         {SUGGESTIONS.map((s) => (
-          <button key={s} className="chat-suggestion" onClick={() => ask(s)} disabled={askMutation.isPending}>
+          <button key={s} className="chat-suggestion" onClick={() => ask(s)} disabled={pending}>
             {s}
           </button>
         ))}
@@ -116,8 +143,8 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
           onChange={(e) => setQuestion(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") ask(question); }}
         />
-        <button onClick={() => ask(question)} disabled={!question || askMutation.isPending} aria-label="Ask">
-          {askMutation.isPending ? "Asking…" : "Ask"}
+        <button onClick={() => ask(question)} disabled={!question || pending} aria-label="Ask">
+          {pending ? "Asking…" : "Ask"}
         </button>
       </div>
     </div>

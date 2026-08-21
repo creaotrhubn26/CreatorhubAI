@@ -13,7 +13,7 @@ import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
-import { askSessionAssistant } from "../lib/sessionAssistant.js";
+import { askSessionAssistant, streamSessionAssistant } from "../lib/sessionAssistant.js";
 import { isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
@@ -125,6 +125,28 @@ sessionsRouter.post("/sessions/:id/ask", async (req, res) => {
     // the model's fault. Must not be reported as a 502 (upstream unreachable).
     return res.status(500).json({ error: err.message });
   }
+  if (req.query.stream === "1") {
+    // Reuses the SSE header pattern from GET /sessions/:id/events above.
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    try {
+      const answer = await streamSessionAssistant(CONFIG.modelBaseUrl, session, events, question, (delta) => {
+        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+      });
+      res.write(`data: ${JSON.stringify({ done: true, answer })}\n\n`);
+    } catch {
+      // Covers both connection-time failure and a mid-stream upstream error —
+      // headers are already sent, so this must be a data frame, not a status
+      // code. The client shows the same "Unavailable" copy as the 502 path.
+      res.write(`data: ${JSON.stringify({ error: "unavailable" })}\n\n`);
+    }
+    res.end();
+    return;
+  }
+
   try {
     const answer = await askSessionAssistant(CONFIG.modelBaseUrl, session, events, question);
     res.json(answer);

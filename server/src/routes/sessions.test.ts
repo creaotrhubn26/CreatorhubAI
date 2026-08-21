@@ -3,6 +3,7 @@ import request from "supertest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Express } from "express";
 
@@ -632,5 +633,99 @@ describe("POST /api/sessions/:id/ask", () => {
 
     const res = await request(app).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
     expect(res.status).toBe(500);
+  });
+});
+
+describe("POST /api/sessions/:id/ask?stream=1", () => {
+  async function makeSession(id: string): Promise<void> {
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
+    }));
+  }
+
+  // Isolate CONFIG.modelBaseUrl per test the same way the 502 test above
+  // does: it's a module-level const read at import time, so the fake
+  // upstream's URL must be set before `app.js` is (re-)imported.
+  async function appWithUpstream(handler: http.RequestListener): Promise<{ app: Express; server: http.Server }> {
+    const server = http.createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    process.env.GLIMMER_MODEL_URL = `http://127.0.0.1:${port}`;
+    vi.resetModules();
+    const { createApp } = await import("../app.js");
+    return { app: createApp(), server };
+  }
+
+  it("streams chunked delta frames followed by a final done frame with the full answer", async () => {
+    const id = "20260822-000001-glimmer-ask-stream-ok";
+    await makeSession(id);
+    const { app: streamApp, server } = await appWithUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "It owns " } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "the parser state." } }] })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    try {
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).send({ question: "why?" });
+      expect(res.status).toBe(200);
+      expect(res.headers["content-type"]).toContain("text/event-stream");
+      const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
+      expect(frames).toEqual([
+        { delta: "It owns " },
+        { delta: "the parser state." },
+        { done: true, answer: "It owns the parser state." },
+      ]);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("emits an error frame, byte-identical to the non-streaming Unavailable path's cause, when the upstream fails mid-stream", async () => {
+    const id = "20260822-000002-glimmer-ask-stream-midfail";
+    await makeSession(id);
+    const { app: streamApp, server } = await appWithUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "Partial" } }] })}\n\n`);
+      // Give the chunk a tick to actually flush to the client before the
+      // connection dies mid-stream, so this genuinely exercises "some deltas
+      // already arrived, then upstream failed" rather than a connection-time
+      // failure.
+      setTimeout(() => res.destroy(), 20);
+    });
+    try {
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).send({ question: "why?" });
+      expect(res.status).toBe(200);
+      const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
+      expect(frames[0]).toEqual({ delta: "Partial" });
+      expect(frames[frames.length - 1]).toEqual({ error: "unavailable" });
+    } finally {
+      server.close();
+    }
+  });
+
+  it("returns 400 without a question, same as the non-streaming path, before ever writing SSE headers", async () => {
+    const res = await request(app).post("/api/sessions/some-id/ask?stream=1").send({});
+    expect(res.status).toBe(400);
+  });
+
+  it("leaves the non-streaming response shape byte-compatible when ?stream=1 is absent", async () => {
+    const id = "20260822-000003-glimmer-ask-nonstream-unchanged";
+    await makeSession(id);
+    const { app: streamApp, server } = await appWithUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "It owns the parser state." } }] }));
+    });
+    try {
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
+      expect(res.status).toBe(200);
+      expect(res.headers["content-type"]).toContain("application/json");
+      expect(res.body).toEqual({ answer: "It owns the parser state.", provenance: "model-output" });
+    } finally {
+      server.close();
+    }
   });
 });
