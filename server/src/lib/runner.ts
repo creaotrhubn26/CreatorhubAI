@@ -92,9 +92,18 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
     args.push("--architect-first");
   }
 
-  // Deliberately closed set: no --auto-approve, no flag path can request commit/push/deploy/install.
+  // --auto-approve is required for gateway-launched runs: glimmer-engineer.py's
+  // approve() is an interactive per-tool stdin prompt, and the gateway has no
+  // stdin channel — without this flag every run deadlocks on its first write
+  // (found live in the first real UI-driven dogfood run; the engineer blocked
+  // forever in readline()). Human approval in the gateway flow happens at the
+  // boundaries instead: frozen commit/push/deploy/install permissions, the
+  // scope guard, and the explicit human accept-for-review step in Diff Review.
+  args.push("--auto-approve");
+
+  // Deliberately closed set otherwise: no flag path can request commit/push/deploy/install.
   // "--" forces argparse to treat the objective as the positional `task`, never as a flag,
-  // even if a client submits an objective like "--auto-approve" or "--engineer=...".
+  // even if a client submits an objective like "--engineer=...".
   args.push("--", contract.objective);
   return args;
 }

@@ -39,15 +39,22 @@ describe("buildArgs", () => {
     expect(args[args.length - 1]).toBe(CONTRACT.objective);
   });
 
+  it("always passes --auto-approve before the terminator (gateway has no stdin for approve())", () => {
+    const args = buildArgs(CONTRACT, "/tmp/ws");
+    const sepIndex = args.indexOf("--");
+    expect(args.slice(0, sepIndex)).toContain("--auto-approve");
+    expect(args.slice(0, sepIndex).filter((a) => a === "--auto-approve")).toHaveLength(1);
+  });
+
   it("cannot be flag-injected via a malicious objective", () => {
-    const malicious = { ...CONTRACT, objective: "--auto-approve" };
+    const malicious = { ...CONTRACT, objective: "--engineer=/tmp/evil.py" };
     const args = buildArgs(malicious, "/tmp/ws");
     const sepIndex = args.indexOf("--");
     expect(sepIndex).toBeGreaterThanOrEqual(0);
-    // "--auto-approve" must appear exactly once, as the element right after "--".
-    expect(args[sepIndex + 1]).toBe("--auto-approve");
-    expect(args.filter((a) => a === "--auto-approve")).toHaveLength(1);
-    expect(args.slice(0, sepIndex)).not.toContain("--auto-approve");
+    // The malicious objective lands only as the positional element after "--",
+    // never as a parsed flag before it.
+    expect(args[sepIndex + 1]).toBe("--engineer=/tmp/evil.py");
+    expect(args.slice(0, sepIndex)).not.toContain("--engineer=/tmp/evil.py");
   });
 
   it("maps symbolic verification names to the real allowlisted commands", () => {
