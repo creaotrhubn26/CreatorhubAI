@@ -1985,6 +1985,150 @@ def evaluate_verification_tasks(tasks, results: list) -> None:
         # check never really produced a pass/fail verdict.
 
 
+# ============================================================
+# O2 phase 1 (glimmer-v7 reconciliation): deterministic
+# documentation-impact detector.
+# ============================================================
+# Scope is deliberately tiny (reconciliation doc, O2 entry): "deterministic
+# change-impact detector (routes/schema/API/config/auth touched?) creating a
+# REQUIRED doc task + gates.documentationCurrent. Graph, ADR store, drift
+# detection and semantic doc verification: defer entirely." No repo-map
+# lookup, no model call -- path/filename pattern matching only.
+
+# Category -> standalone words checked with boundary-safe matching (see
+# detect_documentation_impact). "routes"/"router" both catch the plain-
+# word and plural-directory forms ("routes/user.ts", "router.ts",
+# "user.routes.ts") without a separate glob branch. "authentication" is
+# listed explicitly (not derived from "auth") because it's a real distinct
+# word, separator-bounded on its own in filenames like
+# "authentication.ts" -- no camel-boundary logic needed for it.
+_DOC_IMPACT_WORDS = {
+    "routes": ("routes", "router"),
+    "schema": ("schema", "schemas", "migration", "migrations", "prisma"),
+    "api": ("api", "openapi", "swagger"),
+    "config": ("config",),
+    "auth": ("auth", "authentication", "session", "sessions", "permission",
+              "permissions", "token", "tokens"),
+}
+
+# Review round 1: idiomatic TS/JS identifiers -- AuthService.ts,
+# authMiddleware.ts, SessionManager.ts -- are a real practical miss under
+# plain non-alnum-only boundaries, since camelCase/PascalCase segments
+# aren't separated by any non-alnum character at all. Scoped to
+# auth/session/token only (not routes/schema/api/config): routes in
+# particular has an explicit existing self-check requiring "userRouter.ts"
+# to keep NOT matching "router", so the stricter non-alnum-only boundary
+# stays the default everywhere except here.
+_CAMEL_AWARE_CATEGORIES = {"auth"}
+
+
+def _word_hits(word: str, path: str, camel_aware: bool) -> bool:
+    """Case-insensitive search for `word` in `path` (original case, NOT
+    lowercased -- camel-awareness needs the real casing) with a boundary
+    on both sides. Boundary = start/end of string or a non-alnum
+    separator. When camel_aware, ALSO accepts a camelCase/PascalCase
+    segment edge: the character immediately after the match is uppercase
+    (e.g. "auth" in "authMiddleware"), or the character immediately
+    before the match is lowercase while the match itself starts uppercase
+    (e.g. "Auth" in a hypothetical "userAuthService" -- a lower-to-upper
+    transition marks a new segment; "AuthService" itself is already
+    covered by start-of-string). This still rejects "author"/
+    "possession": both are a plain lowercase continuation with no
+    separator and no case transition, so neither boundary rule fires."""
+    for m in re.finditer(re.escape(word), path, re.IGNORECASE):
+        start, end = m.start(), m.end()
+        before_ok = start == 0 or not path[start - 1].isalnum()
+        after_ok = end == len(path) or not path[end].isalnum()
+        if camel_aware:
+            if not before_ok and path[start - 1].islower() and path[start].isupper():
+                before_ok = True
+            if not after_ok and path[end].isupper():
+                after_ok = True
+        if before_ok and after_ok:
+            return True
+    return False
+
+
+def detect_documentation_impact(changed_files) -> list:
+    """O2 phase 1: pure, deterministic classifier -- no model, no repo-map.
+    Classifies each changed path into zero or more of
+    {routes, schema, api, config, auth} by filename/path pattern only, and
+    returns the SORTED list of categories hit across all changed files
+    (empty list == no documentation impact).
+
+    Boundary-sane by construction (see _word_hits): a compound identifier
+    does NOT false-positive just because it contains a keyword as a
+    substring -- e.g. "author.ts" does NOT match "auth" (no separator and
+    no case transition between "auth" and the following "or"), and
+    "userRouter.ts" does NOT match "router" (routes/schema/api/config use
+    the stricter non-alnum-only boundary). Path/extension separators
+    ("/", ".", "-", "_") all count as boundaries, so "routes/user.ts",
+    "user_auth.py" and "webpack.config.js" DO match. The auth/session/
+    token words additionally accept a camelCase/PascalCase segment edge,
+    so "AuthService.ts", "authMiddleware.ts" and "SessionManager.ts" DO
+    match while "Authors.tsx"/"possession.ts" still do NOT (plain
+    lowercase continuation, no case transition). Case-insensitive
+    throughout.
+
+    Never raises: any non-string entry is coerced with str(); an empty/
+    None input returns [] immediately.
+    """
+    impacts = set()
+    for raw in (changed_files or []):
+        path = str(raw).replace("\\", "/")
+        lower = path.lower()
+        segments = [s for s in lower.split("/") if s]
+        basename = segments[-1] if segments else lower
+
+        for category, words in _DOC_IMPACT_WORDS.items():
+            camel_aware = category in _CAMEL_AWARE_CATEGORIES
+            for word in words:
+                if _word_hits(word, path, camel_aware):
+                    impacts.add(category)
+                    break
+
+        # Explicit filename/segment checks the word list can't express
+        # as a clean standalone word.
+        if basename.endswith(".sql"):
+            impacts.add("schema")
+        if basename == "dockerfile" or basename.startswith("docker-compose"):
+            impacts.add("config")
+        if basename == ".env.example":
+            impacts.add("config")
+        if ".github" in segments and "workflows" in segments:
+            impacts.add("config")
+
+    return sorted(impacts)
+
+
+def documentation_task(next_id: int, impacts: list) -> dict:
+    """O2: the REQUIRED documentation task appended to tasks.json when
+    C3's task graph is active and detect_documentation_impact found
+    something. kind="documentation" is an honest new addition to C3's
+    kind vocabulary (alongside "implementation"/"verification" -- see
+    @glimmer/shared's GlimmerTask.kind, extended to match) precisely
+    because NOTHING in this codebase can verify documentation currency
+    yet (phase 1 is detection only): the task is created `pending` and
+    stays `pending` forever -- none of C3's writers
+    (set_implementation_tasks_status / evaluate_implementation_tasks /
+    evaluate_verification_tasks / reset_verification_tasks_status) match
+    on kind=="documentation", so it is never auto-completed. Only a human
+    closing it out of band reflects reality. dependsOn is deliberately []:
+    it doesn't block or get blocked by implementation/verification tasks,
+    it just needs to exist and stay visible."""
+    return {
+        "id": f"t{next_id}",
+        "description": (
+            "Update documentation for this change (impacted areas: "
+            + ", ".join(impacts) + "). Docs currency cannot be verified "
+            "automatically yet -- a human must close this task."
+        ),
+        "kind": "documentation",
+        "dependsOn": [],
+        "status": "pending",
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
     ap.add_argument("task", nargs="+")
@@ -2160,6 +2304,12 @@ def main():
 
     success, failure, checkpoint_sha = False, None, None
     final_label = "NOT VERIFIED"
+    # O2: initialized here (before the try), not just at its usual C3 spot
+    # inside the try below -- the finally block now reads `tasks` on EVERY
+    # exit path, including a V2Error raised before that inner assignment
+    # ever runs (e.g. readiness_probe failing below), which would otherwise
+    # be a NameError in finally.
+    tasks = None
     try:
         if not args.skip_model_readiness:
             manifest["modelReadiness"] = readiness_probe(args.model_readiness_url, args.readiness_timeout)
@@ -2186,10 +2336,10 @@ def main():
         # so plan_candidate_count below is 0 and the prompt/env are
         # unaffected in every degraded case.
         candidate_evidence = []
-        # C3: tasks stays None (no tasks.json ever written) in every
-        # degraded case, same uniform-None-on-no-plan contract as
+        # C3: tasks (initialized above the try, before O2 needed it in
+        # `finally` too -- see that comment) stays None in every degraded
+        # case, same uniform-None-on-no-plan contract as
         # architecture_plan/candidate_evidence just above.
-        tasks = None
         if args.architect_first:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
@@ -2505,6 +2655,32 @@ def main():
         manifest["finalChangedFiles"] = changed_files(ws, baseline)
         manifest["checkpointsCollapsed"] = head(ws) == baseline
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
+
+        # O2 phase 1: deterministic doc-impact detection runs once here,
+        # against the session's FINAL changed-files set (this is the point
+        # after which changed_files can no longer change -- collapse() just
+        # ran and no further engineer/repair round follows). Same
+        # merge-not-clobber discipline as every other gates writer (C2 sets
+        # gates["architectureApproved"] earlier in this same run) -- read
+        # whatever's already there (possibly nothing at all, on a run
+        # without --architect-first) and add this key onto it. Honest gate
+        # semantics: False when impact is detected (phase 1 has no way to
+        # verify docs ARE current, so it can never claim True), None when
+        # the change touched nothing doc-relevant (zero behavior change).
+        doc_impacts = detect_documentation_impact(manifest["finalChangedFiles"])
+        gates = dict(manifest.get("gates") or {})
+        gates["documentationCurrent"] = False if doc_impacts else None
+        manifest["gates"] = gates
+        if doc_impacts:
+            manifest["documentationImpact"] = doc_impacts
+            # C3's machinery: only append when a task graph actually exists
+            # for this session (--architect-first produced a usable plan).
+            # No tasks.json is ever created just for this -- same
+            # zero-behavior-change-without-a-plan contract C3 itself uses.
+            if tasks is not None:
+                tasks.append(documentation_task(len(tasks) + 1, doc_impacts))
+                save_tasks(session, tasks)
+
         manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
         save()
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
@@ -3309,6 +3485,128 @@ def _tasks_selfcheck() -> None:
     print("task graph (C3) self-check: PASS")
 
 
+def _doc_impact_selfcheck() -> None:
+    """O2 phase 1 (glimmer-v7 reconciliation): proves the deterministic
+    change-impact classifier's category boundaries, the honest gate
+    semantics (False/None, never True), the REQUIRED task-append wiring,
+    and that merging documentationCurrent onto manifest["gates"] never
+    clobbers a gate C2 already wrote (architectureApproved). Run with:
+    python3 glimmer-v2.py --doc-impact-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. Category classification, including the two explicit boundary
+    #    cases from the reconciliation doc's O2 entry.
+    # ------------------------------------------------------------
+    assert detect_documentation_impact(["src/author.ts"]) == [], (
+        "author.ts must NOT match auth -- no boundary between 'auth' and 'or'"
+    )
+    assert detect_documentation_impact(["src/routes/user.ts"]) == ["routes"]
+    assert detect_documentation_impact(["src/userRouter.ts"]) == [], (
+        "camelCase compound must not match 'router' -- no separator"
+    )
+    assert detect_documentation_impact(["prisma/schema.prisma"]) == ["schema"]
+    assert detect_documentation_impact(["db/migrations/0001_init.sql"]) == ["schema"]
+    assert detect_documentation_impact(["src/api/users.ts"]) == ["api"]
+    assert detect_documentation_impact(["openapi.yaml"]) == ["api"]
+    assert detect_documentation_impact(["webpack.config.js"]) == ["config"]
+    assert detect_documentation_impact([".env.example"]) == ["config"]
+    assert detect_documentation_impact(["Dockerfile"]) == ["config"]
+    assert detect_documentation_impact(["docker-compose.yml"]) == ["config"]
+    assert detect_documentation_impact([".github/workflows/ci.yml"]) == ["config"]
+    assert detect_documentation_impact(["src/user_auth.py"]) == ["auth"]
+    assert detect_documentation_impact(["src/session.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/permissions/check.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/token.ts"]) == ["auth"]
+
+    # Review round 1: camelCase/PascalCase auth/session/token identifiers
+    # -- a real practical miss under plain non-alnum-only boundaries,
+    # since these compound names have no separator at all between
+    # segments.
+    assert detect_documentation_impact(["src/AuthService.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/authMiddleware.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/authentication.ts"]) == ["auth"]
+    assert detect_documentation_impact(["src/SessionManager.ts"]) == ["auth"]
+    # ...but still not author/possession -- plain lowercase continuation,
+    # no separator and no case transition either.
+    assert detect_documentation_impact(["src/author.ts"]) == []
+    assert detect_documentation_impact(["src/Authors.tsx"]) == []
+    assert detect_documentation_impact(["src/possession.ts"]) == []
+
+    # Multiple files, multiple categories, deduped + sorted.
+    assert detect_documentation_impact(
+        ["src/routes/user.ts", "src/api/users.ts", "src/routes/other.ts"]
+    ) == ["api", "routes"]
+    # Clean change: no category hit anywhere.
+    assert detect_documentation_impact(["src/components/Button.tsx", "README.md"]) == []
+    # Never raises on None/empty input.
+    assert detect_documentation_impact(None) == []
+    assert detect_documentation_impact([]) == []
+
+    # ------------------------------------------------------------
+    # 2. documentation_task shape: honest kind, pending, no auto-complete.
+    # ------------------------------------------------------------
+    task = documentation_task(3, ["routes", "auth"])
+    assert task["id"] == "t3"
+    assert task["kind"] == "documentation"
+    assert task["status"] == "pending"
+    assert task["dependsOn"] == []
+    # C3's existing writers must not touch a documentation-kind task --
+    # confirms "it stays pending, nothing auto-completes it, a human
+    # closes it".
+    tasks = [task]
+    set_implementation_tasks_status(tasks, "in_progress")
+    assert tasks[0]["status"] == "pending"
+    evaluate_implementation_tasks(tasks, ["src/routes/user.ts"], 0)
+    assert tasks[0]["status"] == "pending"
+    evaluate_verification_tasks(tasks, [{"command": "npm run typecheck", "status": "PASS"}])
+    assert tasks[0]["status"] == "pending"
+    reset_verification_tasks_status(tasks)
+    assert tasks[0]["status"] == "pending"
+
+    # ------------------------------------------------------------
+    # 3. The exact gates-merge/task-append logic used in main()'s finally
+    #    block, replicated here (main() itself needs a live session to
+    #    run end to end) -- on impact: task appended (only when a task
+    #    graph exists) + gate False; merge preserves a pre-existing
+    #    architectureApproved key. On a clean change: gate None, never
+    #    True, no task appended even when a task graph exists.
+    # ------------------------------------------------------------
+    def _apply(manifest, tasks, changed_files):
+        doc_impacts = detect_documentation_impact(changed_files)
+        gates = dict(manifest.get("gates") or {})
+        gates["documentationCurrent"] = False if doc_impacts else None
+        manifest["gates"] = gates
+        if doc_impacts and tasks is not None:
+            tasks.append(documentation_task(len(tasks) + 1, doc_impacts))
+        return doc_impacts
+
+    manifest = {"gates": {"architectureApproved": True}}
+    tasks = [{"id": "t1", "kind": "implementation", "status": "complete", "dependsOn": []}]
+    impacts = _apply(manifest, tasks, ["src/routes/user.ts"])
+    assert impacts == ["routes"]
+    assert manifest["gates"]["documentationCurrent"] is False
+    assert manifest["gates"]["architectureApproved"] is True, "must not clobber C2's gate"
+    assert len(tasks) == 2 and tasks[1]["kind"] == "documentation"
+
+    # Impact but no task graph (no --architect-first plan): gate False,
+    # no task appended (nothing to append to -- C3's own zero-behavior-
+    # change-without-a-plan contract).
+    manifest_no_tasks = {}
+    impacts2 = _apply(manifest_no_tasks, None, ["auth/login.ts"])
+    assert impacts2 == ["auth"]
+    assert manifest_no_tasks["gates"]["documentationCurrent"] is False
+
+    manifest_clean = {"gates": {"architectureApproved": None}}
+    tasks_clean = [{"id": "t1", "kind": "implementation", "status": "complete", "dependsOn": []}]
+    impacts3 = _apply(manifest_clean, tasks_clean, ["src/components/Button.tsx"])
+    assert impacts3 == []
+    assert manifest_clean["gates"]["documentationCurrent"] is None
+    assert manifest_clean["gates"]["architectureApproved"] is None
+    assert len(tasks_clean) == 1, "no doc task on a clean change"
+
+    print("doc-impact (O2 phase 1) self-check: PASS")
+
+
 def _visual_selfcheck() -> None:
     """C4 (glimmer-v7): proves the vision-verification plumbing without a
     live browser or a live model call.
@@ -3523,6 +3821,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--visual-selfcheck"]:
         _visual_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--doc-impact-selfcheck"]:
+        _doc_impact_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:

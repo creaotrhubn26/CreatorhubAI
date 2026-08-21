@@ -2,6 +2,7 @@
 
 import argparse
 import functools
+import hashlib
 import json
 import os
 import re
@@ -111,6 +112,140 @@ MAX_EVIDENCE_TOTAL = 50000
 # and tool_blocked.command carry unbounded model-controlled strings with no
 # cap at all; reuse the same limit for consistency across event fields.
 MAX_EVENT_FIELD = 1800
+
+
+# ============================================================
+# O3 (glimmer-v7 reconciliation): failure memory.
+# ============================================================
+# The reconciliation doc's O3 entry is "repository memory keyed by repo
+# identity; failure memory from tool_blocked events." Repo memory already
+# EXISTS as C7's repo-map cache (glimmer-v2.py, ~/.muse-glimmer/repo-maps/
+# <head-sha>.json) — that half is deliberately SKIPPED here, not
+# reimplemented: it is keyed by HEAD SHA (invalidated on every commit/
+# lockfile change) because a repo map describes code structure, which
+# really does go stale on every commit. Failure memory is the opposite
+# shape — "this shell command is blocked by policy in this repo" is true
+# across commits and branches, so it needs a key that survives them,
+# hence a separate identity function below rather than reusing
+# REPO_MAP_CACHE_ROOT's SHA keying.
+MUSE_GLIMMER_HOME = Path.home() / ".muse-glimmer"
+
+
+def _repo_identity(workspace) -> str:
+    """O3: stable identity for a repo, used to key
+    ~/.muse-glimmer/memory/<repo-id>/. Cheapest deterministic choice that
+    actually survives commits/branches (unlike C7's SHA keying, see the
+    module comment above): basename(git root) + a short hash of the
+    ABSOLUTE git root path. Not the remote URL — new-glimmer-task.sh's own
+    preflight already permits/produces worktrees with no upstream at all,
+    so "no remote" can't be the common case this depends on. Two
+    differently-located repos that happen to share a basename still get
+    distinct ids because the hash covers the full path; the same repo
+    always resolves to the same id regardless of cwd."""
+    root = Path(workspace).resolve()
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:10]
+    return f"{root.name}-{digest}"
+
+
+def _blocked_commands_path(workspace) -> Path:
+    return MUSE_GLIMMER_HOME / "memory" / _repo_identity(workspace) / "blocked-commands.json"
+
+
+# LRU cap (reconciliation doc: "~50 entries LRU") -- keeps the file (and the
+# eventual prompt injection) bounded even for a repo that accumulates many
+# distinct blocked patterns over a long history of sessions.
+BLOCKED_COMMANDS_CAP = 50
+
+
+def record_blocked_command(workspace, command, reason) -> None:
+    """O3: append/dedupe one tool_blocked occurrence into this repo's
+    failure memory. Same never-raises discipline as every other
+    best-effort disk write in this codebase (C1/C3/C6's tasks.json /
+    architecture-plan.json writers): a memory-directory failure
+    (permissions, full disk, read-only $HOME) must never take down an
+    otherwise-healthy engineering session. This is pure best-effort
+    learning, not enforcement -- shell_policy/architect's write-gate
+    already enforce the actual block synchronously, regardless of
+    whether this write succeeds. LRU-capped at BLOCKED_COMMANDS_CAP: the
+    least-recently-seen entries beyond the cap are dropped on every
+    write."""
+    try:
+        path = _blocked_commands_path(workspace)
+        entries = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    entries = loaded
+            except (OSError, ValueError):
+                entries = []
+
+        now = datetime.now(timezone.utc).isoformat()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("command") == command:
+                entry["count"] = int(entry.get("count") or 1) + 1
+                entry["reason"] = reason
+                entry["lastSeen"] = now
+                break
+        else:
+            entries.append({
+                "command": command,
+                "reason": reason,
+                "count": 1,
+                "lastSeen": now,
+            })
+
+        entries.sort(key=lambda e: e.get("lastSeen") or "")
+        entries = entries[-BLOCKED_COMMANDS_CAP:]
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    except Exception as exc:  # never-raises: best-effort memory only.
+        print(f"[ENGINEER] WARN: failed to record blocked command in memory: {exc}")
+
+
+# Hard budget caps for the prompt-injection side (reconciliation doc: "hard
+# cap the injected text (~1KB)" / "~10 most-frequent"). This shares the same
+# 65,536-token context window as the repo map, architecture plan, tasks and
+# everything else in the prompt.
+MAX_BLOCKED_MEMORY_ITEMS = 10
+MAX_BLOCKED_MEMORY_CHARS = 1024
+
+
+def failure_memory_addendum(workspace) -> str:
+    """O3: compact system-prompt addendum surfacing this repo's previously
+    blocked command patterns, sorted most-frequent first and capped to
+    MAX_BLOCKED_MEMORY_ITEMS. Returns "" (inject nothing) whenever the
+    memory file doesn't exist, is empty, or is unreadable -- zero behavior
+    change for the overwhelmingly common case of a repo that has never
+    tripped shell_policy/the architect write-gate. Hard-capped to
+    MAX_BLOCKED_MEMORY_CHARS regardless of how many entries exist. Never
+    raises."""
+    try:
+        path = _blocked_commands_path(workspace)
+        if not path.exists():
+            return ""
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list) or not loaded:
+            return ""
+        entries = sorted(
+            (e for e in loaded if isinstance(e, dict) and e.get("command")),
+            key=lambda e: e.get("count") or 0,
+            reverse=True,
+        )[:MAX_BLOCKED_MEMORY_ITEMS]
+        if not entries:
+            return ""
+        lines = [
+            f"- {e['command']!r} ({e.get('reason') or 'blocked by policy'})"
+            for e in entries
+        ]
+        text = (
+            "\n\nThese command patterns were previously blocked by policy "
+            "in this repository -- do not attempt them:\n" + "\n".join(lines)
+        )
+        return text[:MAX_BLOCKED_MEMORY_CHARS]
+    except Exception:  # never-raises: absence of memory must never break a run.
+        return ""
 
 
 # ============================================================
@@ -1754,6 +1889,7 @@ def execute_tool(
             command=tool_name,
             reason="architect mode is read-only",
         )
+        record_blocked_command(workspace, tool_name, "architect mode is read-only")
 
         return message, False
 
@@ -1850,6 +1986,7 @@ def execute_tool(
                 command=command[:MAX_EVENT_FIELD],
                 reason=reason,
             )
+            record_blocked_command(workspace, command[:MAX_EVENT_FIELD], reason)
 
             return message, False
 
@@ -4862,6 +4999,125 @@ def _semantic_tools_selfcheck() -> None:
     print("semantic tools (O4) self-check: PASS")
 
 
+def _failure_memory_selfcheck() -> None:
+    """O3 (glimmer-v7 reconciliation): failure-memory self-check -- no
+    live model or session needed. Covers write/dedupe/count, the
+    BLOCKED_COMMANDS_CAP LRU cap, the prompt-injection addendum (present
+    only when memory exists, most-frequent first, capped to both
+    MAX_BLOCKED_MEMORY_ITEMS and MAX_BLOCKED_MEMORY_CHARS), and
+    never-raises behavior on an unwritable memory directory / corrupt
+    on-disk JSON. Run with:
+    python3 glimmer-engineer.py --failure-memory-selfcheck
+    """
+    global MUSE_GLIMMER_HOME
+    import tempfile as _tempfile
+
+    real_home = MUSE_GLIMMER_HOME
+    try:
+        with _tempfile.TemporaryDirectory() as td, _tempfile.TemporaryDirectory() as home_td:
+            MUSE_GLIMMER_HOME = Path(home_td)
+            ws = Path(td)
+
+            # ------------------------------------------------------------
+            # 1. Zero behavior change: no memory file yet -> "" addendum.
+            # ------------------------------------------------------------
+            repo = ws / "repo"
+            repo.mkdir()
+            assert failure_memory_addendum(repo) == ""
+
+            # ------------------------------------------------------------
+            # 2. Write + dedupe + count.
+            # ------------------------------------------------------------
+            record_blocked_command(repo, "rm -rf /", "destructive path blocked")
+            record_blocked_command(repo, "rm -rf /", "destructive path blocked")
+            record_blocked_command(repo, "npm install left-pad", "install blocked")
+
+            mem_path = _blocked_commands_path(repo)
+            entries = json.loads(mem_path.read_text(encoding="utf-8"))
+            assert len(entries) == 2, "duplicate command must dedupe into one entry"
+            rm_entry = next(e for e in entries if e["command"] == "rm -rf /")
+            assert rm_entry["count"] == 2
+            assert rm_entry["reason"] == "destructive path blocked"
+            assert "lastSeen" in rm_entry
+
+            # ------------------------------------------------------------
+            # 3. LRU cap at BLOCKED_COMMANDS_CAP entries -- oldest evicted.
+            # ------------------------------------------------------------
+            for i in range(BLOCKED_COMMANDS_CAP + 10):
+                record_blocked_command(repo, f"cmd-{i}", "blocked")
+            entries2 = json.loads(mem_path.read_text(encoding="utf-8"))
+            assert len(entries2) == BLOCKED_COMMANDS_CAP
+            commands = {e["command"] for e in entries2}
+            assert "rm -rf /" not in commands, "oldest entries must be evicted past the cap"
+            assert "npm install left-pad" not in commands
+            assert f"cmd-{BLOCKED_COMMANDS_CAP + 9}" in commands, "most recent entry must survive"
+
+            # ------------------------------------------------------------
+            # 4. Injection text: present only when memory exists, sorted
+            #    most-frequent first, capped in item count and chars.
+            # ------------------------------------------------------------
+            fresh_repo = ws / "repo2"
+            fresh_repo.mkdir()
+            assert failure_memory_addendum(fresh_repo) == "", "no memory file -> no addendum"
+
+            record_blocked_command(fresh_repo, "git push origin main", "push blocked")
+            record_blocked_command(fresh_repo, "git push origin main", "push blocked")
+            record_blocked_command(fresh_repo, "npm run deploy", "deploy blocked")
+            addendum = failure_memory_addendum(fresh_repo)
+            assert addendum != ""
+            assert "git push origin main" in addendum
+            assert addendum.index("git push origin main") < addendum.index("npm run deploy"), (
+                "higher-count entry must sort first"
+            )
+            assert len(addendum) <= MAX_BLOCKED_MEMORY_CHARS
+
+            many_repo = ws / "repo3"
+            many_repo.mkdir()
+            for i in range(30):
+                record_blocked_command(
+                    many_repo,
+                    f"blocked-command-number-{i:03d}-with-a-somewhat-long-name",
+                    "blocked because policy said so, at some length",
+                )
+            big_addendum = failure_memory_addendum(many_repo)
+            assert len(big_addendum) <= MAX_BLOCKED_MEMORY_CHARS
+            assert big_addendum.count("- '") <= MAX_BLOCKED_MEMORY_ITEMS
+
+            # ------------------------------------------------------------
+            # 5. Never-raises: unwritable memory dir / corrupt on-disk
+            #    JSON must never crash a session -- same discipline as
+            #    C1/C3/C6's best-effort writers.
+            # ------------------------------------------------------------
+            unwritable_repo = ws / "repo4"
+            unwritable_repo.mkdir()
+            real_mkdir = Path.mkdir
+
+            def _boom(self, *a, **kw):
+                raise OSError("permission denied (simulated)")
+
+            Path.mkdir = _boom
+            try:
+                record_blocked_command(unwritable_repo, "anything", "anything")  # must not raise
+            finally:
+                Path.mkdir = real_mkdir
+            assert not _blocked_commands_path(unwritable_repo).exists()
+            assert failure_memory_addendum(unwritable_repo) == ""
+
+            corrupt_repo = ws / "repo5"
+            corrupt_repo.mkdir()
+            corrupt_path = _blocked_commands_path(corrupt_repo)
+            corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+            corrupt_path.write_text("not json{{{", encoding="utf-8")
+            assert failure_memory_addendum(corrupt_repo) == "", "corrupt JSON must degrade to no addendum"
+            record_blocked_command(corrupt_repo, "x", "y")  # must not raise; self-heals
+            entries_after = json.loads(corrupt_path.read_text(encoding="utf-8"))
+            assert len(entries_after) == 1 and entries_after[0]["command"] == "x"
+    finally:
+        MUSE_GLIMMER_HOME = real_home
+
+    print("failure memory (O3) self-check: PASS")
+
+
 def run_engineer(
     task,
     workspace,
@@ -5046,6 +5302,12 @@ def run_engineer(
             "overwrite unrelated changes:\n"
             + baseline_preview
         )
+
+    # O3 (glimmer-v7 reconciliation): failure memory. Injected only when
+    # this repo has prior tool_blocked history -- zero behavior change
+    # (no addendum, no injected text at all) for every repo that has
+    # never tripped shell_policy/the architect write-gate.
+    system += failure_memory_addendum(workspace)
 
     messages = [
         {
@@ -5850,6 +6112,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--semantic-tools-selfcheck"]:
         _semantic_tools_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--failure-memory-selfcheck"]:
+        _failure_memory_selfcheck()
         sys.exit(0)
 
     try:
