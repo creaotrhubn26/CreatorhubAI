@@ -10,7 +10,9 @@ import { AgentTimeline } from "../session/AgentTimeline";
 import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
-import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
+import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp, shortSessionId } from "../../state/sessionListMeta";
+import { buildCommands, type PaletteMode } from "../../state/paletteCommands";
+import { CommandPalette } from "../common/CommandPalette";
 import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
@@ -26,20 +28,13 @@ export interface RepoContext {
 }
 
 const OPEN_TABS_KEY = "glimmer.openTabs";
+const LEFT_PANEL_COLLAPSED_KEY = "glimmer.leftPanelCollapsed";
 const RIGHT_PANEL_COLLAPSED_KEY = "glimmer.rightPanelCollapsed";
 const MAX_TABS = 6;
 
-// Session ids are `YYYYMMDD-HHMMSS-glimmer-<task-slug>` — long enough that
-// showing them in full would blow out a tab or breadcrumb. Keep the
-// timestamp (which sorts/identifies) and a short slug tail.
-export function shortSessionId(id: string): string {
-  const marker = "-glimmer-";
-  const idx = id.indexOf(marker);
-  if (idx === -1) return id.length > 18 ? `${id.slice(0, 8)}…${id.slice(-6)}` : id;
-  const stamp = id.slice(0, idx);
-  const slug = id.slice(idx + marker.length);
-  return `${stamp}…${slug.length > 12 ? slug.slice(-12) : slug}`;
-}
+// Re-exported for back-compat — logic now lives in state/sessionListMeta.ts
+// alongside the rest of the session-row formatting helpers.
+export { shortSessionId };
 
 // A running/active session pulses its status dot and gets the elapsed +
 // last-activity line in ActiveSessionScreen. Reuses AgentStateStepper's own
@@ -193,6 +188,23 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const [bottomTab, setBottomTab] = useState<"timeline" | "verification" | "tasks" | "events">("timeline");
   const [bottomCollapsed, setBottomCollapsed] = useState(false);
 
+  // Sidebar collapses the same way the assistant panel does (below) —
+  // persisted, toggled by its own header button or the `[` shortcut.
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() => {
+    try {
+      return window.localStorage?.getItem(LEFT_PANEL_COLLAPSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(LEFT_PANEL_COLLAPSED_KEY, leftPanelCollapsed ? "1" : "0");
+    } catch {
+      /* storage unavailable — collapse state just won't persist */
+    }
+  }, [leftPanelCollapsed]);
+
   // §10: AI Assistant panel collapses like the bottom panel — persisted so
   // it stays out of the way across reloads once the user closes it.
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => {
@@ -209,6 +221,58 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
       /* storage unavailable — collapse state just won't persist */
     }
   }, [rightPanelCollapsed]);
+
+  // Command palette (cmd+K) / session switcher (cmd+P). A single global
+  // keydown listener drives both plus the `[`/`]` panel-toggle shortcuts —
+  // ignored while typing in a field, except the palette's own input
+  // (marked with data-palette-input so Escape/etc still reach it).
+  const [palette, setPalette] = useState<{ open: boolean; mode: PaletteMode }>({ open: false, mode: "command" });
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      const isPaletteInput = target?.dataset.paletteInput === "true";
+      const isTypingElsewhere = !!target && !isPaletteInput &&
+        (/^(input|textarea)$/i.test(target.tagName) || target.isContentEditable);
+      if (isTypingElsewhere) return;
+
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette({ open: true, mode: "command" });
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPalette({ open: true, mode: "session" });
+        return;
+      }
+      if (e.key === "Escape") {
+        setPalette((p) => (p.open ? { ...p, open: false } : p));
+        return;
+      }
+      if (e.key === "[") {
+        setLeftPanelCollapsed((c) => !c);
+        return;
+      }
+      if (e.key === "]") {
+        setRightPanelCollapsed((c) => !c);
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const paletteCommands = useMemo(
+    () => buildCommands({
+      mode: palette.mode,
+      sessions,
+      navigate,
+      toggleLeftPanel: () => setLeftPanelCollapsed((c) => !c),
+      toggleAssistantPanel: () => setRightPanelCollapsed((c) => !c),
+    }),
+    [palette.mode, sessions, navigate]
+  );
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
@@ -366,66 +430,81 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           </button>
         </nav>
 
-        <aside className="ide-leftpanel">
-          <div className="ide-leftpanel__header">
-            GLIMMER
-            <span className="ide-leftpanel__workspace">{repoContext?.repository ?? "Not connected"}</span>
-          </div>
-          <div className="ide-leftpanel__body">
-            <Section title="Sessions" collapsed={collapsedSections.has("sessions")} onToggle={() => toggleSection("sessions")}>
-              {visibleSessions.length === 0 && <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>Unavailable</div>}
-              {sidebarGroups.map((group) => (
-                <div key={group.label}>
-                  <div className="ide-session-daygroup">{group.label}</div>
-                  {group.sessions.map((s) => (
-                    <button
-                      key={s.id}
-                      className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
-                      onClick={() => openSession(s.id)}
-                    >
-                      <span
-                        className={`ide-status-dot${isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
-                        style={{ color: statusColor(s.status) }}
-                      />
-                      <span className="ide-session-row__main">
-                        <span className="ide-session-row__task">{s.task}</span>
-                        <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              ))}
-              {sessions.length > visibleSessions.length && (
-                <Link className="ide-section__link" to="/sessions">View all sessions →</Link>
-              )}
-            </Section>
-
-            <Section title="Model" collapsed={collapsedSections.has("model")} onToggle={() => toggleSection("model")}>
-              <div className="ide-model-row">
-                <span className="ide-status-dot" style={{ color: statusColor(modelStatus?.status ?? "UNKNOWN") }} />
-                <span className="ide-model-row__name">Muse Glimmer</span>
-                {modelStatus && <span className="mono" style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}>{modelStatus.status}</span>}
+        <aside className={`ide-leftpanel${leftPanelCollapsed ? " is-collapsed" : ""}`}>
+          {leftPanelCollapsed ? (
+            <button className="ide-leftpanel__reopen" aria-label="Expand sidebar" onClick={() => setLeftPanelCollapsed(false)}>
+              ›
+            </button>
+          ) : (
+            <>
+              <div className="ide-leftpanel__header">
+                GLIMMER
+                <span className="ide-leftpanel__workspace">{repoContext?.repository ?? "Not connected"}</span>
+                <button
+                  className="ide-leftpanel__collapse"
+                  aria-label="Collapse sidebar"
+                  onClick={() => setLeftPanelCollapsed(true)}
+                >
+                  <IconChevron open={false} />
+                </button>
               </div>
-              {modelStatus?.contextSize && (
-                <div className="ide-model-row" style={{ color: "var(--text-muted)", fontSize: "var(--fs-xs)" }}>
-                  {modelStatus.contextSize.toLocaleString()} ctx
-                </div>
-              )}
-              <Link className="ide-section__link" to="/model">Model Settings</Link>
-            </Section>
-          </div>
+              <div className="ide-leftpanel__body">
+                <Section title="Sessions" collapsed={collapsedSections.has("sessions")} onToggle={() => toggleSection("sessions")}>
+                  {visibleSessions.length === 0 && <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>Unavailable</div>}
+                  {sidebarGroups.map((group) => (
+                    <div key={group.label}>
+                      <div className="ide-session-daygroup">{group.label}</div>
+                      {group.sessions.map((s) => (
+                        <button
+                          key={s.id}
+                          className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
+                          onClick={() => openSession(s.id)}
+                        >
+                          <span
+                            className={`ide-status-dot${isRunningStatus(s.status) ? " ide-status-dot--pulse" : ""}`}
+                            style={{ color: statusColor(s.status) }}
+                          />
+                          <span className="ide-session-row__main">
+                            <span className="ide-session-row__task">{s.task}</span>
+                            <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                  {sessions.length > visibleSessions.length && (
+                    <Link className="ide-section__link" to="/sessions">View all sessions →</Link>
+                  )}
+                </Section>
 
-          <div className="ide-leftpanel__repo">
-            {repoContext ? (
-              <dl>
-                <dt>Worktree</dt><dd className="mono">{repoContext.worktree}</dd>
-                <dt>Baseline</dt><dd className="mono">{repoContext.baseline}</dd>
-                <dt>Status</dt><dd>{repoContext.status}</dd>
-              </dl>
-            ) : (
-              <div>Not connected</div>
-            )}
-          </div>
+                <Section title="Model" collapsed={collapsedSections.has("model")} onToggle={() => toggleSection("model")}>
+                  <div className="ide-model-row">
+                    <span className="ide-status-dot" style={{ color: statusColor(modelStatus?.status ?? "UNKNOWN") }} />
+                    <span className="ide-model-row__name">Muse Glimmer</span>
+                    {modelStatus && <span className="mono" style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}>{modelStatus.status}</span>}
+                  </div>
+                  {modelStatus?.contextSize && (
+                    <div className="ide-model-row" style={{ color: "var(--text-muted)", fontSize: "var(--fs-xs)" }}>
+                      {modelStatus.contextSize.toLocaleString()} ctx
+                    </div>
+                  )}
+                  <Link className="ide-section__link" to="/model">Model Settings</Link>
+                </Section>
+              </div>
+
+              <div className="ide-leftpanel__repo">
+                {repoContext ? (
+                  <dl>
+                    <dt>Worktree</dt><dd className="mono">{repoContext.worktree}</dd>
+                    <dt>Baseline</dt><dd className="mono">{repoContext.baseline}</dd>
+                    <dt>Status</dt><dd>{repoContext.status}</dd>
+                  </dl>
+                ) : (
+                  <div>Not connected</div>
+                )}
+              </div>
+            </>
+          )}
         </aside>
 
         <div className="ide-editor">
@@ -545,6 +624,14 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           {activeSessionId && <span>{events.length} events</span>}
         </div>
       </footer>
+
+      {palette.open && (
+        <CommandPalette
+          commands={paletteCommands}
+          placeholder={palette.mode === "session" ? "Jump to a session…" : "Type a command…"}
+          onClose={() => setPalette((p) => ({ ...p, open: false }))}
+        />
+      )}
     </div>
   );
 }

@@ -651,6 +651,41 @@ pre {
 }
 .ide-rightpanel__reopen:hover { color: var(--text-primary); }
 
+/* ---- left panel (sidebar) collapse ---- */
+.ide-leftpanel.is-collapsed { width: 32px; }
+.ide-leftpanel__header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.ide-leftpanel__collapse { background: none; border: none; color: var(--text-muted); padding: 2px 4px; flex-shrink: 0; }
+.ide-leftpanel__collapse:hover { color: var(--text-primary); }
+.ide-leftpanel__reopen {
+  width: 100%; height: 100%; min-height: 40px; background: none; border: none; color: var(--text-muted);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: var(--space-3); font-size: 14px;
+}
+.ide-leftpanel__reopen:hover { color: var(--text-primary); }
+
+/* ---- command palette (cmd+K / cmd+P) ---- */
+.ide-palette-overlay {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, 0.5);
+  display: flex; justify-content: center; padding-top: 14vh;
+}
+.ide-palette {
+  width: 100%; max-width: 480px; max-height: 60vh; background: var(--surface-2);
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5); display: flex; flex-direction: column; overflow: hidden;
+}
+.ide-palette__input {
+  flex-shrink: 0; width: 100%; background: none; border: none; box-shadow: inset 0 -1px 0 var(--border);
+  padding: var(--space-3); font-size: var(--fs-base); color: var(--text-primary);
+}
+.ide-palette__input:focus { outline: none; }
+.ide-palette__list { list-style: none; margin: 0; padding: var(--space-1) 0; overflow-y: auto; }
+.ide-palette__empty { padding: var(--space-3); font-size: var(--fs-sm); color: var(--text-muted); }
+.ide-palette__option {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  padding: 6px var(--space-3); font-size: var(--fs-sm); color: var(--text-primary); cursor: pointer;
+}
+.ide-palette__option.is-selected { background: var(--surface-raised); box-shadow: inset 2px 0 0 var(--accent); }
+.ide-palette__option-hint { font-size: var(--fs-xs); color: var(--text-muted); flex-shrink: 0; }
+
 /* ---- running-session liveness: pulsing status dot ---- */
 @keyframes ide-status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 .ide-status-dot--pulse { animation: ide-status-pulse 1.6s ease-in-out infinite; }
