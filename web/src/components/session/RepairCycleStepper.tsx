@@ -1,5 +1,5 @@
 import type { GlimmerSession, GlimmerSessionStatus } from "@glimmer/shared";
-import { StatusBadge } from "../common/StatusBadge";
+import { StatusBadge, statusColor } from "../common/StatusBadge";
 
 // Spec §17: Implementation -> Repair 1..N -> Verification -> Final status.
 // Every label below is derived only from fields the session already carries
@@ -38,36 +38,51 @@ export function RepairCycleStepper({ session }: { session: GlimmerSession }) {
 
   const finalState = TERMINAL.has(status) ? status : "PENDING";
 
+  const steps: Array<{ key: string; label: string; state: string }> = [
+    { key: "impl", label: "Implementation", state: implementationState },
+    ...Array.from({ length: repairBudget }, (_, idx) => {
+      const n = idx + 1;
+      const state = n <= repairsUsed ? "DONE" : status === "repairing" && n === repairsUsed + 1 ? "RUNNING" : "PENDING";
+      return { key: `repair-${n}`, label: `Repair ${n}`, state };
+    }),
+    { key: "verify", label: "Verification", state: verificationState },
+    { key: "final", label: "Final status", state: finalState },
+  ];
+
+  // ✓ done / ● active / ○ pending — a real connected stepper instead of a
+  // row of independent badges. Nodes sit on one continuous connector line
+  // (drawn once behind the row, see .stepper__nodes::before in theme.css).
+  function nodeGlyph(state: string): string {
+    if (state === "PENDING") return "○";
+    if (state === "RUNNING") return "●";
+    return "✓";
+  }
+
   return (
     <div>
       <dl>
         <dt>Repair budget</dt>
         <dd className="mono">{repairsUsed} / {repairBudget} used</dd>
       </dl>
-      <ol style={{ display: "flex", gap: 16, listStyle: "none", padding: 0, margin: 0 }}>
-        <li style={{ opacity: implementationState === "RUNNING" || implementationState === "FAILED" ? 1 : 0.7 }}>
-          <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>Implementation</div>
-          <StatusBadge status={implementationState} />
-        </li>
-        {Array.from({ length: repairBudget }, (_, idx) => {
-          const n = idx + 1;
-          const state = n <= repairsUsed ? "DONE" : status === "repairing" && n === repairsUsed + 1 ? "RUNNING" : "PENDING";
-          return (
-            <li key={n} style={{ opacity: state === "PENDING" ? 0.4 : 1 }}>
-              <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>Repair {n}</div>
-              <StatusBadge status={state} />
+      <div className="stepper" style={{ ["--stepper-cols" as any]: steps.length }}>
+        <ul className="stepper__nodes">
+          {steps.map((s) => (
+            <li key={s.key} className="stepper__node-cell">
+              <span className="stepper__node" style={{ ["--node-color" as any]: statusColor(s.state) }} aria-hidden="true">
+                {nodeGlyph(s.state)}
+              </span>
             </li>
-          );
-        })}
-        <li style={{ opacity: verificationState === "PENDING" ? 0.4 : 1 }}>
-          <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>Verification</div>
-          <StatusBadge status={verificationState} />
-        </li>
-        <li style={{ opacity: finalState === "PENDING" ? 0.4 : 1 }}>
-          <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>Final status</div>
-          <StatusBadge status={finalState} />
-        </li>
-      </ol>
+          ))}
+        </ul>
+        <ul className="stepper__labels">
+          {steps.map((s) => (
+            <li key={s.key} style={{ opacity: s.state === "PENDING" ? 0.5 : 1 }}>
+              <div className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>{s.label}</div>
+              <StatusBadge status={s.state} />
+            </li>
+          ))}
+        </ul>
+      </div>
     </div>
   );
 }

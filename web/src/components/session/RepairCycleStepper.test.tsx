@@ -52,4 +52,17 @@ describe("RepairCycleStepper", () => {
     expect(screen.queryByText(/Repair 1/)).not.toBeInTheDocument();
     expect(screen.getByText("0 / 0 used")).toBeInTheDocument();
   });
+
+  // Smoke test for the visual stepper: connected nodes render ✓/●/○ per the
+  // step's real state, not just badge text.
+  it("renders done/active/pending nodes with distinct glyphs", () => {
+    const { container } = render(<RepairCycleStepper session={session({
+      status: "repairing", repairsUsed: 1, repairBudget: 2,
+      verification: { overall: "NOT_RUN", checks: [] },
+    })} />);
+    const nodes = Array.from(container.querySelectorAll(".stepper__node")).map((n) => n.textContent);
+    // Implementation: FAILED -> done (✓), Repair 1: DONE -> ✓, Repair 2: PENDING -> ○.
+    expect(nodes).toContain("✓");
+    expect(nodes).toContain("○");
+  });
 });

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ArchitectReviewDecision, GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
+import { CollapsibleSection } from "../common/CollapsibleSection";
 
 const DECISION_COLOR: Record<ArchitectReviewDecision, string> = {
   APPROVED: "var(--green)",
@@ -29,9 +30,17 @@ export function ArchitectReviewPanel({ sessionId, gates }: { sessionId: string; 
     ? gates.architectureApproved === true ? "approved" : gates.architectureApproved === false ? "rejected" : "not reviewed"
     : null;
 
+  const latest = reviews?.[0];
+  // Formatted as a percentage (not the raw "0.88") so the header summary
+  // never collides verbatim with the confidence line rendered below it.
+  const summary = latest
+    ? `${latest.decision} · ${Math.round(latest.confidence * 100)}%`
+    : gateText
+      ? `gate: ${gateText}`
+      : undefined;
+
   return (
-    <fieldset>
-      <legend>Architect Reviews</legend>
+    <CollapsibleSection title="Architect Reviews" summary={summary}>
       {gateText && (
         <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
           Architecture gate (orchestrator-recorded fact): {gateText}
@@ -46,7 +55,7 @@ export function ArchitectReviewPanel({ sessionId, gates }: { sessionId: string; 
             const color = DECISION_COLOR[review.decision] ?? "var(--gray)";
             return (
               <div key={i} style={{ marginTop: 8 }}>
-                <span style={{ color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "2px 6px", fontSize: 12 }}>
+                <span className="meta-value" style={{ ["--badge-color" as any]: color }}>
                   {review.decision}
                 </span>{" "}
                 <span>Confidence: {review.confidence}</span>
@@ -68,6 +77,6 @@ export function ArchitectReviewPanel({ sessionId, gates }: { sessionId: string; 
           })}
         </>
       )}
-    </fieldset>
+    </CollapsibleSection>
   );
 }

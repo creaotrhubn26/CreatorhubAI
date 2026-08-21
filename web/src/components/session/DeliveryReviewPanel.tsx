@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { DeliveryReviewCustomerReadiness, NextStepPriority } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
+import { CollapsibleSection } from "../common/CollapsibleSection";
 
 const READINESS_COLOR: Record<DeliveryReviewCustomerReadiness, string> = {
   ready_to_ship: "var(--green)",
@@ -31,31 +32,32 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
 
   if (review.reviewFailed) {
     return (
-      <fieldset>
-        <legend>Delivery Review</legend>
+      <CollapsibleSection title="Delivery Review" summary="failed to generate">
         <p>Delivery review failed to generate{review.reviewFailureReason ? `: ${review.reviewFailureReason}` : "."}</p>
-      </fieldset>
+      </CollapsibleSection>
     );
   }
 
   const color = READINESS_COLOR[review.customerReadiness] ?? "var(--gray)";
+  const summary = `${review.customerReadiness} · ${review.confidence.level}`;
 
   return (
-    <fieldset>
-      <legend>Delivery Review</legend>
+    <CollapsibleSection title="Delivery Review" summary={summary}>
       <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
         Model-generated review — not a deterministic fact
       </p>
       <p>{review.summary}</p>
-      <dl>
-        <dt>Customer readiness</dt>
-        <dd>
-          <span style={{ color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "2px 6px", fontSize: 12 }}>
-            {review.customerReadiness}
-          </span>
-        </dd>
-        <dt>Confidence</dt>
-        <dd>{review.confidence.level} — {review.confidence.reason}</dd>
+      <dl className="kv-grid">
+        <div>
+          <dt>Customer readiness</dt>
+          <dd>
+            <span className="meta-value" style={{ ["--badge-color" as any]: color }}>{review.customerReadiness}</span>
+          </dd>
+        </div>
+        <div className="kv-wide">
+          <dt>Confidence</dt>
+          <dd>{review.confidence.level} — {review.confidence.reason}</dd>
+        </div>
       </dl>
       {!!review.strengths?.length && (
         <>
@@ -86,6 +88,6 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
           ))}
         </>
       )}
-    </fieldset>
+    </CollapsibleSection>
   );
 }

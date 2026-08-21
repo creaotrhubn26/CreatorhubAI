@@ -4,6 +4,7 @@ import type { VerificationCheckResult, VerificationSummary } from "@glimmer/shar
 import { glimmerApi } from "../../api/client";
 import { computeVerificationBadge } from "../../state/computeVerificationBadge";
 import { StatusBadge } from "../common/StatusBadge";
+import { EmptyState } from "../common/EmptyState";
 
 const TONE_COLOR: Record<ReturnType<typeof computeVerificationBadge>["tone"], string> = {
   pass: "var(--green)",
@@ -18,7 +19,7 @@ function CheckCard({ check }: { check: VerificationCheckResult }) {
   return (
     <fieldset>
       <legend className="mono">{check.command}</legend>
-      <span style={{ color, border: `1px solid ${color}`, borderRadius: "var(--radius)", padding: "2px 6px", fontSize: 12 }}>
+      <span className="badge-check" style={{ ["--badge-color" as any]: color }}>
         {badge.label}
       </span>
       <dl>
@@ -59,7 +60,7 @@ function BaselineSummary({ checks }: { checks: VerificationCheckResult[] }) {
 // Exported so the IDE shell's bottom-panel VERIFICATION tab can re-home this
 // exact body (session-scoped) without re-implementing the check rendering.
 export function VerificationBody({ verification }: { verification: VerificationSummary | null | undefined }) {
-  if (!verification) return <div>Unavailable</div>;
+  if (!verification) return <EmptyState icon="◌" text="Unavailable" />;
   const checks = verification.checks;
   return (
     <div>
@@ -67,7 +68,7 @@ export function VerificationBody({ verification }: { verification: VerificationS
         <StatusBadge status={verification.overall} />
       </div>
       <BaselineSummary checks={checks} />
-      {checks.length === 0 && <div>Unavailable</div>}
+      {checks.length === 0 && <EmptyState icon="◌" text="Unavailable" />}
       {checks.map((c) => (
         <CheckCard key={c.command} check={c} />
       ))}
