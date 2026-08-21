@@ -584,6 +584,8 @@ pre {
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: var(--space-5) var(--space-3); text-align: center; color: var(--text-muted); }
 .empty-state__icon { font-size: 20px; line-height: 1; opacity: 0.55; }
 .empty-state__text { font-size: var(--fs-sm); }
+.empty-state__action { margin-top: var(--space-2); background: transparent; color: var(--text-secondary); border: 1px solid var(--border-strong); }
+.empty-state__action:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-strong); }
 
 /* ---- session list rows: second line + day grouping ---- */
 .ide-session-row { align-items: flex-start; }
