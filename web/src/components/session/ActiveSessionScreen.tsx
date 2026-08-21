@@ -12,6 +12,26 @@ import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
 import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 
+// Non-success terminal states where a `failure` cause (if present) is worth
+// surfacing as a banner. "verified"/"cancelled" are terminal but not a
+// failure to explain; mid-flow states never carry `failure` at all.
+const NON_SUCCESS_TERMINAL = ["blocked", "failed", "needs_review"];
+
+// USER_CANCELLED reads as neutral (the human chose to stop, not a fault);
+// INFRA_BLOCKED/TIMEOUT/ORCHESTRATION_ABORTED are environment-ish (amber);
+// everything else (CODE_FAIL, POLICY_BLOCK, SCOPE_FAILURE, PARSER_FAILURE,
+// UNKNOWN, ...) is a real failure (red).
+function failureSeverityColor(failureClass: string): string {
+  if (failureClass === "USER_CANCELLED") return "var(--gray)";
+  if (["INFRA_BLOCKED", "TIMEOUT", "ORCHESTRATION_ABORTED"].includes(failureClass)) return "var(--amber)";
+  return "var(--red)";
+}
+
+function humanCase(value: string): string {
+  const lower = value.toLowerCase().replace(/_/g, " ");
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
@@ -55,8 +75,20 @@ export function ActiveSessionScreen() {
   const activityLabel = isRunning ? lastActivityLabel(lastEventAt, nowMs) : null;
   const stalled = isRunning && isStalled(lastEventAt, nowMs);
 
+  const showFailureBanner = session.failure && NON_SUCCESS_TERMINAL.includes(state);
+
   return (
     <div>
+      {showFailureBanner && (
+        <div
+          className="failure-banner"
+          style={{ ["--badge-color" as any]: failureSeverityColor(session.failure!.class) }}
+        >
+          <p className="failure-banner__title">Blocked: {humanCase(session.failure!.class)}</p>
+          {session.failure!.detail && <p className="failure-banner__detail">{session.failure!.detail}</p>}
+          {id && <Link to={`/sessions/${id}/verification`}>See verification</Link>}
+        </div>
+      )}
       <h1>{session.task}</h1>
       {isRunning && (elapsed || activityLabel) && (
         <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
@@ -79,11 +111,6 @@ export function ActiveSessionScreen() {
       </div>
       {cancelMutation.isError && <div>Unavailable — could not cancel this session.</div>}
       <AgentStateStepper current={state} />
-      {session.failure && (
-        <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
-          Failure: {session.failure.class} — {session.failure.detail}
-        </p>
-      )}
       <dl>
         <dt>Changed files</dt>
         <dd>{session.changedFiles.length}</dd>
