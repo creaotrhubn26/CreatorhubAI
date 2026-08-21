@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
@@ -95,7 +95,7 @@ function groupLinesByFile(lines: DiffLine[]): DiffFileGroup[] {
 
 // Renders one line's content through the hand-rolled tokenizer — used by
 // both unified and split modes so highlighting stays consistent everywhere.
-function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
+const HighlightedText = memo(function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
   return (
     <>
       {highlightLine(text, lang).map((t, i) => (
@@ -105,7 +105,7 @@ function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
       ))}
     </>
   );
-}
+});
 
 function UnifiedLine({ l, lang }: { l: DiffLine; lang: Lang }) {
   if (l.kind === "file") return <div className="diff-view__file">{l.text}</div>;

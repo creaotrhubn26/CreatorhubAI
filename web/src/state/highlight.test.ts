@@ -67,6 +67,14 @@ describe("highlightLine — keyword matching", () => {
     expect(tokens.find((t) => t.text === "background-color")?.kind).toBe("type");
   });
 
+  it("highlights numbers and strings inside css values too", () => {
+    const line = '  margin: 10px; content: "hi";';
+    const tokens = highlightLine(line, "css");
+    expect(tokens.find((t) => t.text === "10")?.kind).toBe("number");
+    expect(tokens.find((t) => t.text === '"hi"')?.kind).toBe("string");
+    expect(tokens.map((t) => t.text).join("")).toBe(line);
+  });
+
   it("classifies json keys as type", () => {
     const tokens = highlightLine('  "path": "src/index.ts",', "json");
     expect(tokens.find((t) => t.text === '"path"')?.kind).toBe("type");

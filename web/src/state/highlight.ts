@@ -117,7 +117,10 @@ function tokenizeGeneric(line: string, lang: "ts" | "py" | "rs"): Token[] {
     }
 
     // number: digits, optional decimal point, optional exponent
-    if (/[0-9]/.test(ch) && !/[A-Za-z_$]/.test(code.slice(-1) || "")) {
+    // (no "preceded by a letter" guard needed — the identifier branch below
+    // already consumes every trailing digit of a word like "a2b", so a
+    // digit only reaches here when it starts a fresh token)
+    if (/[0-9]/.test(ch)) {
       push(code, "code");
       code = "";
       let j = i;
@@ -166,11 +169,11 @@ function tokenizeCss(line: string): Token[] {
       { text: indent, kind: "code" },
       { text: prop, kind: "type" },
       { text: colon, kind: "code" },
-      { text: rest, kind: "code" },
+      ...tokenizeGenericStringsAndNumbers(rest),
     ];
     return parts.filter((t) => t.text.length > 0);
   }
-  return line.length > 0 ? [{ text: line, kind: "code" }] : [];
+  return tokenizeGenericStringsAndNumbers(line);
 }
 
 function tokenizeJson(line: string): Token[] {
