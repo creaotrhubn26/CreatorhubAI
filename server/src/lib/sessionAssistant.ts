@@ -68,22 +68,62 @@ export async function askSessionAssistant(
 // [DONE]`), invoking onDelta as each chunk of text arrives. Returns the full
 // concatenated answer once the upstream stream ends. Same evidence/messages
 // as askSessionAssistant — only `stream` and the response handling differ.
+//
+// `signal`, when passed, is combined with our own idle-timeout controller
+// (see below) so the caller (the route handler) can abort the upstream
+// request the moment its own client disconnects, instead of leaving it
+// running to completion for nothing.
 export async function streamSessionAssistant(
   modelBaseUrl: string,
   session: GlimmerSession,
   events: GlimmerEvent[],
   question: string,
   onDelta: (delta: string) => void,
-  timeoutMs = 30_000
+  timeoutMs = 30_000,
+  signal?: AbortSignal
 ): Promise<string> {
   const evidence = summarizeEvidence(session, events);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Idle timeout, not one wall-clock deadline: a slow-but-steady stream of
+  // deltas must not be killed just because the whole answer takes longer
+  // than timeoutMs to finish — only actual silence (no delta at all) for
+  // timeoutMs should abort it. Reset on every delta received.
+  const idleController = new AbortController();
+  let idleTimer = setTimeout(() => idleController.abort(), timeoutMs);
+  function resetIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => idleController.abort(), timeoutMs);
+  }
+  const combinedSignal = signal ? AbortSignal.any([idleController.signal, signal]) : idleController.signal;
+
+  let full = "";
+  // Shared by the in-loop parse and the final flush below (item 7: a stream
+  // that ends without a trailing "\n\n" must not silently drop its last
+  // frame) so both paths process a `data: ...` line identically.
+  function processLine(line: string) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return; // malformed/torn SSE chunk — skip rather than crash the stream
+    }
+    const delta = parsed?.choices?.[0]?.delta?.content;
+    if (typeof delta === "string" && delta) {
+      resetIdleTimer();
+      full += delta;
+      onDelta(delta);
+    }
+  }
+
   try {
     const res = await fetch(`${modelBaseUrl.replace(/\/$/, "")}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal: controller.signal,
+      signal: combinedSignal,
       body: JSON.stringify({ model: "muse-glimmer", stream: true, messages: buildMessages(evidence, question) }),
     });
     if (!res.ok || !res.body) throw new Error(`model request failed: ${res.status}`);
@@ -91,33 +131,19 @@ export async function streamSessionAssistant(
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let full = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? ""; // last entry may be a partial line split across chunks
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const data = trimmed.slice(5).trim();
-        if (data === "[DONE]") continue;
-        let parsed: any;
-        try {
-          parsed = JSON.parse(data);
-        } catch {
-          continue; // malformed/torn SSE chunk — skip rather than crash the stream
-        }
-        const delta = parsed?.choices?.[0]?.delta?.content;
-        if (typeof delta === "string" && delta) {
-          full += delta;
-          onDelta(delta);
-        }
-      }
+      for (const line of lines) processLine(line);
     }
+    processLine(buffer); // flush a final frame with no trailing newline
+
+    if (!full) throw new Error("model returned no usable answer");
     return full;
   } finally {
-    clearTimeout(timer);
+    clearTimeout(idleTimer);
   }
 }

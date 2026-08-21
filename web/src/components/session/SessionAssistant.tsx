@@ -17,55 +17,97 @@ function timeLabel(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+// A turn with neither an answer nor an error is either genuinely in flight
+// or an orphan: a reload mid-question, or a turn asked in a session that got
+// switched away from before it resolved. On (re)load there is no live
+// request behind it anymore, so it can never legitimately finish — resolve
+// it to the same Unavailable copy as any other failure rather than leaving
+// a permanent "Asking…" ghost.
+function resolveStaleTurns(turns: Turn[]): Turn[] {
+  return turns.map((t) => (t.answer === undefined && t.error === undefined ? { ...t, error: UNAVAILABLE_MESSAGE } : t));
+}
+
+interface AssistantState {
+  sid: string;
+  turns: Turn[];
+}
+
+function loadState(sessionId: string): AssistantState {
+  return { sid: sessionId, turns: resolveStaleTurns(loadTurns(sessionId)) };
+}
+
+// Applies a turns-updater only if `prev` still belongs to `forSession` — an
+// async callback (a delta, a completed answer, a fallback result) can land
+// after the user has switched to viewing a different session, and must not
+// write that stale content into the now-current session's state (which would
+// then get saved under the wrong sessionStorage key).
+function applyToSession(prev: AssistantState, forSession: string, fn: (turns: Turn[]) => Turn[]): AssistantState {
+  return prev.sid === forSession ? { sid: prev.sid, turns: fn(prev.turns) } : prev;
+}
+
 export function SessionAssistant({ sessionId, session }: { sessionId: string; session?: GlimmerSession }) {
   const [question, setQuestion] = useState("");
-  const [turns, setTurns] = useState<Turn[]>(() => loadTurns(sessionId));
+  const [chatState, setChatState] = useState<AssistantState>(() => loadState(sessionId));
   const [pending, setPending] = useState(false);
 
-  // The panel can be reused across sessions without unmounting, so history
-  // is (re)loaded whenever the session id changes, not just on first mount.
-  useEffect(() => {
-    setTurns(loadTurns(sessionId));
-  }, [sessionId]);
+  // The panel can be reused across sessions without unmounting. Resetting
+  // during render (rather than in an effect) means the swap to the new
+  // session's history is visible in the very render that picks up the new
+  // sessionId — no stale-session frame is ever committed, and the save
+  // effect below (keyed on chatState.sid, not the sessionId prop) never races a
+  // save-on-change against this load.
+  if (chatState.sid !== sessionId) {
+    setChatState(loadState(sessionId));
+  }
 
   // Persist on every turn change, including pending/errored turns — never
   // just the successful ones, so a reload mid-question doesn't silently drop
-  // or fabricate what actually happened.
+  // or fabricate what actually happened. Saves under chatState.sid (the state's own
+  // session id), so it can only ever write a session's turns under that same
+  // session's key.
   useEffect(() => {
-    saveTurns(sessionId, turns);
-  }, [sessionId, turns]);
-
-  function patchTurn(id: number, patch: Partial<Turn>) {
-    setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
-  }
+    saveTurns(chatState.sid, chatState.turns);
+  }, [chatState]);
 
   async function ask(q: string) {
     if (!q || pending) return;
     const id = Date.now();
-    setTurns((prev) => [...prev, { id, question: q, askedAt: new Date().toISOString() }]);
+    const forSession = sessionId;
+    setChatState((prev) => applyToSession(prev, forSession, (turns) => [...turns, { id, question: q, askedAt: new Date().toISOString() }]));
     setQuestion("");
     setPending(true);
     let streamedAnyDelta = false;
     try {
-      const answer = await glimmerApi.askSessionStream(sessionId, q, (delta) => {
+      const answer = await glimmerApi.askSessionStream(forSession, q, (delta) => {
         streamedAnyDelta = true;
-        setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t)));
+        setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+          turns.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t))
+        ));
       });
-      patchTurn(id, { answer, answeredAt: new Date().toISOString() });
-    } catch {
-      if (streamedAnyDelta) {
-        // Mid-stream failure (server already sent partial output, then an
-        // error frame): show the same Unavailable copy as any other failure,
-        // not a half-finished answer.
-        patchTurn(id, { answer: undefined, error: UNAVAILABLE_MESSAGE });
+      setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+        turns.map((t) => (t.id === id ? { ...t, answer, answeredAt: new Date().toISOString() } : t))
+      ));
+    } catch (streamErr: any) {
+      // The server tags "upstream already reported dead" errors distinctly
+      // (a mid-stream or immediate error frame) — retrying via the
+      // non-streaming endpoint would just hit the same dead upstream, so
+      // only a connection-time failure to our OWN gateway (never reached the
+      // server at all) is worth a fallback attempt.
+      const upstreamReportedDead = streamErr?.name === "AssistantUpstreamError";
+      if (streamedAnyDelta || upstreamReportedDead) {
+        setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+          turns.map((t) => (t.id === id ? { ...t, answer: undefined, error: UNAVAILABLE_MESSAGE } : t))
+        ));
       } else {
-        // Streaming never got off the ground (connection-time failure) —
-        // fall back once to the non-streaming endpoint before giving up.
         try {
-          const data = await glimmerApi.askSession(sessionId, q);
-          patchTurn(id, { answer: data.answer, answeredAt: new Date().toISOString() });
+          const data = await glimmerApi.askSession(forSession, q);
+          setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+            turns.map((t) => (t.id === id ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() } : t))
+          ));
         } catch {
-          patchTurn(id, { error: UNAVAILABLE_MESSAGE });
+          setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+            turns.map((t) => (t.id === id ? { ...t, error: UNAVAILABLE_MESSAGE } : t))
+          ));
         }
       }
     } finally {
@@ -73,6 +115,7 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
     }
   }
 
+  const turns = chatState.sid === sessionId ? chatState.turns : [];
   const hasChanges = !!session?.changedFiles.length;
   // Line-count stats are optional on ChangedFile and this backend never
   // populates them today — showing "+0 -0" when they're simply absent would

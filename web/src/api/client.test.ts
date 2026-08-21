@@ -136,7 +136,8 @@ describe("glimmerApi", () => {
   });
 
   it("askSessionStream buffers a frame split across chunk boundaries instead of dropping it", async () => {
-    const wholeFrame = `data: ${JSON.stringify({ delta: "It owns the parser state." })}\n\n`;
+    const wholeFrame = `data: ${JSON.stringify({ delta: "It owns the parser state." })}\n\n`
+      + `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}\n\n`;
     const splitPoint = Math.floor(wholeFrame.length / 2);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       sseResponse([wholeFrame.slice(0, splitPoint), wholeFrame.slice(splitPoint)])
@@ -146,13 +147,31 @@ describe("glimmerApi", () => {
     expect(deltas).toEqual(["It owns the parser state."]);
   });
 
-  it("askSessionStream rejects when the server sends an error frame", async () => {
+  it("askSessionStream flushes a final frame that has no trailing newline", async () => {
+    // No trailing "\n\n" after the done frame — a naive line-buffer that only
+    // processes complete lines would drop this frame entirely.
+    const frame = `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}`;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(sseResponse([frame]));
+    const answer = await glimmerApi.askSessionStream("s1", "Why?", () => {});
+    expect(answer).toBe("It owns the parser state.");
+  });
+
+  it("askSessionStream rejects when the server sends an error frame, tagged so the caller can skip the fallback", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(sseResponse([`data: ${JSON.stringify({ error: "unavailable" })}\n\n`]));
-    await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toThrow("unavailable");
+    await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toMatchObject({ message: "unavailable", name: "AssistantUpstreamError" });
   });
 
   it("askSessionStream rejects on a non-2xx response instead of hanging", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 502 }));
     await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toThrow();
+  });
+
+  it("askSessionStream rejects a stream that ends after deltas but never sends a done frame", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      sseResponse([`data: ${JSON.stringify({ delta: "Partial" })}\n\n`]) // connection just ends here
+    );
+    const deltas: string[] = [];
+    await expect(glimmerApi.askSessionStream("s1", "Why?", (d) => deltas.push(d))).rejects.toThrow(/done frame/);
+    expect(deltas).toEqual(["Partial"]); // the partial output still streamed before the truncation was detected
   });
 });

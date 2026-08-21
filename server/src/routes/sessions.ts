@@ -132,18 +132,35 @@ sessionsRouter.post("/sessions/:id/ask", async (req, res) => {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
+    // The client tab closing / navigating away must not leave the upstream
+    // model generation running for nothing — abort it the moment our own
+    // response socket closes. Deliberately `res`, not `req`: express.json()
+    // has already fully consumed and ended the request stream by the time
+    // this handler runs, so `req`'s own 'close'/'destroyed' fire almost
+    // immediately regardless of whether the client is still there — `res`
+    // (still open, mid-response) only closes on a genuine disconnect.
+    let clientDisconnected = false;
+    const clientGone = new AbortController();
+    res.on("close", () => {
+      clientDisconnected = true;
+      clientGone.abort();
+    });
     try {
-      const answer = await streamSessionAssistant(CONFIG.modelBaseUrl, session, events, question, (delta) => {
-        res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-      });
+      const answer = await streamSessionAssistant(
+        CONFIG.modelBaseUrl, session, events, question,
+        (delta) => { res.write(`data: ${JSON.stringify({ delta })}\n\n`); },
+        undefined, clientGone.signal
+      );
       res.write(`data: ${JSON.stringify({ done: true, answer })}\n\n`);
     } catch {
       // Covers both connection-time failure and a mid-stream upstream error —
       // headers are already sent, so this must be a data frame, not a status
       // code. The client shows the same "Unavailable" copy as the 502 path.
-      res.write(`data: ${JSON.stringify({ error: "unavailable" })}\n\n`);
+      // Guarded: if we got here because the client itself disconnected, the
+      // socket is already gone and writing to it would throw.
+      if (!clientDisconnected) res.write(`data: ${JSON.stringify({ error: "unavailable" })}\n\n`);
     }
-    res.end();
+    if (!clientDisconnected) res.end();
     return;
   }
 

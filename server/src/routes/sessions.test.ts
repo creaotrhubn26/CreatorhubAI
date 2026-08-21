@@ -712,6 +712,68 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
     expect(res.status).toBe(400);
   });
 
+  it("emits an error frame instead of a done frame when the upstream sends only [DONE] (empty concatenated answer)", async () => {
+    const id = "20260822-000004-glimmer-ask-stream-empty-answer";
+    await makeSession(id);
+    const { app: streamApp, server } = await appWithUpstream((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end("data: [DONE]\n\n");
+    });
+    try {
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).send({ question: "why?" });
+      expect(res.status).toBe(200);
+      const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
+      expect(frames).toEqual([{ error: "unavailable" }]);
+      expect(frames.some((f: any) => f.done)).toBe(false); // never a done frame for an empty answer
+    } finally {
+      server.close();
+    }
+  });
+
+  it("aborts the upstream request the moment the client disconnects mid-stream", async () => {
+    const id = "20260822-000005-glimmer-ask-stream-client-disconnect";
+    await makeSession(id);
+    let upstreamGotClose = false;
+    const { app: streamApp, server: upstreamServer } = await appWithUpstream((req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`);
+      req.on("close", () => { upstreamGotClose = true; });
+      // Deliberately never ends on its own — only the gateway aborting on
+      // client disconnect (or the test's own cleanup) ends this.
+    });
+    const gatewayServer: http.Server = await new Promise((resolve) => {
+      const s = streamApp.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const port = (gatewayServer.address() as any).port;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const body = JSON.stringify({ question: "why?" });
+        const clientReq = http.request(
+          {
+            hostname: "127.0.0.1", port, path: `/api/sessions/${id}/ask?stream=1`, method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+          },
+          (res) => {
+            res.once("data", () => clientReq.destroy()); // simulate the browser tab closing mid-stream
+          }
+        );
+        clientReq.on("error", () => resolve()); // destroying our own socket surfaces as a local error here — expected
+        clientReq.on("close", () => resolve());
+        clientReq.on("timeout", () => reject(new Error("client request timed out")));
+        clientReq.setTimeout(2000);
+        clientReq.write(body);
+        clientReq.end();
+      });
+
+      await new Promise((r) => setTimeout(r, 50)); // let 'close' propagate: Express req -> our AbortController -> upstream
+      expect(upstreamGotClose).toBe(true);
+    } finally {
+      gatewayServer.close();
+      upstreamServer.close();
+    }
+  });
+
   it("leaves the non-streaming response shape byte-compatible when ?stream=1 is absent", async () => {
     const id = "20260822-000003-glimmer-ask-nonstream-unchanged";
     await makeSession(id);

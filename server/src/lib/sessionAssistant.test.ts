@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
-import { askSessionAssistant } from "./sessionAssistant.js";
+import { askSessionAssistant, streamSessionAssistant } from "./sessionAssistant.js";
 import type { GlimmerSession, GlimmerEvent } from "@glimmer/shared";
 
 let server: http.Server | undefined;
@@ -65,5 +65,85 @@ describe("askSessionAssistant", () => {
       res.end(JSON.stringify({ choices: [] }));
     });
     await expect(askSessionAssistant(url, SESSION, EVENTS, "Why?")).rejects.toThrow();
+  });
+});
+
+describe("streamSessionAssistant", () => {
+  it("streams each delta and resolves with the full concatenated answer", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "It owns " } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "the parser state." } }] })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    const deltas: string[] = [];
+    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", (d) => deltas.push(d));
+    expect(deltas).toEqual(["It owns ", "the parser state."]);
+    expect(answer).toBe("It owns the parser state.");
+  });
+
+  it("flushes a final frame with no trailing newline instead of dropping it", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      // No trailing "\n\n" — the connection just ends right after this frame.
+      res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "It owns the parser state." } }] })}`);
+    });
+    const deltas: string[] = [];
+    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", (d) => deltas.push(d));
+    expect(deltas).toEqual(["It owns the parser state."]);
+    expect(answer).toBe("It owns the parser state.");
+  });
+
+  it("throws instead of resolving when the concatenated answer is empty (upstream sent only [DONE])", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end("data: [DONE]\n\n");
+    });
+    await expect(streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {})).rejects.toThrow(/no usable answer/);
+  });
+
+  it("aborts the upstream request when the caller's signal fires (client disconnected)", async () => {
+    let upstreamAborted = false;
+    const url = await listen((req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`);
+      req.on("close", () => { upstreamAborted = true; });
+      // Never ends on its own — only the caller's signal (or a timeout) ends this.
+    });
+    const callerGone = new AbortController();
+    setTimeout(() => callerGone.abort(), 30);
+    await expect(
+      streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 30_000, callerGone.signal)
+    ).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 20)); // let the server-side 'close' event land
+    expect(upstreamAborted).toBe(true);
+  });
+
+  it("does not abort a slow-but-steady stream whose total duration exceeds the idle timeout, as long as gaps between deltas stay under it", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      let n = 0;
+      const timer = setInterval(() => {
+        n += 1;
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: `${n} ` } }] })}\n\n`);
+        if (n === 3) {
+          clearInterval(timer);
+          res.end("data: [DONE]\n\n");
+        }
+      }, 40); // 3 deltas, 40ms apart => ~120ms total, well over a 60ms idle timeout
+    });
+    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 60);
+    expect(answer).toBe("1 2 3 ");
+  });
+
+  it("aborts when the upstream goes idle (no delta at all) for longer than the idle timeout", async () => {
+    const url = await listen((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`);
+      // Then goes silent well past the idle timeout before ever sending [DONE].
+      setTimeout(() => res.end("data: [DONE]\n\n"), 200);
+    });
+    await expect(streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 50)).rejects.toThrow();
   });
 });

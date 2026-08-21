@@ -31,8 +31,9 @@ export const glimmerApi = {
   // reads the SSE body by hand via fetch + a stream reader, parsing `data: `
   // lines and buffering a trailing partial line across chunk boundaries.
   // Resolves with the full concatenated answer once the server's `done`
-  // frame arrives; throws on connection failure or the server's error frame
-  // so the caller can fall back to the non-streaming askSession.
+  // frame arrives; throws on connection failure, a truncated stream, or the
+  // server's error frame so the caller can fall back to the non-streaming
+  // askSession (except for the tagged error-frame case — see below).
   askSessionStream: async (id: string, question: string, onDelta: (delta: string) => void): Promise<string> => {
     const res = await fetch(`${API_BASE}/api/sessions/${id}/ask?stream=1`, {
       method: "POST",
@@ -41,37 +42,55 @@ export const glimmerApi = {
     });
     if (!res.ok || !res.body) throw new Error(`POST /api/sessions/${id}/ask?stream=1 failed: ${res.status}`);
 
+    let full = "";
+    let sawDone = false;
+    // Shared by the in-loop parse and the final flush below so a stream that
+    // ends without a trailing "\n\n" doesn't silently drop its last frame.
+    function processLine(line: string) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) return;
+      const data = trimmed.slice(5).trim();
+      if (!data) return;
+      let parsed: any;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return; // malformed/torn SSE chunk — skip rather than crash the stream
+      }
+      if (typeof parsed.delta === "string") {
+        full += parsed.delta;
+        onDelta(parsed.delta);
+      } else if (parsed.done) {
+        sawDone = true;
+        if (typeof parsed.answer === "string") full = parsed.answer;
+      } else if (parsed.error) {
+        // The server already gave up on the upstream model — this is not a
+        // "connection to our own gateway" failure, so the caller must not
+        // retry via the non-streaming endpoint (same dead upstream). Tagged
+        // so SessionAssistant can tell the two apart.
+        const err = new Error(parsed.error);
+        err.name = "AssistantUpstreamError";
+        throw err;
+      }
+    }
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let full = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? ""; // last entry may be a partial line split across chunks
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const data = trimmed.slice(5).trim();
-        if (!data) continue;
-        let parsed: any;
-        try {
-          parsed = JSON.parse(data);
-        } catch {
-          continue; // malformed/torn SSE chunk — skip rather than crash the stream
-        }
-        if (typeof parsed.delta === "string") {
-          full += parsed.delta;
-          onDelta(parsed.delta);
-        } else if (parsed.done) {
-          if (typeof parsed.answer === "string") full = parsed.answer;
-        } else if (parsed.error) {
-          throw new Error(parsed.error);
-        }
-      }
+      for (const line of lines) processLine(line);
     }
+    processLine(buffer); // flush a final frame with no trailing newline
+
+    // A connection that drops (or a server bug) before the done frame must
+    // not read as "the model finished and said nothing/this much" — it's an
+    // incomplete answer, same provenance risk as fabricating one.
+    if (!sawDone) throw new Error("stream ended before the done frame");
     return full;
   },
   getRepositoryMap: () => request<RepoMap>("/api/repository/map"),
