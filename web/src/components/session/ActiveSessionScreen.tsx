@@ -1,16 +1,13 @@
 import { useParams, Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
-import { useSessionEvents } from "../../api/useSessionEvents";
+import { useSharedSessionEvents } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
 import { AgentStateStepper } from "./AgentStateStepper";
 import { RepairCycleStepper } from "./RepairCycleStepper";
-import { AgentTimeline } from "./AgentTimeline";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
-import { SessionAssistant } from "./SessionAssistant";
 import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
 import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
-import { TasksPanel } from "./TasksPanel";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 
 export function ActiveSessionScreen() {
@@ -35,7 +32,7 @@ export function ActiveSessionScreen() {
     enabled: !!id,
     refetchInterval: 4000,
   });
-  const events = useSessionEvents(id ?? "");
+  const events = useSharedSessionEvents();
 
   if (!session) return <div>Loading session…</div>;
 
@@ -72,10 +69,7 @@ export function ActiveSessionScreen() {
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
-      {id && <TasksPanel sessionId={id} />}
       {id && <DeliveryReviewPanel sessionId={id} />}
-      <AgentTimeline events={events} />
-      {id && <SessionAssistant sessionId={id} />}
     </div>
   );
 }

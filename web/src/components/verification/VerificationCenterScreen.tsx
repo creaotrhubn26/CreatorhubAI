@@ -56,7 +56,9 @@ function BaselineSummary({ checks }: { checks: VerificationCheckResult[] }) {
   );
 }
 
-function VerificationBody({ verification }: { verification: VerificationSummary | null | undefined }) {
+// Exported so the IDE shell's bottom-panel VERIFICATION tab can re-home this
+// exact body (session-scoped) without re-implementing the check rendering.
+export function VerificationBody({ verification }: { verification: VerificationSummary | null | undefined }) {
   if (!verification) return <div>Unavailable</div>;
   const checks = verification.checks;
   return (
