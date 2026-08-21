@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
+import { highlightLine, langFromPath, type Lang } from "../../state/highlight";
 
 type DiffLineKind = "add" | "del" | "context" | "hunk" | "file";
 interface DiffLine {
@@ -92,7 +93,21 @@ function groupLinesByFile(lines: DiffLine[]): DiffFileGroup[] {
   return groups;
 }
 
-function UnifiedLine({ l }: { l: DiffLine }) {
+// Renders one line's content through the hand-rolled tokenizer — used by
+// both unified and split modes so highlighting stays consistent everywhere.
+function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
+  return (
+    <>
+      {highlightLine(text, lang).map((t, i) => (
+        <span className={`tok-${t.kind}`} key={i}>
+          {t.text}
+        </span>
+      ))}
+    </>
+  );
+}
+
+function UnifiedLine({ l, lang }: { l: DiffLine; lang: Lang }) {
   if (l.kind === "file") return <div className="diff-view__file">{l.text}</div>;
   if (l.kind === "hunk") return <div className="diff-view__hunk">{l.text}</div>;
   const marker = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
@@ -101,7 +116,9 @@ function UnifiedLine({ l }: { l: DiffLine }) {
       <span className="diff-view__lineno">{l.oldNo ?? ""}</span>
       <span className="diff-view__lineno">{l.newNo ?? ""}</span>
       <span className="diff-view__marker">{marker}</span>
-      <span className="diff-view__text">{l.text}</span>
+      <span className="diff-view__text">
+        <HighlightedText text={l.text} lang={lang} />
+      </span>
     </div>
   );
 }
@@ -132,7 +149,7 @@ function buildSplitRows(lines: DiffLine[]): SplitRow[] {
   return rows;
 }
 
-function SplitCell({ line, side }: { line?: DiffLine; side: "del" | "add" }) {
+function SplitCell({ line, side, lang }: { line?: DiffLine; side: "del" | "add"; lang: Lang }) {
   if (!line) return <div className={`diff-view__side diff-view__side--${side === "add" ? "right" : "left"} empty`} />;
   const marker = line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
   const lineNo = side === "add" ? line.newNo : line.oldNo;
@@ -140,7 +157,9 @@ function SplitCell({ line, side }: { line?: DiffLine; side: "del" | "add" }) {
     <div className={`diff-view__side diff-view__side--${side === "add" ? "right" : "left"}${line.kind !== "context" ? ` ${line.kind}` : ""}`}>
       <span className="diff-view__lineno">{lineNo ?? ""}</span>
       <span className="diff-view__marker">{marker}</span>
-      <span className="diff-view__text">{line.text}</span>
+      <span className="diff-view__text">
+        <HighlightedText text={line.text} lang={lang} />
+      </span>
     </div>
   );
 }
@@ -151,27 +170,30 @@ function DiffView({ diff, mode, wrap }: { diff: string; mode: "unified" | "split
   const className = `diff-view${mode === "split" ? " diff-view--split" : ""}${wrap ? " wrap" : ""}`;
   return (
     <div className={className}>
-      {groups.map((g, gi) => (
-        <div className="diff-view__filegroup" key={gi}>
-          <div className="diff-view__file-header">
-            <span className="mono">{g.path}</span>
-            <span className="diff-view__stat-add">+{g.added}</span>
-            <span className="diff-view__stat-del">-{g.removed}</span>
+      {groups.map((g, gi) => {
+        const lang = langFromPath(g.path);
+        return (
+          <div className="diff-view__filegroup" key={gi}>
+            <div className="diff-view__file-header">
+              <span className="mono">{g.path}</span>
+              <span className="diff-view__stat-add">+{g.added}</span>
+              <span className="diff-view__stat-del">-{g.removed}</span>
+            </div>
+            {mode === "unified"
+              ? g.lines.map((l, i) => <UnifiedLine l={l} lang={lang} key={i} />)
+              : buildSplitRows(g.lines).map((r, i) =>
+                  r.type === "full" ? (
+                    <UnifiedLine l={r.line} lang={lang} key={i} />
+                  ) : (
+                    <div className="diff-view__split-row" key={i}>
+                      <SplitCell line={r.left} side="del" lang={lang} />
+                      <SplitCell line={r.right} side="add" lang={lang} />
+                    </div>
+                  )
+                )}
           </div>
-          {mode === "unified"
-            ? g.lines.map((l, i) => <UnifiedLine l={l} key={i} />)
-            : buildSplitRows(g.lines).map((r, i) =>
-                r.type === "full" ? (
-                  <UnifiedLine l={r.line} key={i} />
-                ) : (
-                  <div className="diff-view__split-row" key={i}>
-                    <SplitCell line={r.left} side="del" />
-                    <SplitCell line={r.right} side="add" />
-                  </div>
-                )
-              )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

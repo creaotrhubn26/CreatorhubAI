@@ -46,6 +46,14 @@
   /* radius */
   --radius: 5px;
   --radius-sm: 3px;
+
+  /* diff syntax highlighting tokens — muted IDE palette; Task 9 (light
+     theme) re-maps these, code should only ever reference the variables */
+  --tok-keyword: #c586c0;
+  --tok-string: #ce9178;
+  --tok-comment: var(--text-muted);
+  --tok-number: #b5cea8;
+  --tok-type: #4ec9b0;
 }
 
 * { box-sizing: border-box; }
@@ -417,6 +425,11 @@ pre {
 .diff-view__line.add .diff-view__marker { color: var(--green); }
 .diff-view__line.del .diff-view__marker { color: var(--red); }
 .diff-view__text { padding-right: var(--space-3); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-string { color: var(--tok-string); }
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-number { color: var(--tok-number); }
+.tok-type { color: var(--tok-type); }
 
 /* ---- AI assistant chat ---- */
 .chat-greeting { font-size: var(--fs-base); color: var(--text-primary); }
