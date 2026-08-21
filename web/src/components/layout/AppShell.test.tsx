@@ -63,6 +63,26 @@ describe("AppShell", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "Close s1" })).not.toBeInTheDocument());
   });
 
+  // pending-* rows are transient adopted-workspace placeholders — a
+  // duplicate of the real session once it lands, not a second session.
+  it("hides pending-* session rows from the sidebar list", async () => {
+    vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([
+      { id: "pending-abc123", task: "Fix dialog parser", status: "created", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2 },
+      { id: "20260821-221803-glimmer-x", task: "Fix dialog parser", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2 },
+    ] as any);
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppShell repoContext={null}>content</AppShell>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getAllByText("Fix dialog parser")).toHaveLength(1));
+  });
+
   describe("session event stream", () => {
     const realEventSource = globalThis.EventSource;
     afterEach(() => {

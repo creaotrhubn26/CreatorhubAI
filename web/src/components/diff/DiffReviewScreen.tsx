@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
@@ -47,24 +48,130 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
   return out;
 }
 
-function DiffView({ diff }: { diff: string }) {
-  if (!diff) return <div>Unavailable</div>;
-  const lines = parseUnifiedDiff(diff);
+interface DiffFileGroup {
+  path: string;
+  added: number;
+  removed: number;
+  lines: DiffLine[];
+}
+
+function extractPath(groupLines: DiffLine[]): string {
+  for (const l of groupLines) {
+    if (l.kind === "file" && l.text.startsWith("+++ ")) {
+      const raw = l.text.slice(4).trim();
+      if (raw && raw !== "/dev/null") return raw.replace(/^b\//, "");
+    }
+  }
+  for (const l of groupLines) {
+    if (l.kind === "file" && l.text.startsWith("diff --git")) {
+      const m = l.text.match(/ b\/(.+)$/);
+      if (m) return m[1];
+    }
+  }
+  return "file";
+}
+
+// Groups the flat parsed-line stream into one section per file (split on
+// "diff --git" boundaries), with real +N/-M counts computed from the parsed
+// lines themselves — so the sticky per-file header is never a guess.
+function groupLinesByFile(lines: DiffLine[]): DiffFileGroup[] {
+  const groups: DiffFileGroup[] = [];
+  let current: DiffLine[] = [];
+  function flush() {
+    if (current.length === 0) return;
+    const added = current.filter((l) => l.kind === "add").length;
+    const removed = current.filter((l) => l.kind === "del").length;
+    groups.push({ path: extractPath(current), added, removed, lines: current });
+    current = [];
+  }
+  for (const l of lines) {
+    if (l.kind === "file" && l.text.startsWith("diff --git")) flush();
+    current.push(l);
+  }
+  flush();
+  return groups;
+}
+
+function UnifiedLine({ l }: { l: DiffLine }) {
+  if (l.kind === "file") return <div className="diff-view__file">{l.text}</div>;
+  if (l.kind === "hunk") return <div className="diff-view__hunk">{l.text}</div>;
+  const marker = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
   return (
-    <div className="diff-view">
-      {lines.map((l, i) => {
-        if (l.kind === "file") return <div key={i} className="diff-view__file">{l.text}</div>;
-        if (l.kind === "hunk") return <div key={i} className="diff-view__hunk">{l.text}</div>;
-        const marker = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
-        return (
-          <div key={i} className={`diff-view__line${l.kind !== "context" ? ` ${l.kind}` : ""}`}>
-            <span className="diff-view__lineno">{l.oldNo ?? ""}</span>
-            <span className="diff-view__lineno">{l.newNo ?? ""}</span>
-            <span className="diff-view__marker">{marker}</span>
-            <span className="diff-view__text">{l.text}</span>
+    <div className={`diff-view__line${l.kind !== "context" ? ` ${l.kind}` : ""}`}>
+      <span className="diff-view__lineno">{l.oldNo ?? ""}</span>
+      <span className="diff-view__lineno">{l.newNo ?? ""}</span>
+      <span className="diff-view__marker">{marker}</span>
+      <span className="diff-view__text">{l.text}</span>
+    </div>
+  );
+}
+
+type SplitRow = { type: "full"; line: DiffLine } | { type: "pair"; left?: DiffLine; right?: DiffLine };
+
+// §14 side-by-side: same parsed unified diff, hunk-aligned with a simple
+// zip of consecutive del/add runs — context lines mirror on both sides,
+// del-only/add-only lines leave the opposite cell blank. No new data.
+function buildSplitRows(lines: DiffLine[]): SplitRow[] {
+  const rows: SplitRow[] = [];
+  let dels: DiffLine[] = [];
+  let adds: DiffLine[] = [];
+  function flushChange() {
+    const n = Math.max(dels.length, adds.length);
+    for (let i = 0; i < n; i++) rows.push({ type: "pair", left: dels[i], right: adds[i] });
+    dels = [];
+    adds = [];
+  }
+  for (const l of lines) {
+    if (l.kind === "del") { dels.push(l); continue; }
+    if (l.kind === "add") { adds.push(l); continue; }
+    flushChange();
+    if (l.kind === "context") rows.push({ type: "pair", left: l, right: l });
+    else rows.push({ type: "full", line: l });
+  }
+  flushChange();
+  return rows;
+}
+
+function SplitCell({ line, side }: { line?: DiffLine; side: "del" | "add" }) {
+  if (!line) return <div className={`diff-view__side diff-view__side--${side === "add" ? "right" : "left"} empty`} />;
+  const marker = line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
+  const lineNo = side === "add" ? line.newNo : line.oldNo;
+  return (
+    <div className={`diff-view__side diff-view__side--${side === "add" ? "right" : "left"}${line.kind !== "context" ? ` ${line.kind}` : ""}`}>
+      <span className="diff-view__lineno">{lineNo ?? ""}</span>
+      <span className="diff-view__marker">{marker}</span>
+      <span className="diff-view__text">{line.text}</span>
+    </div>
+  );
+}
+
+function DiffView({ diff, mode, wrap }: { diff: string; mode: "unified" | "split"; wrap: boolean }) {
+  if (!diff) return <div>Unavailable</div>;
+  const groups = groupLinesByFile(parseUnifiedDiff(diff));
+  const className = `diff-view${mode === "split" ? " diff-view--split" : ""}${wrap ? " wrap" : ""}`;
+  return (
+    <div className={className}>
+      {groups.map((g, gi) => (
+        <div className="diff-view__filegroup" key={gi}>
+          <div className="diff-view__file-header">
+            <span className="mono">{g.path}</span>
+            <span className="diff-view__stat-add">+{g.added}</span>
+            <span className="diff-view__stat-del">-{g.removed}</span>
           </div>
-        );
-      })}
+          {mode === "unified"
+            ? g.lines.map((l, i) => <UnifiedLine l={l} key={i} />)
+            : buildSplitRows(g.lines).map((r, i) =>
+                r.type === "full" ? (
+                  <UnifiedLine l={r.line} key={i} />
+                ) : (
+                  <div className="diff-view__split-row" key={i}>
+                    <SplitCell line={r.left} side="del" />
+                    <SplitCell line={r.right} side="add" />
+                  </div>
+                )
+              )}
+        </div>
+      ))}
     </div>
   );
 }
@@ -72,6 +179,8 @@ function DiffView({ diff }: { diff: string }) {
 export function DiffReviewScreen() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
+  const [mode, setMode] = useState<"unified" | "split">("unified");
+  const [wrap, setWrap] = useState(false);
   const { data: session } = useQuery({ queryKey: ["session", id], queryFn: () => glimmerApi.getSession(id!), enabled: !!id });
   const { data: diffResult } = useQuery({ queryKey: ["diff", id], queryFn: () => glimmerApi.getSessionDiff(id!), enabled: !!id });
   const revertMutation = useMutation({
@@ -117,7 +226,19 @@ export function DiffReviewScreen() {
         )) ?? <li>Unavailable</li>}
       </ul>
       {revertMutation.isError && <div>Unavailable — could not revert this file.</div>}
-      <DiffView diff={diffResult?.diff ?? ""} />
+      <div className="toolbar">
+        <div role="tablist" aria-label="Diff view mode">
+          {(["unified", "split"] as const).map((m) => (
+            <button key={m} aria-pressed={mode === m} onClick={() => setMode(m)}>
+              {m === "unified" ? "Unified" : "Split"}
+            </button>
+          ))}
+        </div>
+        <button aria-pressed={wrap} onClick={() => setWrap((w) => !w)}>
+          {wrap ? "Unwrap" : "Wrap"}
+        </button>
+      </div>
+      <DiffView diff={diffResult?.diff ?? ""} mode={mode} wrap={wrap} />
     </div>
   );
 }

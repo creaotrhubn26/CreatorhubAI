@@ -13,6 +13,27 @@ const DEFAULT_FORM: TaskComposerFormState = {
 
 const PATH_SCOPED_PACKAGES = new Set(["directory", "files"]);
 
+const SCOPE_LABEL: Record<TaskComposerFormState["scopePackage"], string> = {
+  repository: "entire repository",
+  frontend: "frontend",
+  backend: "backend",
+  directory: "selected directory",
+  files: "selected files",
+};
+
+// Pre-run summary line: one sentence stating exactly what will run, derived
+// live from the real form state — never fabricated, updates as the user types.
+function buildSummaryLine(form: TaskComposerFormState): string {
+  const scope = PATH_SCOPED_PACKAGES.has(form.scopePackage) && form.scopeArea?.trim()
+    ? `${SCOPE_LABEL[form.scopePackage]} (${form.scopeArea.trim()})`
+    : SCOPE_LABEL[form.scopePackage];
+  const verification = form.verification.length === 0
+    ? "no verification checks"
+    : `${form.verification.length} verification check${form.verification.length === 1 ? "" : "s"}`;
+  const repairs = `${form.repairBudget} repair${form.repairBudget === 1 ? "" : "s"}`;
+  return `${form.mode} · ${scope} · ${verification} · ${repairs}`;
+}
+
 export function NewTaskScreen() {
   const [form, setForm] = useState(DEFAULT_FORM);
   const [workspace, setWorkspace] = useState("");
@@ -46,184 +67,195 @@ export function NewTaskScreen() {
   });
 
   return (
-    <div>
-      <h1>What should Glimmer work on?</h1>
-      <textarea
-        value={form.objective}
-        onChange={(e) => setForm({ ...form, objective: e.target.value })}
-        placeholder="What should Glimmer work on?"
-      />
-      <label>
-        Workspace path
-        <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
-      </label>
-
-      <fieldset>
-        <legend>New worktree</legend>
-        <label>
-          Task name
-          <input
-            value={newTaskName}
-            onChange={(e) => setNewTaskName(e.target.value)}
-            placeholder="e.g. role-room-story-logic"
-            disabled={createWorkspaceMutation.isPending}
-          />
-        </label>
-        <button
-          type="button"
-          onClick={() => createWorkspaceMutation.mutate(newTaskName)}
-          disabled={!newTaskName.trim() || createWorkspaceMutation.isPending}
-        >
-          {createWorkspaceMutation.isPending ? "Creating worktree…" : "Create"}
-        </button>
-        {createWorkspaceMutation.isError && (
-          <span role="alert"> {(createWorkspaceMutation.error as Error).message}</span>
-        )}
-      </fieldset>
-
-      <fieldset>
-        <legend>Scope</legend>
-        <select value={form.scopePackage} onChange={(e) => setForm({ ...form, scopePackage: e.target.value as any })}>
-          <option value="repository">Entire repository</option>
-          <option value="frontend">Frontend</option>
-          <option value="backend">Backend</option>
-          <option value="directory">Selected directory</option>
-          <option value="files">Selected files</option>
-        </select>
-        {needsScopePath && (
-          <label>
-            Scope path
-            <input
-              value={form.scopeArea ?? ""}
-              onChange={(e) => setForm({ ...form, scopeArea: e.target.value })}
-              placeholder={form.scopePackage === "files" ? "e.g. src/foo.ts" : "e.g. frontend/src/dialog"}
+    <div className="composer">
+      <div className="composer__scroll">
+        <h1>What should Glimmer work on?</h1>
+        <div className="composer__columns">
+          <div className="composer__main">
+            <textarea
+              value={form.objective}
+              onChange={(e) => setForm({ ...form, objective: e.target.value })}
+              placeholder="What should Glimmer work on?"
             />
-            {scopePathMissing && <span role="alert"> A path is required for this scope.</span>}
-          </label>
-        )}
-      </fieldset>
+            <label>
+              Workspace path
+              <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
+            </label>
 
-      <fieldset>
-        <legend>Mode</legend>
-        <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as any })}>
-          {["inspect", "plan", "implement", "debug", "test", "review"].map((m) => (
-            <option key={m} value={m}>{m}</option>
-          ))}
-        </select>
-      </fieldset>
+            <fieldset>
+              <legend>New worktree</legend>
+              <label>
+                Task name
+                <input
+                  value={newTaskName}
+                  onChange={(e) => setNewTaskName(e.target.value)}
+                  placeholder="e.g. role-room-story-logic"
+                  disabled={createWorkspaceMutation.isPending}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => createWorkspaceMutation.mutate(newTaskName)}
+                disabled={!newTaskName.trim() || createWorkspaceMutation.isPending}
+              >
+                {createWorkspaceMutation.isPending ? "Creating worktree…" : "Create"}
+              </button>
+              {createWorkspaceMutation.isError && (
+                <span role="alert"> {(createWorkspaceMutation.error as Error).message}</span>
+              )}
+            </fieldset>
 
-      <TaskIntelligencePanel scopePackage={form.scopePackage} scopeArea={form.scopeArea || undefined} />
+            <fieldset>
+              <legend>Scope</legend>
+              <select value={form.scopePackage} onChange={(e) => setForm({ ...form, scopePackage: e.target.value as any })}>
+                <option value="repository">Entire repository</option>
+                <option value="frontend">Frontend</option>
+                <option value="backend">Backend</option>
+                <option value="directory">Selected directory</option>
+                <option value="files">Selected files</option>
+              </select>
+              {needsScopePath && (
+                <label>
+                  Scope path
+                  <input
+                    value={form.scopeArea ?? ""}
+                    onChange={(e) => setForm({ ...form, scopeArea: e.target.value })}
+                    placeholder={form.scopePackage === "files" ? "e.g. src/foo.ts" : "e.g. frontend/src/dialog"}
+                  />
+                  {scopePathMissing && <span role="alert"> A path is required for this scope.</span>}
+                </label>
+              )}
+            </fieldset>
 
-      <fieldset>
-        <legend>Verification</legend>
-        <label>
-          <input
-            type="checkbox"
-            checked={form.verification.includes("frontend-typecheck")}
-            onChange={(e) =>
-              setForm({
-                ...form,
-                verification: e.target.checked
-                  ? [...form.verification, "frontend-typecheck"]
-                  : form.verification.filter((v) => v !== "frontend-typecheck"),
-              })
-            }
-          />
-          Frontend typecheck
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={form.verification.includes("targeted-test")}
-            onChange={(e) =>
-              setForm({
-                ...form,
-                verification: e.target.checked
-                  ? [...form.verification, "targeted-test"]
-                  : form.verification.filter((v) => v !== "targeted-test"),
-              })
-            }
-          />
-          Targeted test
-        </label>
-      </fieldset>
+            <fieldset>
+              <legend>Mode</legend>
+              <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as any })}>
+                {["inspect", "plan", "implement", "debug", "test", "review"].map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </fieldset>
 
-      <fieldset>
-        <legend>Repair budget</legend>
-        <input
-          type="range" min={0} max={5} value={form.repairBudget}
-          onChange={(e) => setForm({ ...form, repairBudget: Number(e.target.value) })}
-        />
-        <span>{form.repairBudget}</span>
-      </fieldset>
+            <fieldset>
+              <legend>Verification</legend>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={form.verification.includes("frontend-typecheck")}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      verification: e.target.checked
+                        ? [...form.verification, "frontend-typecheck"]
+                        : form.verification.filter((v) => v !== "frontend-typecheck"),
+                    })
+                  }
+                />
+                Frontend typecheck
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={form.verification.includes("targeted-test")}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      verification: e.target.checked
+                        ? [...form.verification, "targeted-test"]
+                        : form.verification.filter((v) => v !== "targeted-test"),
+                    })
+                  }
+                />
+                Targeted test
+              </label>
+            </fieldset>
+          </div>
 
-      <fieldset>
-        <legend>Permissions</legend>
-        <label><input type="checkbox" checked readOnly /> Read repository</label>
-        <label><input type="checkbox" checked readOnly /> Search repository</label>
-        <label><input type="checkbox" checked readOnly /> Modify files</label>
-        <label><input type="checkbox" checked={false} disabled /> Commit</label>
-        <label><input type="checkbox" checked={false} disabled /> Push</label>
-        <label><input type="checkbox" checked={false} disabled /> Deploy</label>
-        <label><input type="checkbox" checked={false} disabled /> Install dependencies</label>
-      </fieldset>
+          <div className="composer__side">
+            <TaskIntelligencePanel scopePackage={form.scopePackage} scopeArea={form.scopeArea || undefined} />
 
-      <details>
-        <summary>Advanced</summary>
-        <label>
-          Max turns
-          <input
-            type="number" min={1} max={64}
-            value={form.maxTurns ?? ""}
-            onChange={(e) => setForm({ ...form, maxTurns: e.target.value === "" ? undefined : Number(e.target.value) })}
-          />
-        </label>
-        <label>
-          Timeout (seconds)
-          <input
-            type="number" min={60} max={3600}
-            value={form.timeoutSeconds ?? ""}
-            onChange={(e) => setForm({ ...form, timeoutSeconds: e.target.value === "" ? undefined : Number(e.target.value) })}
-          />
-        </label>
-        <label>
-          Toolchain mode
-          <select
-            value={form.toolchainMode}
-            onChange={(e) => setForm({ ...form, toolchainMode: e.target.value as TaskComposerFormState["toolchainMode"] })}
-          >
-            <option value="path">path</option>
-            <option value="linked">linked</option>
-            <option value="none">none</option>
-          </select>
-        </label>
-        <label>
-          Model readiness URL
-          <input
-            type="url"
-            value={form.modelReadinessUrl ?? ""}
-            onChange={(e) => setForm({ ...form, modelReadinessUrl: e.target.value })}
-            placeholder="https://..."
-          />
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={form.architectFirst ?? false}
-            onChange={(e) => setForm({ ...form, architectFirst: e.target.checked })}
-          />
-          Architect first
-        </label>
-        <p>Runs a read-only planning pass first.</p>
-      </details>
+            <fieldset>
+              <legend>Permissions</legend>
+              <label><input type="checkbox" checked readOnly /> Read repository</label>
+              <label><input type="checkbox" checked readOnly /> Search repository</label>
+              <label><input type="checkbox" checked readOnly /> Modify files</label>
+              <label><input type="checkbox" checked={false} disabled /> Commit</label>
+              <label><input type="checkbox" checked={false} disabled /> Push</label>
+              <label><input type="checkbox" checked={false} disabled /> Deploy</label>
+              <label><input type="checkbox" checked={false} disabled /> Install dependencies</label>
+            </fieldset>
 
-      <button
-        className="btn-primary"
-        onClick={() => runMutation.mutate()}
-        disabled={!form.objective || !workspace || scopePathMissing || runMutation.isPending}
-      >
-        RUN GLIMMER
-      </button>
+            <fieldset>
+              <legend>Repair budget</legend>
+              <input
+                type="range" min={0} max={5} value={form.repairBudget}
+                onChange={(e) => setForm({ ...form, repairBudget: Number(e.target.value) })}
+              />
+              <span>{form.repairBudget}</span>
+            </fieldset>
+
+            <details>
+              <summary>Advanced</summary>
+              <label>
+                Max turns
+                <input
+                  type="number" min={1} max={64}
+                  value={form.maxTurns ?? ""}
+                  onChange={(e) => setForm({ ...form, maxTurns: e.target.value === "" ? undefined : Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                Timeout (seconds)
+                <input
+                  type="number" min={60} max={3600}
+                  value={form.timeoutSeconds ?? ""}
+                  onChange={(e) => setForm({ ...form, timeoutSeconds: e.target.value === "" ? undefined : Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                Toolchain mode
+                <select
+                  value={form.toolchainMode}
+                  onChange={(e) => setForm({ ...form, toolchainMode: e.target.value as TaskComposerFormState["toolchainMode"] })}
+                >
+                  <option value="path">path</option>
+                  <option value="linked">linked</option>
+                  <option value="none">none</option>
+                </select>
+              </label>
+              <label>
+                Model readiness URL
+                <input
+                  type="url"
+                  value={form.modelReadinessUrl ?? ""}
+                  onChange={(e) => setForm({ ...form, modelReadinessUrl: e.target.value })}
+                  placeholder="https://..."
+                />
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={form.architectFirst ?? false}
+                  onChange={(e) => setForm({ ...form, architectFirst: e.target.checked })}
+                />
+                Architect first
+              </label>
+              <p>Runs a read-only planning pass first.</p>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <div className="composer__runbar">
+        <p className="composer__summary">{buildSummaryLine(form)}</p>
+        <button
+          className="btn-primary"
+          onClick={() => runMutation.mutate()}
+          disabled={!form.objective || !workspace || scopePathMissing || runMutation.isPending}
+        >
+          RUN GLIMMER
+        </button>
+      </div>
     </div>
   );
 }

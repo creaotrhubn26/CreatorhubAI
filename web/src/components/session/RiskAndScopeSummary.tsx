@@ -1,36 +1,43 @@
 import type { RiskLevel, SessionAnalysis } from "@glimmer/shared";
+import { CollapsibleSection } from "../common/CollapsibleSection";
 
 const RISK_COLOR: Record<RiskLevel, string> = {
   LOW: "var(--green)", MEDIUM: "var(--amber)", HIGH: "var(--red)", CRITICAL: "var(--red)",
 };
 const SEVERE_RISK: ReadonlySet<RiskLevel> = new Set(["HIGH", "CRITICAL"]);
 
+// Note: intentionally never the literal substring "SCOPE EXPANSION" (case
+// insensitively) — that string is reserved for the callout box itself so a
+// single test/user query can't match both the summary and the real notice.
+function scopeSummary(analysis: SessionAnalysis): string {
+  if (analysis.scopeGuard === null) return "scope unknown";
+  if (analysis.scopeGuard.unbounded) return "scope unbounded";
+  if (!analysis.scopeGuard.inScope) return "scope expanded outside plan";
+  return "in scope";
+}
+
 export function RiskAndScopeSummary({ analysis }: { analysis: SessionAnalysis }) {
   const severe = SEVERE_RISK.has(analysis.riskScore);
   const color = RISK_COLOR[analysis.riskScore] ?? "var(--gray)";
+  const summary = `${analysis.riskScore.toLowerCase()} risk · ${scopeSummary(analysis)}`;
 
   return (
-    <fieldset>
-      <legend>Risk &amp; Scope</legend>
+    <CollapsibleSection title="Risk & Scope" summary={summary} defaultOpen>
       <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
         Live — computed from this session's actual changed files ({analysis.provenance})
       </p>
-      <dl>
-        <dt>Risk level</dt>
-        <dd>
-          <span
-            className={`risk-badge risk-${analysis.riskScore.toLowerCase()}`}
-            style={{
-              color,
-              fontWeight: severe ? 700 : 400,
-              border: severe ? `1px solid ${color}` : undefined,
-              borderRadius: severe ? "var(--radius)" : undefined,
-              padding: severe ? "2px 6px" : undefined,
-            }}
-          >
-            {analysis.riskScore}
-          </span>
-        </dd>
+      <dl className="kv-grid">
+        <div>
+          <dt>Risk level</dt>
+          <dd>
+            <span
+              className={`meta-value risk-${analysis.riskScore.toLowerCase()}`}
+              style={{ ["--badge-color" as any]: color, fontWeight: severe ? 700 : 600 }}
+            >
+              {analysis.riskScore}
+            </span>
+          </dd>
+        </div>
       </dl>
       {analysis.scopeGuard === null && (
         <p>Scope guard: Unavailable — no task contract on record for this session.</p>
@@ -51,6 +58,6 @@ export function RiskAndScopeSummary({ analysis }: { analysis: SessionAnalysis })
           </dl>
         </div>
       )}
-    </fieldset>
+    </CollapsibleSection>
   );
 }

@@ -99,4 +99,22 @@ describe("DiffReviewScreen", () => {
     await waitFor(() => expect(screen.getByText(/could not accept/i)).toBeInTheDocument());
     expect(screen.getByText(/human review: not yet accepted/i)).toBeInTheDocument();
   });
+
+  // §14 side-by-side: a mode toggle switches between the unified diff and a
+  // two-column split view, built from the same parsed diff.
+  it("toggles between Unified and Split diff modes, rendering both without throwing", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
+      diff: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n-old line\n+new line\n context line\n",
+    });
+    const { container } = renderScreen();
+    await waitFor(() => expect(container.querySelector(".diff-view")).toBeInTheDocument());
+    expect(container.querySelector(".diff-view--split")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Split" }));
+    expect(container.querySelector(".diff-view--split")).toBeInTheDocument();
+    expect(container.querySelector(".diff-view__split-row")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Unified" }));
+    expect(container.querySelector(".diff-view--split")).not.toBeInTheDocument();
+  });
 });

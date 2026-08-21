@@ -5,10 +5,12 @@ import type { GlimmerEvent, GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { SessionEventsContext, useSessionEvents } from "../../api/useSessionEvents";
 import { statusColor } from "../common/StatusBadge";
+import { EmptyState } from "../common/EmptyState";
 import { AgentTimeline } from "../session/AgentTimeline";
 import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
+import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
   IconNewTask, IconRepository, IconSearch, IconSessions, IconSettings, IconVerification,
@@ -22,6 +24,7 @@ export interface RepoContext {
 }
 
 const OPEN_TABS_KEY = "glimmer.openTabs";
+const RIGHT_PANEL_COLLAPSED_KEY = "glimmer.rightPanelCollapsed";
 const MAX_TABS = 6;
 
 // Session ids are `YYYYMMDD-HHMMSS-glimmer-<task-slug>` — long enough that
@@ -98,7 +101,11 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const activeSessionId = sessionMatch?.[1];
   const activePage = activePageOf(location.pathname);
 
-  const { data: sessions } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions, refetchInterval: 5000 });
+  const { data: rawSessions } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions, refetchInterval: 5000 });
+  // pending-* rows are transient adopted-workspace placeholders — once the
+  // real session id shows up they're a duplicate, not a second session, so
+  // they never belong in any session-browsing list.
+  const sessions = useMemo(() => (rawSessions ?? []).filter((s) => !isPendingSessionId(s.id)), [rawSessions]);
   const { data: modelStatus } = useQuery({ queryKey: ["model-status"], queryFn: glimmerApi.getModelStatus, refetchInterval: 5000 });
   const { data: activeSession } = useQuery({
     queryKey: ["session", activeSessionId],
@@ -157,6 +164,23 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const [bottomTab, setBottomTab] = useState<"timeline" | "verification" | "tasks" | "events">("timeline");
   const [bottomCollapsed, setBottomCollapsed] = useState(false);
 
+  // §10: AI Assistant panel collapses like the bottom panel — persisted so
+  // it stays out of the way across reloads once the user closes it.
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() => {
+    try {
+      return window.localStorage?.getItem(RIGHT_PANEL_COLLAPSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(RIGHT_PANEL_COLLAPSED_KEY, rightPanelCollapsed ? "1" : "0");
+    } catch {
+      /* storage unavailable — collapse state just won't persist */
+    }
+  }, [rightPanelCollapsed]);
+
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
   const matches = useMemo(() => {
@@ -171,7 +195,8 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     setSearchFocused(false);
   }
 
-  const visibleSessions = (sessions ?? []).slice(0, 12);
+  const visibleSessions = sessions.slice(0, 12);
+  const sidebarGroups = useMemo(() => groupSessionsByDay(visibleSessions), [visibleSessions]);
 
   return (
     <div className="ide">
@@ -251,17 +276,25 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           <div className="ide-leftpanel__body">
             <Section title="Sessions" collapsed={collapsedSections.has("sessions")} onToggle={() => toggleSection("sessions")}>
               {visibleSessions.length === 0 && <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>Unavailable</div>}
-              {visibleSessions.map((s) => (
-                <button
-                  key={s.id}
-                  className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
-                  onClick={() => openSession(s.id)}
-                >
-                  <span className="ide-status-dot" style={{ color: statusColor(s.status) }} />
-                  <span className="ide-session-row__task">{s.task}</span>
-                </button>
+              {sidebarGroups.map((group) => (
+                <div key={group.label}>
+                  <div className="ide-session-daygroup">{group.label}</div>
+                  {group.sessions.map((s) => (
+                    <button
+                      key={s.id}
+                      className={`ide-session-row${s.id === activeSessionId ? " is-active" : ""}`}
+                      onClick={() => openSession(s.id)}
+                    >
+                      <span className="ide-status-dot" style={{ color: statusColor(s.status) }} />
+                      <span className="ide-session-row__main">
+                        <span className="ide-session-row__task">{s.task}</span>
+                        <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
               ))}
-              {(sessions?.length ?? 0) > visibleSessions.length && (
+              {sessions.length > visibleSessions.length && (
                 <Link className="ide-section__link" to="/sessions">View all sessions →</Link>
               )}
             </Section>
@@ -352,7 +385,7 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
             </div>
             {!bottomCollapsed && (
               <div className="ide-bottompanel__body">
-                {!activeSessionId && <div className="ide-bottompanel__empty">Open a session to see its {bottomTab}.</div>}
+                {!activeSessionId && <EmptyState icon="▤" text={`Open a session to see its ${bottomTab}.`} />}
                 {activeSessionId && bottomTab === "timeline" && <AgentTimeline events={events} />}
                 {activeSessionId && bottomTab === "verification" && <VerificationBody verification={activeSession?.verification} />}
                 {activeSessionId && bottomTab === "tasks" && <TasksPanel sessionId={activeSessionId} />}
@@ -362,15 +395,32 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           </div>
         </div>
 
-        <aside className="ide-rightpanel">
-          <div className="ide-rightpanel__header">AI Assistant</div>
-          <div className="ide-rightpanel__body">
-            {activeSessionId ? (
-              <SessionAssistant sessionId={activeSessionId} session={activeSession} />
-            ) : (
-              <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Open a session to ask questions about it.</p>
-            )}
-          </div>
+        <aside className={`ide-rightpanel${rightPanelCollapsed ? " is-collapsed" : ""}`}>
+          {rightPanelCollapsed ? (
+            <button className="ide-rightpanel__reopen" aria-label="Expand AI Assistant" onClick={() => setRightPanelCollapsed(false)}>
+              ‹
+            </button>
+          ) : (
+            <>
+              <div className="ide-rightpanel__header">
+                AI Assistant
+                <button
+                  className="ide-rightpanel__collapse"
+                  aria-label="Collapse AI Assistant"
+                  onClick={() => setRightPanelCollapsed(true)}
+                >
+                  <IconChevron open={false} />
+                </button>
+              </div>
+              <div className="ide-rightpanel__body">
+                {activeSessionId ? (
+                  <SessionAssistant sessionId={activeSessionId} session={activeSession} />
+                ) : (
+                  <EmptyState icon="💬" text="Open a session to ask questions about it." />
+                )}
+              </div>
+            </>
+          )}
         </aside>
       </div>
 
