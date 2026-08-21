@@ -11,8 +11,18 @@ export function createApp(): Express {
   const app = express();
   // This API spawns processes and writes to the repo: only the local web dev
   // server's origin (web/vite.config.ts port 5183, either loopback spelling)
-  // may call it — never `*`, which any visited website could reach.
-  app.use(cors({ origin: ["http://127.0.0.1:5183", "http://localhost:5183"] }));
+  // or the packaged Tauri desktop shell's webview origin may call it — never
+  // `*`, which any visited website could reach.
+  app.use(
+    cors({
+      origin: [
+        "http://127.0.0.1:5183",
+        "http://localhost:5183",
+        "tauri://localhost",
+        "https://tauri.localhost",
+      ],
+    })
+  );
   app.use(express.json());
   app.use("/api", statusRouter);
   app.use("/api", sessionsRouter);

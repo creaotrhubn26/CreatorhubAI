@@ -2,3 +2,5 @@ node_modules/
 dist/
 .superpowers/
 *.tsbuildinfo
+src-tauri/target/
+src-tauri/gen/
