@@ -3066,30 +3066,40 @@ def gates_block_verified(gates: dict) -> bool:
     resolved(tasks) returned False -- some required task is unresolved)
     blocks. None means no tasks.json (C3's task graph never ran for this
     session), same "mechanism didn't run -- not applicable" pass-through
-    every other optional gate here already uses."""
+    every other optional gate here already uses.
+
+    Task 8.1 (V7 §23.10): gates.customerReadinessApproved joins the same
+    True/False/None contract -- computed by compute_customer_readiness_gate
+    from the contract's optional qualityGates plus the session's
+    DeliveryReview. None means qualityGates.customerReadinessRequired was
+    never set (gate not requested for this task), same "not applicable"
+    pass-through as the others; False (required but missing/failed review,
+    or a real review that didn't meet qualityGates.minimumCustomerReadiness)
+    blocks exactly like documentationCurrent=False does."""
     if gates.get("implementationComplete") is not True:
         return True
     if gates.get("verificationPassed") is not True:
         return True
     return any(gates.get(key) is False for key in
                 ("architectureApproved", "scopeApproved", "tasksResolved",
-                 "documentationCurrent"))
+                 "documentationCurrent", "customerReadinessApproved"))
 
 
 def blocked_gate_names(gates: dict) -> list:
-    """Review round 1 (Important) + Task 4.2 + Task 7.1: which gate(s)
-    actually caused gates_block_verified to return True, in the same
-    checked order -- mirrors gates_block_verified exactly (same two
+    """Review round 1 (Important) + Task 4.2 + Task 7.1 + Task 8.1: which
+    gate(s) actually caused gates_block_verified to return True, in the
+    same checked order -- mirrors gates_block_verified exactly (same two
     hard-required keys, same not-False-only set, now including
-    tasksResolved and documentationCurrent) so the two can never silently
-    drift apart. Feeds describe_blocked_gates' honest, cause-naming
-    failure detail."""
+    tasksResolved, documentationCurrent, and customerReadinessApproved) so
+    the two can never silently drift apart. Feeds describe_blocked_gates'
+    honest, cause-naming failure detail."""
     blocked = []
     if gates.get("implementationComplete") is not True:
         blocked.append("implementationComplete")
     if gates.get("verificationPassed") is not True:
         blocked.append("verificationPassed")
-    for key in ("architectureApproved", "scopeApproved", "tasksResolved", "documentationCurrent"):
+    for key in ("architectureApproved", "scopeApproved", "tasksResolved",
+                "documentationCurrent", "customerReadinessApproved"):
         if gates.get(key) is False:
             blocked.append(key)
     return blocked
@@ -3146,6 +3156,95 @@ def describe_blocked_gates(manifest: dict) -> str:
     if not parts:
         return "one or more V7 §5.11 gates blocked promotion to verified"
     return "; ".join(parts)
+
+
+# ============================================================
+# Task 8.1 (V7 §23.10/§23.11): "would I send this to a customer?" quality
+# gate. glimmer-engineer.py already writes delivery-review.json (V7 §23.7,
+# validate_delivery_review's DELIVERY_REVIEW_READINESS_VALUES) at the end
+# of its own run, in the SAME session dir this orchestrator owns -- these
+# helpers only ever READ that file, never write it. Best-to-worst order,
+# identical to @glimmer/shared's DeliveryReviewCustomerReadiness union and
+# glimmer-engineer.py's DELIVERY_REVIEW_READINESS_VALUES (that one's a set,
+# unordered -- this tuple is the one place the ORDER is a fact, needed for
+# both the gate comparison below and statuses.overall's worst-of below).
+# ============================================================
+CUSTOMER_READINESS_ORDER = (
+    "ready_to_ship",
+    "ready_with_known_limitations",
+    "needs_polish",
+    "needs_rework",
+    "not_customer_ready",
+)
+
+
+def compare_customer_readiness(readiness: str, minimum: str) -> bool:
+    """Pure comparison over CUSTOMER_READINESS_ORDER: True iff `readiness`
+    is at least as good as `minimum` (equal or earlier in the best-to-worst
+    order). Fails closed (returns False, never raises) on either argument
+    not being a recognized value -- upstream callers only ever pass values
+    already validated (contract.qualityGates.minimumCustomerReadiness via
+    argparse `choices=`/control-center's validateAdvanced; the review's own
+    customerReadiness via validate_delivery_review), but this function's own
+    contract is "never fabricate True from garbage input", independent of
+    whether an upstream check happens to hold."""
+    if readiness not in CUSTOMER_READINESS_ORDER or minimum not in CUSTOMER_READINESS_ORDER:
+        return False
+    return CUSTOMER_READINESS_ORDER.index(readiness) <= CUSTOMER_READINESS_ORDER.index(minimum)
+
+
+def compute_customer_readiness_gate(quality_gates, delivery_review) -> "bool | None":
+    """V7 §23.10's gate, as a pure function of already-loaded data (same
+    discipline as compute_doc_gate -- both main() and
+    --quality-gates-selfcheck call this SAME function). Returns:
+
+    None  -- qualityGates.customerReadinessRequired was never set (absent
+             contract section, or explicitly False): gate not requested for
+             this task, "not applicable", never blocks. Backend-only/
+             internal tasks (V7 §23.10's own guidance) simply never pass
+             --customer-readiness-required, so this is the default for
+             every existing session, unchanged behavior.
+    False -- required but: no delivery-review.json exists for this session
+             (fail closed -- never fabricate a passing review that was
+             never generated), or its customerReadiness isn't a recognized
+             value, or it IS recognized but doesn't meet
+             qualityGates.minimumCustomerReadiness (when given).
+    True  -- required, a real review exists, and either no minimum was
+             given (customerReadinessRequired alone only asks "did the
+             self-review actually run", not "did it clear some bar") or the
+             review's customerReadiness meets/exceeds the given minimum.
+    """
+    if not quality_gates or not quality_gates.get("customerReadinessRequired"):
+        return None
+    if not isinstance(delivery_review, dict):
+        return False
+    readiness = delivery_review.get("customerReadiness")
+    if readiness not in CUSTOMER_READINESS_ORDER:
+        return False
+    minimum = quality_gates.get("minimumCustomerReadiness")
+    if minimum is None:
+        return True
+    return compare_customer_readiness(readiness, minimum)
+
+
+def load_delivery_review(session_dir):
+    """Load delivery-review.json from the session dir (same convention as
+    load_architecture_plan above -- glimmer-engineer.py's
+    _delivery_review_file_path writes to the parent of GLIMMER_EVENTS_PATH,
+    which IS session_dir from this side). Returns the parsed dict, or None
+    uniformly for every degraded case: file missing, unreadable, not valid
+    JSON, or not a JSON object. Unlike load_architecture_plan, a
+    reviewFailed review is NOT discarded here -- _fallback_delivery_review
+    already sets customerReadiness to "not_customer_ready" (the worst real
+    value), which is exactly correct fail-closed input for
+    compute_customer_readiness_gate above; a generation failure should read
+    as "definitely not customer ready", not as "no evidence either way"."""
+    path = Path(session_dir) / "delivery-review.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def architect_review_failure_text(review):
@@ -4514,6 +4613,166 @@ def run_doc_pass(ws, events_path, sid, manifest: dict, tasks, session) -> None:
 
 
 # ============================================================
+# Task 8.1 (V7 §23.11): combined statuses -- a single honest composite
+# object (manifest["statuses"]), separate from the per-gate booleans above
+# and from control-center's own (independently computed, read-time)
+# finalStatus (server/src/lib/sessions.ts composeFinalStatus/§22.17). Both
+# exist for different reasons: finalStatus is the gateway's own read-time
+# summary of the SAME manifest facts; this is the orchestrator's own
+# self-report, written once, at session close-out, mirroring V7 §23.11's
+# example shape ("Do not overload one status field").
+#
+# Each leg keeps ITS OWN natural vocabulary rather than a fabricated shared
+# one -- reusing exactly what already exists elsewhere in this codebase
+# (ladder: reuse before inventing): "VERIFIED"/"FAILED"/"NOT_RUN" for
+# technical (a deliberately coarser mirror of control-center's richer
+# VerificationOverall -- see compute_technical_status's own docstring for
+# the ceiling), "approved"/"rejected"/"not_run" for architecture/
+# documentation (control-center's own FinalGateStatus), the exact
+# NOT_RUN/PASS/FAIL/BLOCKED/PASS_WITH_WARNINGS vocabulary glimmer-visual.py
+# itself already writes to findings.json for visual (plus the "not_run"
+# sentinel for "no visual/ dir at all", same distinction control-center's
+# FinalStatus.visual already draws), and CUSTOMER_READINESS_ORDER's 5-level
+# vocabulary for delivery. overall is expressed in that same 5-level
+# vocabulary -- the only one granular enough to rank every leg's outcome
+# against each other -- via compute_overall_status's worst-of composition.
+# ============================================================
+
+VISUAL_FINDINGS_STATUSES = ("NOT_RUN", "PASS", "FAIL", "BLOCKED", "PASS_WITH_WARNINGS")
+
+
+def compute_technical_status(manifest: dict) -> str:
+    """statuses.technical: "NOT_RUN" when this session's last attempt never
+    reached a real verificationResults list (no attempts at all -- e.g.
+    --repo-map-only -- or the one attempt recorded exited before verify()
+    ever ran, e.g. a changed-files-budget-exceeded break); otherwise
+    "VERIFIED" when manifest["status"] reached one of the two VERIFIED
+    terminals, "FAILED" for every other outcome that DID reach a real
+    verification attempt.
+
+    Deliberately a coarser 3-state mirror of control-center's own
+    VerificationOverall (which also distinguishes PARTIAL/BLOCKED/
+    BASELINE_FAILURE/NEEDS_REVIEW -- states derived partly from gateway-
+    side facts, like human override history, that never live in this
+    manifest at all): this is an honest, best-effort orchestrator self-
+    report, not a replacement for control-center's own richer read-time
+    computation. ponytail: 3-state ceiling; widen to match VerificationOverall
+    exactly if a future task needs statuses.technical to drive UI logic
+    beyond a plain badge.
+    """
+    attempts = manifest.get("attempts") or []
+    if not attempts:
+        return "NOT_RUN"
+    last = attempts[-1] if isinstance(attempts[-1], dict) else {}
+    if not last.get("verificationResults"):
+        return "NOT_RUN"
+    return "VERIFIED" if manifest.get("status") in ("verified", "no-change-verified") else "FAILED"
+
+
+def _gate_to_status_leg(value) -> str:
+    """True/False/None -> "approved"/"rejected"/"not_run" -- the exact
+    mapping control-center's own gateToFinalStatus (server/src/lib/
+    sessions.ts) already uses for gates.architectureApproved/
+    documentationCurrent, reused verbatim here for the same two gates'
+    statuses legs."""
+    if value is True:
+        return "approved"
+    if value is False:
+        return "rejected"
+    return "not_run"
+
+
+def read_visual_status_leg(session_dir) -> str:
+    """statuses.visual: "not_run" when this session never produced a
+    visual/ dir at all (the "visual" verify token was never opted into --
+    same distinction control-center's readSession draws between its own
+    "not_run" sentinel and VisualFindingsStatus's own "NOT_RUN"). Once the
+    dir exists, read findings.json's own "status" field verbatim (already
+    exactly VISUAL_FINDINGS_STATUSES -- glimmer-visual.py's build_findings
+    is the sole writer); missing/unreadable/malformed/unrecognized findings
+    honestly degrade to "NOT_RUN" (capture ran, but nothing readable to
+    report), never fabricated as PASS."""
+    visual_dir = Path(session_dir) / "visual"
+    if not visual_dir.is_dir():
+        return "not_run"
+    try:
+        findings_doc = json.loads((visual_dir / "findings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "NOT_RUN"
+    status = findings_doc.get("status") if isinstance(findings_doc, dict) else None
+    return status if status in VISUAL_FINDINGS_STATUSES else "NOT_RUN"
+
+
+def compute_delivery_status_leg(delivery_review) -> str:
+    """statuses.delivery: the DeliveryReview's own customerReadiness
+    verbatim (already one of CUSTOMER_READINESS_ORDER's 5 values --
+    validate_delivery_review/_fallback_delivery_review both guarantee
+    this), or "not_run" when no delivery-review.json exists for this
+    session at all (never fabricated as a specific readiness level)."""
+    if not isinstance(delivery_review, dict):
+        return "not_run"
+    readiness = delivery_review.get("customerReadiness")
+    return readiness if readiness in CUSTOMER_READINESS_ORDER else "not_run"
+
+
+# Per-leg rank functions: map each leg's OWN vocabulary onto
+# CUSTOMER_READINESS_ORDER's index space (0 = best, len-1 = worst) purely
+# for worst-of comparison purposes -- None means "this leg never produced a
+# real judgment", excluded from the comparison entirely (an absent/
+# not-run subsystem must never drag `overall` down, V7 §23.11's own
+# "honest, not fabricated" requirement).
+_TECHNICAL_RANK = {"VERIFIED": 0, "FAILED": len(CUSTOMER_READINESS_ORDER) - 1}
+_GATE_RANK = {"approved": 0, "rejected": len(CUSTOMER_READINESS_ORDER) - 1}
+_VISUAL_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "BLOCKED": 3, "FAIL": len(CUSTOMER_READINESS_ORDER) - 1}
+
+
+def compute_overall_status(technical: str, architecture: str, documentation: str,
+                            visual: str, delivery: str) -> str:
+    """statuses.overall: worst-of composition across every leg that
+    actually produced a real judgment, expressed in CUSTOMER_READINESS_
+    ORDER's own vocabulary (the only leg-vocabulary granular enough to rank
+    every other leg's outcome against it -- see this section's own header
+    comment). "not_run" only when EVERY leg is absent/not-run -- an honest
+    "nothing to report" rather than a fabricated best-case default."""
+    ranks = [r for r in (
+        _TECHNICAL_RANK.get(technical),
+        _GATE_RANK.get(architecture),
+        _GATE_RANK.get(documentation),
+        _VISUAL_RANK.get(visual),
+        CUSTOMER_READINESS_ORDER.index(delivery) if delivery in CUSTOMER_READINESS_ORDER else None,
+    ) if r is not None]
+    if not ranks:
+        return "not_run"
+    return CUSTOMER_READINESS_ORDER[max(ranks)]
+
+
+def compute_statuses(manifest: dict, session_dir) -> dict:
+    """Compose manifest["statuses"] (V7 §23.11) from facts already on
+    `manifest` (gates, attempts, status) plus two session-dir file reads
+    (visual/findings.json, delivery-review.json) -- same "pure function
+    called by both main() and its own selfcheck" discipline as
+    compute_doc_gate. Called exactly once, from main()'s `finally` block,
+    so it runs on EVERY exit path (same unconditional-coverage reasoning as
+    finalDiffHash just above its call site) -- even a session that never
+    reached a single gate gets an honest all-"not_run"-except-technical
+    statuses object, never an absent field."""
+    gates = manifest.get("gates") or {}
+    technical = compute_technical_status(manifest)
+    architecture = _gate_to_status_leg(gates.get("architectureApproved"))
+    documentation = _gate_to_status_leg(gates.get("documentationCurrent"))
+    visual = read_visual_status_leg(session_dir)
+    delivery = compute_delivery_status_leg(load_delivery_review(session_dir))
+    return {
+        "technical": technical,
+        "architecture": architecture,
+        "documentation": documentation,
+        "visual": visual,
+        "delivery": delivery,
+        "overall": compute_overall_status(technical, architecture, documentation, visual, delivery),
+    }
+
+
+# ============================================================
 # Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation"): the
 # ADR store lives at <workspace>/docs/decisions/ADR-NNNN.md, one file per
 # decision, a simple frontmatter block (not a real YAML parser -- stdlib
@@ -5131,6 +5390,21 @@ def main():
     ap.add_argument("--no-architect", action="store_true",
                     help="Explicitly opt out of the risk-based architect auto-trigger (V7 §5.5). "
                          "Errors if combined with --architect-first.")
+    # Task 8.1 (V7 §23.10): contract.qualityGates. `choices=` is the CLI-level
+    # fail-closed rejection for an unrecognized minimum -- argparse exits 2
+    # before any session dir is even created, same "reject, don't guess"
+    # posture control-center's own validateAdvanced (a 400) applies at its
+    # own boundary. Omitted entirely (both flags absent) means no
+    # qualityGates section at all -- same omit-when-unset contract every
+    # other optional TaskContract field here already follows.
+    ap.add_argument("--customer-readiness-required", action="store_true",
+                    help="Contract qualityGates.customerReadinessRequired: this session's "
+                         "DeliveryReview must exist (and, with --minimum-customer-readiness, "
+                         "must meet that bar) or gates.customerReadinessApproved=False blocks VERIFIED.")
+    ap.add_argument("--minimum-customer-readiness", choices=CUSTOMER_READINESS_ORDER, default=None,
+                    help="Contract qualityGates.minimumCustomerReadiness: the DeliveryReview's "
+                         "customerReadiness must be at least this good (V7 §23.10's own ordering, "
+                         "best to worst: " + ", ".join(CUSTOMER_READINESS_ORDER) + ").")
     args = ap.parse_args()
 
     ws = Path(args.workspace).expanduser().resolve()
@@ -5226,6 +5500,15 @@ def main():
     # unset contract just above).
     if args.max_changed_files is not None:
         contract["budgets"] = {"maxChangedFiles": args.max_changed_files}
+    # Task 8.1 (V7 §23.10): qualityGates -- omitted entirely when neither
+    # flag was passed, same convention as budgets/maxTurns above.
+    if args.customer_readiness_required or args.minimum_customer_readiness is not None:
+        quality_gates = {}
+        if args.customer_readiness_required:
+            quality_gates["customerReadinessRequired"] = True
+        if args.minimum_customer_readiness is not None:
+            quality_gates["minimumCustomerReadiness"] = args.minimum_customer_readiness
+        contract["qualityGates"] = quality_gates
 
     # Task 2.1 (V7 §5.5): risk score always computed (even on a run that
     # passes neither --architect-first nor --no-architect) so
@@ -5593,24 +5876,39 @@ def main():
                                 gates["tasksResolvedBy"] = "human"
                                 for task_id, action in override_resolutions:
                                     emit_event(events_path, "task_override_applied", sid, taskId=task_id, action=action)
+                        # Task 8.1 (V7 §23.10): quality gate, same "no
+                        # bypass" reasoning as tasksResolved just above --
+                        # this no-change path has its OWN real
+                        # DeliveryReview (glimmer-engineer.py's final-answer
+                        # turn runs regardless of whether files changed), so
+                        # a required-but-failing review must block here too,
+                        # not just on the real-diff VERIFIED path below.
+                        gates["customerReadinessApproved"] = compute_customer_readiness_gate(
+                            contract.get("qualityGates"), load_delivery_review(session)
+                        )
                         manifest["gates"] = gates
 
-                        if gates["tasksResolved"] is False:
-                            # Fix round 1 (MODERATE 5): "no bypass" -- a
-                            # required task left unresolved (e.g. a prior
-                            # repair round's task never actually completed)
-                            # must block promotion here exactly like it
-                            # blocks the real-diff VERIFIED path below.
-                            blocked_gates = ["tasksResolved"]
-                            attempt["blockedGates"] = blocked_gates
-                            manifest["blockedGates"] = blocked_gates
+                        no_change_blocked_gates = [
+                            k for k in ("tasksResolved", "customerReadinessApproved")
+                            if gates.get(k) is False
+                        ]
+                        if no_change_blocked_gates:
+                            # Fix round 1 (MODERATE 5) + Task 8.1: "no
+                            # bypass" -- a required task left unresolved
+                            # (e.g. a prior repair round's task never
+                            # actually completed), and/or a required-but-
+                            # unmet customer-readiness gate, must block
+                            # promotion here exactly like they block the
+                            # real-diff VERIFIED path below.
+                            attempt["blockedGates"] = no_change_blocked_gates
+                            manifest["blockedGates"] = no_change_blocked_gates
                             attempt["status"] = "needs-architect-review-consistency-rejected"
                             manifest["attempts"].append(attempt)
                             manifest["status"] = "needs-architect-review-consistency-rejected"
                             manifest["state"] = canonical_session_state(manifest["status"])
                             emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
-                            final_label = "NOT VERIFIED — GATE BLOCKED (tasksResolved)"
-                            print("\n[V2] gates blocked promotion to verified: ['tasksResolved']")
+                            final_label = "NOT VERIFIED — GATE BLOCKED (" + ", ".join(no_change_blocked_gates) + ")"
+                            print(f"\n[V2] gates blocked promotion to verified: {no_change_blocked_gates}")
                             save()
                             break
 
@@ -6069,6 +6367,16 @@ def main():
                         gates["tasksResolvedBy"] = "human"
                         for task_id, action in override_resolutions:
                             emit_event(events_path, "task_override_applied", sid, taskId=task_id, action=action)
+                # Task 8.1 (V7 §23.10): must be set BEFORE gates_block_
+                # verified is consulted below (same C1-lesson ordering as
+                # run_doc_pass/documentationCurrent above) -- otherwise the
+                # gate is decorative. load_delivery_review reads whatever
+                # glimmer-engineer.py's final-answer turn already wrote to
+                # delivery-review.json for this session (real review, or
+                # the reviewFailed fallback -- either way, real evidence).
+                gates["customerReadinessApproved"] = compute_customer_readiness_gate(
+                    contract.get("qualityGates"), load_delivery_review(session)
+                )
                 manifest["gates"] = gates
 
                 if gates_block_verified(gates):
@@ -6226,6 +6534,15 @@ def main():
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
 
         manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
+        # Task 8.1 (V7 §23.11): combined statuses -- computed last, in this
+        # SAME unconditional `finally` block, so every exit path (VERIFIED,
+        # blocked, failed, interrupted) gets an honest statuses object, not
+        # just the two VERIFIED-reaching branches above (those are the only
+        # ones that ever populate gates.architectureApproved/
+        # documentationCurrent/customerReadinessApproved at all -- a session
+        # that never got that far reads back as "not_run" for those three
+        # legs here, which IS the honest fact).
+        manifest["statuses"] = compute_statuses(manifest, session)
         save()
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
         # the canonical manifest["state"], not the raw manifest["status"].
@@ -8380,6 +8697,9 @@ def _gates_selfcheck() -> None:
         # Task 4.2: tasksResolved joins architectureApproved/scopeApproved's
         # True/False/None contract (see the shared loop just below).
         "tasksResolved": True,
+        # Task 8.1: customerReadinessApproved joins the exact same contract
+        # (see the shared loop just below).
+        "customerReadinessApproved": True,
     }
     assert gates_block_verified(all_true) is False, "V7 §5.11's own worked example must pass"
 
@@ -8389,7 +8709,7 @@ def _gates_selfcheck() -> None:
     assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
 
     for optional_key in ("architectureApproved", "scopeApproved", "tasksResolved",
-                         "documentationCurrent"):
+                         "documentationCurrent", "customerReadinessApproved"):
         blocked = dict(all_true, **{optional_key: False})
         assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
         nulled = dict(all_true, **{optional_key: None})
@@ -8429,6 +8749,14 @@ def _gates_selfcheck() -> None:
     assert blocked_gate_names(dict(all_true, tasksResolved=False)) == ["tasksResolved"]
     assert blocked_gate_names(dict(all_true, tasksResolved=None)) == [], (
         "no tasks.json (task graph never ran) must NOT block or appear as a named cause"
+    )
+
+    # Task 8.1: customerReadinessApproved=False is a named blocked gate,
+    # same contract as documentationCurrent/tasksResolved; None (gate never
+    # requested) must NOT block or appear as a named cause.
+    assert blocked_gate_names(dict(all_true, customerReadinessApproved=False)) == ["customerReadinessApproved"]
+    assert blocked_gate_names(dict(all_true, customerReadinessApproved=None)) == [], (
+        "qualityGates.customerReadinessRequired never set must NOT block or appear as a named cause"
     )
     assert blocked_gate_names(
         dict(all_true, architectureApproved=False, scopeApproved=False, tasksResolved=False)
@@ -8508,6 +8836,18 @@ def _gates_selfcheck() -> None:
         "documentationCurrent can never actually block a VERIFIED promotion"
     )
 
+    # 5a-i. Task 8.1: same C1-lesson ordering for the new quality gate --
+    # gates["customerReadinessApproved"] must be computed before
+    # gates_block_verified is consulted on the real-diff VERIFIED path, or
+    # it too would be decorative.
+    real_diff_customer_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(', doc_pass_call_idx
+    )
+    assert doc_pass_call_idx < real_diff_customer_gate_idx < gates_block_idx, (
+        "gates[\"customerReadinessApproved\"] must be computed after the doc pass and before "
+        "gates_block_verified is consulted, or the quality gate can never actually block VERIFIED"
+    )
+
     # 5b. Review round 1 (minor): once flagged, consistency_gate's default
     #     must be None, never True -- a flagged diff with no plan/budget
     #     to review against must read as indeterminate, not clean. Proven
@@ -8545,11 +8885,19 @@ def _gates_selfcheck() -> None:
     tasks_resolved_idx = main_source.index(
         'gates["tasksResolved"] = (', no_change_ok_idx,
     )
-    tasks_resolved_check_idx = main_source.index('if gates["tasksResolved"] is False:', no_change_ok_idx)
-    no_change_verified_label_idx = main_source.index('"no-change-verified"', tasks_resolved_check_idx)
-    assert no_change_if_idx < no_change_ok_idx < impl_null_idx < tasks_resolved_idx < tasks_resolved_check_idx, (
-        "the no-change path must compute implementationComplete=null and tasksResolved, "
-        "in that order, before deciding whether tasksResolved blocks"
+    # Task 8.1: the quality gate is computed after tasksResolved, still
+    # strictly before the combined no_change_blocked_gates check below --
+    # same "must be set before the blocking decision is made" ordering as
+    # every other optional gate in this branch.
+    customer_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(', no_change_ok_idx,
+    )
+    no_change_blocked_idx = main_source.index("no_change_blocked_gates = [", no_change_ok_idx)
+    no_change_verified_label_idx = main_source.index('"no-change-verified"', no_change_blocked_idx)
+    assert (no_change_if_idx < no_change_ok_idx < impl_null_idx < tasks_resolved_idx
+            < customer_gate_idx < no_change_blocked_idx), (
+        "the no-change path must compute implementationComplete=null, tasksResolved, and "
+        "customerReadinessApproved, in that order, before deciding what blocks"
     )
     # Review round 1 (Minor 8a): the anchor above only pins the assignment's
     # `gates["tasksResolved"] = (` prefix (needed once the RHS became a
@@ -8557,11 +8905,11 @@ def _gates_selfcheck() -> None:
     # call, not just that prefix, genuinely sits inside this same span, so
     # a future edit can't hollow out the assignment while leaving the
     # anchor text intact.
-    assert "required_tasks_resolved(" in main_source[tasks_resolved_idx:tasks_resolved_check_idx], (
+    assert "required_tasks_resolved(" in main_source[tasks_resolved_idx:customer_gate_idx], (
         "gates[\"tasksResolved\"] must actually be computed via required_tasks_resolved(...) in this span"
     )
-    assert tasks_resolved_check_idx < no_change_verified_label_idx, (
-        "the tasksResolved==False block must be checked BEFORE the no-change-verified success path -- no bypass"
+    assert no_change_blocked_idx < no_change_verified_label_idx, (
+        "the no_change_blocked_gates check must run BEFORE the no-change-verified success path -- no bypass"
     )
     # This path must NOT reuse gates_block_verified (which would wrongly
     # block on implementationComplete=null, a real property only THIS
@@ -8569,10 +8917,245 @@ def _gates_selfcheck() -> None:
     # branches (this one and the real-diff VERIFIED one below it).
     real_diff_ok_idx = main_source.index("if ok:", no_change_verified_label_idx)
     assert "gates_block_verified(gates)" not in main_source[no_change_ok_idx:real_diff_ok_idx], (
-        "the no-change path must check tasksResolved directly, not via gates_block_verified"
+        "the no-change path must check tasksResolved/customerReadinessApproved directly, "
+        "not via gates_block_verified"
     )
 
     print("gates (Task 2.3, V7 §5.10/§5.11) self-check: PASS")
+
+
+def _quality_gates_selfcheck() -> None:
+    """Task 8.1 (V7 §23.10/§23.11): proves compare_customer_readiness /
+    compute_customer_readiness_gate's comparison vocabulary (including
+    unknown-value rejection) and fail-closed-missing-review behavior, the
+    gates_block_verified/blocked_gate_names blocking matrix for the new
+    customerReadinessApproved key (already extended in _gates_selfcheck --
+    repeated here narrowly so this selfcheck stands on its own), the
+    statuses composition (compute_statuses/compute_overall_status,
+    including worst-of and absent-subsystem honesty), and the source-
+    ordering proof that both branches compute the gate before
+    gates_block_verified is consulted. Run with:
+    python3 glimmer-v2.py --quality-gates-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. compare_customer_readiness: ordering + unknown-value rejection.
+    # ------------------------------------------------------------
+    assert compare_customer_readiness("ready_to_ship", "ready_to_ship") is True
+    assert compare_customer_readiness("ready_to_ship", "not_customer_ready") is True, (
+        "the best value must meet every minimum"
+    )
+    assert compare_customer_readiness("not_customer_ready", "ready_to_ship") is False, (
+        "the worst value must not meet the strictest minimum"
+    )
+    assert compare_customer_readiness("needs_polish", "ready_with_known_limitations") is False
+    assert compare_customer_readiness("ready_with_known_limitations", "needs_polish") is True
+    # Every value meets itself as its own minimum (boundary, not strict >).
+    for value in CUSTOMER_READINESS_ORDER:
+        assert compare_customer_readiness(value, value) is True
+    # Unknown values on either side fail closed, never raise.
+    assert compare_customer_readiness("extremely_ready", "needs_polish") is False
+    assert compare_customer_readiness("ready_to_ship", "extremely_ready") is False
+    assert compare_customer_readiness("bogus", "also_bogus") is False
+
+    # ------------------------------------------------------------
+    # 2. compute_customer_readiness_gate: None/True/False per §23.10.
+    # ------------------------------------------------------------
+    # Gate never requested -- absent qualityGates, or customerReadinessRequired
+    # explicitly False -- is "not applicable", regardless of any review.
+    assert compute_customer_readiness_gate(None, {"customerReadiness": "not_customer_ready"}) is None
+    assert compute_customer_readiness_gate(
+        {"customerReadinessRequired": False}, {"customerReadiness": "ready_to_ship"}
+    ) is None
+    assert compute_customer_readiness_gate({}, {"customerReadiness": "ready_to_ship"}) is None
+
+    # Required but no review at all (engineer never reached a final-answer
+    # turn, or delivery-review.json is missing/unreadable) -- fail closed,
+    # never a fabricated pass.
+    assert compute_customer_readiness_gate({"customerReadinessRequired": True}, None) is False
+    assert compute_customer_readiness_gate({"customerReadinessRequired": True}, {}) is False, (
+        "a review dict with no customerReadiness key at all must fail closed"
+    )
+    assert compute_customer_readiness_gate(
+        {"customerReadinessRequired": True}, {"customerReadiness": "not-a-real-value"}
+    ) is False, "an unrecognized customerReadiness value must fail closed, never fabricate True"
+
+    # Required, real review, no minimum given -- "did the review run" is
+    # the whole ask; True even for the worst real readiness value.
+    assert compute_customer_readiness_gate(
+        {"customerReadinessRequired": True}, {"customerReadiness": "not_customer_ready"}
+    ) is True
+
+    # Required, real review, explicit minimum -- delegates to
+    # compare_customer_readiness.
+    quality_gates = {"customerReadinessRequired": True, "minimumCustomerReadiness": "ready_with_known_limitations"}
+    assert compute_customer_readiness_gate(quality_gates, {"customerReadiness": "ready_to_ship"}) is True
+    assert compute_customer_readiness_gate(
+        quality_gates, {"customerReadiness": "ready_with_known_limitations"}
+    ) is True
+    assert compute_customer_readiness_gate(quality_gates, {"customerReadiness": "needs_polish"}) is False
+    assert compute_customer_readiness_gate(quality_gates, {"customerReadiness": "not_customer_ready"}) is False
+
+    # _fallback_delivery_review's shape (glimmer-engineer.py): reviewFailed
+    # review still carries a real customerReadiness ("not_customer_ready",
+    # the worst value) -- must fail closed against any real minimum, exactly
+    # like a genuinely bad review would, not be treated as "no evidence".
+    fallback_shaped = {"customerReadiness": "not_customer_ready", "reviewFailed": True,
+                       "reviewFailureReason": "model never produced valid JSON"}
+    assert compute_customer_readiness_gate(quality_gates, fallback_shaped) is False
+
+    # ------------------------------------------------------------
+    # 3. gate blocking matrix (gates_block_verified/blocked_gate_names) --
+    #    narrow, self-contained repeat of what _gates_selfcheck already
+    #    covers in full, so this selfcheck proves the wiring on its own.
+    # ------------------------------------------------------------
+    baseline_gates = {
+        "implementationComplete": True, "verificationPassed": True,
+        "architectureApproved": True, "scopeApproved": True,
+        "tasksResolved": True, "documentationCurrent": True,
+        "customerReadinessApproved": True,
+    }
+    assert gates_block_verified(baseline_gates) is False
+    assert gates_block_verified(dict(baseline_gates, customerReadinessApproved=False)) is True
+    assert gates_block_verified(dict(baseline_gates, customerReadinessApproved=None)) is False
+    assert blocked_gate_names(dict(baseline_gates, customerReadinessApproved=False)) == [
+        "customerReadinessApproved"
+    ]
+
+    # ------------------------------------------------------------
+    # 4. load_delivery_review: real file / missing / malformed.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert load_delivery_review(session) is None, "no delivery-review.json at all -> None"
+        (session / "delivery-review.json").write_text("not json {{{", encoding="utf-8")
+        assert load_delivery_review(session) is None, "unparseable JSON -> None, never raises"
+        (session / "delivery-review.json").write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+        assert load_delivery_review(session) is None, "a JSON array (not object) -> None"
+        real_review = {"customerReadiness": "ready_with_known_limitations", "summary": "x",
+                       "confidence": {"level": "high", "reason": "y"}}
+        (session / "delivery-review.json").write_text(json.dumps(real_review), encoding="utf-8")
+        assert load_delivery_review(session) == real_review
+
+    # ------------------------------------------------------------
+    # 5. statuses composition (V7 §23.11): compute_technical_status,
+    #    _gate_to_status_leg, read_visual_status_leg, compute_delivery_
+    #    status_leg, compute_overall_status's worst-of + absent-subsystem
+    #    honesty, and compute_statuses end to end.
+    # ------------------------------------------------------------
+    assert compute_technical_status({"attempts": [], "status": "repo-map-only"}) == "NOT_RUN"
+    assert compute_technical_status(
+        {"attempts": [{"changedFiles": []}], "status": "failed-changed-files-budget-exceeded"}
+    ) == "NOT_RUN", "an attempt that never reached verify() (no verificationResults) is honestly NOT_RUN"
+    assert compute_technical_status(
+        {"attempts": [{"verificationResults": [{"ok": True}]}], "status": "verified"}
+    ) == "VERIFIED"
+    assert compute_technical_status(
+        {"attempts": [{"verificationResults": [{"ok": True}]}], "status": "no-change-verified"}
+    ) == "VERIFIED"
+    assert compute_technical_status(
+        {"attempts": [{"verificationResults": [{"ok": False}]}], "status": "failed-repair-budget-exhausted"}
+    ) == "FAILED"
+
+    assert _gate_to_status_leg(True) == "approved"
+    assert _gate_to_status_leg(False) == "rejected"
+    assert _gate_to_status_leg(None) == "not_run"
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert read_visual_status_leg(session) == "not_run", "no visual/ dir at all -> not_run sentinel"
+        visual_dir = session / "visual"
+        visual_dir.mkdir()
+        assert read_visual_status_leg(session) == "NOT_RUN", (
+            "visual/ exists but findings.json missing -> honest NOT_RUN, never fabricated PASS"
+        )
+        (visual_dir / "findings.json").write_text(json.dumps({"status": "PASS_WITH_WARNINGS"}), encoding="utf-8")
+        assert read_visual_status_leg(session) == "PASS_WITH_WARNINGS"
+        (visual_dir / "findings.json").write_text(json.dumps({"status": "not-a-real-status"}), encoding="utf-8")
+        assert read_visual_status_leg(session) == "NOT_RUN", "unrecognized status value -> NOT_RUN, not fabricated"
+
+    assert compute_delivery_status_leg(None) == "not_run"
+    assert compute_delivery_status_leg({"customerReadiness": "needs_rework"}) == "needs_rework"
+    assert compute_delivery_status_leg({"customerReadiness": "bogus"}) == "not_run"
+
+    # Worst-of: a single bad leg among otherwise-clean legs drives overall.
+    assert compute_overall_status("VERIFIED", "approved", "approved", "PASS", "ready_to_ship") == "ready_to_ship"
+    assert compute_overall_status(
+        "VERIFIED", "approved", "approved", "PASS", "needs_polish"
+    ) == "needs_polish", "V7 §23.11's own worked example: everything else clean, delivery is the worst leg"
+    assert compute_overall_status("FAILED", "approved", "approved", "PASS", "ready_to_ship") == "not_customer_ready", (
+        "a failed technical leg must be the worst-ranked outcome, mapped onto the readiness vocabulary"
+    )
+    assert compute_overall_status(
+        "VERIFIED", "rejected", "approved", "PASS", "ready_with_known_limitations"
+    ) == "not_customer_ready", (
+        "rejected architecture ranks worse than a merely-limited delivery leg -- architecture drives overall here"
+    )
+    assert compute_overall_status(
+        "VERIFIED", "rejected", "approved", "PASS", "ready_to_ship"
+    ) == "not_customer_ready", "rejected architecture alone is the worst leg when delivery itself is clean"
+    # Absent subsystems (not_run/NOT_RUN) never drag overall down.
+    assert compute_overall_status("NOT_RUN", "not_run", "not_run", "not_run", "ready_to_ship") == "ready_to_ship"
+    # Every leg absent -> honestly "not_run", never a fabricated best-case default.
+    assert compute_overall_status("NOT_RUN", "not_run", "not_run", "not_run", "not_run") == "not_run"
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        manifest = {
+            "attempts": [{"verificationResults": [{"ok": True}]}], "status": "verified",
+            "gates": {"architectureApproved": True, "documentationCurrent": None},
+        }
+        assert compute_statuses(manifest, session) == {
+            "technical": "VERIFIED", "architecture": "approved", "documentation": "not_run",
+            "visual": "not_run", "delivery": "not_run", "overall": "ready_to_ship",
+        }, "no visual/ dir and no delivery-review.json -> both honestly not_run; nothing else drags overall down"
+        (session / "delivery-review.json").write_text(
+            json.dumps({"customerReadiness": "needs_rework"}), encoding="utf-8"
+        )
+        assert compute_statuses(manifest, session)["delivery"] == "needs_rework"
+        assert compute_statuses(manifest, session)["overall"] == "needs_rework"
+
+    # ------------------------------------------------------------
+    # 6. Source-ordering proof (both branches): the quality gate must be
+    #    computed before gates_block_verified is consulted -- otherwise it
+    #    is decorative, exactly the C1 lesson documentationCurrent already
+    #    had to learn.
+    # ------------------------------------------------------------
+    import inspect
+    main_source = inspect.getsource(main)
+    gates_block_idx = main_source.index("if gates_block_verified(gates):")
+    real_diff_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(',
+        main_source.index("run_doc_pass(ws, events_path, sid, manifest, tasks, session)"),
+    )
+    assert real_diff_gate_idx < gates_block_idx, (
+        "the real-diff branch must compute customerReadinessApproved before gates_block_verified runs"
+    )
+    no_change_ok_idx = main_source.index("if ok:", main_source.index("if not files:"))
+    no_change_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(', no_change_ok_idx
+    )
+    no_change_blocked_idx = main_source.index("no_change_blocked_gates = [", no_change_ok_idx)
+    assert no_change_gate_idx < no_change_blocked_idx, (
+        "the no-change branch must compute customerReadinessApproved before deciding what blocks"
+    )
+
+    # ------------------------------------------------------------
+    # 7. CLI-level fail-closed rejection: an unrecognized
+    #    --minimum-customer-readiness value must be rejected by argparse
+    #    itself (exit code 2), before any workspace/session validation --
+    #    the "unknown value -> CLI error, fail closed" half of the contract
+    #    validation V7 §23.10 asks for (control-center's validateAdvanced
+    #    is the 400-JSON-response half, tested on that side).
+    # ------------------------------------------------------------
+    result = subprocess.run(
+        [sys.executable, __file__, "--workspace", "/definitely-not-a-real-glimmer-workspace",
+         "--minimum-customer-readiness", "extremely_ready", "--", "task"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, "argparse must reject an unrecognized minimumCustomerReadiness value"
+    assert "minimum-customer-readiness" in result.stderr
+
+    print("quality gates (Task 8.1, V7 §23.10/§23.11) self-check: PASS")
 
 
 def _visual_selfcheck() -> None:
@@ -9848,6 +10431,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--gates-selfcheck"]:
         _gates_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--quality-gates-selfcheck"]:
+        _quality_gates_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--skills-selfcheck"]:
         _skills_selfcheck()
