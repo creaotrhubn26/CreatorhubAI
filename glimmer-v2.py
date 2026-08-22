@@ -1845,6 +1845,92 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         return p.wait()
 
 
+# ============================================================
+# Task 2.1 (V7 §5.5 first half): risk-triggered architect mode
+# ============================================================
+# Deterministic score, no model involvement. Fixed points per signal,
+# each independent (any subset can fire and stacks):
+#
+#   signal                                                     points
+#   --------------------------------------------------------------
+#   contract.mode == "refactor"                                     3
+#   multi-package scope (contract.scope.package == "repository")    2
+#   candidate_count > ARCHITECT_RISK_CANDIDATE_THRESHOLD             2
+#   protected-area keyword in contract.objective                    3
+#   verification_level == "full"                                    2
+#
+# score >= ARCHITECT_RISK_THRESHOLD auto-triggers architect-first
+# (unless --no-architect was passed); see main()'s architect_trigger_mode.
+#
+# "mode == refactor": @glimmer/shared's TaskContract.mode union (and
+# --mode's own choices) has no "refactor" value today -- this signal is
+# honored anyway, forward-compatible with a future TaskContract value,
+# and simply never fires under the CLI's current --mode choices.
+ARCHITECT_RISK_CANDIDATE_THRESHOLD = 5
+ARCHITECT_RISK_THRESHOLD = 5
+
+# Same plain-word, exact-token style as detect_documentation_impact's
+# _DOC_IMPACT_WORDS/_word_hits, applied to the objective text via the
+# existing _segment_tokens tokenizer (skills section, above) instead of
+# a fresh regex -- exact-token match is enough here (no camelCase
+# identifiers expected in a free-text objective sentence).
+_PROTECTED_AREA_WORDS = frozenset({
+    "auth", "authentication", "payment", "payments",
+    "migration", "migrations", "schema", "security",
+})
+
+
+def validate_architect_flags(architect_first, no_architect) -> None:
+    """Task 2.1: --architect-first (manual force-on) and --no-architect
+    (explicit opt-out) are a direct contradiction of intent when both are
+    passed -- raise rather than silently picking a side. Pure/standalone
+    so it's testable without spawning main()'s full argparse/workspace
+    setup, same pattern as validate_visual_url."""
+    if architect_first and no_architect:
+        raise V2Error("--architect-first and --no-architect are mutually exclusive")
+
+
+def compute_architect_risk(contract_like, candidate_count, verification_level) -> dict:
+    """Pure, deterministic V7 §5.5 risk score for auto-triggering
+    architect-first mode. No model call, no I/O, no randomness --
+    same inputs always produce the same {"score": int, "signals": [str]}.
+
+    `contract_like` is treated defensively (never indexed directly) so a
+    partial/malformed dict can't raise. `candidate_count` is a plain int
+    supplied by the caller (main() passes len(scope.paths) -- the only
+    pre-architect proxy for "how many files this touches," since no
+    ArchitecturePlan.candidateFiles exists yet at trigger-decision time).
+    `signals` lists which rows of the table above fired, in table order.
+    """
+    contract_like = contract_like or {}
+    scope = contract_like.get("scope") or {}
+    score = 0
+    signals = []
+
+    if contract_like.get("mode") == "refactor":
+        score += 3
+        signals.append("mode_refactor")
+
+    if scope.get("package") == "repository":
+        score += 2
+        signals.append("multi_package_scope")
+
+    if isinstance(candidate_count, int) and candidate_count > ARCHITECT_RISK_CANDIDATE_THRESHOLD:
+        score += 2
+        signals.append("candidate_count_high")
+
+    objective_tokens = _segment_tokens(str(contract_like.get("objective") or ""))
+    if _PROTECTED_AREA_WORDS.intersection(objective_tokens):
+        score += 3
+        signals.append("protected_area_keyword")
+
+    if verification_level == "full":
+        score += 2
+        signals.append("verification_full")
+
+    return {"score": score, "signals": signals}
+
+
 def load_architecture_plan(session_dir):
     """C1 (glimmer-v7): load architecture-plan.json from the session dir
     (same convention glimmer-engineer.py's _architecture_plan_file_path
@@ -2554,15 +2640,21 @@ def main():
     ap.add_argument("--readiness-timeout", type=int, default=180)
     ap.add_argument("--toolchain-mode", choices=("path", "linked", "none"), default="path",
                     help="path=reuse source tool binaries via env (safe default); linked=temporary ignored node_modules symlinks during trusted verification only; none=no source toolchain reuse")
-    # C1 (glimmer-v7): opt-in only, default False. Never auto-triggered by
-    # risk or anything else — TaskContract has no risk field today (risk is
-    # computed post-run, client-side, in a separate TS project), so there is
-    # nothing to gate an automatic invocation on. A human/caller must pass
-    # this explicitly. Every existing invocation (this flag omitted) takes
-    # the exact same code path as before this change.
+    # C1 (glimmer-v7): manual force-on, default False. Independent of the
+    # Task 2.1 risk-based auto-trigger below (§5.5) -- passing this always
+    # runs architect mode regardless of score.
     ap.add_argument("--architect-first", action="store_true",
                     help="Run glimmer-engineer.py --mode architect before iteration 0 and feed its "
-                         "ArchitecturePlan into the engineering prompt. Off by default; never auto-triggered.")
+                         "ArchitecturePlan into the engineering prompt. Manual force-on, independent "
+                         "of the risk-based auto-trigger (see --no-architect).")
+    # Task 2.1 (V7 §5.5): explicit opt-out of the risk-based auto-trigger
+    # (compute_architect_risk). Wins over auto-trigger (score >= threshold
+    # with this passed still runs with NO architect) but not over an
+    # explicit --architect-first -- passing both is a direct contradiction
+    # of intent and is rejected below rather than silently picking a side.
+    ap.add_argument("--no-architect", action="store_true",
+                    help="Explicitly opt out of the risk-based architect auto-trigger (V7 §5.5). "
+                         "Errors if combined with --architect-first.")
     args = ap.parse_args()
 
     ws = Path(args.workspace).expanduser().resolve()
@@ -2579,6 +2671,7 @@ def main():
         raise V2Error("--max-repairs must be 0..5")
     if args.max_changed_files is not None and not (1 <= args.max_changed_files <= 500):
         raise V2Error("--max-changed-files must be 1..500")
+    validate_architect_flags(args.architect_first, args.no_architect)
     validate_visual_url(args.verify, args.visual_url)
 
     recovery = recover_interrupted_checkpoint(ws)
@@ -2657,12 +2750,41 @@ def main():
     if args.max_changed_files is not None:
         contract["budgets"] = {"maxChangedFiles": args.max_changed_files}
 
+    # Task 2.1 (V7 §5.5): risk score always computed (even on a run that
+    # passes neither --architect-first nor --no-architect) so
+    # manifest["architectTrigger"] records the decision for every session,
+    # not just auto-triggered ones. candidate_count is the only
+    # pre-architect proxy available at this point -- see compute_
+    # architect_risk's docstring.
+    architect_candidate_count = len(scope.get("paths") or [])
+    architect_risk = compute_architect_risk(contract, architect_candidate_count, args.verification_level)
+    if args.architect_first:
+        architect_trigger_mode = "manual"
+    elif architect_risk["score"] >= ARCHITECT_RISK_THRESHOLD and not args.no_architect:
+        architect_trigger_mode = "auto"
+    else:
+        architect_trigger_mode = "off"
+    run_architect = architect_trigger_mode in ("manual", "auto")
+    if architect_trigger_mode == "auto":
+        emit_event(events_path, "architect_autotriggered", sid,
+                   score=architect_risk["score"], threshold=ARCHITECT_RISK_THRESHOLD,
+                   signals=architect_risk["signals"])
+
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
         "state": canonical_session_state("initialized"),
         "eventsFile": "events.jsonl", "contract": contract,
+        # Task 2.1 (V7 §5.5): always present, regardless of trigger mode --
+        # the deterministic decision itself is worth recording even on an
+        # "off" run (score/signals still computed, just below threshold or
+        # explicitly opted out).
+        "architectTrigger": {
+            "mode": architect_trigger_mode,
+            "score": architect_risk["score"],
+            "signals": architect_risk["signals"],
+        },
         # Task 1.4 (V7 §38): manifest completion -- additive fields only,
         # every existing reader (control-center/server/src/lib/sessions.ts)
         # tolerates unknown JSON keys already (plain JSON.parse, no schema
@@ -2767,13 +2889,15 @@ def main():
             manifest["modelReadiness"] = {"status": "SKIPPED"}
             save()
 
-        # C1 (glimmer-v7): opt-in only (--architect-first), runs once before
-        # iteration 0. architecture_plan stays None (identical to never
-        # having passed the flag) whenever it's skipped, or the architect
-        # run fails/times out/produces invalid JSON — see
+        # C1 (glimmer-v7) + Task 2.1 (V7 §5.5): runs once before iteration 0
+        # whenever run_architect is True -- manual force-on (--architect-
+        # first) or risk-based auto-trigger (architect_trigger_mode ==
+        # "auto", computed above). architecture_plan stays None (identical
+        # to run_architect being False) whenever it's skipped, or the
+        # architect run fails/times out/produces invalid JSON — see
         # run_architect_first/load_architecture_plan's uniform-None
         # degradation contract. manifest["architectPlan"] is only ever
-        # added when --architect-first was actually passed (fix round 1,
+        # added when run_architect was actually True (fix round 1,
         # Important finding: without this, there's no way to measure
         # architect-mode activity/usefulness separately from the main
         # run — the reconciliation doc requires shipping C1 "behind a
@@ -2789,7 +2913,7 @@ def main():
         # `finally` too -- see that comment) stays None in every degraded
         # case, same uniform-None-on-no-plan contract as
         # architecture_plan/candidate_evidence just above.
-        if args.architect_first:
+        if run_architect:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
             )
@@ -2798,9 +2922,9 @@ def main():
             # C2: gates/architectReviews are only ever added to the
             # manifest when a usable plan exists — with no plan there is
             # nothing to review against, so C2 never runs and these keys
-            # would otherwise be pure clutter on a --architect-first run
-            # that didn't even get a usable plan (mirrors architectPlan's
-            # own architect_first-only gating just above).
+            # would otherwise be pure clutter on a run_architect run that
+            # didn't even get a usable plan (mirrors architectPlan's own
+            # run_architect gating just above).
             if architecture_plan is not None:
                 manifest["gates"] = {"architectureApproved": None}
                 manifest["architectReviews"] = {"max": ARCHITECT_REVIEW_BUDGET, "used": 0}
@@ -3653,6 +3777,106 @@ def _architect_first_selfcheck() -> None:
     assert inspect.signature(invoke_engineer).parameters["plan_candidate_count"].default == 0
 
     print("architect-first self-check: PASS")
+
+
+def _architect_risk_selfcheck() -> None:
+    """Task 2.1 (V7 §5.5): proves compute_architect_risk's scoring table
+    signal-by-signal, a combination that crosses ARCHITECT_RISK_THRESHOLD,
+    a case that stays below it, and the --architect-first/--no-architect
+    flag-interaction rules (validate_architect_flags). No model, no
+    session, no subprocess. Run with:
+    python3 glimmer-v2.py --architect-risk-selfcheck
+    """
+    base_contract = {
+        "objective": "add a dashboard widget",
+        "scope": {"package": "frontend"},
+        "mode": "implement",
+    }
+
+    # 1. Zero signals -> score 0, no signals, well below threshold.
+    zero = compute_architect_risk(base_contract, 0, "minimal")
+    assert zero == {"score": 0, "signals": []}
+    assert zero["score"] < ARCHITECT_RISK_THRESHOLD
+
+    # 2. Each signal individually.
+    refactor = compute_architect_risk({**base_contract, "mode": "refactor"}, 0, "minimal")
+    assert refactor == {"score": 3, "signals": ["mode_refactor"]}
+
+    multi_pkg = compute_architect_risk(
+        {**base_contract, "scope": {"package": "repository"}}, 0, "minimal")
+    assert multi_pkg == {"score": 2, "signals": ["multi_package_scope"]}
+
+    high_candidates = compute_architect_risk(
+        base_contract, ARCHITECT_RISK_CANDIDATE_THRESHOLD + 1, "minimal")
+    assert high_candidates == {"score": 2, "signals": ["candidate_count_high"]}
+    # Exactly-at-threshold does NOT fire (strictly greater-than).
+    at_candidate_threshold = compute_architect_risk(
+        base_contract, ARCHITECT_RISK_CANDIDATE_THRESHOLD, "minimal")
+    assert at_candidate_threshold == {"score": 0, "signals": []}
+
+    protected = compute_architect_risk(
+        {**base_contract, "objective": "migrate the auth schema"}, 0, "minimal")
+    assert protected == {"score": 3, "signals": ["protected_area_keyword"]}
+    # Substring, not whole-token, must NOT false-positive (e.g. "author").
+    no_false_positive = compute_architect_risk(
+        {**base_contract, "objective": "credit the author of this module"}, 0, "minimal")
+    assert no_false_positive == {"score": 0, "signals": []}
+
+    full_verify = compute_architect_risk(base_contract, 0, "full")
+    assert full_verify == {"score": 2, "signals": ["verification_full"]}
+    # "standard" is not "full" -- no signal.
+    assert compute_architect_risk(base_contract, 0, "standard") == {"score": 0, "signals": []}
+
+    # 3. Combination crossing the threshold: mode_refactor (3) +
+    # multi_package_scope (2) == 5 == ARCHITECT_RISK_THRESHOLD. Order of
+    # signals in the output follows table order regardless of which
+    # fields were set on the input.
+    combo = compute_architect_risk(
+        {"objective": "x", "scope": {"package": "repository"}, "mode": "refactor"}, 0, "minimal")
+    assert combo["score"] == 5 == ARCHITECT_RISK_THRESHOLD
+    assert combo["signals"] == ["mode_refactor", "multi_package_scope"]
+
+    # 4. Below threshold: any single signal alone (max single signal is 3)
+    # never reaches the threshold on its own.
+    assert refactor["score"] < ARCHITECT_RISK_THRESHOLD
+    assert protected["score"] < ARCHITECT_RISK_THRESHOLD
+
+    # 5. All five signals stack additively, in table order.
+    everything = compute_architect_risk(
+        {
+            "objective": "migrate the payment schema",
+            "scope": {"package": "repository"},
+            "mode": "refactor",
+        },
+        ARCHITECT_RISK_CANDIDATE_THRESHOLD + 5,
+        "full",
+    )
+    assert everything == {
+        "score": 12,
+        "signals": [
+            "mode_refactor", "multi_package_scope", "candidate_count_high",
+            "protected_area_keyword", "verification_full",
+        ],
+    }
+
+    # 6. Defensive against malformed/partial input -- never raises.
+    assert compute_architect_risk(None, 0, None) == {"score": 0, "signals": []}
+    assert compute_architect_risk({}, "not-an-int", "full") == {"score": 2, "signals": ["verification_full"]}
+
+    # 7. Flag-interaction rules (validate_architect_flags): --no-architect
+    # wins over the auto-trigger (a separate, main()-side score check --
+    # not this function's concern), but --architect-first + --no-architect
+    # together is an explicit contradiction and must raise.
+    validate_architect_flags(False, False)  # no-op, no error
+    validate_architect_flags(True, False)   # --architect-first alone, fine
+    validate_architect_flags(False, True)   # --no-architect alone, fine
+    try:
+        validate_architect_flags(True, True)
+        assert False, "expected V2Error for --architect-first + --no-architect"
+    except V2Error as exc:
+        assert "mutually exclusive" in str(exc)
+
+    print("architect-risk self-check: PASS")
 
 
 def _architect_review_selfcheck() -> None:
@@ -4558,6 +4782,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-first-selfcheck"]:
         _architect_first_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-risk-selfcheck"]:
+        _architect_risk_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-review-selfcheck"]:
         _architect_review_selfcheck()

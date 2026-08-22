@@ -31,6 +31,10 @@ EVENT_TYPES = {
     "architect_planning_started", "architect_plan_created",
     "architect_review_requested", "architect_review_completed",
     "architect_replan_started",
+    # Task 2.1 (V7 §5.5): emitted by glimmer-v2.py main() only when the
+    # deterministic risk score (compute_architect_risk) crosses
+    # ARCHITECT_RISK_THRESHOLD and --no-architect was not passed.
+    "architect_autotriggered",
     "task_created", "task_status_changed", "task_list_completed",
     "visual_verification_started", "visual_finding_detected",
     "visual_verification_completed",
