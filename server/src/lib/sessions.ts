@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
-import { gitStatus } from "./git.js";
+import { computeDiffHash } from "./git.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
@@ -105,25 +105,47 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   // sites in glimmer-v2.py) -- absent everywhere else, same optional-pass-
   // through discipline as gates/architectPlan/failure above.
   if (m.verifiedAt) session.verifiedAt = m.verifiedAt;
+  // V7 §20: written unconditionally by glimmer-v2.py's `finally` block on
+  // every exit path, right after collapse() -- see the field's own comment
+  // on GlimmerSession for what it actually captures and why.
+  if (m.finalDiffHash) session.finalDiffHash = m.finalDiffHash;
   return session;
 }
 
 // V7 §20 session-level verification freeze: staleness is a fact the gateway
 // DETECTS, read-time, rather than something any daemon enforces -- nothing
-// runs after glimmer-v2.py exits. Deterministic rule: a session is stale iff
-// it reached VERIFIED (has verifiedAt) AND its workspace directory still
-// exists AND that workspace currently has uncommitted changes (tracked or
-// untracked -- gitStatus's `dirty` already covers both via `git status
-// --porcelain`, see git.ts). A workspace that no longer exists is NOT
-// stale -- there is nothing to compare against, and the human may have
-// legitimately committed and cleaned up after accepting the result; guessing
-// "stale" with no evidence would be dishonest. Any other git failure (not a
-// repo, permissions, ...) is treated the same way: no evidence, no claim.
-async function isWorkspaceDirtyNow(workspace: string): Promise<boolean> {
+// runs after glimmer-v2.py exits.
+//
+// Review round 1 fix: the original rule ("workspace has uncommitted changes
+// now") was wrong -- collapse() (glimmer-v2.py, in the session's `finally`)
+// resets HEAD back to baselineSha and DELIBERATELY leaves the produced diff
+// sitting as uncommitted working-tree state (that's what View diff/accept
+// read). So every successful-with-a-diff session is "dirty" at verifiedAt
+// time by construction -- the old rule flagged the entire success path as
+// stale immediately.
+//
+// The real rule: a session is stale iff its CURRENT diff against baselineSha
+// no longer matches manifest.finalDiffHash (the fingerprint glimmer-v2.py
+// took of that exact diff when the session collapsed) -- i.e. something
+// wrote to the workspace after verification finished. Committing the
+// accepted diff elsewhere does NOT change this hash (git diff against a
+// fixed baseline sha compares content, not HEAD position), so an accepted-
+// and-committed session correctly reads back as still-verified, not stale.
+//
+// Bounded timeout (STALE_CHECK_TIMEOUT_MS): this runs on a route a session
+// screen polls every 4s -- a hung mount/filesystem must error out fast, not
+// hang the request.
+const STALE_CHECK_TIMEOUT_MS = 5_000;
+
+async function currentDiffHash(workspace: string, baselineSha: string): Promise<string | null> {
   try {
-    return (await gitStatus(workspace)).dirty;
+    return await computeDiffHash(workspace, baselineSha, { timeoutMs: STALE_CHECK_TIMEOUT_MS });
   } catch {
-    return false;
+    // Missing workspace, not a git repo, timed out, permissions, ... -- no
+    // evidence either way. Never claim "stale" without proof (the human may
+    // have legitimately committed and cleaned up the workspace after
+    // accepting the result).
+    return null;
   }
 }
 
@@ -281,7 +303,7 @@ async function copyGatewayContract(fromId: string, toId: string): Promise<void> 
 }
 
 // computeStale defaults to false: staleness detection spawns git (see
-// isWorkspaceDirtyNow above), and this function backs BOTH the session-list
+// currentDiffHash above), and this function backs BOTH the session-list
 // endpoint (polled every few seconds by the sidebar) and the single-session
 // endpoint. Running a git spawn per session on every list poll would fork-
 // bomb the server (N sessions x one poll every 4s) for a fact only the one
@@ -300,8 +322,12 @@ export async function readSession(
   if (taskContract) session = { ...session, taskContract };
   const humanAcceptance = await readHumanAcceptance(real);
   if (humanAcceptance) session = { ...session, humanAcceptance };
-  if (opts.computeStale && session.status === "verified" && session.verifiedAt) {
-    if (await isWorkspaceDirtyNow(session.workspace)) {
+  // Missing finalDiffHash (manifest predates this task) -> never stale, same
+  // honesty rule as currentDiffHash returning null: no fingerprint to
+  // compare against, no claim.
+  if (opts.computeStale && session.status === "verified" && session.finalDiffHash) {
+    const current = await currentDiffHash(session.workspace, session.baselineSha);
+    if (current !== null && current !== session.finalDiffHash) {
       session = { ...session, status: "stale" };
     }
   }

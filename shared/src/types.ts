@@ -152,9 +152,22 @@ export interface GlimmerSession {
   // V7 §20: stamped by glimmer-v2.py at the moment a session reached
   // VERIFIED (both the real-diff "verified" path and the empty-diff
   // "no-change-verified" path). Optional -- absent on sessions predating
-  // this task and on any non-verified session. Used only by the gateway's
-  // own stale-detection read (see readSession); not otherwise displayed.
+  // this task and on any non-verified session. An audit fact only -- NOT
+  // itself part of the stale computation (see finalDiffHash below).
   verifiedAt?: string;
+  // V7 §20: manifest.finalDiffHash, written unconditionally by
+  // glimmer-v2.py's `finally` block on EVERY exit path (not just VERIFIED),
+  // right after collapse() resets HEAD back to baselineSha and leaves the
+  // produced diff as uncommitted working-tree state. It's sha256 of the
+  // tracked diff against baselineSha plus untracked file contents (see
+  // server/src/lib/git.ts's computeDiffHash for the exact cross-language
+  // byte contract). This is the fact readSession's stale detection actually
+  // compares against -- not workspace dirtiness (a verified session is
+  // EXPECTED to be dirty at verifiedAt time; only a diff that no longer
+  // matches finalDiffHash means the workspace changed since verification).
+  // Optional -- absent on sessions predating this task; readSession never
+  // claims "stale" without it.
+  finalDiffHash?: string;
 }
 
 export interface HumanAcceptance {

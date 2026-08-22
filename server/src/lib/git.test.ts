@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gitStatus, gitDiff, gitRevertFile } from "./git.js";
+import { gitStatus, gitDiff, gitRevertFile, computeDiffHash } from "./git.js";
 
 const exec = promisify(execFile);
 let repo: string;
@@ -58,6 +58,64 @@ describe("gitDiff with an untracked (new) file", () => {
     expect(diff).toContain("-one"); // a.txt tracked modification (set up in beforeAll)
     expect(diff).toContain("+two");
     expect(diff).toContain("+untracked content");
+  });
+});
+
+// V7 §20 — CROSS-LANGUAGE CONTRACT TEST. computeDiffHash must produce
+// byte-identical output to glimmer-v2.py's diff_hash() for the same inputs,
+// or session-level stale detection silently breaks (a drift here would
+// still "work" — it would just always disagree with the orchestrator).
+// This is not a hand-derived expected value: it's the real output of the
+// real Python function, captured once against this exact fixture, so a
+// future edit to either side's hashing logic that breaks the contract fails
+// this test instead of shipping silently.
+describe("computeDiffHash — cross-language contract with glimmer-v2.py's diff_hash()", () => {
+  it("matches the real Python diff_hash() output for a fixed tracked+untracked fixture", async () => {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-diffhash-contract-"));
+    try {
+      await exec("git", ["init", "-q"], { cwd: ws });
+      await exec("git", ["config", "user.email", "t@t.com"], { cwd: ws });
+      await exec("git", ["config", "user.name", "t"], { cwd: ws });
+      await fs.writeFile(path.join(ws, "a.txt"), "one\n");
+      await exec("git", ["add", "a.txt"], { cwd: ws });
+      await exec("git", ["commit", "-q", "-m", "init"], { cwd: ws });
+      const baseline = (await exec("git", ["rev-parse", "HEAD"], { cwd: ws })).stdout.trim();
+
+      // Uncommitted tracked change + one untracked file -- exercises both
+      // halves of diff_hash's input.
+      await fs.writeFile(path.join(ws, "a.txt"), "one\ntwo\n");
+      await fs.writeFile(path.join(ws, "new.txt"), "brand new\n");
+
+      const hash = await computeDiffHash(ws, baseline);
+
+      // Golden value, produced once by running the REAL glimmer-v2.py
+      // diff_hash() against this exact fixture (same commands/content as
+      // above):
+      //   python3 -c '
+      //     import importlib.util, pathlib
+      //     spec = importlib.util.spec_from_file_location(
+      //         "glimmer_v2", "/path/to/glimmer-v2.py")
+      //     mod = importlib.util.module_from_spec(spec)
+      //     spec.loader.exec_module(mod)
+      //     print(mod.diff_hash(pathlib.Path(ws), baseline))
+      //   '
+      // (run with cwd=repo root so glimmer-v2.py's sibling imports resolve)
+      expect(hash).toBe("023ec2dbdcc21fa531e402476a0c2dfa84be7d6910f16733d372492969d08311");
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("computeDiffHash — bounded timeout", () => {
+  // MED (review round 1): this runs on a route a session screen polls every
+  // 4s -- a hung mount/filesystem must error out fast, not hang the request
+  // forever. A 1ms timeout can't complete even a trivial `git diff`
+  // spawn+exec, so this proves the timeoutMs option actually reaches the
+  // underlying process (both the diff spawn and the ls-files spawn), rather
+  // than just being accepted and ignored.
+  it("rejects instead of hanging when timeoutMs is too small for the git process to complete", async () => {
+    await expect(computeDiffHash(repo, "HEAD", { timeoutMs: 1 })).rejects.toThrow();
   });
 });
 

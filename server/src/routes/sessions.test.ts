@@ -20,6 +20,13 @@ let app: Express;
 let workspace: string;
 let stateRoot: string;
 let readSessionEventsBatch: typeof import("./sessions.js").readSessionEventsBatch;
+// computeDiffHash comes from lib/git.js, which imports config.js -- like
+// app.js/sessions.js above, this MUST be a dynamic import done after
+// GLIMMER_STATE_ROOT is set below, never a static top-of-file import: a
+// static import runs at module-parse time, before this beforeAll, which
+// would warm config.js's module cache with the wrong (real ~/.muse-glimmer)
+// state root and 404 every route in this entire file.
+let computeDiffHash: typeof import("../lib/git.js").computeDiffHash;
 const sessionId = "diff-error-session";
 
 beforeAll(async () => {
@@ -32,6 +39,7 @@ beforeAll(async () => {
   const { createApp } = await import("../app.js");
   app = createApp();
   ({ readSessionEventsBatch } = await import("./sessions.js"));
+  ({ computeDiffHash } = await import("../lib/git.js"));
 
   // A workspace directory that exists but is not a git repo — `git diff`
   // inside it fails, which is what we want gitDiff to reject with.
@@ -801,8 +809,16 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
 // (see the comment at that route and at readSession's computeStale option —
 // a per-session git spawn on every list poll would scale with session
 // count).
+// V7 §20 review round 1: fixtures below model production ordering, not
+// plain dirtiness -- glimmer-v2.py's collapse() leaves a real VERIFIED
+// session's workspace with an uncommitted diff on purpose, so finalDiffHash
+// (fingerprinted from that exact post-collapse state) is what staleness
+// actually compares against, not `git status --porcelain`.
 describe("stale verified-session detection (V7 §20)", () => {
   let staleWorkspace: string;
+  let baselineSha: string;
+  let postCollapseHash: string;
+  const POST_COLLAPSE_CONTENT = "one\ntwo\n";
 
   beforeAll(async () => {
     staleWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-route-stale-ws-"));
@@ -812,14 +828,40 @@ describe("stale verified-session detection (V7 §20)", () => {
     await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\n");
     await execGit("git", ["add", "a.txt"], { cwd: staleWorkspace });
     await execGit("git", ["commit", "-q", "-m", "init"], { cwd: staleWorkspace });
+    baselineSha = (await execGit("git", ["rev-parse", "HEAD"], { cwd: staleWorkspace })).stdout.trim();
+
+    // Model collapse()'s end state: HEAD stays at baselineSha, working tree
+    // holds the uncommitted diff -- finalDiffHash below is the real
+    // computeDiffHash() fingerprint of exactly this state, same as
+    // glimmer-v2.py's `finally` block computes it.
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT);
+    postCollapseHash = await computeDiffHash(staleWorkspace, baselineSha);
   });
 
   afterAll(async () => {
     await fs.rm(staleWorkspace, { recursive: true, force: true });
   });
 
-  it("GET /sessions/:id reports stale for a verified session whose workspace changed since verifiedAt", async () => {
-    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "changed after verify\n");
+  it("GET /sessions/:id reports plain verified right after collapse, before anything else touches the workspace", async () => {
+    const id = "20260822-000009-glimmer-route-verified-unchanged";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
+        baseline: baselineSha, attempts: [],
+      })
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("verified");
+  });
+
+  it("GET /sessions/:id reports stale once the workspace is modified again after collapse", async () => {
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\ntwo\nTHREE\n");
     const id = "20260822-000010-glimmer-route-stale";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
@@ -827,16 +869,20 @@ describe("stale verified-session detection (V7 §20)", () => {
       path.join(dir, "manifest.json"),
       JSON.stringify({
         task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
-        workspace: staleWorkspace, branch: "main", baseline: null, attempts: [],
+        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
+        baseline: baselineSha, attempts: [],
       })
     );
 
     const res = await request(app).get(`/api/sessions/${id}`);
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("stale");
+
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT); // restore
   });
 
-  it("GET /sessions (list) does NOT compute staleness — the same dirty verified session still reads as plain verified", async () => {
+  it("GET /sessions (list) does NOT compute staleness — the same modified verified session still reads as plain verified", async () => {
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\ntwo\nTHREE\n");
     const id = "20260822-000011-glimmer-route-stale-list";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
@@ -844,7 +890,8 @@ describe("stale verified-session detection (V7 §20)", () => {
       path.join(dir, "manifest.json"),
       JSON.stringify({
         task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
-        workspace: staleWorkspace, branch: "main", baseline: null, attempts: [],
+        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
+        baseline: baselineSha, attempts: [],
       })
     );
 
@@ -853,6 +900,6 @@ describe("stale verified-session detection (V7 §20)", () => {
     const row = res.body.find((s: { id: string }) => s.id === id);
     expect(row?.status).toBe("verified");
 
-    await execGit("git", ["checkout", "--", "a.txt"], { cwd: staleWorkspace });
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT); // restore
   });
 });
