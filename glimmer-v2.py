@@ -2987,19 +2987,22 @@ def gates_block_verified(gates: dict) -> bool:
     blocks). Pure/deterministic -- exercised directly by
     --gates-selfcheck without a live model or session.
 
-    Review round 1 (Important): documentationCurrent is deliberately NOT
-    in this blocking set. detect_documentation_impact (O2 phase 1) is a
-    ONE-WAY detector -- it can only ever produce False (doc-relevant
-    change detected) or None (no impact / didn't run), NEVER True (it has
-    no way to verify docs actually ARE current). Blocking on it would mean
-    ANY routes/schema/api/config/auth-touching change is permanently
-    unable to reach VERIFIED, no matter how good the diff is -- the gate
-    computed in main()'s finally block (see gates["documentationCurrent"]
-    there) runs AFTER this function's caller already decided VERIFIED vs.
-    not, so wiring it in here would also just be decorative (the decision
-    it claims to gate has already been made). Deferred to a future round
-    where the doc gate becomes real tri-state (an actual freshness check,
-    not just an impact detector).
+    Task 7.1 (reverses the Round-2/review-round-1 deferral noted below):
+    documentationCurrent now DOES block, on the same not-False-only
+    contract as architectureApproved/scopeApproved/tasksResolved. That
+    deferral held only while detect_documentation_impact (O2 phase 1) was
+    the sole producer of this gate -- a ONE-WAY detector that can only
+    ever emit False or None, never True, since it has no way to verify
+    docs actually ARE current. Blocking on that alone would have made
+    every routes/schema/api/config/auth-touching change permanently
+    unable to reach VERIFIED. That is no longer the whole story: Task 7.1/
+    7.2's graph-based verification (verify_doc_nodes + map_changed_files_
+    to_doc_nodes + apply_doc_impact/check_doc_drift, composed in main()'s
+    finally block) CAN legitimately produce True -- when a repo has a
+    docs/graph.json and every doc node impacted by this session's diff
+    verifies CURRENT. Repos without a graph still get None (mechanism
+    didn't run -- not applicable, never blocks), so this is additive, not
+    a new way to fail for repos that never opted in.
 
     Task 4.2: gates.tasksResolved follows the exact same Round-2
     True/False/None contract as architectureApproved/scopeApproved above
@@ -3013,22 +3016,24 @@ def gates_block_verified(gates: dict) -> bool:
     if gates.get("verificationPassed") is not True:
         return True
     return any(gates.get(key) is False for key in
-                ("architectureApproved", "scopeApproved", "tasksResolved"))
+                ("architectureApproved", "scopeApproved", "tasksResolved",
+                 "documentationCurrent"))
 
 
 def blocked_gate_names(gates: dict) -> list:
-    """Review round 1 (Important) + Task 4.2: which gate(s) actually caused
-    gates_block_verified to return True, in the same checked order --
-    mirrors gates_block_verified exactly (same two hard-required keys,
-    same not-False-only set, now including tasksResolved) so the two can
-    never silently drift apart. Feeds describe_blocked_gates' honest,
-    cause-naming failure detail."""
+    """Review round 1 (Important) + Task 4.2 + Task 7.1: which gate(s)
+    actually caused gates_block_verified to return True, in the same
+    checked order -- mirrors gates_block_verified exactly (same two
+    hard-required keys, same not-False-only set, now including
+    tasksResolved and documentationCurrent) so the two can never silently
+    drift apart. Feeds describe_blocked_gates' honest, cause-naming
+    failure detail."""
     blocked = []
     if gates.get("implementationComplete") is not True:
         blocked.append("implementationComplete")
     if gates.get("verificationPassed") is not True:
         blocked.append("verificationPassed")
-    for key in ("architectureApproved", "scopeApproved", "tasksResolved"):
+    for key in ("architectureApproved", "scopeApproved", "tasksResolved", "documentationCurrent"):
         if gates.get(key) is False:
             blocked.append(key)
     return blocked
@@ -3691,11 +3696,14 @@ def evaluate_verification_tasks(tasks, results: list) -> None:
 # O2 phase 1 (glimmer-v7 reconciliation): deterministic
 # documentation-impact detector.
 # ============================================================
-# Scope is deliberately tiny (reconciliation doc, O2 entry): "deterministic
-# change-impact detector (routes/schema/API/config/auth touched?) creating a
-# REQUIRED doc task + gates.documentationCurrent. Graph, ADR store, drift
-# detection and semantic doc verification: defer entirely." No repo-map
-# lookup, no model call -- path/filename pattern matching only.
+# Scope was originally deliberately tiny (reconciliation doc, O2 entry):
+# "deterministic change-impact detector (routes/schema/API/config/auth
+# touched?) creating a REQUIRED doc task + gates.documentationCurrent.
+# Graph, ADR store, drift detection and semantic doc verification: defer
+# entirely." No repo-map lookup, no model call -- path/filename pattern
+# matching only. Task 7.1/7.2 (further down this file) built the graph +
+# deterministic drift detection the deferral above named; this detector
+# stays as-is as the fallback for repos with no docs/graph.json.
 
 # Category -> standalone words checked with boundary-safe matching (see
 # detect_documentation_impact). "routes"/"router" both catch the plain-
@@ -3751,6 +3759,38 @@ def _word_hits(word: str, path: str, camel_aware: bool) -> bool:
     return False
 
 
+def _categories_for_path(raw) -> set:
+    """Per-file half of detect_documentation_impact's classification,
+    factored out so Task 7.2's graph node-mapping (map_changed_files_to_
+    doc_nodes) can reuse the exact same keyword table per changed file --
+    detect_documentation_impact itself only ever needed the UNION across a
+    whole changed-files list, this is that union's per-file term."""
+    path = str(raw).replace("\\", "/")
+    lower = path.lower()
+    segments = [s for s in lower.split("/") if s]
+    basename = segments[-1] if segments else lower
+
+    categories = set()
+    for category, words in _DOC_IMPACT_WORDS.items():
+        camel_aware = category in _CAMEL_AWARE_CATEGORIES
+        for word in words:
+            if _word_hits(word, path, camel_aware):
+                categories.add(category)
+                break
+
+    # Explicit filename/segment checks the word list can't express
+    # as a clean standalone word.
+    if basename.endswith(".sql"):
+        categories.add("schema")
+    if basename == "dockerfile" or basename.startswith("docker-compose"):
+        categories.add("config")
+    if basename == ".env.example":
+        categories.add("config")
+    if ".github" in segments and "workflows" in segments:
+        categories.add("config")
+    return categories
+
+
 def detect_documentation_impact(changed_files) -> list:
     """O2 phase 1: pure, deterministic classifier -- no model, no repo-map.
     Classifies each changed path into zero or more of
@@ -3777,58 +3817,40 @@ def detect_documentation_impact(changed_files) -> list:
     """
     impacts = set()
     for raw in (changed_files or []):
-        path = str(raw).replace("\\", "/")
-        lower = path.lower()
-        segments = [s for s in lower.split("/") if s]
-        basename = segments[-1] if segments else lower
-
-        for category, words in _DOC_IMPACT_WORDS.items():
-            camel_aware = category in _CAMEL_AWARE_CATEGORIES
-            for word in words:
-                if _word_hits(word, path, camel_aware):
-                    impacts.add(category)
-                    break
-
-        # Explicit filename/segment checks the word list can't express
-        # as a clean standalone word.
-        if basename.endswith(".sql"):
-            impacts.add("schema")
-        if basename == "dockerfile" or basename.startswith("docker-compose"):
-            impacts.add("config")
-        if basename == ".env.example":
-            impacts.add("config")
-        if ".github" in segments and "workflows" in segments:
-            impacts.add("config")
-
+        impacts |= _categories_for_path(raw)
     return sorted(impacts)
 
 
-def documentation_task(next_id: int, impacts: list) -> dict:
+def documentation_task(next_id: int, impacts: list, node_ids: "list | None" = None) -> dict:
     """O2 + Task 4.1: the documentation task appended to tasks.json when
     C3's task graph is active and detect_documentation_impact found
     something. kind="documentation" is an honest addition to C3's kind
     vocabulary (alongside "implementation"/"verification"/"repair" -- see
     @glimmer/shared's GlimmerTask.kind, extended to match) precisely
-    because NOTHING in this codebase can verify documentation currency
-    yet (phase 1 is detection only): completion.type="docs" is never
-    matched by set_implementation_tasks_status / evaluate_implementation_
-    tasks / evaluate_verification_tasks / reset_verification_tasks_status
-    (all of which dispatch on completion.type=="files_changed"/
-    "check_passed" -- see their docstrings), so this task is created
-    `pending` and stays `pending` forever. Only a human closing it out of
-    band reflects reality. dependsOn is deliberately []: it doesn't block
-    or get blocked by implementation/verification tasks, it just needs to
-    exist and stay visible.
+    because NOTHING in this codebase can auto-CLOSE this task yet:
+    completion.type="docs" is never matched by set_implementation_tasks_
+    status / evaluate_implementation_tasks / evaluate_verification_tasks /
+    reset_verification_tasks_status (all of which dispatch on
+    completion.type=="files_changed"/"check_passed" -- see their
+    docstrings), so this task is created `pending` and stays `pending`
+    forever. Only a human closing it out of band reflects reality.
+    dependsOn is deliberately []: it doesn't block or get blocked by
+    implementation/verification tasks, it just needs to exist and stay
+    visible.
 
-    Task 4.1: priority is "recommended", not "required" -- matches the
-    ruling already encoded in gates_block_verified (documentationCurrent
-    is deliberately NOT in VERIFIED's blocking set, since phase 1's
-    detector can only ever produce False/None, never True). Making this
-    task "required" would make required_tasks_resolved permanently False
-    for every doc-relevant change, silently re-introducing the exact
-    blocking behavior that gate ruling rejected. createdBecause records
-    the same impacted-areas list baked into the description, machine-
-    shaped for display."""
+    Task 4.1: priority is "recommended", not "required" -- this task's own
+    completion can never auto-resolve (see above), so making it "required"
+    would make required_tasks_resolved permanently False for every
+    doc-relevant change, forever. That is orthogonal to Task 7.1's
+    documentationCurrent gate (which CAN legitimately become True now, via
+    the graph -- see gates_block_verified) -- documentationCurrent gates
+    VERIFIED directly; this task's priority only affects tasksResolved,
+    and the two must not be conflated. createdBecause records the same
+    impacted-areas list baked into the description, machine-shaped for
+    display. Task 7.2: node_ids (when the target repo has a docs/graph.json
+    and map_changed_files_to_doc_nodes found impacted doc nodes) is
+    recorded as this task's "nodeIds" -- always present, [] when there was
+    no graph or no impacted node."""
     now = _task_timestamp()
     return {
         "id": f"t{next_id}",
@@ -3844,12 +3866,317 @@ def documentation_task(next_id: int, impacts: list) -> dict:
         "priority": "recommended",
         "evidenceIds": [],
         "affectedFiles": [],
+        "nodeIds": list(node_ids or []),
         "blockingReason": None,
         "createdAt": now,
         "updatedAt": now,
         "completion": {"type": "docs"},
         "createdBecause": ", ".join(impacts),
     }
+
+
+# ============================================================
+# Task 7.1/7.2 (V7 "Machine-readable Documentation Graph" / "Documentation
+# status model" / "Documentation provenance" / "Drift detection" /
+# "Impact analysis through the graph" / "Documentation Gate"): a real,
+# tri-state documentationCurrent gate on top of O2 phase 1's one-way
+# detector above. The graph -- <workspace>/docs/graph.json -- lives IN THE
+# TARGET REPO, not in glimmer's own session state: it's a project artifact
+# a human (or a future bootstrap/curation step, Task 7.4) authors, and
+# Glimmer only reads + deterministically verifies it. Every status
+# transition below is a filesystem or git check -- nothing here calls a
+# model. Most repos have no graph yet; that is an honest "not applicable"
+# (None), never an error.
+# ============================================================
+
+DOC_STATUS_CURRENT = "CURRENT"
+DOC_STATUS_STALE = "STALE"
+DOC_STATUS_UNVERIFIED = "UNVERIFIED"
+DOC_STATUS_MISSING = "MISSING"
+DOC_STATUS_DEPRECATED = "DEPRECATED"
+DOC_STATUS_GENERATED = "GENERATED"
+DOC_STATUSES = {
+    DOC_STATUS_CURRENT, DOC_STATUS_STALE, DOC_STATUS_UNVERIFIED,
+    DOC_STATUS_MISSING, DOC_STATUS_DEPRECATED, DOC_STATUS_GENERATED,
+}
+# DEPRECATED/GENERATED are explicit human/bootstrap markers, not a
+# freshness verdict -- verify_doc_nodes/apply_doc_impact/check_doc_drift
+# all leave nodes in either state untouched rather than silently
+# reclassifying them (a deprecated node's file going missing is expected,
+# not a finding; a bootstrap-generated skeleton stays generated until a
+# human curates it).
+_DOC_STATUS_FROZEN = {DOC_STATUS_DEPRECATED, DOC_STATUS_GENERATED}
+
+DOC_GRAPH_RELATIVE_PATH = "docs/graph.json"
+
+# Task 7.2: which graph node `type` a changed file's O2-phase-1 category
+# corresponds to, for the keyword-table half of map_changed_files_to_
+# doc_nodes. Node types come from the graph.json schema (system/service/
+# route/schema/config/doc) -- "api" and "auth" changes are heuristically
+# attributed to a "service" node (there is no dedicated api/auth node
+# type); this is a coarse heuristic, not a claim of precision.
+_CATEGORY_TO_NODE_TYPE = {
+    "routes": "route",
+    "schema": "schema",
+    "config": "config",
+    "api": "service",
+    "auth": "service",
+}
+
+# Backticked, dot-extensioned, repo-path-looking references inside a doc
+# node's own markdown -- e.g. `backend/server/services/x.ts` or
+# `README.md`. Deliberately loose (this is a drift *signal*, not a parser):
+# anything that looks like a path reference and doesn't resolve under the
+# workspace root is a finding.
+_DOC_PATH_REF_RE = re.compile(r"`([\w][\w./-]*\.[A-Za-z0-9]{1,10})`")
+
+
+def load_doc_graph(ws) -> "dict | None":
+    """Task 7.1: tolerant reader for <ws>/docs/graph.json. Absent file ->
+    None (most repos have no graph yet -- not an error). Malformed JSON,
+    or valid JSON that isn't the expected {"nodes": [...], "edges": [...]}
+    shape -> None + a warning, never a raised exception -- a hand-edited or
+    partially-written graph file must never crash a session."""
+    path = Path(ws) / DOC_GRAPH_RELATIVE_PATH
+    if not path.is_file():
+        return None
+    try:
+        graph = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"[V2] WARN: malformed {DOC_GRAPH_RELATIVE_PATH}: {exc}")
+        return None
+    if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+        print(f"[V2] WARN: {DOC_GRAPH_RELATIVE_PATH} missing a nodes[] list, ignoring")
+        return None
+    graph.setdefault("edges", [])
+    graph.setdefault("schemaVersion", 1)
+    return graph
+
+
+def _write_doc_graph(ws, graph: dict) -> None:
+    """Atomic tmp+replace write of docs/graph.json back into the TARGET
+    repo -- same never-crash-the-session discipline as save_tasks: a disk
+    write failure here degrades to a log line, it must never take down an
+    otherwise-successful session."""
+    path = Path(ws) / DOC_GRAPH_RELATIVE_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[V2] WARN: failed to write {DOC_GRAPH_RELATIVE_PATH}: {exc}")
+
+
+def _doc_git_sha(ws, path: str):
+    """git log -1 --format=%H -- <path>: the sha of the last commit that
+    touched `path`, or None when it has no commit history at all
+    (untracked/new file). Deliberately ignores the working tree -- Glimmer
+    sessions leave changes UNCOMMITTED for human review, so an in-session
+    edit to `path` is invisible here by design; this only catches drift
+    that happened across already-committed history."""
+    return git(ws, "log", "-1", "--format=%H", "--", path, check=False) or None
+
+
+def verify_doc_nodes(graph: dict, ws) -> list:
+    """Task 7.1: the deterministic doc verification pass. For every node in
+    graph["nodes"] (except frozen DEPRECATED/GENERATED nodes -- see
+    _DOC_STATUS_FROZEN):
+
+      1. node["path"] doesn't exist on disk -> MISSING.
+      2. doc-type node with any provenance.evidence path that doesn't
+         exist -> STALE (recorded as provenance.missingEvidence).
+      3. no provenance.sha on record -> UNVERIFIED (never had a baseline).
+      4. node["path"] has no committed history (_doc_git_sha -> None) ->
+         UNVERIFIED (nothing to compare a baseline against).
+      5. committed sha for node["path"] != provenance.sha -> STALE (the
+         file changed since this node was last confirmed current).
+      6. otherwise -> CURRENT.
+
+    Mutates `graph` in place (status/confidence/provenance.updatedAt) and
+    writes it back atomically. Returns [{"nodeId", "status"}] for every
+    node actually (re)computed, in node order -- callers emit
+    documentation_verified from this. Never model-driven: every branch
+    above is a filesystem or git check, never a judgment call."""
+    now = _task_timestamp()
+    results = []
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict) or not node.get("id"):
+            continue
+        if node.get("status") in _DOC_STATUS_FROZEN:
+            continue
+
+        node_path = node.get("path") or ""
+        provenance = dict(node.get("provenance") or {})
+
+        if not node_path or not (Path(ws) / node_path).exists():
+            status = DOC_STATUS_MISSING
+        else:
+            missing_evidence = [
+                str(ev) for ev in (provenance.get("evidence") or [])
+                if node.get("type") == "doc" and not (Path(ws) / str(ev)).exists()
+            ]
+            if missing_evidence:
+                status = DOC_STATUS_STALE
+                provenance["missingEvidence"] = missing_evidence[:10]
+            elif not provenance.get("sha"):
+                status = DOC_STATUS_UNVERIFIED
+            else:
+                current_sha = _doc_git_sha(ws, node_path)
+                if current_sha is None:
+                    status = DOC_STATUS_UNVERIFIED
+                elif current_sha != provenance["sha"]:
+                    status = DOC_STATUS_STALE
+                else:
+                    status = DOC_STATUS_CURRENT
+
+        node["status"] = status
+        node["confidence"] = {
+            DOC_STATUS_CURRENT: "high",
+            DOC_STATUS_STALE: "low",
+            DOC_STATUS_MISSING: "low",
+        }.get(status, "unknown")
+        provenance["updatedAt"] = now
+        node["provenance"] = provenance
+        results.append({"nodeId": node["id"], "status": status})
+
+    _write_doc_graph(ws, graph)
+    return results
+
+
+def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
+    """Task 7.2 ("Impact analysis through the graph"): which doc-type
+    nodes does this diff's changed-file set touch? Two independent
+    signals, unioned into a "touched" node set:
+
+      1. path-prefix match -- a changed file IS a node's recorded path, or
+         lives under it as a directory prefix.
+      2. the existing O2 phase-1 keyword table (_categories_for_path) --
+         a changed file's category (routes/schema/config/api/auth) maps
+         to a node type via _CATEGORY_TO_NODE_TYPE.
+
+    A touched node that is itself type=="doc" is directly impacted. A
+    touched node that is NOT a doc is impacted through any "documents"
+    edge pointing at it (edge.kind=="documents", edge.to==touched node id
+    -- edge.from is the doc node documenting it). Returns the sorted,
+    deduped list of impacted doc node ids. Pure -- no I/O, no mutation."""
+    nodes_by_id = {
+        n["id"]: n for n in (graph.get("nodes") or [])
+        if isinstance(n, dict) and n.get("id")
+    }
+    touched = set()
+    for raw in (changed_files or []):
+        path = str(raw).replace("\\", "/")
+        for node in nodes_by_id.values():
+            node_path = str(node.get("path") or "").replace("\\", "/")
+            if node_path and (path == node_path or path.startswith(node_path.rstrip("/") + "/")):
+                touched.add(node["id"])
+        for category in _categories_for_path(path):
+            wanted_type = _CATEGORY_TO_NODE_TYPE.get(category)
+            if wanted_type is None:
+                continue
+            for node in nodes_by_id.values():
+                if node.get("type") == wanted_type:
+                    touched.add(node["id"])
+
+    impacted = {nid for nid in touched if nodes_by_id[nid].get("type") == "doc"}
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("kind") != "documents":
+            continue
+        if edge.get("to") not in touched:
+            continue
+        doc_node = nodes_by_id.get(edge.get("from"))
+        if doc_node is not None and doc_node.get("type") == "doc":
+            impacted.add(edge["from"])
+
+    return sorted(impacted)
+
+
+def apply_doc_impact(graph: dict, ws, changed_files, node_ids: list) -> list:
+    """Task 7.2: flags each impacted doc node STALE, UNLESS that node's own
+    path is itself among this diff's changed files -- the doc was edited
+    in the same diff as the code it documents, so trust verify_doc_nodes'
+    read of it rather than blanket-overriding it to STALE (this is what
+    makes gates.documentationCurrent=True reachable: change code + its doc
+    in the same diff and nothing else wrong -> impacted node stays
+    whatever verify_doc_nodes computed, e.g. CURRENT). Frozen DEPRECATED/
+    GENERATED nodes are left untouched. Writes the graph back atomically.
+    Returns [{"nodeId", "reason"}] for the nodes actually flagged --
+    callers emit documentation_stale_detected from this."""
+    changed_set = {str(f).replace("\\", "/") for f in (changed_files or [])}
+    nodes_by_id = {
+        n["id"]: n for n in (graph.get("nodes") or [])
+        if isinstance(n, dict) and n.get("id")
+    }
+    now = _task_timestamp()
+    flagged = []
+    for node_id in node_ids:
+        node = nodes_by_id.get(node_id)
+        if node is None or node.get("status") in _DOC_STATUS_FROZEN:
+            continue
+        node_path = str(node.get("path") or "").replace("\\", "/")
+        if node_path and node_path in changed_set:
+            continue  # doc updated alongside the code it documents
+        node["status"] = DOC_STATUS_STALE
+        node["confidence"] = "low"
+        provenance = dict(node.get("provenance") or {})
+        provenance["updatedAt"] = now
+        node["provenance"] = provenance
+        flagged.append({
+            "nodeId": node_id,
+            "reason": "impacted by changed files in this session's diff",
+        })
+    _write_doc_graph(ws, graph)
+    return flagged
+
+
+def check_doc_drift(graph: dict, ws) -> list:
+    """Task 7.2 ("Drift detection"): deterministic drift check -- for each
+    doc-type node (except frozen DEPRECATED/GENERATED), read its own file
+    and regex-scan it for backticked, repo-path-looking references (see
+    _DOC_PATH_REF_RE). Any reference that doesn't resolve to a real path
+    under `ws` is a drift finding. Findings are capped at 10 per node,
+    recorded at node.provenance.driftFindings, and any node with at least
+    one finding is flagged STALE. Writes the graph back atomically.
+    Returns [{"nodeId", "reason"}] for every node with new findings --
+    callers emit documentation_stale_detected from this."""
+    now = _task_timestamp()
+    flagged = []
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict) or node.get("type") != "doc":
+            continue
+        if node.get("status") in _DOC_STATUS_FROZEN:
+            continue
+        abs_path = Path(ws) / str(node.get("path") or "")
+        if not abs_path.is_file():
+            continue  # verify_doc_nodes already marks this MISSING
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        findings = []
+        for ref in _DOC_PATH_REF_RE.findall(text):
+            if (Path(ws) / ref).exists():
+                continue
+            findings.append(ref)
+            if len(findings) >= 10:
+                break
+        if not findings:
+            continue
+
+        provenance = dict(node.get("provenance") or {})
+        provenance["driftFindings"] = findings[:10]
+        provenance["updatedAt"] = now
+        node["provenance"] = provenance
+        node["status"] = DOC_STATUS_STALE
+        node["confidence"] = "low"
+        flagged.append({
+            "nodeId": node["id"],
+            "reason": f"{len(findings)} documented path reference(s) not found",
+        })
+    _write_doc_graph(ws, graph)
+    return flagged
 
 
 # ============================================================
@@ -5186,29 +5513,71 @@ def main():
         manifest["checkpointsCollapsed"] = head(ws) == baseline
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
 
-        # O2 phase 1: deterministic doc-impact detection runs once here,
+        # O2 phase 1 + Task 7.1/7.2: doc-impact detection runs once here,
         # against the session's FINAL changed-files set (this is the point
         # after which changed_files can no longer change -- collapse() just
         # ran and no further engineer/repair round follows). Same
         # merge-not-clobber discipline as every other gates writer (C2 sets
         # gates["architectureApproved"] earlier in this same run) -- read
         # whatever's already there (possibly nothing at all, on a run
-        # without --architect-first) and add this key onto it. Honest gate
-        # semantics: False when impact is detected (phase 1 has no way to
-        # verify docs ARE current, so it can never claim True), None when
-        # the change touched nothing doc-relevant (zero behavior change).
+        # without --architect-first) and add this key onto it.
+        #
+        # documentationCurrent is now real tri-state (Task 7.1): when the
+        # TARGET repo has <workspace>/docs/graph.json, run the deterministic
+        # verify + graph-based impact + drift passes against it and derive
+        # the gate from actual node statuses (True only when every doc node
+        # impacted by this diff verifies CURRENT; False when any is STALE/
+        # MISSING/otherwise unproven). No graph, or a graph with no
+        # impacted nodes at all -> None ("mechanism didn't run/nothing to
+        # verify" -- not applicable, never blocks). No graph falls back to
+        # O2 phase 1's one-way detector (False/None only, same as before).
         doc_impacts = detect_documentation_impact(manifest["finalChangedFiles"])
         gates = dict(manifest.get("gates") or {})
-        gates["documentationCurrent"] = False if doc_impacts else None
+        doc_graph = load_doc_graph(ws)
+        doc_node_ids = []
+        if doc_graph is not None:
+            for verified in verify_doc_nodes(doc_graph, ws):
+                emit_event(events_path, "documentation_verified", sid,
+                           nodeId=verified["nodeId"], status=verified["status"])
+
+            doc_node_ids = map_changed_files_to_doc_nodes(doc_graph, manifest["finalChangedFiles"])
+            if doc_node_ids:
+                emit_event(events_path, "documentation_impact_detected", sid,
+                           files=manifest["finalChangedFiles"], nodeIds=doc_node_ids)
+                for stale in apply_doc_impact(doc_graph, ws, manifest["finalChangedFiles"], doc_node_ids):
+                    emit_event(events_path, "documentation_stale_detected", sid,
+                               nodeId=stale["nodeId"], reason=stale["reason"])
+            for drifted in check_doc_drift(doc_graph, ws):
+                emit_event(events_path, "documentation_stale_detected", sid,
+                           nodeId=drifted["nodeId"], reason=drifted["reason"])
+
+            if doc_node_ids:
+                doc_nodes_by_id = {n["id"]: n for n in doc_graph.get("nodes") or [] if n.get("id")}
+                impacted_statuses = [doc_nodes_by_id[n]["status"] for n in doc_node_ids if n in doc_nodes_by_id]
+                if any(s in (DOC_STATUS_STALE, DOC_STATUS_MISSING) for s in impacted_statuses):
+                    gates["documentationCurrent"] = False
+                elif impacted_statuses and all(s == DOC_STATUS_CURRENT for s in impacted_statuses):
+                    gates["documentationCurrent"] = True
+                else:
+                    # UNVERIFIED/DEPRECATED/GENERATED among the impacted set:
+                    # not proven current, but also not an outright drift
+                    # finding -- conservative False, never a guessed True.
+                    gates["documentationCurrent"] = False
+            else:
+                gates["documentationCurrent"] = None
+        else:
+            gates["documentationCurrent"] = False if doc_impacts else None
         manifest["gates"] = gates
         if doc_impacts:
             manifest["documentationImpact"] = doc_impacts
+            if doc_node_ids:
+                manifest["documentationImpactNodeIds"] = doc_node_ids
             # C3's machinery: only append when a task graph actually exists
             # for this session (--architect-first produced a usable plan).
             # No tasks.json is ever created just for this -- same
             # zero-behavior-change-without-a-plan contract C3 itself uses.
             if tasks is not None:
-                doc_task = documentation_task(_next_task_id(tasks), doc_impacts)
+                doc_task = documentation_task(_next_task_id(tasks), doc_impacts, doc_node_ids)
                 tasks.append(doc_task)
                 save_tasks(session, tasks)
                 # Fix round 1 (MINOR 10): this dynamic task creation was the
@@ -6904,6 +7273,119 @@ def _tasks_selfcheck() -> None:
     print("task graph (C3) self-check: PASS")
 
 
+def _doc_graph_selfcheck() -> None:
+    """Task 7.1/7.2 (V7 documentation intelligence): proves the doc-graph
+    reader/verifier/impact/drift passes and the tri-state gate composition
+    without a live session. Run with: python3 glimmer-v2.py --doc-graph-selfcheck
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+
+        # --- 1. load_doc_graph tolerance ---
+        assert load_doc_graph(ws) is None, "absent graph must read as None"
+        (ws / "docs").mkdir()
+        (ws / "docs" / "graph.json").write_text("not json {{{")
+        assert load_doc_graph(ws) is None, "malformed graph must read as None, not raise"
+        (ws / "docs" / "graph.json").write_text(json.dumps({"edges": []}))
+        assert load_doc_graph(ws) is None, "graph without nodes[] must read as None"
+        (ws / "docs" / "graph.json").write_text(json.dumps({"nodes": []}))
+        g = load_doc_graph(ws)
+        assert g is not None and g["edges"] == [] and g["schemaVersion"] == 1, (
+            "valid minimal graph must gain edges/schemaVersion defaults"
+        )
+
+        # --- 2. verify_doc_nodes status transitions (real git repo) ---
+        run(["git", "init", "-q"], ws)
+        (ws / "src").mkdir()
+        (ws / "src" / "api.ts").write_text("export const x = 1;")
+        (ws / "docs" / "api.md").write_text("Covers `src/api.ts`.")
+        run(["git", "add", "-A"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "init"], ws)
+        api_sha = _doc_git_sha(ws, "docs/api.md")
+        assert api_sha, "committed file must have a git sha"
+
+        graph = {
+            "schemaVersion": 1,
+            "nodes": [
+                {"id": "doc-api", "type": "doc", "path": "docs/api.md",
+                 "status": "UNVERIFIED",
+                 "provenance": {"evidence": ["src/api.ts"], "sha": api_sha}},
+                {"id": "doc-gone", "type": "doc", "path": "docs/nope.md",
+                 "status": "UNVERIFIED", "provenance": {}},
+                {"id": "doc-stale-ev", "type": "doc", "path": "docs/api.md",
+                 "status": "UNVERIFIED",
+                 "provenance": {"evidence": ["src/deleted.ts"], "sha": api_sha}},
+                {"id": "doc-nosha", "type": "doc", "path": "docs/api.md",
+                 "status": "UNVERIFIED", "provenance": {}},
+                {"id": "svc-users", "type": "service", "path": "src/api.ts",
+                 "status": "UNVERIFIED", "provenance": {"sha": _doc_git_sha(ws, "src/api.ts")}},
+                {"id": "doc-frozen", "type": "doc", "path": "docs/nope.md",
+                 "status": DOC_STATUS_DEPRECATED, "provenance": {}},
+            ],
+            "edges": [{"from": "doc-api", "to": "svc-users", "kind": "documents"}],
+        }
+        results = verify_doc_nodes(graph, ws)
+        by_id = {r["nodeId"]: r["status"] for r in results}
+        assert by_id["doc-api"] == DOC_STATUS_CURRENT, by_id
+        assert by_id["doc-gone"] == DOC_STATUS_MISSING
+        assert by_id["doc-stale-ev"] == DOC_STATUS_STALE
+        assert by_id["doc-nosha"] == DOC_STATUS_UNVERIFIED
+        assert "doc-frozen" not in by_id, "frozen DEPRECATED node must not be recomputed"
+        # sha-mismatch -> STALE: rewrite + recommit the doc, keep the old sha on record.
+        (ws / "docs" / "api.md").write_text("Covers `src/api.ts`. Updated.")
+        run(["git", "add", "-A"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "edit"], ws)
+        results2 = verify_doc_nodes(graph, ws)
+        assert {r["nodeId"]: r["status"] for r in results2}["doc-api"] == DOC_STATUS_STALE, (
+            "committed change since provenance.sha must flag STALE"
+        )
+        # Written back atomically: file on disk reflects the mutation, no tmp remains.
+        on_disk = json.loads((ws / "docs" / "graph.json").read_text())
+        assert {n["id"]: n["status"] for n in on_disk["nodes"]}["doc-gone"] == DOC_STATUS_MISSING
+        assert not list((ws / "docs").glob("graph.json.tmp*")), "no tmp file may survive"
+
+        # --- 3. map_changed_files_to_doc_nodes: prefix + category/edge ---
+        impacted = map_changed_files_to_doc_nodes(graph, ["src/api.ts"])
+        # src/api.ts prefix-touches svc-users AND category "api" -> type
+        # "service" -> svc-users; the documents edge lifts it to doc-api.
+        assert impacted == ["doc-api"], impacted
+        assert map_changed_files_to_doc_nodes(graph, ["unrelated/z.txt"]) == []
+
+        # --- 4. apply_doc_impact: stale-flag, same-diff doc exemption, frozen skip ---
+        for n in graph["nodes"]:
+            if n["id"] == "doc-api":
+                n["status"] = DOC_STATUS_CURRENT
+        flagged = apply_doc_impact(graph, ws, ["src/api.ts", "docs/api.md"], ["doc-api", "doc-frozen"])
+        assert flagged == [], "doc edited in the same diff must stay CURRENT; frozen skipped"
+        flagged2 = apply_doc_impact(graph, ws, ["src/api.ts"], ["doc-api"])
+        assert [f["nodeId"] for f in flagged2] == ["doc-api"]
+        assert {n["id"]: n["status"] for n in graph["nodes"]}["doc-api"] == DOC_STATUS_STALE
+
+        # --- 5. check_doc_drift: backticked missing ref -> finding + STALE ---
+        (ws / "docs" / "drifty.md").write_text("See `src/api.ts` and `src/removed.ts`.")
+        graph["nodes"].append({"id": "doc-drifty", "type": "doc", "path": "docs/drifty.md",
+                               "status": "UNVERIFIED", "provenance": {}})
+        drifted = check_doc_drift(graph, ws)
+        assert [d["nodeId"] for d in drifted] == ["doc-drifty"], drifted
+        drifty = [n for n in graph["nodes"] if n["id"] == "doc-drifty"][0]
+        assert drifty["provenance"]["driftFindings"] == ["src/removed.ts"]
+        assert drifty["status"] == DOC_STATUS_STALE
+
+        # --- 6. Gate tri-state composition (mirror of main()'s finally logic) ---
+        def gate_for(statuses):
+            if any(s in (DOC_STATUS_STALE, DOC_STATUS_MISSING) for s in statuses):
+                return False
+            if statuses and all(s == DOC_STATUS_CURRENT for s in statuses):
+                return True
+            return False if statuses else None
+        assert gate_for([DOC_STATUS_CURRENT, DOC_STATUS_CURRENT]) is True
+        assert gate_for([DOC_STATUS_CURRENT, DOC_STATUS_STALE]) is False
+        assert gate_for([DOC_STATUS_UNVERIFIED]) is False, "unproven must never gate True"
+        assert gate_for([]) is None
+
+    print("doc-graph (Task 7.1/7.2) self-check: PASS")
+
+
 def _doc_impact_selfcheck() -> None:
     """O2 phase 1 (glimmer-v7 reconciliation): proves the deterministic
     change-impact classifier's category boundaries, the honest gate
@@ -7148,20 +7630,19 @@ def _gates_selfcheck() -> None:
     # block.
     assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
 
-    for optional_key in ("architectureApproved", "scopeApproved", "tasksResolved"):
+    for optional_key in ("architectureApproved", "scopeApproved", "tasksResolved",
+                         "documentationCurrent"):
         blocked = dict(all_true, **{optional_key: False})
         assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
         nulled = dict(all_true, **{optional_key: None})
         assert gates_block_verified(nulled) is False, f"{optional_key}=None must NOT block VERIFIED"
 
-    # documentationCurrent=False must NOT block -- the one property the
-    # real path can never exhibit otherwise (its producer never runs
-    # before this decision), proven directly here.
-    assert gates_block_verified(dict(all_true, documentationCurrent=False)) is False, (
-        "documentationCurrent must never block VERIFIED -- phase 1's detector can only "
-        "ever produce False/None, never True, and its producer runs after this decision anyway"
-    )
-    assert gates_block_verified(dict(all_true, documentationCurrent=None)) is False
+    # Task 7.1 (reverses the Round-2 deferral): documentationCurrent is
+    # now a real tri-state gate -- graph-based verification can produce
+    # True, so False legitimately blocks (covered by the loop above);
+    # True passes, and repos without a docs/graph.json stay None (never
+    # block) -- see gates_block_verified's docstring.
+    assert gates_block_verified(dict(all_true, documentationCurrent=True)) is False
 
     assert gates_block_verified(dict(all_true, implementationComplete=False)) is True
     assert gates_block_verified(dict(all_true, implementationComplete=None)) is True, (
@@ -7180,9 +7661,9 @@ def _gates_selfcheck() -> None:
     assert blocked_gate_names(dict(all_true, architectureApproved=False, scopeApproved=False)) == [
         "architectureApproved", "scopeApproved",
     ]
-    # documentationCurrent=False must never show up as a blocked gate --
-    # it isn't in gates_block_verified's checked set at all.
-    assert blocked_gate_names(dict(all_true, documentationCurrent=False)) == []
+    # Task 7.1: documentationCurrent=False is now a named blocked gate,
+    # same contract as the other optional gates.
+    assert blocked_gate_names(dict(all_true, documentationCurrent=False)) == ["documentationCurrent"]
 
     # Task 4.2: tasksResolved=False (some required task never resolved) is
     # named exactly like architectureApproved/scopeApproved, and combines
@@ -8269,6 +8750,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--visual-selfcheck"]:
         _visual_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--doc-graph-selfcheck"]:
+        _doc_graph_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--doc-impact-selfcheck"]:
         _doc_impact_selfcheck()

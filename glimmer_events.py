@@ -39,6 +39,11 @@ EVENT_TYPES = {
     "visual_verification_started", "visual_finding_detected",
     "visual_verification_completed",
     "delivery_review_started", "delivery_review_completed",
+    # Task 7.1/7.2 (V7 documentation intelligence): emitted by
+    # glimmer-v2.py's finally-block doc pass when the TARGET repo has a
+    # docs/graph.json -- deterministic node ids/statuses only.
+    "documentation_impact_detected", "documentation_stale_detected",
+    "documentation_verified",
     # Task 2.4 (V7 §5.5 second half): emitted by glimmer-engineer.py's
     # run_engineer loop -- "architect_consult_advised" for each
     # deterministic mid-implementation trigger that fires (at most once
@@ -138,6 +143,9 @@ def _selfcheck() -> None:
             ("visual_verification_completed", {"status": "PASS"}),
             ("delivery_review_started", {}),
             ("delivery_review_completed", {"customerReadiness": "ready_to_ship", "confidence": "high"}),
+            ("documentation_impact_detected", {"files": ["src/api/u.ts"], "nodeIds": ["api-users"]}),
+            ("documentation_stale_detected", {"nodeId": "api-users", "reason": "impacted by change"}),
+            ("documentation_verified", {"nodeId": "api-users", "status": "CURRENT"}),
             ("architect_consult_advised", {"trigger": "turns_high_no_writes", "detail": "turn 7/10 (over 60% of the turn budget) with no repository write yet"}),
             ("architect_consulted", {"questionChars": 42, "answerChars": 210}),
         ]
