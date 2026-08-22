@@ -4898,6 +4898,13 @@ def _recovery_ladder_selfcheck() -> None:
     real_http_json = http_json
     real_events_path = GLIMMER_EVENTS_PATH
     real_session_id = GLIMMER_SESSION_ID
+    # Fix round 1 (MED): same discipline as _model_provider_selfcheck --
+    # the tier-3 success sub-check routes through the real "engineer"
+    # provider singleton, which bumps the module-global usage totals; left
+    # unrestored, the atexit writer could fabricate a model-usage.json
+    # into a live session dir when this selfcheck runs with session env set.
+    real_totals = {k: dict(v) for k, v in _MODEL_USAGE_TOTALS.items()}
+    _MODEL_USAGE_TOTALS.clear()
 
     messages = [
         {"role": "system", "content": "SYS"},
@@ -5050,6 +5057,8 @@ def _recovery_ladder_selfcheck() -> None:
         http_json = real_http_json
         GLIMMER_EVENTS_PATH = real_events_path
         GLIMMER_SESSION_ID = real_session_id
+        _MODEL_USAGE_TOTALS.clear()
+        _MODEL_USAGE_TOTALS.update(real_totals)
 
     print("recovery-ladder self-check: PASS")
 
