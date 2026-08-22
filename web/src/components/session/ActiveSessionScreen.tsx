@@ -14,6 +14,7 @@ import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
 import { GatesRow } from "./GatesRow";
 import { StatusesRow } from "./StatusesRow";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
+import { DeliveryPacketPanel } from "./DeliveryPacketPanel";
 import { VisualVerificationPanel } from "./VisualVerificationPanel";
 import { EvidencePanel } from "./EvidencePanel";
 
@@ -177,6 +178,7 @@ export function ActiveSessionScreen() {
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
       {id && <DeliveryReviewPanel sessionId={id} />}
+      {id && <DeliveryPacketPanel sessionId={id} />}
       {id && <VisualVerificationPanel sessionId={id} />}
       {id && <EvidencePanel sessionId={id} />}
     </div>

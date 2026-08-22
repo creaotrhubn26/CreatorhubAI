@@ -542,6 +542,66 @@ describe("GET /api/sessions/:id/delivery-review", () => {
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
   });
+
+  // Task 8.2 (V7 §23.15): a session that triggered architect escalation
+  // gets it merged onto the SAME response, not a separate route.
+  it("merges architect-escalation.json onto the response when present", async () => {
+    const id = "20260821-000010-glimmer-delivery-escalated";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(deliveryReview));
+    await fs.writeFile(
+      path.join(dir, "architect-escalation.json"),
+      JSON.stringify({ consultationFailed: true, reason: "architect model unreachable" })
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ...deliveryReview,
+      architectEscalation: { consultationFailed: true, reason: "architect model unreachable" },
+    });
+  });
+});
+
+describe("GET /api/sessions/:id/delivery-packet", () => {
+  const packet = {
+    task: "add widget", planRef: null, changedFiles: ["src/widget.ts"], orchestratorUpdatedFiles: [],
+    verification: { status: "VERIFIED", results: null }, visual: "not_run",
+    statuses: { technical: "VERIFIED", architecture: "not_run", documentation: "not_run", visual: "not_run", delivery: "not_run", overall: "not_run" },
+    customerReadiness: null, limitations: null, forwardPlan: null, confidence: null,
+    humanReviewStatus: "pending",
+  };
+
+  it("returns the parsed delivery-packet.json when present", async () => {
+    const id = "20260821-000011-glimmer-packet-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-packet.json"), JSON.stringify(packet));
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-packet`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(packet);
+  });
+
+  it("returns 404 when no packet was ever written (opt-in artifact)", async () => {
+    const id = "20260821-000012-glimmer-packet-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-packet`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260821-000013-glimmer-packet-fserror";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(path.join(dir, "delivery-packet.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-packet`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
 });
 
 describe("GET /api/sessions/:id/evidence", () => {
@@ -941,7 +1001,7 @@ describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
 });
 
 describe("opt-in artifact routes reject path-traversal ids", () => {
-  it.each(["plan", "architect-reviews", "delivery-review", "tasks", "evidence"])(
+  it.each(["plan", "architect-reviews", "delivery-review", "delivery-packet", "tasks", "evidence"])(
     "GET /api/sessions/:id/%s returns 404 for a traversal id",
     async (routeName) => {
       const res = await request(app).get(`/api/sessions/..%2F..%2Fevil/${routeName}`);

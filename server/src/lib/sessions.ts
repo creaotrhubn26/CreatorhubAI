@@ -5,7 +5,8 @@ import { computeDiffHash } from "./git.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
-  ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
+  ArchitecturePlan, ArchitectReview, DeliveryReview, ArchitectEscalation, DeliveryPacket,
+  GlimmerTask, HumanAcceptance,
   FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
   EvidenceIndexEntry, EvidenceEntryResponse,
 } from "@glimmer/shared";
@@ -264,8 +265,27 @@ export function readArchitecturePlan(id: string): Promise<ArchitecturePlan | nul
   return readSessionJsonFile<ArchitecturePlan>(id, "architecture-plan.json");
 }
 
-export function readDeliveryReview(id: string): Promise<DeliveryReview | null> {
-  return readSessionJsonFile<DeliveryReview>(id, "delivery-review.json");
+// Task 8.2 (V7 §23.15) -- architect-escalation.json, only ever written
+// when glimmer-v2.py's deterministic escalation trigger fired for this
+// session. Absence is normal (most sessions never trigger it); merged
+// onto the DeliveryReview response below rather than served as its own
+// route, since it's always read alongside the review it escalates.
+function readArchitectEscalation(id: string): Promise<ArchitectEscalation | null> {
+  return readSessionJsonFile<ArchitectEscalation>(id, "architect-escalation.json");
+}
+
+export async function readDeliveryReview(id: string): Promise<DeliveryReview | null> {
+  const review = await readSessionJsonFile<DeliveryReview>(id, "delivery-review.json");
+  if (!review) return null;
+  const escalation = await readArchitectEscalation(id);
+  return escalation ? { ...review, architectEscalation: escalation } : review;
+}
+
+// Task 8.2 (V7 §23.16) -- delivery-packet.json, assembled once by
+// glimmer-v2.py at session close-out. Same opt-in-artifact-absence
+// convention as the other session-dir reads here.
+export function readDeliveryPacket(id: string): Promise<DeliveryPacket | null> {
+  return readSessionJsonFile<DeliveryPacket>(id, "delivery-packet.json");
 }
 
 // Task 4.1 (V7 R4): glimmer-v2.py's save_tasks now writes a versioned

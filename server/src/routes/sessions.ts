@@ -6,7 +6,7 @@ import { CONFIG, sessionsDir } from "../config.js";
 import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
-  readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
+  readArchitecturePlan, readArchitectReviews, readDeliveryReview, readDeliveryPacket, readSessionTasks,
   writeHumanAcceptance, readVisualManifest, readVisualFindings,
   readTaskOverrides, writeTaskOverride, applyTaskOverrides,
   readEvidenceIndex, readEvidenceEntry,
@@ -289,6 +289,19 @@ sessionsRouter.get("/sessions/:id/delivery-review", async (req, res) => {
     const review = await readDeliveryReview(req.params.id);
     if (!review) return res.status(404).json({ error: "not found" });
     res.json(review);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Task 8.2 (V7 §23.16) -- delivery-packet.json, assembled once by
+// glimmer-v2.py at session close-out. Same opt-in-artifact-absence
+// convention as /delivery-review, /plan, etc.
+sessionsRouter.get("/sessions/:id/delivery-packet", async (req, res) => {
+  try {
+    const packet = await readDeliveryPacket(req.params.id);
+    if (!packet) return res.status(404).json({ error: "not found" });
+    res.json(packet);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

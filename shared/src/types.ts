@@ -384,6 +384,23 @@ export interface DeliveryNextStep {
   action: string;
 }
 
+// Task 8.2 (V7 §23.15) -- architect-escalation.json, written by
+// glimmer-engineer.py's `--mode consult` ONLY when glimmer-v2.py's
+// deterministic trigger fires (a high/critical DeliveryConcern AND
+// architect mode enabled for the session). Merged onto DeliveryReview at
+// read time (see server/src/lib/sessions.ts readDeliveryReview) rather
+// than served as its own route -- it is always read alongside the review
+// it escalates, never independently. consultationFailed marks a
+// model-down/spawn-failure degrade path (same convention as
+// DeliveryReview.reviewFailed) -- the session outcome is never affected
+// either way (§23.15: a second opinion, not a second gate).
+export interface ArchitectEscalation {
+  question?: string;
+  answer?: string;
+  consultationFailed?: true;
+  reason?: string;
+}
+
 export interface DeliveryReview {
   summary: string;
   approachRationale?: string[];
@@ -396,6 +413,40 @@ export interface DeliveryReview {
   confidence: { level: "low" | "medium" | "high"; reason: string };
   reviewFailed?: true;
   reviewFailureReason?: string;
+  architectEscalation?: ArchitectEscalation;
+}
+
+// V7 §23.16 -- delivery-packet.json, assembled once by glimmer-v2.py at
+// session close-out (main()'s unconditional `finally` block, right after
+// manifest.statuses). Deliberately NOT a duplicate of every full artifact
+// (architecture-plan.json/delivery-review.json/visual findings remain
+// their own routes) -- this is the concise handoff summary V7 §23.16
+// asks for. Fields derived from the session's own DeliveryReview
+// (customerReadiness/limitations/forwardPlan/confidence) carry an
+// explicit provenance tag (same DataProvenance union every other
+// model-derived API field already uses) and are null whenever no
+// delivery-review.json exists for the session at all -- never
+// fabricated. planRef is null whenever architect mode was never engaged
+// for this session.
+export interface DeliveryPacket {
+  task: string | null;
+  planRef: { architectUsed: boolean; architectureApproved: boolean | null } | null;
+  changedFiles: string[];
+  orchestratorUpdatedFiles: string[];
+  verification: { status: "VERIFIED" | "FAILED" | "NOT_RUN"; results: unknown };
+  visual: VisualFindingsStatus | "not_run";
+  statuses: GlimmerSession["statuses"];
+  customerReadiness: { value: DeliveryReviewCustomerReadiness | null; provenance: DataProvenance; reviewFailed?: true } | null;
+  limitations: {
+    unresolvedItems: string[];
+    intentionallyNotChanged: string[];
+    concerns: DeliveryConcern[];
+    provenance: DataProvenance;
+    reviewFailed?: true;
+  } | null;
+  forwardPlan: { nextSteps: DeliveryNextStep[]; provenance: DataProvenance; reviewFailed?: true } | null;
+  confidence: { level: "low" | "medium" | "high"; reason: string; provenance: DataProvenance; reviewFailed?: true } | null;
+  humanReviewStatus: string;
 }
 
 // V7 §22.14 visual evidence store — these mirror glimmer-visual.py's real

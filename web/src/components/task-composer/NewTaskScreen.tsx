@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
 import { computeArchitectRisk, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
@@ -47,7 +47,18 @@ function buildArchitectRiskLine(form: TaskComposerFormState): string | null {
 }
 
 export function NewTaskScreen() {
-  const [form, setForm] = useState(DEFAULT_FORM);
+  const location = useLocation();
+  // Task 8.2 (V7 §23.14): DeliveryReviewPanel's "convert next step to task"
+  // action navigates here with { state: { objective } } -- a DRAFT prefill
+  // only (the objective field, pre-filled; the human still reviews/edits
+  // every other field and presses Run themselves). Read once at mount, the
+  // same "seed initial state, ignore afterward" pattern router.state-based
+  // prefills always use -- a later in-place navigation to this same route
+  // (e.g. clicking "New Task" again) does not fight the user's own typing.
+  const prefillObjective = (location.state as { objective?: string } | null)?.objective;
+  const [form, setForm] = useState<TaskComposerFormState>(() =>
+    prefillObjective ? { ...DEFAULT_FORM, objective: prefillObjective } : DEFAULT_FORM
+  );
   const [workspace, setWorkspace] = useState("");
   const [newTaskName, setNewTaskName] = useState("");
   const navigate = useNavigate();

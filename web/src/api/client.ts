@@ -1,6 +1,7 @@
 import type {
   DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
-  SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance, CreateWorkspaceResult,
+  SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, DeliveryPacket, GlimmerTask, HumanAcceptance,
+  CreateWorkspaceResult,
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
 } from "@glimmer/shared";
 
@@ -25,6 +26,8 @@ export const glimmerApi = {
   getArchitecturePlan: (id: string) => request<ArchitecturePlan>(`/api/sessions/${id}/plan`),
   getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),
+  // Task 8.2 (V7 §23.16) -- the concise session close-out handoff document.
+  getDeliveryPacket: (id: string) => request<DeliveryPacket>(`/api/sessions/${id}/delivery-packet`),
   getSessionTasks: (id: string) => request<GlimmerTask[]>(`/api/sessions/${id}/tasks`),
   // Task 5.2 (V7 §26/§46) -- evidence-index.json list + one capped
   // entry lookup by id, same one-route-two-shapes split as the server
