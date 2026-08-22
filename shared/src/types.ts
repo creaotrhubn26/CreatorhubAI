@@ -776,6 +776,24 @@ export interface ArchitectConsultedEvent extends GlimmerEventBase {
   questionChars: number;
   answerChars: number;
 }
+// Task 7.1/7.2 (V7 documentation intelligence): emitted by glimmer-v2.py's
+// finally-block doc pass when the TARGET repo carries a docs/graph.json.
+// Deterministic node ids/statuses/file lists only -- never model text.
+export interface DocumentationImpactDetectedEvent extends GlimmerEventBase {
+  type: "documentation_impact_detected";
+  files: string[];
+  nodeIds: string[];
+}
+export interface DocumentationStaleDetectedEvent extends GlimmerEventBase {
+  type: "documentation_stale_detected";
+  nodeId: string;
+  reason: string;
+}
+export interface DocumentationVerifiedEvent extends GlimmerEventBase {
+  type: "documentation_verified";
+  nodeId: string;
+  status: string;
+}
 
 export type GlimmerEvent =
   | ToolStartedEvent
@@ -810,7 +828,10 @@ export type GlimmerEvent =
   | DeliveryReviewStartedEvent
   | DeliveryReviewCompletedEvent
   | ArchitectConsultAdvisedEvent
-  | ArchitectConsultedEvent;
+  | ArchitectConsultedEvent
+  | DocumentationImpactDetectedEvent
+  | DocumentationStaleDetectedEvent
+  | DocumentationVerifiedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
