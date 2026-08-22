@@ -363,6 +363,29 @@ def status(ws):
     return lines(git(ws, "status", "--porcelain=v1", "--untracked-files=all"))
 
 
+def clean_start_dirty(ws) -> list:
+    """The clean-start check's own dirty list -- status(ws), except
+    docs/graph.json (only that exact path, see DOC_GRAPH_RELATIVE_PATH) is
+    tolerated (Round 7 live checkpoint, L2): it is orchestrator-owned
+    bookkeeping a prior session's doc pass may have legitimately left
+    modified/uncommitted (Glimmer never commits on the model's behalf --
+    noCommit is a hard constraint), so back-to-back sessions must not
+    deadlock against each other over it. Every other dirty path still
+    blocks, exactly as before.
+
+    Excluded via a git pathspec (`:(exclude)...`), NOT by slicing/string-
+    matching status(ws)'s porcelain lines -- git()'s blanket .strip() eats
+    the leading status-column space whenever the excluded path would
+    otherwise be the very first line of combined stdout, which silently
+    breaks a column-based (`line[3:]`) parse of that one line. main() and
+    --doc-graph-selfcheck both call this SAME function so the selfcheck
+    exercises the real logic, never a private reimplementation that could
+    silently drift from it (the exact class of gap Review round 7's C1
+    called out)."""
+    return lines(git(ws, "status", "--porcelain=v1", "--untracked-files=all",
+                      "--", ".", f":(exclude){DOC_GRAPH_RELATIVE_PATH}"))
+
+
 def branch(ws):
     return git(ws, "branch", "--show-current")
 
@@ -383,7 +406,19 @@ def commit_subject(ws, rev="HEAD"):
 def changed_files(ws, baseline):
     tracked = lines(git(ws, "diff", "--name-only", baseline, "--"))
     untracked = lines(git(ws, "ls-files", "--others", "--exclude-standard"))
-    return sorted(set(tracked + untracked))
+    all_files = sorted(set(tracked + untracked))
+    # Round 7 live checkpoint (L2): docs/graph.json is orchestrator-owned
+    # deterministic bookkeeping (see DOC_GRAPH_RELATIVE_PATH / _write_doc_graph)
+    # -- run_doc_pass, not the model, ever writes it. Excluding it here, at
+    # the one shared function every model-changed-files/scope-guard/
+    # maxChangedFiles-budget call site already routes through, means a
+    # legitimate graph-status rewrite is never attributed to the model's
+    # diff, never eats the changed-files budget, and never trips scope
+    # guard -- whether it was this session's own doc pass that wrote it,
+    # or a prior session's write still sitting uncommitted in the tree.
+    # Tracked separately, honestly, via manifest["orchestratorUpdatedFiles"]
+    # (see run_doc_pass).
+    return [f for f in all_files if f != DOC_GRAPH_RELATIVE_PATH]
 
 
 def changed_files_budget_exceeded(files: list, max_changed_files) -> bool:
@@ -1565,7 +1600,7 @@ def _contract_scope_text(contract):
     return ", ".join(scope_bits)
 
 
-def make_architect_prompt(contract, summary):
+def make_architect_prompt(contract, summary, ws=None):
     """C1 (glimmer-v7): the "task" text handed to `glimmer-engineer.py
     --mode architect` — NOT make_prompt's full engineering OPERATING
     CONTRACT (that prose is write-loop-specific: freeze rules, diff/
@@ -1574,6 +1609,12 @@ def make_architect_prompt(contract, summary):
     ARCHITECT_SYSTEM_PROMPT) already carries the permissions/output-shape
     instructions; this is just the objective + contract + repo map it
     needs to plan against.
+
+    Task 7.3 (V7 "ADR consultation"): `ws` (optional, defaults to None so
+    every pre-existing 2-arg call site is byte-for-byte unaffected) is
+    passed straight to build_adr_prompt_section, which appends "" whenever
+    there's nothing to add -- so this stays the exact same prompt for any
+    repo with no docs/decisions/ or no matching ADR.
     """
     return textwrap.dedent(f"""
     TASK CONTRACT (authoritative — sole source of scope/mode/constraints for this task):
@@ -1587,7 +1628,7 @@ def make_architect_prompt(contract, summary):
 
     TRUSTED REPOSITORY MAP:
     {summary}
-    """).strip()
+    """).strip() + build_adr_prompt_section(contract, ws)
 
 
 
@@ -2628,7 +2669,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     emit_event(events_path, "architect_planning_started", sid)
 
     try:
-        architect_prompt = make_architect_prompt(contract, summary)
+        architect_prompt = make_architect_prompt(contract, summary, ws)
         (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
 
         rc = invoke_engineer(
@@ -2685,17 +2726,19 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 # as C1's read_candidate_evidence treating model output as untrusted.
 
 
-def make_architect_replan_prompt(contract, summary, review, from_version):
+def make_architect_replan_prompt(contract, summary, review, from_version, ws=None):
     """V7 §5.12: the re-planning prompt. Reuses make_architect_prompt's
-    exact planning-mode text (objective + contract + repo map, byte-
-    identical prefix) and APPENDS the prior review's findings/
-    requiredChanges as evidence of why plan v{from_version} was
-    rejected, so the architect revises instead of re-deriving from
-    scratch with no memory of what failed. `review` is whatever load_
-    architect_review returned (already normalized: findings/
-    requiredChanges default to [] when absent) -- never raises on an
-    empty/None review, same tolerant-but-honest bar as architect_review_
-    failure_text.
+    exact planning-mode text (objective + contract + repo map [+ any
+    matching ADRs, Task 7.3], byte-identical prefix) and APPENDS the
+    prior review's findings/requiredChanges as evidence of why plan
+    v{from_version} was rejected, so the architect revises instead of
+    re-deriving from scratch with no memory of what failed. `review` is
+    whatever load_architect_review returned (already normalized:
+    findings/requiredChanges default to [] when absent) -- never raises
+    on an empty/None review, same tolerant-but-honest bar as
+    architect_review_failure_text. `ws` (optional) is forwarded straight
+    to make_architect_prompt; omitting it reproduces the exact pre-Task-
+    7.3 prompt.
     """
     review = review or {}
     findings = review.get("findings") or []
@@ -2716,7 +2759,7 @@ def make_architect_replan_prompt(contract, summary, review, from_version):
     if not findings and not required_changes:
         lines.append("  (review produced no specific findings/requiredChanges)")
 
-    return make_architect_prompt(contract, summary) + "\n\n" + "\n".join(lines)
+    return make_architect_prompt(contract, summary, ws) + "\n\n" + "\n".join(lines)
 
 
 def run_architect_replan(engineer, ws, contract, summary, session, events_path, sid,
@@ -2732,7 +2775,7 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path, 
     print("=" * 72)
 
     try:
-        replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version)
+        replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version, ws)
         (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
 
         # Fix round 1 (HIGH): architecture-plan.json already holds
@@ -2848,7 +2891,8 @@ ARCHITECT_REVIEW_DECISIONS = {
 }
 
 
-def make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=None):
+def make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=None,
+                         matched_adr_ids=None):
     """C2: the review-request payload v2 (trusted layer) writes to disk
     for the architect-review subprocess to read directly (glimmer-
     engineer.py's _load_review_request) — V7 §5.6's shape, scoped down
@@ -2870,6 +2914,14 @@ def make_review_request(plan, files, change_types, diff_text, iteration, review_
     payload shape from before this task, so every later review round
     (which has no fresh task list to add, and no reason to re-review one
     already approved) is unaffected.
+
+    Task 7.3 (V7 "ADR consultation"): matched_adr_ids is select_matching_
+    adr_ids(contract, ws)'s output -- additive, same "key present only
+    when there's something to say" discipline as taskList: omitted
+    (falsy/None) means either no docs/decisions/ dir or nothing matched,
+    reproducing the exact pre-Task-7.3 payload shape. When present, it
+    lets the architect note a deviation against a specific ADR without
+    re-deriving the area match itself.
     """
     request = {
         "type": "architect_review_request",
@@ -2883,6 +2935,8 @@ def make_review_request(plan, files, change_types, diff_text, iteration, review_
     }
     if task_list is not None:
         request["taskList"] = task_list
+    if matched_adr_ids:
+        request["matchedAdrIds"] = matched_adr_ids
     return request
 
 
@@ -2987,19 +3041,24 @@ def gates_block_verified(gates: dict) -> bool:
     blocks). Pure/deterministic -- exercised directly by
     --gates-selfcheck without a live model or session.
 
-    Review round 1 (Important): documentationCurrent is deliberately NOT
-    in this blocking set. detect_documentation_impact (O2 phase 1) is a
-    ONE-WAY detector -- it can only ever produce False (doc-relevant
-    change detected) or None (no impact / didn't run), NEVER True (it has
-    no way to verify docs actually ARE current). Blocking on it would mean
-    ANY routes/schema/api/config/auth-touching change is permanently
-    unable to reach VERIFIED, no matter how good the diff is -- the gate
-    computed in main()'s finally block (see gates["documentationCurrent"]
-    there) runs AFTER this function's caller already decided VERIFIED vs.
-    not, so wiring it in here would also just be decorative (the decision
-    it claims to gate has already been made). Deferred to a future round
-    where the doc gate becomes real tri-state (an actual freshness check,
-    not just an impact detector).
+    Task 7.1 (reverses the Round-2/review-round-1 deferral noted below):
+    documentationCurrent now DOES block, on the same not-False-only
+    contract as architectureApproved/scopeApproved/tasksResolved. That
+    deferral held only while detect_documentation_impact (O2 phase 1) was
+    the sole producer of this gate -- a ONE-WAY detector that can only
+    ever emit False or None, never True, since it has no way to verify
+    docs actually ARE current. Blocking on that alone would have made
+    every routes/schema/api/config/auth-touching change permanently
+    unable to reach VERIFIED. That is no longer the whole story: Task 7.1/
+    7.2's graph-based verification (verify_doc_nodes + map_changed_files_
+    to_doc_nodes + apply_doc_impact/check_doc_drift + compute_doc_gate,
+    composed by run_doc_pass and called from main()'s `if ok:` branch --
+    Review round 7, C1 -- strictly BEFORE this function is consulted, not
+    from `finally` after the fact) CAN legitimately produce True -- when a
+    repo has a docs/graph.json and every doc node impacted by this
+    session's diff verifies CURRENT. Repos without a graph still get None
+    (mechanism didn't run -- not applicable, never blocks), so this is
+    additive, not a new way to fail for repos that never opted in.
 
     Task 4.2: gates.tasksResolved follows the exact same Round-2
     True/False/None contract as architectureApproved/scopeApproved above
@@ -3013,22 +3072,24 @@ def gates_block_verified(gates: dict) -> bool:
     if gates.get("verificationPassed") is not True:
         return True
     return any(gates.get(key) is False for key in
-                ("architectureApproved", "scopeApproved", "tasksResolved"))
+                ("architectureApproved", "scopeApproved", "tasksResolved",
+                 "documentationCurrent"))
 
 
 def blocked_gate_names(gates: dict) -> list:
-    """Review round 1 (Important) + Task 4.2: which gate(s) actually caused
-    gates_block_verified to return True, in the same checked order --
-    mirrors gates_block_verified exactly (same two hard-required keys,
-    same not-False-only set, now including tasksResolved) so the two can
-    never silently drift apart. Feeds describe_blocked_gates' honest,
-    cause-naming failure detail."""
+    """Review round 1 (Important) + Task 4.2 + Task 7.1: which gate(s)
+    actually caused gates_block_verified to return True, in the same
+    checked order -- mirrors gates_block_verified exactly (same two
+    hard-required keys, same not-False-only set, now including
+    tasksResolved and documentationCurrent) so the two can never silently
+    drift apart. Feeds describe_blocked_gates' honest, cause-naming
+    failure detail."""
     blocked = []
     if gates.get("implementationComplete") is not True:
         blocked.append("implementationComplete")
     if gates.get("verificationPassed") is not True:
         blocked.append("verificationPassed")
-    for key in ("architectureApproved", "scopeApproved", "tasksResolved"):
+    for key in ("architectureApproved", "scopeApproved", "tasksResolved", "documentationCurrent"):
         if gates.get(key) is False:
             blocked.append(key)
     return blocked
@@ -3107,7 +3168,7 @@ def architect_review_failure_text(review):
 
 
 def run_architect_review(engineer, ws, plan, files, change_types, baseline, session, events_path, sid,
-                          iteration, review_round, task_list=None):
+                          iteration, review_round, task_list=None, matched_adr_ids=None):
     """C2 (glimmer-v7): pre-verification architect review (V7 §5.9),
     invoked from main()'s per-iteration loop only when a plan exists.
     Reuses invoke_engineer's SAME mode="architect" spawn path as C1's
@@ -3125,6 +3186,10 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     see that function's docstring for why this is the one review call
     that carries it (iteration==0, review_round==1 only; every other
     call site passes nothing, keeping their payload unchanged).
+
+    matched_adr_ids (Task 7.3): also forwarded straight into make_review_
+    request's additive matchedAdrIds field -- callers compute it once via
+    select_matching_adr_ids(contract, ws).
     """
     print("\n" + "=" * 72)
     print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
@@ -3143,7 +3208,8 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
         if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
             diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
 
-        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=task_list)
+        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round,
+                                       task_list=task_list, matched_adr_ids=matched_adr_ids)
         request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
 
         rc = invoke_engineer(
@@ -3691,11 +3757,14 @@ def evaluate_verification_tasks(tasks, results: list) -> None:
 # O2 phase 1 (glimmer-v7 reconciliation): deterministic
 # documentation-impact detector.
 # ============================================================
-# Scope is deliberately tiny (reconciliation doc, O2 entry): "deterministic
-# change-impact detector (routes/schema/API/config/auth touched?) creating a
-# REQUIRED doc task + gates.documentationCurrent. Graph, ADR store, drift
-# detection and semantic doc verification: defer entirely." No repo-map
-# lookup, no model call -- path/filename pattern matching only.
+# Scope was originally deliberately tiny (reconciliation doc, O2 entry):
+# "deterministic change-impact detector (routes/schema/API/config/auth
+# touched?) creating a REQUIRED doc task + gates.documentationCurrent.
+# Graph, ADR store, drift detection and semantic doc verification: defer
+# entirely." No repo-map lookup, no model call -- path/filename pattern
+# matching only. Task 7.1/7.2 (further down this file) built the graph +
+# deterministic drift detection the deferral above named; this detector
+# stays as-is as the fallback for repos with no docs/graph.json.
 
 # Category -> standalone words checked with boundary-safe matching (see
 # detect_documentation_impact). "routes"/"router" both catch the plain-
@@ -3751,6 +3820,38 @@ def _word_hits(word: str, path: str, camel_aware: bool) -> bool:
     return False
 
 
+def _categories_for_path(raw) -> set:
+    """Per-file half of detect_documentation_impact's classification,
+    factored out so Task 7.2's graph node-mapping (map_changed_files_to_
+    doc_nodes) can reuse the exact same keyword table per changed file --
+    detect_documentation_impact itself only ever needed the UNION across a
+    whole changed-files list, this is that union's per-file term."""
+    path = str(raw).replace("\\", "/")
+    lower = path.lower()
+    segments = [s for s in lower.split("/") if s]
+    basename = segments[-1] if segments else lower
+
+    categories = set()
+    for category, words in _DOC_IMPACT_WORDS.items():
+        camel_aware = category in _CAMEL_AWARE_CATEGORIES
+        for word in words:
+            if _word_hits(word, path, camel_aware):
+                categories.add(category)
+                break
+
+    # Explicit filename/segment checks the word list can't express
+    # as a clean standalone word.
+    if basename.endswith(".sql"):
+        categories.add("schema")
+    if basename == "dockerfile" or basename.startswith("docker-compose"):
+        categories.add("config")
+    if basename == ".env.example":
+        categories.add("config")
+    if ".github" in segments and "workflows" in segments:
+        categories.add("config")
+    return categories
+
+
 def detect_documentation_impact(changed_files) -> list:
     """O2 phase 1: pure, deterministic classifier -- no model, no repo-map.
     Classifies each changed path into zero or more of
@@ -3777,58 +3878,40 @@ def detect_documentation_impact(changed_files) -> list:
     """
     impacts = set()
     for raw in (changed_files or []):
-        path = str(raw).replace("\\", "/")
-        lower = path.lower()
-        segments = [s for s in lower.split("/") if s]
-        basename = segments[-1] if segments else lower
-
-        for category, words in _DOC_IMPACT_WORDS.items():
-            camel_aware = category in _CAMEL_AWARE_CATEGORIES
-            for word in words:
-                if _word_hits(word, path, camel_aware):
-                    impacts.add(category)
-                    break
-
-        # Explicit filename/segment checks the word list can't express
-        # as a clean standalone word.
-        if basename.endswith(".sql"):
-            impacts.add("schema")
-        if basename == "dockerfile" or basename.startswith("docker-compose"):
-            impacts.add("config")
-        if basename == ".env.example":
-            impacts.add("config")
-        if ".github" in segments and "workflows" in segments:
-            impacts.add("config")
-
+        impacts |= _categories_for_path(raw)
     return sorted(impacts)
 
 
-def documentation_task(next_id: int, impacts: list) -> dict:
+def documentation_task(next_id: int, impacts: list, node_ids: "list | None" = None) -> dict:
     """O2 + Task 4.1: the documentation task appended to tasks.json when
     C3's task graph is active and detect_documentation_impact found
     something. kind="documentation" is an honest addition to C3's kind
     vocabulary (alongside "implementation"/"verification"/"repair" -- see
     @glimmer/shared's GlimmerTask.kind, extended to match) precisely
-    because NOTHING in this codebase can verify documentation currency
-    yet (phase 1 is detection only): completion.type="docs" is never
-    matched by set_implementation_tasks_status / evaluate_implementation_
-    tasks / evaluate_verification_tasks / reset_verification_tasks_status
-    (all of which dispatch on completion.type=="files_changed"/
-    "check_passed" -- see their docstrings), so this task is created
-    `pending` and stays `pending` forever. Only a human closing it out of
-    band reflects reality. dependsOn is deliberately []: it doesn't block
-    or get blocked by implementation/verification tasks, it just needs to
-    exist and stay visible.
+    because NOTHING in this codebase can auto-CLOSE this task yet:
+    completion.type="docs" is never matched by set_implementation_tasks_
+    status / evaluate_implementation_tasks / evaluate_verification_tasks /
+    reset_verification_tasks_status (all of which dispatch on
+    completion.type=="files_changed"/"check_passed" -- see their
+    docstrings), so this task is created `pending` and stays `pending`
+    forever. Only a human closing it out of band reflects reality.
+    dependsOn is deliberately []: it doesn't block or get blocked by
+    implementation/verification tasks, it just needs to exist and stay
+    visible.
 
-    Task 4.1: priority is "recommended", not "required" -- matches the
-    ruling already encoded in gates_block_verified (documentationCurrent
-    is deliberately NOT in VERIFIED's blocking set, since phase 1's
-    detector can only ever produce False/None, never True). Making this
-    task "required" would make required_tasks_resolved permanently False
-    for every doc-relevant change, silently re-introducing the exact
-    blocking behavior that gate ruling rejected. createdBecause records
-    the same impacted-areas list baked into the description, machine-
-    shaped for display."""
+    Task 4.1: priority is "recommended", not "required" -- this task's own
+    completion can never auto-resolve (see above), so making it "required"
+    would make required_tasks_resolved permanently False for every
+    doc-relevant change, forever. That is orthogonal to Task 7.1's
+    documentationCurrent gate (which CAN legitimately become True now, via
+    the graph -- see gates_block_verified) -- documentationCurrent gates
+    VERIFIED directly; this task's priority only affects tasksResolved,
+    and the two must not be conflated. createdBecause records the same
+    impacted-areas list baked into the description, machine-shaped for
+    display. Task 7.2: node_ids (when the target repo has a docs/graph.json
+    and map_changed_files_to_doc_nodes found impacted doc nodes) is
+    recorded as this task's "nodeIds" -- always present, [] when there was
+    no graph or no impacted node."""
     now = _task_timestamp()
     return {
         "id": f"t{next_id}",
@@ -3844,12 +3927,912 @@ def documentation_task(next_id: int, impacts: list) -> dict:
         "priority": "recommended",
         "evidenceIds": [],
         "affectedFiles": [],
+        "nodeIds": list(node_ids or []),
         "blockingReason": None,
         "createdAt": now,
         "updatedAt": now,
         "completion": {"type": "docs"},
         "createdBecause": ", ".join(impacts),
     }
+
+
+# ============================================================
+# Task 7.1/7.2 (V7 "Machine-readable Documentation Graph" / "Documentation
+# status model" / "Documentation provenance" / "Drift detection" /
+# "Impact analysis through the graph" / "Documentation Gate"): a real,
+# tri-state documentationCurrent gate on top of O2 phase 1's one-way
+# detector above. The graph -- <workspace>/docs/graph.json -- lives IN THE
+# TARGET REPO, not in glimmer's own session state: it's a project artifact
+# a human (or a future bootstrap/curation step, Task 7.4) authors, and
+# Glimmer only reads + deterministically verifies it. Every status
+# transition below is a filesystem or git check -- nothing here calls a
+# model. Most repos have no graph yet; that is an honest "not applicable"
+# (None), never an error.
+# ============================================================
+
+DOC_STATUS_CURRENT = "CURRENT"
+DOC_STATUS_STALE = "STALE"
+DOC_STATUS_UNVERIFIED = "UNVERIFIED"
+DOC_STATUS_MISSING = "MISSING"
+DOC_STATUS_DEPRECATED = "DEPRECATED"
+DOC_STATUS_GENERATED = "GENERATED"
+DOC_STATUSES = {
+    DOC_STATUS_CURRENT, DOC_STATUS_STALE, DOC_STATUS_UNVERIFIED,
+    DOC_STATUS_MISSING, DOC_STATUS_DEPRECATED, DOC_STATUS_GENERATED,
+}
+# DEPRECATED/GENERATED are explicit human/bootstrap markers, not a
+# freshness verdict -- verify_doc_nodes/apply_doc_impact/check_doc_drift
+# all leave nodes in either state untouched rather than silently
+# reclassifying them (a deprecated node's file going missing is expected,
+# not a finding; a bootstrap-generated skeleton stays generated until a
+# human curates it).
+_DOC_STATUS_FROZEN = {DOC_STATUS_DEPRECATED, DOC_STATUS_GENERATED}
+
+DOC_GRAPH_RELATIVE_PATH = "docs/graph.json"
+
+# Task 7.2: which graph node `type` a changed file's O2-phase-1 category
+# corresponds to, for the keyword-table half of map_changed_files_to_
+# doc_nodes. Node types come from the graph.json schema (system/service/
+# route/schema/config/doc) -- "api" and "auth" changes are heuristically
+# attributed to a "service" node (there is no dedicated api/auth node
+# type); this is a coarse heuristic, not a claim of precision.
+_CATEGORY_TO_NODE_TYPE = {
+    "routes": "route",
+    "schema": "schema",
+    "config": "config",
+    "api": "service",
+    "auth": "service",
+}
+
+# Backticked, dot-extensioned, repo-path-looking references inside a doc
+# node's own markdown -- e.g. `backend/server/services/x.ts` or
+# `README.md`. Deliberately loose (this is a drift *signal*, not a parser):
+# anything that looks like a path reference and doesn't resolve under the
+# workspace root is a finding. _looks_like_doc_path_ref below narrows the
+# raw regex match down to things that are actually plausible paths
+# (Review round 7, M2) -- the regex alone also matches ordinary prose
+# like `Node.js`/`example.com`/`v1.2`, none of which are path references.
+_DOC_PATH_REF_RE = re.compile(r"`([\w][\w./-]*\.[A-Za-z0-9]{1,10})`")
+
+# Review round 7 (M2): extensions allowed to match WITHOUT a "/" in the
+# reference -- root-level doc/config files that legitimately get named
+# bare in prose (`README.md`, `package.json`, `.env`...). Source-code
+# extensions are deliberately excluded here: a bare `Node.js`/`Express.js`
+# is prose about a runtime/framework, not a path, and requiring a "/" for
+# those (matching real code references like `src/api.ts`) is what keeps
+# check_doc_drift from flagging ordinary text as a broken path.
+_DOC_PATH_REF_NO_SLASH_EXTS = {
+    "md", "mdx", "json", "yml", "yaml", "toml", "ini", "cfg", "env", "txt", "rst", "lock",
+}
+
+
+def _looks_like_doc_path_ref(ref: str) -> bool:
+    """Review round 7 (M2): a backticked, dot-extensioned regex match is
+    only treated as a repo path reference when it contains a path
+    separator, or its extension is one of the root-level doc/config
+    types above. Filters out `Node.js`, `example.com`, `v1.2`, `foo.bar`
+    -- prose that matches the loose regex but was never a path -- while
+    still catching real references like `src/api.ts` or `README.md`."""
+    if "/" in ref:
+        return True
+    ext = ref.rsplit(".", 1)[-1].lower()
+    return ext in _DOC_PATH_REF_NO_SLASH_EXTS
+
+
+# Round 7 live checkpoint (L1), tightened re-review 2 (MN1): an
+# UPPERCASE run of 3+ identical letters filling a whole path segment or
+# a whole stem (`NNNN`, `ADR-XXXX.md`) or an angle-bracket segment
+# (`<name>`) is an obvious template placeholder from example prose
+# ("see `decisions/ADR-NNNN.md`") -- check_doc_drift skips these rather
+# than flagging them as broken links. Lowercase/partial runs
+# (`wwwroot/appsettings.json`, `src/aaa.ts`) are real names and stay
+# eligible for drift flagging.
+_DOC_PATH_REF_PLACEHOLDER_RE = re.compile(
+    r"(?:^|/|-|_|\.)([A-Z])\1{2,}(?=$|/|-|_|\.)"
+)
+
+
+def _ref_has_placeholder(ref: str) -> bool:
+    if "<" in ref and ">" in ref:
+        return True
+    return bool(_DOC_PATH_REF_PLACEHOLDER_RE.search(ref))
+
+
+def load_doc_graph(ws) -> "dict | None":
+    """Task 7.1: tolerant reader for <ws>/docs/graph.json. Absent file ->
+    None (most repos have no graph yet -- not an error). Malformed JSON,
+    or valid JSON that isn't the expected {"nodes": [...], "edges": [...]}
+    shape -> None + a warning, never a raised exception -- a hand-edited or
+    partially-written graph file must never crash a session."""
+    path = Path(ws) / DOC_GRAPH_RELATIVE_PATH
+    if not path.is_file():
+        return None
+    try:
+        graph = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"[V2] WARN: malformed {DOC_GRAPH_RELATIVE_PATH}: {exc}")
+        return None
+    if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+        print(f"[V2] WARN: {DOC_GRAPH_RELATIVE_PATH} missing a nodes[] list, ignoring")
+        return None
+    graph.setdefault("edges", [])
+    graph.setdefault("schemaVersion", 1)
+    return graph
+
+
+def _write_doc_graph(ws, graph: dict) -> None:
+    """Atomic tmp+replace write of docs/graph.json back into the TARGET
+    repo -- same never-crash-the-session discipline as save_tasks: a disk
+    write failure here degrades to a log line, it must never take down an
+    otherwise-successful session.
+
+    Review round 7 (C2): skipped entirely when the serialized graph is
+    byte-identical to what's already on disk -- a verified session that
+    changed nothing in the graph must not touch docs/graph.json (a
+    tracked, human-curated file in the TARGET repo) at all, or every
+    such session would show up as "someone modified the workspace after
+    verification" in the Control Center's own staleness check."""
+    path = Path(ws) / DOC_GRAPH_RELATIVE_PATH
+    serialized = json.dumps(graph, indent=2)
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == serialized:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        tmp.write_text(serialized, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[V2] WARN: failed to write {DOC_GRAPH_RELATIVE_PATH}: {exc}")
+
+
+def _doc_git_sha(ws, path: str):
+    """git log -1 --format=%H -- <path>: the sha of the last commit that
+    touched `path`, or None when it has no commit history at all
+    (untracked/new file). Deliberately ignores the working tree -- Glimmer
+    sessions leave changes UNCOMMITTED for human review, so an in-session
+    edit to `path` is invisible here by design; this only catches drift
+    that happened across already-committed history."""
+    return git(ws, "log", "-1", "--format=%H", "--", path, check=False) or None
+
+
+def verify_doc_nodes(graph: dict, ws) -> list:
+    """Task 7.1: the deterministic doc verification pass. For every node in
+    graph["nodes"] (except frozen DEPRECATED/GENERATED nodes -- see
+    _DOC_STATUS_FROZEN):
+
+      1. node["path"] doesn't exist on disk -> MISSING.
+      2. doc-type node with any provenance.evidence path that doesn't
+         exist -> STALE (recorded as provenance.missingEvidence).
+      3. no provenance.sha on record -> UNVERIFIED (never had a baseline).
+      4. node["path"] has no committed history (_doc_git_sha -> None) ->
+         UNVERIFIED (nothing to compare a baseline against).
+      5. committed sha for node["path"] != provenance.sha -> STALE (the
+         file changed since this node was last confirmed current).
+      6. otherwise -> CURRENT.
+
+    Mutates `graph` in place (status/confidence/provenance.updatedAt) and
+    writes it back atomically. Returns [{"nodeId", "status"}] for every
+    node actually (re)computed, in node order -- callers emit
+    documentation_verified from this. Never model-driven: every branch
+    above is a filesystem or git check, never a judgment call.
+
+    Review round 7 (C2): provenance.updatedAt is only bumped for a node
+    whose status/confidence/missingEvidence actually changed this pass --
+    a repeat run against an unchanged repo must reproduce the exact same
+    graph.json bytes (see _write_doc_graph's identical-content no-op),
+    so a verified session that touched nothing doesn't get fingerprinted
+    as "the workspace changed after verification" purely because this
+    function stamped a fresh timestamp onto every node, every time."""
+    now = _task_timestamp()
+    results = []
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict) or not node.get("id"):
+            continue
+        if node.get("status") in _DOC_STATUS_FROZEN:
+            continue
+
+        node_path = node.get("path") or ""
+        old_provenance = dict(node.get("provenance") or {})
+        provenance = dict(old_provenance)
+        provenance.pop("missingEvidence", None)
+
+        if not node_path or not (Path(ws) / node_path).exists():
+            status = DOC_STATUS_MISSING
+        else:
+            missing_evidence = [
+                str(ev) for ev in (provenance.get("evidence") or [])
+                if node.get("type") == "doc" and not (Path(ws) / str(ev)).exists()
+            ]
+            if missing_evidence:
+                status = DOC_STATUS_STALE
+                provenance["missingEvidence"] = missing_evidence[:10]
+            elif not provenance.get("sha"):
+                status = DOC_STATUS_UNVERIFIED
+            else:
+                current_sha = _doc_git_sha(ws, node_path)
+                if current_sha is None:
+                    status = DOC_STATUS_UNVERIFIED
+                elif current_sha != provenance["sha"]:
+                    status = DOC_STATUS_STALE
+                else:
+                    status = DOC_STATUS_CURRENT
+
+        confidence = {
+            DOC_STATUS_CURRENT: "high",
+            DOC_STATUS_STALE: "low",
+            DOC_STATUS_MISSING: "low",
+        }.get(status, "unknown")
+        changed = (
+            node.get("status") != status
+            or node.get("confidence") != confidence
+            or old_provenance.get("missingEvidence") != provenance.get("missingEvidence")
+        )
+        node["status"] = status
+        node["confidence"] = confidence
+        if changed:
+            provenance["updatedAt"] = now
+        else:
+            provenance = old_provenance
+        node["provenance"] = provenance
+        results.append({"nodeId": node["id"], "status": status})
+
+    _write_doc_graph(ws, graph)
+    return results
+
+
+def _paths_share_area(path: str, node_path: str) -> bool:
+    """Review round 7 (M1): whether a changed file plausibly belongs to
+    the same area of the repo as a graph node's own recorded path --
+    identical, one nested under the other, or sharing an immediate
+    parent directory. Scopes the O2 category heuristic in
+    map_changed_files_to_doc_nodes down from "every node of this type,
+    repo-wide" to "nodes actually near this changed file" -- without
+    this, one changed route file marks every route doc in the repo
+    impacted, regardless of which route it documents."""
+    if not path or not node_path:
+        return False
+    if path == node_path:
+        return True
+    if path.startswith(node_path.rstrip("/") + "/") or node_path.startswith(path.rstrip("/") + "/"):
+        return True
+    path_dir = path.rsplit("/", 1)[0] if "/" in path else ""
+    node_dir = node_path.rsplit("/", 1)[0] if "/" in node_path else ""
+    return bool(path_dir) and path_dir == node_dir
+
+
+def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
+    """Task 7.2 ("Impact analysis through the graph"): which doc-type
+    nodes does this diff's changed-file set touch? Three independent
+    signals, unioned into a "touched" node set:
+
+      1. path-prefix match -- a changed file IS a node's recorded path, or
+         lives under it as a directory prefix.
+      2. the existing O2 phase-1 keyword table (_categories_for_path) --
+         a changed file's category (routes/schema/config/api/auth) maps
+         to a node type via _CATEGORY_TO_NODE_TYPE -- narrowed (Review
+         round 7, M1) to nodes of that type whose OWN path also shares an
+         area with the changed file (_paths_share_area), not every node
+         of that type in the graph. Without this, one route file change
+         would mark every route doc in the repo impacted/STALE.
+      3. Round 7 live checkpoint (L3): exact match against the node's own
+         provenance.evidence entries -- a doc node that explicitly records
+         "I was verified against src/greet.js" must be treated as touched
+         the moment src/greet.js changes, even when the file lives nowhere
+         near the doc's own path and matches no category heuristic. Without
+         this, a changed evidence file only ever reached the gate by luck,
+         via check_doc_drift accidentally re-scanning the same doc's prose
+         for broken links -- the evidence link itself was silently ignored.
+
+    A touched node that is itself type=="doc" is directly impacted. A
+    touched node that is NOT a doc is impacted through any "documents"
+    edge pointing at it (edge.kind=="documents", edge.to==touched node id
+    -- edge.from is the doc node documenting it). Returns the sorted,
+    deduped list of impacted doc node ids. Pure -- no I/O, no mutation."""
+    nodes_by_id = {
+        n["id"]: n for n in (graph.get("nodes") or [])
+        if isinstance(n, dict) and n.get("id")
+    }
+    touched = set()
+    for raw in (changed_files or []):
+        path = str(raw).replace("\\", "/")
+        for node in nodes_by_id.values():
+            node_path = str(node.get("path") or "").replace("\\", "/")
+            if node_path and (path == node_path or path.startswith(node_path.rstrip("/") + "/")):
+                touched.add(node["id"])
+            evidence = (node.get("provenance") or {}).get("evidence") or []
+            if any(path == str(ev).replace("\\", "/") for ev in evidence):
+                touched.add(node["id"])
+        for category in _categories_for_path(path):
+            wanted_type = _CATEGORY_TO_NODE_TYPE.get(category)
+            if wanted_type is None:
+                continue
+            for node in nodes_by_id.values():
+                if node.get("type") != wanted_type:
+                    continue
+                node_path = str(node.get("path") or "").replace("\\", "/")
+                if _paths_share_area(path, node_path):
+                    touched.add(node["id"])
+
+    impacted = {nid for nid in touched if nodes_by_id[nid].get("type") == "doc"}
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("kind") != "documents":
+            continue
+        if edge.get("to") not in touched:
+            continue
+        doc_node = nodes_by_id.get(edge.get("from"))
+        if doc_node is not None and doc_node.get("type") == "doc":
+            impacted.add(edge["from"])
+
+    return sorted(impacted)
+
+
+def apply_doc_impact(graph: dict, ws, changed_files, node_ids: list) -> list:
+    """Task 7.2: flags each impacted doc node STALE, UNLESS that node's own
+    path is itself among this diff's changed files -- the doc was edited
+    in the same diff as the code it documents, so trust verify_doc_nodes'
+    read of it rather than blanket-overriding it to STALE (this is what
+    makes gates.documentationCurrent=True reachable: change code + its doc
+    in the same diff and nothing else wrong -> impacted node stays
+    whatever verify_doc_nodes computed, e.g. CURRENT). Frozen DEPRECATED/
+    GENERATED nodes are left untouched. Writes the graph back atomically.
+    Returns [{"nodeId", "reason"}] for the nodes actually flagged --
+    callers emit documentation_stale_detected from this.
+
+    Review round 7 (M3): the same-diff exemption is now a real edge back
+    to CURRENT, not just "leave whatever verify_doc_nodes already
+    computed alone" -- editing a doc alongside the code it documents is
+    exactly the deterministic "this is confirmed accurate" signal
+    provenance.sha otherwise has no way to ever receive (nothing else in
+    this file writes it), so a node that drifted STALE once would
+    otherwise stay STALE forever with no path back short of hand-editing
+    graph.json. Stamps provenance.sha to the path's current committed
+    git sha -- the same deterministic _doc_git_sha check verify_doc_nodes
+    itself uses, never a guess.
+    # ponytail: this stamps the PRE-commit sha (sessions leave the diff
+    # uncommitted for human review), so once the human commits, one more
+    # session's verify_doc_nodes pass will legitimately re-flag it STALE
+    # against the new commit before self-healing again on the next
+    # same-diff edit. Upgrade path: a `--docs-verify --accept` command
+    # that re-baselines against HEAD after a human commits, if that one-
+    # cycle lag ever matters in practice."""
+    changed_set = {str(f).replace("\\", "/") for f in (changed_files or [])}
+    nodes_by_id = {
+        n["id"]: n for n in (graph.get("nodes") or [])
+        if isinstance(n, dict) and n.get("id")
+    }
+    now = _task_timestamp()
+    flagged = []
+    for node_id in node_ids:
+        node = nodes_by_id.get(node_id)
+        if node is None or node.get("status") in _DOC_STATUS_FROZEN:
+            continue
+        node_path = str(node.get("path") or "").replace("\\", "/")
+        if node_path and node_path in changed_set:
+            # doc updated alongside the code it documents -- re-baseline,
+            # don't just skip (Review round 7, M3).
+            provenance = dict(node.get("provenance") or {})
+            fresh_sha = _doc_git_sha(ws, node_path)
+            if node.get("status") != DOC_STATUS_CURRENT or provenance.get("sha") != fresh_sha:
+                node["status"] = DOC_STATUS_CURRENT
+                node["confidence"] = "high"
+                provenance["sha"] = fresh_sha
+                provenance["updatedAt"] = now
+                node["provenance"] = provenance
+            continue
+        node["status"] = DOC_STATUS_STALE
+        node["confidence"] = "low"
+        provenance = dict(node.get("provenance") or {})
+        provenance["updatedAt"] = now
+        node["provenance"] = provenance
+        flagged.append({
+            "nodeId": node_id,
+            "reason": "impacted by changed files in this session's diff",
+        })
+    _write_doc_graph(ws, graph)
+    return flagged
+
+
+def check_doc_drift(graph: dict, ws) -> list:
+    """Task 7.2 ("Drift detection"): deterministic drift check -- for each
+    doc-type node (except frozen DEPRECATED/GENERATED), read its own file
+    and regex-scan it for backticked, repo-path-looking references (see
+    _DOC_PATH_REF_RE), narrowed to plausible paths by
+    _looks_like_doc_path_ref (Review round 7, M2 -- the raw regex alone
+    also matches prose like `Node.js`/`example.com`, which is never a
+    path reference). A reference resolves (is not a finding) if it exists
+    either under the workspace root OR under the doc file's OWN directory
+    (Round 7 live checkpoint, L1) -- a doc at docs/README.md that says
+    `` `graph.json` `` means docs/graph.json, not a repo-root graph.json;
+    resolving only from repo root made every doc that refers to a
+    sibling file by its bare name a false-positive drift finding. A
+    reference containing an obvious placeholder segment (`NNNN`, `XXXX`,
+    `<...>` -- see _ref_has_placeholder) is skipped entirely, not
+    flagged: example prose like "see `decisions/ADR-NNNN.md`" was never a
+    real path. Findings are capped at 10 per node,
+    recorded at node.provenance.driftFindings, and any node with at least
+    one finding is flagged STALE. Writes the graph back atomically.
+    Returns [{"nodeId", "reason"}] for every node with new findings --
+    callers emit documentation_stale_detected from this."""
+    now = _task_timestamp()
+    flagged = []
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict) or node.get("type") != "doc":
+            continue
+        if node.get("status") in _DOC_STATUS_FROZEN:
+            continue
+        abs_path = Path(ws) / str(node.get("path") or "")
+        if not abs_path.is_file():
+            continue  # verify_doc_nodes already marks this MISSING
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        findings = []
+        for ref in _DOC_PATH_REF_RE.findall(text):
+            if not _looks_like_doc_path_ref(ref):
+                continue
+            if _ref_has_placeholder(ref):
+                continue
+            if (Path(ws) / ref).exists() or (abs_path.parent / ref).exists():
+                continue
+            findings.append(ref)
+            if len(findings) >= 10:
+                break
+        if not findings:
+            continue
+
+        provenance = dict(node.get("provenance") or {})
+        provenance["driftFindings"] = findings[:10]
+        provenance["updatedAt"] = now
+        node["provenance"] = provenance
+        node["status"] = DOC_STATUS_STALE
+        node["confidence"] = "low"
+        flagged.append({
+            "nodeId": node["id"],
+            "reason": f"{len(findings)} documented path reference(s) not found",
+        })
+    _write_doc_graph(ws, graph)
+    return flagged
+
+
+def compute_doc_gate(doc_graph, doc_node_ids: list) -> "bool | None":
+    """Task 7.1's tri-state gates["documentationCurrent"] derivation,
+    extracted as a pure function (Review round 7, Minor 1 / the selfcheck
+    gap C1 exposed): both main() and --doc-graph-selfcheck now call this
+    SAME function, instead of the selfcheck asserting against a private
+    re-implementation that could silently drift from what main() actually
+    does -- which is exactly how C1 (the gate never actually blocking)
+    went undetected.
+
+    doc_graph is None: no docs/graph.json in this repo -- ALWAYS None
+    (Review round 7, C3), regardless of what O2 phase 1's one-way
+    detect_documentation_impact detector found. That detector can only
+    ever emit False or None, never True (it has no way to verify docs
+    actually ARE current), so once C1 made this gate's value actually
+    reach gates_block_verified, letting a no-graph repo's False through
+    here would permanently brick every repo that never opted into the
+    graph the instant it touched a routes/schema/api/config/auth-shaped
+    file, with no action the engineer could take to clear it -- exactly
+    the Round-2 deadlock this gate was designed never to reintroduce.
+    That detector's finding still drives its own REQUIRED documentation
+    task (see run_doc_pass) -- it just never reaches the VERIFIED gate
+    for a repo with no graph to verify against.
+    doc_graph present but doc_node_ids is empty: None -- graph-based
+    verification ran and found nothing this diff impacts, honestly "not
+    applicable".
+    doc_graph present and impacted: True only when EVERY impacted node
+    verifies CURRENT; False when any is STALE/MISSING/otherwise
+    unproven -- never a guessed True."""
+    if doc_graph is None:
+        return None
+    if not doc_node_ids:
+        return None
+    doc_nodes_by_id = {n["id"]: n for n in doc_graph.get("nodes") or [] if n.get("id")}
+    impacted_statuses = [doc_nodes_by_id[n]["status"] for n in doc_node_ids if n in doc_nodes_by_id]
+    if any(s in (DOC_STATUS_STALE, DOC_STATUS_MISSING) for s in impacted_statuses):
+        return False
+    if impacted_statuses and all(s == DOC_STATUS_CURRENT for s in impacted_statuses):
+        return True
+    # UNVERIFIED/DEPRECATED/GENERATED among the impacted set: not proven
+    # current, but also not an outright drift finding -- conservative
+    # False, never a guessed True.
+    return False
+
+
+def run_doc_pass(ws, events_path, sid, manifest: dict, tasks, session) -> None:
+    """Task 7.1/7.2, Review round 7 (C1): the full deterministic doc pass
+    -- load the graph, verify nodes, map this session's FINAL changed-
+    file set to impacted doc nodes, apply impact/drift, and derive
+    gates["documentationCurrent"] via compute_doc_gate. Mutates
+    `manifest` in place (gates, documentationImpact*, and -- when a task
+    graph exists -- appends a documentation task via save_tasks).
+
+    Called from exactly ONE place in main() per session (guarded by the
+    `doc_pass_done` flag there), and it must be called BEFORE
+    gates_block_verified is consulted -- this is the fix for C1, where
+    the equivalent logic used to run only in `finally`, strictly AFTER
+    VERIFIED had already been decided, making the gate purely decorative.
+    Requires manifest["finalChangedFiles"] to already reflect the
+    session's true final diff (i.e. collapse() has already run) -- see
+    main()'s call site."""
+    final_changed_files = manifest["finalChangedFiles"]
+    doc_impacts = detect_documentation_impact(final_changed_files)
+    doc_graph = load_doc_graph(ws)
+    doc_node_ids = []
+    if doc_graph is not None:
+        for verified in verify_doc_nodes(doc_graph, ws):
+            emit_event(events_path, "documentation_verified", sid,
+                       nodeId=verified["nodeId"], status=verified["status"])
+
+        doc_node_ids = map_changed_files_to_doc_nodes(doc_graph, final_changed_files)
+        if doc_node_ids:
+            emit_event(events_path, "documentation_impact_detected", sid,
+                       files=final_changed_files, nodeIds=doc_node_ids)
+            for stale in apply_doc_impact(doc_graph, ws, final_changed_files, doc_node_ids):
+                emit_event(events_path, "documentation_stale_detected", sid,
+                           nodeId=stale["nodeId"], reason=stale["reason"])
+        for drifted in check_doc_drift(doc_graph, ws):
+            emit_event(events_path, "documentation_stale_detected", sid,
+                       nodeId=drifted["nodeId"], reason=drifted["reason"])
+
+        # Round 7 live checkpoint (L2): docs/graph.json is excluded from
+        # changed_files()'s output (it's orchestrator-owned, never model
+        # output -- see that function), so if the doc pass above (this
+        # session's, or a prior tolerated-dirty one -- see the clean-start
+        # check) left it differing from HEAD, that fact must still be
+        # recorded SOMEWHERE honestly, or the graph rewrite becomes
+        # invisible bookkeeping rather than a labeled, separate thing.
+        # Additive field -- omitted entirely when the graph isn't dirty.
+        if bool(git(ws, "status", "--porcelain=v1", "--untracked-files=all",
+                     "--", DOC_GRAPH_RELATIVE_PATH, check=False)):
+            manifest["orchestratorUpdatedFiles"] = [DOC_GRAPH_RELATIVE_PATH]
+
+    # Same merge-not-clobber discipline as every other gates writer (e.g.
+    # architectureApproved, set earlier in the same run) -- read whatever
+    # is already there and add this key onto it.
+    gates = dict(manifest.get("gates") or {})
+    gates["documentationCurrent"] = compute_doc_gate(doc_graph, doc_node_ids)
+    manifest["gates"] = gates
+
+    if doc_impacts:
+        manifest["documentationImpact"] = doc_impacts
+        if doc_node_ids:
+            manifest["documentationImpactNodeIds"] = doc_node_ids
+        # C3's machinery: only append when a task graph actually exists
+        # for this session (--architect-first produced a usable plan). No
+        # tasks.json is ever created just for this -- same zero-behavior-
+        # change-without-a-plan contract C3 itself uses.
+        if tasks is not None:
+            doc_task = documentation_task(_next_task_id(tasks), doc_impacts, doc_node_ids)
+            tasks.append(doc_task)
+            save_tasks(session, tasks)
+            emit_event(events_path, "task_created", sid,
+                       taskId=doc_task["id"], kind=doc_task["kind"],
+                       description=doc_task["description"][:200],
+                       source=doc_task["source"], priority=doc_task["priority"])
+
+
+# ============================================================
+# Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation"): the
+# ADR store lives at <workspace>/docs/decisions/ADR-NNNN.md, one file per
+# decision, a simple frontmatter block (not a real YAML parser -- stdlib
+# only, and the shape is deliberately this simple):
+#
+#   ---
+#   id: ADR-0001
+#   status: accepted
+#   areas: [auth, backend]
+#   title: Some decision title
+#   ---
+#   Context / Decision / Consequences prose...
+#
+# ADRs are HUMAN-authored. Nothing in this file (or anywhere in Glimmer)
+# ever writes one -- load_adrs below is a READER ONLY. This is the
+# hallucination guard V7's "ADR consultation" section calls for:
+# Glimmer must never invent architectural history, only surface real,
+# human-recorded decisions to the architect.
+# ============================================================
+
+ADR_DECISIONS_RELATIVE_DIR = "docs/decisions"
+ADR_MAX_COUNT = 100
+ADR_PROMPT_MAX_MATCHED = 5
+ADR_PROMPT_BODY_CHARS = 500
+
+_ADR_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
+
+
+def _parse_adr_frontmatter(text: str):
+    """Tolerant parser for the `--- key: value ... ---` frontmatter block
+    above -- plain `key: value` lines, `areas` additionally accepting an
+    inline bracket list (`areas: [a, b]`). Returns (fields dict, body str),
+    or None when the text has no recognizable frontmatter block at all
+    (the caller treats None as "malformed, skip + warn" -- never raises)."""
+    m = _ADR_FRONTMATTER_RE.match(text)
+    if not m:
+        return None
+    fm_text, body = m.group(1), m.group(2)
+    fields = {}
+    for line in fm_text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "areas" and value.startswith("[") and value.endswith("]"):
+            value = [v.strip().strip("'\"") for v in value[1:-1].split(",") if v.strip()]
+        fields[key] = value
+    return fields, body.strip()
+
+
+def load_adrs(ws) -> list:
+    """Task 7.3: tolerant reader for <ws>/docs/decisions/ADR-*.md. Absent
+    directory -> [] (most repos have no ADRs yet -- an honest "not
+    applicable", not an error). A single malformed file (no frontmatter,
+    or no id) is skipped with a warning -- it never aborts the whole read,
+    same discipline as load_doc_graph. Capped to the first ADR_MAX_COUNT
+    files in sorted (filename) order, so ADR-0001..ADR-0100 always win
+    over anything past that -- deterministic, and a runaway ADR count
+    can't blow up prompt-building."""
+    decisions_dir = Path(ws) / ADR_DECISIONS_RELATIVE_DIR
+    if not decisions_dir.is_dir():
+        return []
+
+    adrs = []
+    for path in sorted(decisions_dir.glob("ADR-*.md"))[:ADR_MAX_COUNT]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"[V2] WARN: unreadable ADR {path}: {exc}")
+            continue
+        parsed = _parse_adr_frontmatter(text)
+        if parsed is None:
+            print(f"[V2] WARN: malformed ADR (no frontmatter): {path}")
+            continue
+        fields, body = parsed
+        adr_id = fields.get("id")
+        if not adr_id:
+            print(f"[V2] WARN: malformed ADR (no id): {path}")
+            continue
+        areas = fields.get("areas")
+        if not isinstance(areas, list):
+            areas = [a for a in re.split(r"[,\s]+", str(areas or "")) if a]
+        adrs.append({
+            "id": str(adr_id),
+            "status": fields.get("status") or "proposed",
+            "areas": [str(a).lower() for a in areas],
+            "title": fields.get("title") or str(adr_id),
+            "body": body,
+            "path": str(path.relative_to(Path(ws))),
+        })
+    return adrs
+
+
+def _adr_contract_tokens(contract) -> set:
+    """The exact-token universe an ADR's areas[] are matched against:
+    the contract's scope tokens (same _skills_scope_text/_segment_tokens
+    pair select_skills uses for skill-area matching) UNIONED with the
+    contract's objective tokens -- Task 7.3 explicitly calls for matching
+    "the contract's area/objective tokens", and ADR areas are plain words
+    like skill areas, so the identical tokenizer/boundary rules apply."""
+    contract = contract or {}
+    tokens = set(_segment_tokens(_skills_scope_text(contract)))
+    tokens |= set(_segment_tokens(str(contract.get("objective") or "")))
+    return tokens
+
+
+def select_matching_adrs(contract, adrs) -> list:
+    """Task 7.3 ("ADR consultation"): which ADRs match this contract --
+    deterministic EXACT-token match against adr["areas"], same discipline
+    as select_skills (a raw substring test would let a short area like
+    "ui" match unrelated tokens that merely contain those letters) --
+    NEVER a model judgment. Ordered by id ascending (stable, reproducible
+    prompt) and capped to ADR_PROMPT_MAX_MATCHED.
+
+    Review round 7 (M4): only status=="accepted" ADRs are eligible at
+    all -- the spec's "ADR consultation" section scopes the architect's
+    deference to an ACTIVE ADR ("if Engineer proposes something that
+    conflicts with an active ADR"); a superseded/rejected/still-proposed
+    one is explicitly not that, and the prompt's own instruction ("flag
+    an ARCHITECTURAL DEVIATION instead of silently overriding it") would
+    otherwise tell the architect to defend a decision that was already
+    overturned, or one nobody accepted in the first place. Filtered
+    before the cap, so an accepted ADR is never bumped out by older
+    non-accepted ones."""
+    tokens = _adr_contract_tokens(contract)
+    if not tokens:
+        return []
+    matched = [
+        adr for adr in (adrs or [])
+        if adr.get("status") == "accepted"
+        and any(area and area in tokens for area in adr.get("areas") or [])
+    ]
+    matched.sort(key=lambda a: a["id"])
+    return matched[:ADR_PROMPT_MAX_MATCHED]
+
+
+def select_matching_adr_ids(contract, ws) -> list:
+    """Task 7.3: just the ids from select_matching_adrs(contract,
+    load_adrs(ws)) -- the one call site both build_adr_prompt_section and
+    make_review_request's additive matchedAdrIds field need. `ws` is None
+    whenever there's no real workspace to read from (mirrors
+    build_adr_prompt_section's own None-safety); never raises."""
+    if not ws:
+        return []
+    try:
+        return [a["id"] for a in select_matching_adrs(contract, load_adrs(ws))]
+    except Exception:
+        return []
+
+
+def build_adr_prompt_section(contract, ws) -> str:
+    """Task 7.3: the "ARCHITECTURE DECISION RECORDS" block make_architect_
+    prompt appends -- "" (byte-for-byte no change) whenever ws is None,
+    docs/decisions/ doesn't exist, or nothing matches this contract.
+    Same never-raises-into-"" discipline as build_skills_block. Reminds
+    the architect in-band that ADRs are human-authored and consumption-
+    only -- the hallucination guard from V7's "ADR consultation" section
+    lives here in the prompt text, not just in load_adrs never writing."""
+    if not ws:
+        return ""
+    try:
+        matched = select_matching_adrs(contract, load_adrs(ws))
+    except Exception:
+        return ""
+    if not matched:
+        return ""
+
+    parts = []
+    for adr in matched:
+        body = adr["body"]
+        if len(body) > ADR_PROMPT_BODY_CHARS:
+            body = body[:ADR_PROMPT_BODY_CHARS] + "...[truncated]"
+        parts.append(f"--- {adr['id']} ({adr['status']}): {adr['title']} ---\n{body}")
+    block = "\n\n".join(parts)
+    return (
+        "\n\nARCHITECTURE DECISION RECORDS -- HUMAN-authored, matched "
+        "deterministically by exact area/objective token (never a model "
+        f"judgment), at most {ADR_PROMPT_MAX_MATCHED}. These record WHY "
+        "past decisions were made. If your plan conflicts with one, flag "
+        "an ARCHITECTURAL DEVIATION instead of silently overriding it -- "
+        "an ADR may be superseded, but that must be an explicit decision. "
+        "Glimmer never generates ADRs itself -- only a human authors "
+        "them:\n" + block
+    )
+
+
+# ============================================================
+# Task 7.4 (V7 "Bootstrapping an existing repository"): --docs-bootstrap
+# builds the initial docs/graph.json skeleton (+ docs/decisions/ +
+# docs/README.md) for a repo that has neither yet. One node per
+# package/config/workflow from the existing repo map, all stamped
+# status=GENERATED -- which is already a FROZEN status (_DOC_STATUS_
+# FROZEN, Task 7.1): verify_doc_nodes/apply_doc_impact/check_doc_drift
+# all leave GENERATED nodes untouched, so a bootstrapped skeleton stays
+# honestly "unverified, machine-generated" until a human actually curates
+# it -- exactly the "ratchet" the architecture doc's bootstrap section
+# describes, with zero new status-machine code needed.
+# ============================================================
+
+DOCS_README_RELATIVE_PATH = "docs/README.md"
+
+_DOCS_README_STUB = """# Documentation graph
+
+This directory holds Glimmer's machine-readable documentation intelligence
+for this repository:
+
+- `graph.json` -- nodes (systems/services/routes/schemas/configs/docs) and
+  the edges between them, each carrying a `status` (CURRENT/STALE/
+  UNVERIFIED/MISSING/DEPRECATED/GENERATED) and a `provenance` record of
+  the evidence/commit it was last verified against.
+- `decisions/ADR-NNNN.md` -- human-authored Architecture Decision Records.
+  Glimmer only ever *reads* these; it never writes or generates one.
+
+## Honesty about GENERATED nodes
+
+Every node created by `--docs-bootstrap` is stamped `status: GENERATED` --
+a real, factual inventory entry (a package, a config file, a CI workflow
+that exists on disk), NOT a verified description of what that thing does
+or why. GENERATED nodes are left alone by verification/drift/impact
+checks until a human curates them (fills in an honest title, sets a real
+status, links them to actual documentation) -- at that point they become
+ordinary CURRENT/STALE/UNVERIFIED nodes like any hand-authored one.
+
+Every area Glimmer touches should end up at least as well documented as
+before it started -- preferably better.
+"""
+
+
+def build_docs_bootstrap_graph(repo_map: dict) -> dict:
+    """Task 7.4: pure function, repo_map (build_repo_map's shape) -> an
+    initial graph.json skeleton. One node per package/config/workflow
+    entry, type-mapped onto the graph's system|service|route|schema|
+    config vocabulary (workflow -> config: there is no dedicated
+    "workflow" node type, same coarse-heuristic spirit as Task 7.2's
+    _CATEGORY_TO_NODE_TYPE mapping "api"/"auth" onto "service"). Every
+    node: status=GENERATED, confidence="unknown", provenance={"evidence":
+    [], "sha": None} -- an honest "this is a real, factual inventory
+    entry, nothing more" per Bootstrap Phase 3 ("low-risk factual graph
+    nodes"). No edges -- inferring a "documents" edge would be a claim
+    this phase doesn't support."""
+    nodes = []
+    seen_ids = set()
+
+    def _add(node_id, node_type, path, title):
+        if node_id in seen_ids:
+            return
+        seen_ids.add(node_id)
+        nodes.append({
+            "id": node_id,
+            "type": node_type,
+            "path": path,
+            "title": title,
+            "status": DOC_STATUS_GENERATED,
+            "confidence": "unknown",
+            "provenance": {"evidence": [], "sha": None},
+        })
+
+    for pkg in repo_map.get("packages") or []:
+        if not isinstance(pkg, dict):
+            continue
+        dir_ = pkg.get("dir") or "."
+        node_id = "service:root" if dir_ == "." else f"service:{dir_}"
+        _add(node_id, "service", dir_, pkg.get("name") or dir_)
+
+    for cfg in repo_map.get("configs") or []:
+        _add(f"config:{cfg}", "config", str(cfg), str(cfg))
+
+    for wf in repo_map.get("workflows") or []:
+        _add(f"config:{wf}", "config", str(wf), str(wf))
+
+    return {"schemaVersion": 1, "nodes": nodes, "edges": []}
+
+
+def _docs_bootstrap(workspace) -> int:
+    """Task 7.4 CLI entry point (`--docs-bootstrap <workspace>`): builds
+    docs/graph.json + docs/decisions/ + docs/README.md. NEVER overwrites
+    an existing graph.json -- fails loud (a human, or a prior bootstrap,
+    already owns that file; silently clobbering real curation would be
+    the opposite of honest). Prints a summary. No model call anywhere in
+    this path -- deterministic, same as the rest of Task 7.1/7.2/7.4."""
+    ws = Path(workspace).expanduser().resolve()
+    if not ws.is_dir():
+        print(f"[V2] --docs-bootstrap: workspace not found: {ws}", file=sys.stderr)
+        return 1
+
+    graph_path = ws / DOC_GRAPH_RELATIVE_PATH
+    if graph_path.exists():
+        print(
+            f"[V2] --docs-bootstrap: refusing to overwrite existing "
+            f"{DOC_GRAPH_RELATIVE_PATH} -- delete it first if you really "
+            "want to regenerate the skeleton.",
+            file=sys.stderr,
+        )
+        return 1
+
+    repo_map = build_repo_map(ws)
+    graph = build_docs_bootstrap_graph(repo_map)
+
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+
+    (ws / ADR_DECISIONS_RELATIVE_DIR).mkdir(parents=True, exist_ok=True)
+
+    readme_path = ws / DOCS_README_RELATIVE_PATH
+    if not readme_path.exists():
+        readme_path.write_text(_DOCS_README_STUB, encoding="utf-8")
+
+    by_type = {}
+    for n in graph["nodes"]:
+        by_type[n["type"]] = by_type.get(n["type"], 0) + 1
+    counts = ", ".join(f"{k}={v}" for k, v in sorted(by_type.items())) or "none"
+    print(f"[V2] --docs-bootstrap: wrote {DOC_GRAPH_RELATIVE_PATH} "
+          f"({len(graph['nodes'])} nodes: {counts})")
+    print(f"[V2] --docs-bootstrap: {ADR_DECISIONS_RELATIVE_DIR}/ ready for human-authored ADRs")
+    print(f"[V2] --docs-bootstrap: {DOCS_README_RELATIVE_PATH} written")
+    print("[V2] --docs-bootstrap: every node is status=GENERATED (unverified until a human curates it)")
+    return 0
 
 
 # ============================================================
@@ -4179,7 +5162,8 @@ def main():
             print(f"  - {f}")
         raise V2Error("Recovery completed safely. Review/reset the preserved diff, then rerun v2.1")
 
-    b, baseline, up, dirty = branch(ws), head(ws), upstream(ws), status(ws)
+    b, baseline, up = branch(ws), head(ws), upstream(ws)
+    dirty = clean_start_dirty(ws)
     if dirty:
         raise V2Error("V2.1 requires clean start:\n" + "\n".join(dirty[:100]))
     if not args.allow_non_glimmer_branch and not b.startswith("glimmer/"):
@@ -4365,6 +5349,13 @@ def main():
     # task_list_completed fires at most once per session (see
     # emit_task_transitions's docstring).
     task_list_completed_flag = [False]
+    # Review round 7 (C1): whether run_doc_pass has already run this
+    # session. Set True at the one call site inside the `if ok:` branch
+    # below (the only place a real VERIFIED promotion can happen); the
+    # `finally` block's fallback call is skipped when this is already
+    # True, so the doc pass -- and its graph.json writes/events -- runs
+    # exactly once per session regardless of which exit path is taken.
+    doc_pass_done = False
     try:
         if not args.skip_model_readiness:
             # Task 1.3 (V7 §40): readiness_probe raises V2Error on a hard
@@ -4694,6 +5685,11 @@ def main():
                         # the derived task list -- one budgeted pass, not
                         # a re-review on every repair round.
                         task_list=(tasks if iteration == 0 and review_round == 1 else None),
+                        # Task 7.3 (ADR consultation): computed fresh per
+                        # round (cheap -- capped file read) rather than
+                        # threaded from outside the loop, so a human
+                        # editing docs/decisions/ mid-session is picked up.
+                        matched_adr_ids=select_matching_adr_ids(contract, ws),
                     )
                     attempt.setdefault("architectReviews", []).append(
                         {"round": review_round, "review": review}
@@ -5011,6 +6007,7 @@ def main():
                         post_review = run_architect_review(
                             engineer, ws, architecture_plan, files, change_types, baseline,
                             session, events_path, sid, iteration, review_round + 1,
+                            matched_adr_ids=select_matching_adr_ids(contract, ws),
                         )
                         attempt.setdefault("architectReviews", []).append(
                             {"round": review_round + 1, "review": post_review,
@@ -5026,6 +6023,26 @@ def main():
                     # honesty, not a block (V7 §5.10's plan is an estimate,
                     # not a contract): record the flag, leave scopeApproved
                     # indeterminate (null), let VERIFIED proceed.
+
+                # Review round 7 (C1): the doc pass (load graph, verify
+                # nodes, map impact, apply impact, drift check, gate
+                # derivation) must run -- and gates["documentationCurrent"]
+                # must be set -- strictly BEFORE gates_block_verified is
+                # consulted below, or the gate is decorative (this is
+                # exactly what C1 found: it used to run only in `finally`,
+                # after VERIFIED was already decided). It needs the
+                # session's FINAL changed-file set, which needs collapse()
+                # to have already run; ok=True always exits this loop
+                # (break, either branch below), so this genuinely is the
+                # last iteration and collapsing here is safe -- the
+                # `finally` block's own collapse()/changed_files() calls
+                # below are idempotent no-ops once this has already run.
+                collapse(ws, baseline)
+                manifest["finalHead"] = head(ws)
+                manifest["finalChangedFiles"] = changed_files(ws, baseline)
+                manifest["checkpointsCollapsed"] = head(ws) == baseline
+                run_doc_pass(ws, events_path, sid, manifest, tasks, session)
+                doc_pass_done = True
 
                 gates = dict(manifest.get("gates") or {})
                 gates["implementationComplete"] = bool(files) and last_engineer_rc == 0
@@ -5184,39 +6201,29 @@ def main():
         manifest["finalHead"] = head(ws)
         manifest["finalChangedFiles"] = changed_files(ws, baseline)
         manifest["checkpointsCollapsed"] = head(ws) == baseline
-        manifest["finalDiffHash"] = diff_hash(ws, baseline)
 
-        # O2 phase 1: deterministic doc-impact detection runs once here,
-        # against the session's FINAL changed-files set (this is the point
-        # after which changed_files can no longer change -- collapse() just
-        # ran and no further engineer/repair round follows). Same
-        # merge-not-clobber discipline as every other gates writer (C2 sets
-        # gates["architectureApproved"] earlier in this same run) -- read
-        # whatever's already there (possibly nothing at all, on a run
-        # without --architect-first) and add this key onto it. Honest gate
-        # semantics: False when impact is detected (phase 1 has no way to
-        # verify docs ARE current, so it can never claim True), None when
-        # the change touched nothing doc-relevant (zero behavior change).
-        doc_impacts = detect_documentation_impact(manifest["finalChangedFiles"])
-        gates = dict(manifest.get("gates") or {})
-        gates["documentationCurrent"] = False if doc_impacts else None
-        manifest["gates"] = gates
-        if doc_impacts:
-            manifest["documentationImpact"] = doc_impacts
-            # C3's machinery: only append when a task graph actually exists
-            # for this session (--architect-first produced a usable plan).
-            # No tasks.json is ever created just for this -- same
-            # zero-behavior-change-without-a-plan contract C3 itself uses.
-            if tasks is not None:
-                doc_task = documentation_task(_next_task_id(tasks), doc_impacts)
-                tasks.append(doc_task)
-                save_tasks(session, tasks)
-                # Fix round 1 (MINOR 10): this dynamic task creation was the
-                # one C3/O2 call site that never emitted task_created at all.
-                emit_event(events_path, "task_created", sid,
-                           taskId=doc_task["id"], kind=doc_task["kind"],
-                           description=doc_task["description"][:200],
-                           source=doc_task["source"], priority=doc_task["priority"])
+        # Review round 7 (C1): the doc pass already ran above, inline in
+        # the `if ok:` branch, on any path that reached a real VERIFIED-
+        # or-blocked decision (doc_pass_done is True there). Every OTHER
+        # exit path (verification never passed, INFRA_BLOCKED/TIMEOUT,
+        # repair budget exhausted, SIGTERM/interrupt, or any exception
+        # before that point) never got a chance to run it -- run it here,
+        # exactly once, as the fallback. collapse()/changed_files() just
+        # above are themselves idempotent no-ops when the `if ok:` branch
+        # already ran them, so this is safe to always execute.
+        if not doc_pass_done:
+            run_doc_pass(ws, events_path, sid, manifest, tasks, session)
+
+        # Review round 7 (C2): fingerprinted AFTER the doc pass (whichever
+        # branch ran it) rather than before -- verify_doc_nodes/apply_doc_
+        # impact/check_doc_drift only write docs/graph.json back when
+        # something in it actually changed (see _write_doc_graph's no-op-
+        # on-no-change guard), so a verified session that alters nothing
+        # in the graph gets the SAME finalDiffHash on every run; one that
+        # legitimately changes a node's status is fingerprinted with that
+        # change already included, instead of going stale the instant the
+        # doc pass writes back.
+        manifest["finalDiffHash"] = diff_hash(ws, baseline)
 
         manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
         save()
@@ -6904,6 +7911,237 @@ def _tasks_selfcheck() -> None:
     print("task graph (C3) self-check: PASS")
 
 
+def _doc_graph_selfcheck() -> None:
+    """Task 7.1/7.2 (V7 documentation intelligence): proves the doc-graph
+    reader/verifier/impact/drift passes and the tri-state gate composition
+    without a live session. Run with: python3 glimmer-v2.py --doc-graph-selfcheck
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+
+        # --- 1. load_doc_graph tolerance ---
+        assert load_doc_graph(ws) is None, "absent graph must read as None"
+        (ws / "docs").mkdir()
+        (ws / "docs" / "graph.json").write_text("not json {{{")
+        assert load_doc_graph(ws) is None, "malformed graph must read as None, not raise"
+        (ws / "docs" / "graph.json").write_text(json.dumps({"edges": []}))
+        assert load_doc_graph(ws) is None, "graph without nodes[] must read as None"
+        (ws / "docs" / "graph.json").write_text(json.dumps({"nodes": []}))
+        g = load_doc_graph(ws)
+        assert g is not None and g["edges"] == [] and g["schemaVersion"] == 1, (
+            "valid minimal graph must gain edges/schemaVersion defaults"
+        )
+
+        # --- 2. verify_doc_nodes status transitions (real git repo) ---
+        run(["git", "init", "-q"], ws)
+        (ws / "src").mkdir()
+        (ws / "src" / "api.ts").write_text("export const x = 1;")
+        (ws / "docs" / "api.md").write_text("Covers `src/api.ts`.")
+        run(["git", "add", "-A"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "init"], ws)
+        api_sha = _doc_git_sha(ws, "docs/api.md")
+        assert api_sha, "committed file must have a git sha"
+
+        graph = {
+            "schemaVersion": 1,
+            "nodes": [
+                {"id": "doc-api", "type": "doc", "path": "docs/api.md",
+                 "status": "UNVERIFIED",
+                 "provenance": {"evidence": ["src/api.ts"], "sha": api_sha}},
+                {"id": "doc-gone", "type": "doc", "path": "docs/nope.md",
+                 "status": "UNVERIFIED", "provenance": {}},
+                {"id": "doc-stale-ev", "type": "doc", "path": "docs/api.md",
+                 "status": "UNVERIFIED",
+                 "provenance": {"evidence": ["src/deleted.ts"], "sha": api_sha}},
+                {"id": "doc-nosha", "type": "doc", "path": "docs/api.md",
+                 "status": "UNVERIFIED", "provenance": {}},
+                {"id": "svc-users", "type": "service", "path": "src/api.ts",
+                 "status": "UNVERIFIED", "provenance": {"sha": _doc_git_sha(ws, "src/api.ts")}},
+                {"id": "doc-frozen", "type": "doc", "path": "docs/nope.md",
+                 "status": DOC_STATUS_DEPRECATED, "provenance": {}},
+            ],
+            "edges": [{"from": "doc-api", "to": "svc-users", "kind": "documents"}],
+        }
+        results = verify_doc_nodes(graph, ws)
+        by_id = {r["nodeId"]: r["status"] for r in results}
+        assert by_id["doc-api"] == DOC_STATUS_CURRENT, by_id
+        assert by_id["doc-gone"] == DOC_STATUS_MISSING
+        assert by_id["doc-stale-ev"] == DOC_STATUS_STALE
+        assert by_id["doc-nosha"] == DOC_STATUS_UNVERIFIED
+        assert "doc-frozen" not in by_id, "frozen DEPRECATED node must not be recomputed"
+        # sha-mismatch -> STALE: rewrite + recommit the doc, keep the old sha on record.
+        (ws / "docs" / "api.md").write_text("Covers `src/api.ts`. Updated.")
+        run(["git", "add", "-A"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "edit"], ws)
+        results2 = verify_doc_nodes(graph, ws)
+        assert {r["nodeId"]: r["status"] for r in results2}["doc-api"] == DOC_STATUS_STALE, (
+            "committed change since provenance.sha must flag STALE"
+        )
+        # Written back atomically: file on disk reflects the mutation, no tmp remains.
+        on_disk = json.loads((ws / "docs" / "graph.json").read_text())
+        assert {n["id"]: n["status"] for n in on_disk["nodes"]}["doc-gone"] == DOC_STATUS_MISSING
+        assert not list((ws / "docs").glob("graph.json.tmp*")), "no tmp file may survive"
+
+        # --- 3. map_changed_files_to_doc_nodes: prefix + category/edge ---
+        impacted = map_changed_files_to_doc_nodes(graph, ["src/api.ts"])
+        # src/api.ts prefix-touches svc-users AND category "api" -> type
+        # "service" -> svc-users; the documents edge lifts it to doc-api.
+        assert impacted == ["doc-api"], impacted
+        assert map_changed_files_to_doc_nodes(graph, ["unrelated/z.txt"]) == []
+
+        # --- 3b. Round 7 live checkpoint (L3): a changed file matching a
+        # doc node's own provenance.evidence must be treated as touched,
+        # even with no path-prefix or category relationship at all --
+        # this is the signal that used to be silently ignored, and the
+        # live smoke-test scenario this fixes exactly. ---
+        graph["nodes"].append({
+            "id": "doc-evidence-linked", "type": "doc", "path": "docs/evidence-linked.md",
+            "status": "UNVERIFIED", "provenance": {"evidence": ["src/unrelated_evidence.ts"]},
+        })
+        assert map_changed_files_to_doc_nodes(graph, ["src/unrelated_evidence.ts"]) == [
+            "doc-evidence-linked"
+        ], "changed file matching provenance.evidence must impact its doc node (L3)"
+        assert map_changed_files_to_doc_nodes(graph, ["src/no_match_at_all.ts"]) == []
+
+        # --- 4. apply_doc_impact: stale-flag, same-diff doc exemption, frozen skip ---
+        for n in graph["nodes"]:
+            if n["id"] == "doc-api":
+                n["status"] = DOC_STATUS_CURRENT
+        flagged = apply_doc_impact(graph, ws, ["src/api.ts", "docs/api.md"], ["doc-api", "doc-frozen"])
+        assert flagged == [], "doc edited in the same diff must stay CURRENT; frozen skipped"
+        flagged2 = apply_doc_impact(graph, ws, ["src/api.ts"], ["doc-api"])
+        assert [f["nodeId"] for f in flagged2] == ["doc-api"]
+        assert {n["id"]: n["status"] for n in graph["nodes"]}["doc-api"] == DOC_STATUS_STALE
+
+        # --- 5. check_doc_drift: backticked missing ref -> finding + STALE ---
+        (ws / "docs" / "drifty.md").write_text("See `src/api.ts` and `src/removed.ts`.")
+        graph["nodes"].append({"id": "doc-drifty", "type": "doc", "path": "docs/drifty.md",
+                               "status": "UNVERIFIED", "provenance": {}})
+        drifted = check_doc_drift(graph, ws)
+        assert [d["nodeId"] for d in drifted] == ["doc-drifty"], drifted
+        drifty = [n for n in graph["nodes"] if n["id"] == "doc-drifty"][0]
+        assert drifty["provenance"]["driftFindings"] == ["src/removed.ts"]
+        assert drifty["status"] == DOC_STATUS_STALE
+
+        # --- 5b. Round 7 live checkpoint (L1): a bare-name ref resolves
+        # relative to the doc file's OWN directory, not just repo root;
+        # a ref with an obvious placeholder segment is skipped, not
+        # flagged. docs/graph.json already exists on disk at this point
+        # (verify_doc_nodes wrote it in step 2 above), so a doc living in
+        # docs/ that refers to it by bare name (`graph.json`) must resolve
+        # -- and `decisions/ADR-NNNN.md` (no such file, and never will be
+        # one) must be skipped as an example placeholder, not flagged. ---
+        (ws / "docs" / "relref.md").write_text(
+            "See `graph.json` and `decisions/ADR-NNNN.md` for details."
+        )
+        graph["nodes"].append({"id": "doc-relref", "type": "doc", "path": "docs/relref.md",
+                               "status": "UNVERIFIED", "provenance": {}})
+        drifted2 = check_doc_drift(graph, ws)
+        assert "doc-relref" not in [d["nodeId"] for d in drifted2], (
+            "doc-dir-relative ref and placeholder ref must not be flagged as drift (L1)"
+        )
+        relref = [n for n in graph["nodes"] if n["id"] == "doc-relref"][0]
+        assert relref["status"] == "UNVERIFIED", "must not be flipped to STALE by a false drift finding"
+        assert _ref_has_placeholder("decisions/ADR-NNNN.md") is True
+        assert _ref_has_placeholder("<id>/file.ts") is True
+        assert _ref_has_placeholder("src/api.ts") is False
+        # MN1 (re-review 2): lowercase/partial runs are real names, never
+        # placeholders -- only uppercase whole-segment/whole-stem runs are.
+        assert _ref_has_placeholder("wwwroot/appsettings.json") is False
+        assert _ref_has_placeholder("src/aaa.ts") is False
+        assert _ref_has_placeholder("WWW.md") is True
+        assert _ref_has_placeholder("XXXX/notes.md") is True
+
+        # --- 6. Gate tri-state composition: calls compute_doc_gate, the
+        # SAME function main() calls via run_doc_pass (Review round 7,
+        # Minor 1 -- this used to be a private re-implementation here
+        # that could silently drift from what main() actually ran, which
+        # is exactly how C1 went undetected). ---
+        def _gate_graph(statuses):
+            return {"nodes": [{"id": f"n{i}", "status": s} for i, s in enumerate(statuses)]}
+
+        def _ids(n):
+            return [f"n{i}" for i in range(n)]
+
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_CURRENT, DOC_STATUS_CURRENT]), _ids(2)) is True
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_CURRENT, DOC_STATUS_STALE]), _ids(2)) is False
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_UNVERIFIED]), _ids(1)) is False, (
+            "unproven must never gate True"
+        )
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_CURRENT]), []) is None, (
+            "graph present, nothing impacted this diff -> not applicable"
+        )
+        # C3: no graph at all -- ALWAYS None, even when O2 phase 1's
+        # one-way detector fired (that finding still drives its own
+        # REQUIRED task via run_doc_pass -- it just never reaches this
+        # gate for a repo with no graph to verify against). Getting this
+        # wrong (a no-graph repo's False reaching gates_block_verified)
+        # would permanently brick every non-graph repo the instant it
+        # touched a routes/schema/api/config/auth-shaped file.
+        assert compute_doc_gate(None, []) is None, "no graph -> never applicable, regardless of doc_impacts"
+
+        # --- 7. Round 7 live checkpoint (L2): docs/graph.json is
+        # orchestrator-owned bookkeeping, never model output -- must never
+        # be attributed to the model's changed files/scope guard/budget,
+        # must not deadlock the next session's clean-start check, and its
+        # dirtiness must be labeled separately (orchestratorUpdatedFiles).
+        # `ws` here is the same real git repo used above (already has
+        # commits from step 2). ---
+        # Earlier steps in this selfcheck already left assorted untracked
+        # docs/*.md fixtures lying around, so the tree isn't clean here --
+        # test the INVARIANT (rewriting docs/graph.json changes nothing
+        # observable) rather than assuming a pristine tree.
+        head_sha = head(ws)
+        before = changed_files(ws, head_sha)
+        assert DOC_GRAPH_RELATIVE_PATH not in before
+        (ws / "docs" / "graph.json").write_text('{"nodes": [], "edges": []}\n')
+        after = changed_files(ws, head_sha)
+        assert after == before, (
+            "rewriting docs/graph.json must never change the model-facing changed-files set"
+        )
+        # Clean-start's own dirty-filter (the SAME clean_start_dirty()
+        # main() calls -- not a private reimplementation, see its
+        # docstring): touching ONLY docs/graph.json must not add to the
+        # blocking dirty set; a genuinely dirty OTHER path still must.
+        # docs/graph.json is deliberately the ONLY dirty path at this
+        # point in the test, so this also covers the real regression this
+        # repro caught: a naive `line[3:]` column-slice of status(ws)
+        # breaks when the excluded path is the first (or only) line,
+        # because git()'s blanket .strip() eats that line's leading space.
+        for f in (ws / "docs" / "drifty.md", ws / "docs" / "relref.md"):
+            f.unlink(missing_ok=True)
+        run(["git", "add", "-A"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "settle"], ws)
+        assert clean_start_dirty(ws) == [], "a solely-dirty docs/graph.json must not block clean-start"
+        (ws / "docs" / "graph.json").write_text('{"nodes": [], "edges": [], "x": 1}\n')
+        assert clean_start_dirty(ws) == [], (
+            "touching only docs/graph.json must not change the blocking dirty set"
+        )
+        (ws / "src" / "extra.ts").write_text("export const y = 2;")
+        assert len(clean_start_dirty(ws)) == 1, "a genuinely dirty OTHER path must still block clean-start"
+        (ws / "src" / "extra.ts").unlink()
+
+        # orchestratorUpdatedFiles: run_doc_pass labels a dirty (untracked)
+        # graph separately rather than silently folding it into
+        # finalChangedFiles.
+        run_doc_pass_manifest = {"finalChangedFiles": []}
+        run_doc_pass(ws, ws / "events.jsonl", "selfcheck", run_doc_pass_manifest, None, None)
+        assert run_doc_pass_manifest.get("orchestratorUpdatedFiles") == [DOC_GRAPH_RELATIVE_PATH], (
+            "a dirty docs/graph.json must be labeled orchestratorUpdatedFiles, not hidden"
+        )
+        # Commit the graph so it matches HEAD (clean) -- the field must
+        # not be fabricated once there is nothing dirty to report.
+        run(["git", "add", "docs/graph.json"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "graph"], ws)
+        run_doc_pass_manifest2 = {"finalChangedFiles": []}
+        run_doc_pass(ws, ws / "events.jsonl", "selfcheck", run_doc_pass_manifest2, None, None)
+        assert "orchestratorUpdatedFiles" not in run_doc_pass_manifest2, (
+            "a clean (committed) docs/graph.json must never fabricate orchestratorUpdatedFiles"
+        )
+
+    print("doc-graph (Task 7.1/7.2) self-check: PASS")
+
+
 def _doc_impact_selfcheck() -> None:
     """O2 phase 1 (glimmer-v7 reconciliation): proves the deterministic
     change-impact classifier's category boundaries, the honest gate
@@ -7125,14 +8363,16 @@ def _gates_selfcheck() -> None:
 
     # ------------------------------------------------------------
     # 4. gates_block_verified: implementationComplete/verificationPassed
-    #    must be exactly True; architectureApproved/scopeApproved may be
-    #    True OR None, only False blocks. documentationCurrent is
-    #    deliberately NOT in the blocking set (review round 1, Important)
-    #    -- it can only ever be False or None, never True, so wiring it
-    #    in would make EVERY doc-relevant change permanently unable to
-    #    reach VERIFIED; also its producer runs in main()'s finally block,
-    #    strictly AFTER this function's caller already decided VERIFIED
-    #    vs. not, so it would be decorative even if wired in.
+    #    must be exactly True; architectureApproved/scopeApproved/
+    #    tasksResolved/documentationCurrent may be True OR None, only
+    #    False blocks. documentationCurrent IS in the blocking set (Task
+    #    7.1, reversing the Round-2 deferral) -- graph-based verification
+    #    (verify_doc_nodes + map_changed_files_to_doc_nodes + apply_doc_
+    #    impact/check_doc_drift, composed by run_doc_pass) can legitimately
+    #    produce True, so False is a real block, not decorative. Review
+    #    round 7 (C1): run_doc_pass now runs from main()'s `if ok:` branch
+    #    -- BEFORE gates_block_verified is consulted below -- not from
+    #    `finally` (see section 6's source-ordering proof).
     # ------------------------------------------------------------
     all_true = {
         "implementationComplete": True, "architectureApproved": True,
@@ -7148,20 +8388,19 @@ def _gates_selfcheck() -> None:
     # block.
     assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
 
-    for optional_key in ("architectureApproved", "scopeApproved", "tasksResolved"):
+    for optional_key in ("architectureApproved", "scopeApproved", "tasksResolved",
+                         "documentationCurrent"):
         blocked = dict(all_true, **{optional_key: False})
         assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
         nulled = dict(all_true, **{optional_key: None})
         assert gates_block_verified(nulled) is False, f"{optional_key}=None must NOT block VERIFIED"
 
-    # documentationCurrent=False must NOT block -- the one property the
-    # real path can never exhibit otherwise (its producer never runs
-    # before this decision), proven directly here.
-    assert gates_block_verified(dict(all_true, documentationCurrent=False)) is False, (
-        "documentationCurrent must never block VERIFIED -- phase 1's detector can only "
-        "ever produce False/None, never True, and its producer runs after this decision anyway"
-    )
-    assert gates_block_verified(dict(all_true, documentationCurrent=None)) is False
+    # Task 7.1 (reverses the Round-2 deferral): documentationCurrent is
+    # now a real tri-state gate -- graph-based verification can produce
+    # True, so False legitimately blocks (covered by the loop above);
+    # True passes, and repos without a docs/graph.json stay None (never
+    # block) -- see gates_block_verified's docstring.
+    assert gates_block_verified(dict(all_true, documentationCurrent=True)) is False
 
     assert gates_block_verified(dict(all_true, implementationComplete=False)) is True
     assert gates_block_verified(dict(all_true, implementationComplete=None)) is True, (
@@ -7180,9 +8419,9 @@ def _gates_selfcheck() -> None:
     assert blocked_gate_names(dict(all_true, architectureApproved=False, scopeApproved=False)) == [
         "architectureApproved", "scopeApproved",
     ]
-    # documentationCurrent=False must never show up as a blocked gate --
-    # it isn't in gates_block_verified's checked set at all.
-    assert blocked_gate_names(dict(all_true, documentationCurrent=False)) == []
+    # Task 7.1: documentationCurrent=False is now a named blocked gate,
+    # same contract as the other optional gates.
+    assert blocked_gate_names(dict(all_true, documentationCurrent=False)) == ["documentationCurrent"]
 
     # Task 4.2: tasksResolved=False (some required task never resolved) is
     # named exactly like architectureApproved/scopeApproved, and combines
@@ -7252,6 +8491,21 @@ def _gates_selfcheck() -> None:
     )
     assert consistency_call_idx < gates_block_idx < verified_label_idx, (
         "gates_block_verified's decision must be made, and consulted, BEFORE the VERIFIED promotion"
+    )
+
+    # 5a. Review round 7 (C1): the doc pass (run_doc_pass, which sets
+    #     gates["documentationCurrent"]) must run BEFORE gates_block_
+    #     verified is consulted -- otherwise the gate is decorative. This
+    #     is exactly the assertion the round-7 review found missing: C1
+    #     shipped with the doc gate wired into gates_block_verified's
+    #     blocking set, but computed only in `finally`, strictly AFTER
+    #     the VERIFIED/blocked decision above had already been made.
+    #     `.index` finds the FIRST occurrence -- the call inside the
+    #     `if ok:` branch -- not the `finally` block's own fallback call.
+    doc_pass_call_idx = main_source.index("run_doc_pass(ws, events_path, sid, manifest, tasks, session)")
+    assert doc_pass_call_idx < gates_block_idx, (
+        "run_doc_pass must execute before gates_block_verified is consulted, or "
+        "documentationCurrent can never actually block a VERIFIED promotion"
     )
 
     # 5b. Review round 1 (minor): once flagged, consistency_gate's default
@@ -8242,6 +9496,322 @@ def _candidate_ranking_selfcheck() -> None:
     print("candidate ranking (V7 §27) self-check: PASS")
 
 
+def _adr_selfcheck() -> None:
+    """Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation").
+    Covers: frontmatter parsing (tolerant -- malformed/missing-id files
+    skipped, never raise), load_adrs' absent-dir/cap behavior, exact-token
+    area matching (no substring false-positive, mirroring select_skills),
+    the ADR_PROMPT_MAX_MATCHED cap + id-ascending ordering, the prompt-
+    section's shape/truncation/empty-when-nothing-matches, make_
+    architect_prompt's byte-identical-with-no-ws contract, and make_
+    review_request's additive matchedAdrIds field.
+    Run with: python3 glimmer-v2.py --adr-selfcheck
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+
+        # ------------------------------------------------------------
+        # 1. load_adrs: absent docs/decisions/ -> [], never an error.
+        # ------------------------------------------------------------
+        assert load_adrs(ws) == [], "no docs/decisions/ dir -> [] (not an error)"
+
+        decisions = ws / "docs" / "decisions"
+        decisions.mkdir(parents=True)
+
+        # A well-formed ADR.
+        (decisions / "ADR-0001.md").write_text(
+            "---\n"
+            "id: ADR-0001\n"
+            "status: accepted\n"
+            "areas: [auth, backend]\n"
+            "title: Session ownership belongs to the backend\n"
+            "---\n"
+            "Context\nUsers need cross-device recovery.\n\n"
+            "Decision\nBackend owns persistent session ownership.\n",
+            encoding="utf-8",
+        )
+        # A second, non-matching ADR (different area).
+        (decisions / "ADR-0002.md").write_text(
+            "---\n"
+            "id: ADR-0002\n"
+            "status: accepted\n"
+            "areas: [billing]\n"
+            "title: Billing retries\n"
+            "---\n"
+            "Body text.\n",
+            encoding="utf-8",
+        )
+        # Malformed: no frontmatter delimiters at all -- skipped, not raised.
+        (decisions / "ADR-0003.md").write_text("just some prose, no frontmatter\n", encoding="utf-8")
+        # Malformed: frontmatter present but no id -- skipped, not raised.
+        (decisions / "ADR-0004.md").write_text(
+            "---\nstatus: accepted\nareas: [auth]\ntitle: Missing id\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        # Not an ADR file at all (glob shouldn't pick it up).
+        (decisions / "notes.md").write_text("---\nid: ADR-9999\n---\nignored\n", encoding="utf-8")
+
+        adrs = load_adrs(ws)
+        ids = sorted(a["id"] for a in adrs)
+        assert ids == ["ADR-0001", "ADR-0002"], (
+            f"malformed ADR-0003/0004 and non-matching-glob notes.md must be skipped, got {ids!r}"
+        )
+        by_id = {a["id"]: a for a in adrs}
+        assert by_id["ADR-0001"]["areas"] == ["auth", "backend"]
+        assert by_id["ADR-0001"]["status"] == "accepted"
+        assert by_id["ADR-0001"]["title"] == "Session ownership belongs to the backend"
+        assert "Backend owns persistent session ownership" in by_id["ADR-0001"]["body"]
+
+        # ------------------------------------------------------------
+        # 2. select_matching_adrs: EXACT-token match, not substring -- a
+        #    contract scoped to "authorization" (contains "auth" as a
+        #    substring but is a different whole token) must NOT match
+        #    ADR-0001's "auth" area.
+        # ------------------------------------------------------------
+        contract_auth = {
+            "objective": "fix the auth session bug",
+            "scope": {"package": "backend"},
+        }
+        matched = select_matching_adrs(contract_auth, adrs)
+        assert [a["id"] for a in matched] == ["ADR-0001"], matched
+
+        contract_no_substring = {
+            "objective": "improve authorization middleware",
+            "scope": {"package": "frontend"},
+        }
+        # "authorization" tokenizes to one whole token "authorization",
+        # which is NOT "auth" -- must not match via substring.
+        assert select_matching_adrs(contract_no_substring, adrs) == [], (
+            "exact-token match must not let 'authorization' match ADR area 'auth' as a substring"
+        )
+
+        # scope.package deliberately "frontend" here (not "backend") --
+        # ADR-0001 also carries area "backend", so a "backend"-scoped
+        # contract would legitimately match it too; this isolates the
+        # objective-keyword ("billing") signal on its own.
+        contract_billing = {"objective": "retry billing", "scope": {"package": "frontend"}}
+        assert [a["id"] for a in select_matching_adrs(contract_billing, adrs)] == ["ADR-0002"]
+
+        contract_none = {"objective": "unrelated task", "scope": {"package": "frontend"}}
+        assert select_matching_adrs(contract_none, adrs) == []
+
+        # ------------------------------------------------------------
+        # 2b. Review round 7 (M4): superseded/proposed/rejected ADRs are
+        #     never eligible, even when their areas would otherwise match
+        #     -- only status=="accepted" is fed to the architect prompt.
+        # ------------------------------------------------------------
+        (decisions / "ADR-0010.md").write_text(
+            "---\nid: ADR-0010\nstatus: superseded\nareas: [auth]\ntitle: Old auth decision\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        (decisions / "ADR-0011.md").write_text(
+            "---\nid: ADR-0011\nstatus: proposed\nareas: [auth]\ntitle: New auth idea\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        (decisions / "ADR-0012.md").write_text(
+            "---\nid: ADR-0012\nstatus: rejected\nareas: [auth]\ntitle: Rejected auth idea\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        adrs_with_inactive = load_adrs(ws)
+        inactive_matched = select_matching_adrs(contract_auth, adrs_with_inactive)
+        assert [a["id"] for a in inactive_matched] == ["ADR-0001"], (
+            f"superseded/proposed/rejected ADRs must never match, got {inactive_matched}"
+        )
+        assert select_matching_adr_ids(contract_auth, ws) == ["ADR-0001"], (
+            "select_matching_adr_ids must exclude non-accepted ADRs the same way"
+        )
+
+        # select_matching_adr_ids mirrors select_matching_adrs, just ids;
+        # None/empty ws never raises.
+        assert select_matching_adr_ids(contract_auth, ws) == ["ADR-0001"]
+        assert select_matching_adr_ids(contract_auth, None) == []
+        assert select_matching_adr_ids(contract_auth, "") == []
+
+        # Cap: ADR_PROMPT_MAX_MATCHED matches, ordered by id ascending.
+        for n in range(3, 3 + ADR_PROMPT_MAX_MATCHED + 2):
+            (decisions / f"ADR-{n:04d}.md").write_text(
+                f"---\nid: ADR-{n:04d}\nstatus: accepted\nareas: [auth]\ntitle: extra {n}\n---\nBody.\n",
+                encoding="utf-8",
+            )
+        many_adrs = load_adrs(ws)
+        many_matched = select_matching_adrs(contract_auth, many_adrs)
+        assert len(many_matched) == ADR_PROMPT_MAX_MATCHED, (
+            f"expected capped to {ADR_PROMPT_MAX_MATCHED}, got {len(many_matched)}"
+        )
+        assert [a["id"] for a in many_matched] == sorted(a["id"] for a in many_matched), (
+            "matched ADRs must be ordered by id ascending"
+        )
+
+        # ------------------------------------------------------------
+        # 3. build_adr_prompt_section: "" when ws is None or nothing
+        #    matches; a real section (with truncation) when something does.
+        # ------------------------------------------------------------
+        assert build_adr_prompt_section(contract_auth, None) == ""
+        assert build_adr_prompt_section(contract_none, ws) == ""
+
+        section = build_adr_prompt_section(contract_auth, ws)
+        assert "ARCHITECTURE DECISION RECORDS" in section
+        assert "ADR-0001" in section
+        assert "HUMAN-authored" in section
+
+        long_body_adr = decisions / "ADR-0002.md"
+        long_body_adr.write_text(
+            "---\nid: ADR-0002\nstatus: accepted\nareas: [auth]\ntitle: Long\n---\n"
+            + ("x" * (ADR_PROMPT_BODY_CHARS + 200)) + "\n",
+            encoding="utf-8",
+        )
+        long_section = build_adr_prompt_section(contract_auth, ws)
+        assert "[truncated]" in long_section, "a body over ADR_PROMPT_BODY_CHARS must be truncated"
+
+        # ------------------------------------------------------------
+        # 4. make_architect_prompt: ws=None (the default) reproduces the
+        #    exact pre-Task-7.3 prompt; passing ws appends the ADR section
+        #    only when something actually matches.
+        # ------------------------------------------------------------
+        contract_full = {
+            "objective": "fix the auth session bug",
+            "scope": {"package": "backend"},
+            "mode": "implement",
+            "constraints": {},
+            "verification": [],
+            "repairBudget": 0,
+        }
+        no_ws_prompt = make_architect_prompt(contract_full, "repo summary")
+        assert no_ws_prompt == make_architect_prompt(contract_full, "repo summary", ws=None), (
+            "ws defaulting to None must be identical to omitting it"
+        )
+        assert "ARCHITECTURE DECISION RECORDS" not in no_ws_prompt
+
+        with_ws_prompt = make_architect_prompt(contract_full, "repo summary", ws)
+        assert with_ws_prompt.startswith(no_ws_prompt), (
+            "the ADR section must be a pure suffix -- the base prompt text must not change"
+        )
+        assert "ARCHITECTURE DECISION RECORDS" in with_ws_prompt
+
+        empty_ws = Path(td) / "no-adrs-here"
+        empty_ws.mkdir()
+        assert make_architect_prompt(contract_full, "repo summary", empty_ws) == no_ws_prompt, (
+            "a workspace with no docs/decisions/ must reproduce the exact no-ws prompt"
+        )
+
+    # ------------------------------------------------------------
+    # 5. make_review_request: matchedAdrIds is additive -- absent when
+    #    falsy/None (exact pre-Task-7.3 shape), present when given.
+    # ------------------------------------------------------------
+    plan = {"objective": "x", "packages": [], "risk": "low"}
+    base_request = make_review_request(plan, ["a.ts"], {"a.ts": "modified"}, "diff", 0, 1)
+    assert "matchedAdrIds" not in base_request
+
+    request_with_ids = make_review_request(
+        plan, ["a.ts"], {"a.ts": "modified"}, "diff", 0, 1, matched_adr_ids=["ADR-0001"],
+    )
+    assert request_with_ids["matchedAdrIds"] == ["ADR-0001"]
+
+    request_with_empty = make_review_request(
+        plan, ["a.ts"], {"a.ts": "modified"}, "diff", 0, 1, matched_adr_ids=[],
+    )
+    assert "matchedAdrIds" not in request_with_empty, "an empty match list must not add a noise key"
+
+    print("ADR store + consultation (V7 §7.3) self-check: PASS")
+
+
+def _docs_bootstrap_selfcheck() -> None:
+    """Task 7.4 (V7 "Bootstrapping an existing repository"): the
+    --docs-bootstrap skeleton builder. Covers build_docs_bootstrap_graph's
+    type-mapping (package->service, config/workflow->config) against a
+    fake repo map, every node's honest GENERATED/unknown/no-sha shape, and
+    _docs_bootstrap's real-filesystem behavior: writes graph.json +
+    docs/decisions/ + docs/README.md on a clean workspace, and REFUSES
+    (never overwrites) when graph.json already exists.
+    Run with: python3 glimmer-v2.py --docs-bootstrap-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. build_docs_bootstrap_graph: pure, from a fake repo map.
+    # ------------------------------------------------------------
+    fake_repo_map = {
+        "packages": [
+            {"path": "package.json", "dir": ".", "name": "root-pkg"},
+            {"path": "frontend/package.json", "dir": "frontend", "name": "@app/frontend"},
+        ],
+        "configs": ["tsconfig.json", "frontend/tsconfig.json"],
+        "workflows": [".github/workflows/ci.yml"],
+    }
+    graph = build_docs_bootstrap_graph(fake_repo_map)
+    assert graph["schemaVersion"] == 1
+    assert graph["edges"] == [], "Phase 3 (bootstrap) must never invent edges"
+
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    assert by_id["service:root"]["type"] == "service"
+    assert by_id["service:root"]["path"] == "."
+    assert by_id["service:root"]["title"] == "root-pkg"
+    assert by_id["service:frontend"]["type"] == "service"
+    assert by_id["service:frontend"]["path"] == "frontend"
+    assert by_id["config:tsconfig.json"]["type"] == "config"
+    assert by_id["config:frontend/tsconfig.json"]["type"] == "config"
+    assert by_id["config:.github/workflows/ci.yml"]["type"] == "config", (
+        "workflow has no dedicated node type -- must fall back to config"
+    )
+
+    for node in graph["nodes"]:
+        assert node["status"] == DOC_STATUS_GENERATED
+        assert node["confidence"] == "unknown"
+        assert node["provenance"] == {"evidence": [], "sha": None}
+
+    # verify_doc_nodes must leave every bootstrapped node untouched --
+    # GENERATED is a frozen status (Task 7.1's _DOC_STATUS_FROZEN), the
+    # exact mechanism that makes bootstrap output honest ("unverified
+    # until a human curates it") without any new status-machine code.
+    assert DOC_STATUS_GENERATED in _DOC_STATUS_FROZEN
+
+    # Duplicate dir across packages/configs must not double-add a node.
+    dup_map = {"packages": [{"path": "a/package.json", "dir": "a", "name": "a"}],
+               "configs": [], "workflows": []}
+    dup_graph = build_docs_bootstrap_graph(dup_map)
+    assert len(dup_graph["nodes"]) == 1
+
+    # ------------------------------------------------------------
+    # 2. _docs_bootstrap: real filesystem behavior.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        (ws / "package.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+        # build_repo_map (reused, unmodified, by _docs_bootstrap) shells
+        # out to git -- a real (if empty) repo is needed for this fixture.
+        subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=ws, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=ws, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=ws, check=True)
+
+        rc = _docs_bootstrap(str(ws))
+        assert rc == 0, "bootstrap on a clean workspace must succeed"
+
+        graph_path = ws / DOC_GRAPH_RELATIVE_PATH
+        assert graph_path.is_file()
+        written = json.loads(graph_path.read_text(encoding="utf-8"))
+        assert any(n["id"] == "service:root" for n in written["nodes"])
+
+        assert (ws / ADR_DECISIONS_RELATIVE_DIR).is_dir()
+        assert (ws / DOCS_README_RELATIVE_PATH).is_file()
+        assert "GENERATED" in (ws / DOCS_README_RELATIVE_PATH).read_text(encoding="utf-8")
+
+        # NEVER overwrites an existing graph -- fails loud (non-zero rc),
+        # and the on-disk file must be byte-identical to what a human (or
+        # a prior bootstrap) already wrote there.
+        graph_path.write_text('{"nodes": [], "edges": [], "curated": true}', encoding="utf-8")
+        before = graph_path.read_text(encoding="utf-8")
+        rc2 = _docs_bootstrap(str(ws))
+        assert rc2 != 0, "bootstrap must refuse to overwrite an existing graph.json"
+        assert graph_path.read_text(encoding="utf-8") == before, (
+            "an existing graph.json must be left byte-for-byte untouched on refusal"
+        )
+
+        # A nonexistent workspace must also fail loud, not crash.
+        assert _docs_bootstrap(str(ws / "does-not-exist")) != 0
+
+    print("docs bootstrap (V7 §7.4) self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
@@ -8270,6 +9840,9 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--visual-selfcheck"]:
         _visual_selfcheck()
         raise SystemExit(0)
+    if sys.argv[1:] == ["--doc-graph-selfcheck"]:
+        _doc_graph_selfcheck()
+        raise SystemExit(0)
     if sys.argv[1:] == ["--doc-impact-selfcheck"]:
         _doc_impact_selfcheck()
         raise SystemExit(0)
@@ -8288,6 +9861,22 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--candidate-ranking-selfcheck"]:
         _candidate_ranking_selfcheck()
         raise SystemExit(0)
+    if sys.argv[1:] == ["--adr-selfcheck"]:
+        _adr_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--docs-bootstrap-selfcheck"]:
+        _docs_bootstrap_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:2] == ["--docs-bootstrap"]:
+        # Task 7.4: a standalone CLI mode, not a task run -- takes a bare
+        # workspace path instead of the usual `task ... --workspace ...`
+        # shape, so it's dispatched here (same special-case-before-
+        # argparse pattern as every --*-selfcheck above) rather than
+        # forced through main()'s required-positional-task argparse.
+        if len(sys.argv) != 3:
+            print("Usage: glimmer-v2.py --docs-bootstrap <workspace>", file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(_docs_bootstrap(sys.argv[2]))
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         raise SystemExit(main())
