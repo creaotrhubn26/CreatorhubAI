@@ -373,6 +373,16 @@ export interface ArchitectReviewCompletedEvent extends GlimmerEventBase {
 export interface ArchitectReplanStartedEvent extends GlimmerEventBase {
   type: "architect_replan_started";
 }
+// architect_autotriggered (V7 §5.5, Task 2.1): emitted by glimmer-v2.py's
+// deterministic risk score (compute_architect_risk) only when the score
+// crosses the threshold and --no-architect was not passed. score/
+// threshold/signals mirror manifest.architectTrigger verbatim.
+export interface ArchitectAutotriggeredEvent extends GlimmerEventBase {
+  type: "architect_autotriggered";
+  score: number;
+  threshold: number;
+  signals: string[];
+}
 export interface TaskCreatedEvent extends GlimmerEventBase {
   type: "task_created";
   taskId: string;
@@ -434,6 +444,7 @@ export type GlimmerEvent =
   | ArchitectReviewRequestedEvent
   | ArchitectReviewCompletedEvent
   | ArchitectReplanStartedEvent
+  | ArchitectAutotriggeredEvent
   | TaskCreatedEvent
   | TaskStatusChangedEvent
   | TaskListCompletedEvent
@@ -451,7 +462,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "session_created", "skill_loaded", "model_retry", "context_selected",
   "architect_planning_started", "architect_plan_created",
   "architect_review_requested", "architect_review_completed",
-  "architect_replan_started",
+  "architect_replan_started", "architect_autotriggered",
   "task_created", "task_status_changed", "task_list_completed",
   "visual_verification_started", "visual_finding_detected",
   "visual_verification_completed",
