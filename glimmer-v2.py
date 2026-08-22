@@ -222,12 +222,15 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "BUDGET_EXHAUSTED", "detail": "architect review budget exhausted (V7 §5.13)", "evidenceIds": []}
     if raw == "needs-architect-review":
         return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation or the review budget was exhausted (V7 §5.10/§5.13)", "evidenceIds": []}
-    # Task 2.3 (V7 §5.10): TECHNICALLY_VERIFIED + ARCHITECTURE_REVIEW_FAILED
-    # = NEEDS_REWORK -- tests passed, but the post-verification consistency
-    # check flagged files outside plan.candidateFiles/expectedScope.maxFiles
-    # and the follow-up architect review round rejected the diff.
+    # Task 2.3 (V7 §5.10/§5.11): TECHNICALLY_VERIFIED but one or more
+    # mandatory gates did not hold -- NEEDS_REWORK. Review round 1
+    # (Important): three genuinely distinct causes share this one raw
+    # status (scope-guard expansion, engineer rc!=0 after a passing diff,
+    # a real consistency-review rejection); describe_blocked_gates builds
+    # an honest, cause-naming detail from manifest["blockedGates"] instead
+    # of one fixed string that was wrong for two of the three.
     if raw == "needs-architect-review-consistency-rejected":
-        return {"class": "POLICY_BLOCK", "detail": "post-verification architecture consistency review rejected the implementation (V7 §5.10)", "evidenceIds": []}
+        return {"class": "POLICY_BLOCK", "detail": describe_blocked_gates(manifest), "evidenceIds": []}
     # Task 1.3: readiness_probe (main()'s preflight) now records this exact
     # status when the model server never becomes reachable, instead of
     # falling through to the generic "initialized" -> "failed-aborted"
@@ -2335,16 +2338,100 @@ def gates_block_verified(gates: dict) -> bool:
     implementationComplete and verificationPassed to be exactly True
     (both are always computable by the time this runs -- there is no
     honest "not applicable" for either), and architectureApproved/
-    scopeApproved/documentationCurrent to each be anything OTHER than
-    False (None = not-applicable/never-ran, still allowed; only an
-    explicit False blocks). Pure/deterministic -- exercised directly by
-    --gates-selfcheck without a live model or session."""
+    scopeApproved to each be anything OTHER than False (None =
+    not-applicable/never-ran, still allowed; only an explicit False
+    blocks). Pure/deterministic -- exercised directly by
+    --gates-selfcheck without a live model or session.
+
+    Review round 1 (Important): documentationCurrent is deliberately NOT
+    in this blocking set. detect_documentation_impact (O2 phase 1) is a
+    ONE-WAY detector -- it can only ever produce False (doc-relevant
+    change detected) or None (no impact / didn't run), NEVER True (it has
+    no way to verify docs actually ARE current). Blocking on it would mean
+    ANY routes/schema/api/config/auth-touching change is permanently
+    unable to reach VERIFIED, no matter how good the diff is -- the gate
+    computed in main()'s finally block (see gates["documentationCurrent"]
+    there) runs AFTER this function's caller already decided VERIFIED vs.
+    not, so wiring it in here would also just be decorative (the decision
+    it claims to gate has already been made). Deferred to a future round
+    where the doc gate becomes real tri-state (an actual freshness check,
+    not just an impact detector)."""
     if gates.get("implementationComplete") is not True:
         return True
     if gates.get("verificationPassed") is not True:
         return True
     return any(gates.get(key) is False for key in
-                ("architectureApproved", "scopeApproved", "documentationCurrent"))
+                ("architectureApproved", "scopeApproved"))
+
+
+def blocked_gate_names(gates: dict) -> list:
+    """Review round 1 (Important): which gate(s) actually caused
+    gates_block_verified to return True, in the same checked order --
+    mirrors gates_block_verified exactly (same two hard-required keys,
+    same not-False-only set) so the two can never silently drift apart.
+    Feeds describe_blocked_gates' honest, cause-naming failure detail."""
+    blocked = []
+    if gates.get("implementationComplete") is not True:
+        blocked.append("implementationComplete")
+    if gates.get("verificationPassed") is not True:
+        blocked.append("verificationPassed")
+    for key in ("architectureApproved", "scopeApproved"):
+        if gates.get(key) is False:
+            blocked.append(key)
+    return blocked
+
+
+def describe_blocked_gates(manifest: dict) -> str:
+    """Review round 1 (Important): an honest, cause-naming detail for a
+    session that reached the VERIFIED gates check and got blocked.
+    Three genuinely distinct causes can all land on the same raw status
+    (needs-architect-review-consistency-rejected) -- a scope-guard
+    expansion, an engineer that exited non-zero after a passing diff, and
+    a real post-verification consistency-review rejection -- and they
+    must not all read as "architecture review rejected" (wrong for two
+    of the three). Reads manifest["blockedGates"] (set at the block
+    site), the LAST attempt's scopeGuard, and the top-level consistency
+    record for the actual file lists. Never raises on a
+    missing/malformed manifest -- degrades to a generic detail.
+    """
+    blocked = manifest.get("blockedGates") or []
+    attempts = manifest.get("attempts") or []
+    last_attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+    scope_guard = last_attempt.get("scopeGuard") or {}
+    consistency = manifest.get("consistency") or {}
+
+    parts = []
+    if "implementationComplete" in blocked:
+        # Controller ruling: this exact phrase, never "architecture review
+        # rejected" -- rc != 0 after a passing diff is an engineer-outcome
+        # fact, unrelated to any architect review.
+        parts.append("engineer exited non-zero after a passing diff")
+    if "scopeApproved" in blocked:
+        expanded = scope_guard.get("expandedFiles") or []
+        outside = consistency.get("outsideFiles") or []
+        if expanded and outside:
+            parts.append(
+                "scope guard expansion outside declared scope ("
+                + ", ".join(expanded)
+                + ") AND post-verification consistency review rejected files outside "
+                "the architecture plan (" + ", ".join(outside) + ")"
+            )
+        elif expanded:
+            parts.append("scope guard expansion outside declared scope: " + ", ".join(expanded))
+        elif outside:
+            parts.append(
+                "post-verification consistency review rejected files outside the "
+                "architecture plan: " + ", ".join(outside)
+            )
+        else:
+            parts.append("post-verification consistency review rejected the implementation")
+    if "architectureApproved" in blocked:
+        parts.append("architecture review gate rejected")
+    if "verificationPassed" in blocked:
+        parts.append("verification did not pass")
+    if not parts:
+        return "one or more V7 §5.11 gates blocked promotion to verified"
+    return "; ".join(parts)
 
 
 def architect_review_failure_text(review):
@@ -2425,10 +2512,10 @@ def _normalize_plan_path(raw) -> str:
     """Cheap path normalization shared by check_post_verification_
     consistency's membership comparison -- not a security boundary (unlike
     _resolve_candidate_path's containment check above), just enough
-    normalization that "./src/x.ts" and "src/x.ts" compare equal. Never
-    raises on malformed input."""
-    p = str(raw).strip().replace("\\", "/")
-    return p[2:] if p.startswith("./") else p
+    normalization that "./src/x.ts", "src/x.ts/", and "src//x.ts" all
+    compare equal. Never raises on malformed input."""
+    p = str(raw).strip().replace("\\", "/").strip("/")
+    return os.path.normpath(p) if p else p
 
 
 def check_post_verification_consistency(files: list, plan) -> dict:
@@ -2461,7 +2548,15 @@ def check_post_verification_consistency(files: list, plan) -> dict:
             if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip():
                 candidate_paths.add(_normalize_plan_path(c["path"]))
 
-    outside = [f for f in files if _normalize_plan_path(f) not in candidate_paths]
+    # Review round 1 (minor): an architect that named NO usable candidate
+    # files at all (empty/malformed candidateFiles) has given us nothing
+    # to compare against -- that is honestly "can't tell", not "every
+    # file is outside scope". Only flag on outsideFiles when there is at
+    # least one real candidate path to compare against; maxFiles is an
+    # independent, still-live signal either way.
+    outside = [] if not candidate_paths else [
+        f for f in files if _normalize_plan_path(f) not in candidate_paths
+    ]
 
     max_files = None
     expected_scope = plan.get("expectedScope")
@@ -3327,6 +3422,18 @@ def main():
                         save_tasks(session, tasks)
                         emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
                     if ok:
+                        # Review round 1 (minor): the checks genuinely ran
+                        # and passed on this path too (just against an empty
+                        # diff) -- record verificationPassed so GatesRow
+                        # isn't blank on a verified session. Merge, don't
+                        # clobber (same discipline as every other gates
+                        # writer); implementationComplete is deliberately
+                        # left unset here -- no files changed, so "any
+                        # changed files" is false and there is nothing
+                        # honest to claim either way.
+                        gates = dict(manifest.get("gates") or {})
+                        gates["verificationPassed"] = True
+                        manifest["gates"] = gates
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
@@ -3535,7 +3642,15 @@ def main():
                     scope_result = compute_scope_guard(files, manifest.get("contract", {}))
                     attempt["scopeGuard"] = scope_result
 
-                manifest["gates"] = {"architectureApproved": architect_gates_value(architect_outcome)}
+                # Review round 1 (minor): merge, don't clobber -- same
+                # discipline as every other gates writer (finally block's
+                # documentationCurrent merge, the post-verify consistency
+                # block just below). A wholesale reassignment here would
+                # silently wipe out any other gate key already recorded
+                # earlier this run.
+                gates = dict(manifest.get("gates") or {})
+                gates["architectureApproved"] = architect_gates_value(architect_outcome)
+                manifest["gates"] = gates
                 save()
 
                 if architect_outcome in ("rejected", "budget_exhausted"):
@@ -3624,8 +3739,17 @@ def main():
                 manifest["consistency"] = consistency
                 consistency_gate = True
                 architect_reviews = manifest.get("architectReviews")
-                if consistency["flagged"] and architecture_plan is not None and architect_reviews is not None:
-                    if architect_reviews["used"] < ARCHITECT_REVIEW_BUDGET:
+                if consistency["flagged"]:
+                    # Review round 1 (minor): once flagged, default to
+                    # indeterminate (None), never True -- a flagged diff
+                    # must not silently read as "clean" just because
+                    # architecture_plan/architectReviews happened to be
+                    # missing. Only an actual review decision below can
+                    # promote this to True (approved) or demote it to
+                    # False (rejected/unrecognized).
+                    consistency_gate = None
+                    if (architecture_plan is not None and architect_reviews is not None
+                            and architect_reviews["used"] < ARCHITECT_REVIEW_BUDGET):
                         architect_reviews["used"] += 1
                         save()
                         post_review = run_architect_review(
@@ -3636,18 +3760,16 @@ def main():
                             {"round": review_round + 1, "review": post_review,
                              "trigger": "post_verification_consistency"}
                         )
-                        if post_review is None:
-                            consistency_gate = None  # fail-open: never ran, can't tell
-                        else:
+                        if post_review is not None:
                             consistency_gate = (
                                 classify_architect_review_decision(post_review["decision"]) == "approved"
                             )
-                    else:
-                        # No budget left to spend on a review round -- honesty,
-                        # not a block (V7 §5.10's plan is an estimate, not a
-                        # contract): record the flag, leave scopeApproved
-                        # indeterminate (null), let VERIFIED proceed.
-                        consistency_gate = None
+                        # else: post_review is None (fail-open) -- consistency_gate
+                        # stays the None set just above; never ran, can't tell.
+                    # else: no budget left / no plan to review against --
+                    # honesty, not a block (V7 §5.10's plan is an estimate,
+                    # not a contract): record the flag, leave scopeApproved
+                    # indeterminate (null), let VERIFIED proceed.
 
                 gates = dict(manifest.get("gates") or {})
                 gates["implementationComplete"] = bool(files) and last_engineer_rc == 0
@@ -3658,21 +3780,29 @@ def main():
                 manifest["gates"] = gates
 
                 if gates_block_verified(gates):
-                    # V7 §5.10: TECHNICALLY_VERIFIED + ARCHITECTURE_REVIEW_FAILED
-                    # = NEEDS_REWORK -- tests passed but the post-verification
-                    # consistency review rejected the diff; must never be
-                    # promoted to VERIFIED. Terminal, same as the pre-verify
-                    # architect-review rejection path above (budget for this
-                    # round is already spent).
+                    # V7 §5.10/§5.11: tests passed but one or more mandatory
+                    # gates did not hold; must never be promoted to VERIFIED.
+                    # Terminal, same as the pre-verify architect-review
+                    # rejection path above (budget for any review round
+                    # spent above is already consumed). Review round 1
+                    # (Important): three genuinely distinct causes can land
+                    # here (a scope-guard expansion, an engineer that
+                    # exited non-zero after a passing diff, a real
+                    # consistency-review rejection) -- record WHICH gate(s)
+                    # actually blocked so classify_failure can build an
+                    # honest, cause-naming detail instead of one fixed
+                    # string that was wrong for two of the three causes.
+                    blocked_gates = blocked_gate_names(gates)
+                    attempt["blockedGates"] = blocked_gates
+                    manifest["blockedGates"] = blocked_gates
                     attempt["status"] = "needs-architect-review-consistency-rejected"
                     manifest["attempts"].append(attempt)
                     manifest["status"] = "needs-architect-review-consistency-rejected"
                     manifest["state"] = canonical_session_state(manifest["status"])
                     emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                     save()
-                    final_label = "ARCHITECTURE CONSISTENCY REVIEW FAILED — NOT VERIFIED"
-                    print("\n[V2] post-verification consistency review rejected the implementation; "
-                          "blocking promotion to verified.")
+                    final_label = "NOT VERIFIED — GATE BLOCKED (" + ", ".join(blocked_gates) + ")"
+                    print(f"\n[V2] gates blocked promotion to verified: {blocked_gates}")
                     break
 
                 attempt["status"] = "verified"
@@ -4731,8 +4861,11 @@ def _architect_replan_selfcheck() -> None:
     loop_start_idx = main_source.index("while True:", main_source.index("review_round = 0"))
     # NOT the plan-creation-time `{"architectureApproved": None}` (an
     # earlier, unrelated occurrence of the same prefix) -- the specific
-    # post-loop assignment that closes out the review sub-loop.
-    gates_idx = main_source.index('manifest["gates"] = {"architectureApproved": architect_gates_value(architect_outcome)}')
+    # post-loop assignment that closes out the review sub-loop. Task 2.3
+    # review round 1 changed this from a wholesale `manifest["gates"] = {...}`
+    # to a merge-not-clobber assignment; anchor on the merge's own key
+    # write instead of the old literal.
+    gates_idx = main_source.index('gates["architectureApproved"] = architect_gates_value(architect_outcome)')
     replan_emit_idx = main_source.index('emit_event(events_path, "architect_replan_started"')
     assert loop_start_idx < replan_emit_idx < gates_idx, (
         "architect_replan_started must be emitted from inside the review loop"
@@ -5155,18 +5288,37 @@ def _gates_selfcheck() -> None:
     assert over_budget["outsideFiles"] == []
     assert "maxFiles=2" in over_budget["reason"]
 
-    # Malformed candidateFiles/expectedScope (model output, hostile input)
-    # never raises -- degrades to "zero usable candidates", which honestly
-    # flags every changed file as outside (a plan present but unreadable
-    # can't vouch for anything being in scope, unlike "no plan" above,
-    # which has nothing to compare against at all).
+    # Review round 1 (minor): empty/malformed candidateFiles (model
+    # output, hostile input) never raises, and must NOT guarantee a flag
+    # by itself -- an architect that named zero usable candidate files
+    # has given us nothing to compare against, which is honestly "can't
+    # tell", not "everything is outside scope". maxFiles stays a live,
+    # independent signal regardless.
     malformed = check_post_verification_consistency(
         ["a.ts"], {"candidateFiles": "not-a-list", "expectedScope": "not-a-dict"}
     )
-    assert malformed["flagged"] is True and malformed["outsideFiles"] == ["a.ts"]
-    assert check_post_verification_consistency(
+    assert malformed == {"flagged": False, "outsideFiles": [], "reason": None}
+    no_usable_entries = check_post_verification_consistency(
         ["a.ts"], {"candidateFiles": [{"path": 123}, "not-a-dict", {"path": "  "}]}
-    )["flagged"] is True  # none of those entries resolve to a usable candidate path
+    )
+    assert no_usable_entries == {"flagged": False, "outsideFiles": [], "reason": None}
+
+    # ...but maxFiles alone still flags even when candidateFiles is
+    # entirely unusable -- the two checks are independent.
+    malformed_over_budget = check_post_verification_consistency(
+        ["a.ts", "b.ts", "c.ts"],
+        {"candidateFiles": "not-a-list", "expectedScope": {"maxFiles": 1}},
+    )
+    assert malformed_over_budget["flagged"] is True
+    assert malformed_over_budget["outsideFiles"] == []
+    assert "maxFiles=1" in malformed_over_budget["reason"]
+
+    # Path normalization (minor fix): leading/trailing slashes and
+    # double slashes are tolerated, not just a bare "./" prefix.
+    normalized_plan = {"candidateFiles": [{"path": "/src/a.ts/"}]}
+    assert check_post_verification_consistency(["src//a.ts"], normalized_plan) == {
+        "flagged": False, "outsideFiles": [], "reason": None,
+    }
 
     # ------------------------------------------------------------
     # 2. scope_guard_gate_value
@@ -5188,8 +5340,14 @@ def _gates_selfcheck() -> None:
 
     # ------------------------------------------------------------
     # 4. gates_block_verified: implementationComplete/verificationPassed
-    #    must be exactly True; architectureApproved/scopeApproved/
-    #    documentationCurrent may be True OR None, only False blocks.
+    #    must be exactly True; architectureApproved/scopeApproved may be
+    #    True OR None, only False blocks. documentationCurrent is
+    #    deliberately NOT in the blocking set (review round 1, Important)
+    #    -- it can only ever be False or None, never True, so wiring it
+    #    in would make EVERY doc-relevant change permanently unable to
+    #    reach VERIFIED; also its producer runs in main()'s finally block,
+    #    strictly AFTER this function's caller already decided VERIFIED
+    #    vs. not, so it would be decorative even if wired in.
     # ------------------------------------------------------------
     all_true = {
         "implementationComplete": True, "architectureApproved": True,
@@ -5201,11 +5359,20 @@ def _gates_selfcheck() -> None:
     # dict.get -- never-ran/not-applicable, must not block.
     assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
 
-    for optional_key in ("architectureApproved", "scopeApproved", "documentationCurrent"):
+    for optional_key in ("architectureApproved", "scopeApproved"):
         blocked = dict(all_true, **{optional_key: False})
         assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
         nulled = dict(all_true, **{optional_key: None})
         assert gates_block_verified(nulled) is False, f"{optional_key}=None must NOT block VERIFIED"
+
+    # documentationCurrent=False must NOT block -- the one property the
+    # real path can never exhibit otherwise (its producer never runs
+    # before this decision), proven directly here.
+    assert gates_block_verified(dict(all_true, documentationCurrent=False)) is False, (
+        "documentationCurrent must never block VERIFIED -- phase 1's detector can only "
+        "ever produce False/None, never True, and its producer runs after this decision anyway"
+    )
+    assert gates_block_verified(dict(all_true, documentationCurrent=None)) is False
 
     assert gates_block_verified(dict(all_true, implementationComplete=False)) is True
     assert gates_block_verified(dict(all_true, implementationComplete=None)) is True, (
@@ -5213,6 +5380,59 @@ def _gates_selfcheck() -> None:
     )
     assert gates_block_verified(dict(all_true, verificationPassed=False)) is True
     assert gates_block_verified(dict(all_true, verificationPassed=None)) is True
+
+    # ------------------------------------------------------------
+    # 4b. blocked_gate_names / describe_blocked_gates (review round 1,
+    #     Important): honest, cause-naming detail per distinct cause.
+    # ------------------------------------------------------------
+    assert blocked_gate_names(all_true) == []
+    assert blocked_gate_names(dict(all_true, implementationComplete=False)) == ["implementationComplete"]
+    assert blocked_gate_names(dict(all_true, scopeApproved=False)) == ["scopeApproved"]
+    assert blocked_gate_names(dict(all_true, architectureApproved=False, scopeApproved=False)) == [
+        "architectureApproved", "scopeApproved",
+    ]
+    # documentationCurrent=False must never show up as a blocked gate --
+    # it isn't in gates_block_verified's checked set at all.
+    assert blocked_gate_names(dict(all_true, documentationCurrent=False)) == []
+
+    # Controller ruling: implementationComplete's detail must say exactly
+    # this, never "architecture review rejected".
+    impl_blocked = {"blockedGates": ["implementationComplete"], "attempts": [], "consistency": {}}
+    assert describe_blocked_gates(impl_blocked) == "engineer exited non-zero after a passing diff"
+
+    # scopeApproved blocked via a real scope-guard expansion (consistency
+    # clean) -- names the actual expanded files, not "architecture review
+    # rejected".
+    scope_only = {
+        "blockedGates": ["scopeApproved"],
+        "attempts": [{"scopeGuard": {"expandedFiles": ["src/unexpected.ts"]}}],
+        "consistency": {"outsideFiles": []},
+    }
+    scope_detail = describe_blocked_gates(scope_only)
+    assert "scope guard expansion" in scope_detail and "src/unexpected.ts" in scope_detail
+    assert "architecture review rejected" not in scope_detail
+
+    # scopeApproved blocked via a real consistency-review rejection
+    # (scope guard clean) -- names the actual outside files.
+    consistency_only = {
+        "blockedGates": ["scopeApproved"],
+        "attempts": [{"scopeGuard": {"expandedFiles": []}}],
+        "consistency": {"outsideFiles": ["src/extra.ts"]},
+    }
+    consistency_detail = describe_blocked_gates(consistency_only)
+    assert "consistency review rejected" in consistency_detail and "src/extra.ts" in consistency_detail
+
+    # Both causes at once -- both named, not collapsed into one.
+    both = {
+        "blockedGates": ["scopeApproved"],
+        "attempts": [{"scopeGuard": {"expandedFiles": ["a.ts"]}}],
+        "consistency": {"outsideFiles": ["b.ts"]},
+    }
+    both_detail = describe_blocked_gates(both)
+    assert "a.ts" in both_detail and "b.ts" in both_detail
+
+    # Never raises on a missing/malformed manifest.
+    assert describe_blocked_gates({}) == "one or more V7 §5.11 gates blocked promotion to verified"
 
     # ------------------------------------------------------------
     # 5. Source-ordering proof: the consistency check must run strictly
@@ -5232,6 +5452,26 @@ def _gates_selfcheck() -> None:
     )
     assert consistency_call_idx < gates_block_idx < verified_label_idx, (
         "gates_block_verified's decision must be made, and consulted, BEFORE the VERIFIED promotion"
+    )
+
+    # 5b. Review round 1 (minor): once flagged, consistency_gate's default
+    #     must be None, never True -- a flagged diff with no plan/budget
+    #     to review against must read as indeterminate, not clean. Proven
+    #     structurally: the ONLY `consistency_gate = None` assignment that
+    #     sits directly inside the `if consistency["flagged"]:` block
+    #     (immediately after it, before any nested budget/plan check) is
+    #     the real default -- there is no `consistency_gate = True`
+    #     anywhere after that same `if` line.
+    flagged_if_idx = main_source.index('if consistency["flagged"]:')
+    default_none_idx = main_source.index("consistency_gate = None", flagged_if_idx)
+    plan_check_idx = main_source.index("if (architecture_plan is not None and architect_reviews is not None", flagged_if_idx)
+    assert flagged_if_idx < default_none_idx < plan_check_idx, (
+        "consistency_gate must default to None immediately upon flagging, "
+        "before checking whether a review can actually run"
+    )
+    assert "consistency_gate = True" not in main_source[flagged_if_idx:], (
+        "once flagged, consistency_gate must never be reset to True except via an "
+        "actual approved review decision"
     )
 
     print("gates (Task 2.3, V7 §5.10/§5.11) self-check: PASS")
