@@ -138,12 +138,24 @@ def load_states_file(path):
     actions): any user-supplied "initial" entry is dropped rather than
     merged, so the very first capture is always the plain, untouched page
     load no matter what the config file says.
+
+    Fix round 3: every state name is slugified (`re.sub(r"[^a-z0-9]+",
+    "-", name.lower()).strip("-")`) before being stored -- the stored
+    "name" IS the slug, so manifest.states / capture "state" / finding
+    tags / the "{viewport}-{state}.png" filename below all derive from
+    this one normalized value and can never disagree. This also closes a
+    latent write-side path-traversal: an unslugified name containing "/"
+    or ".." would otherwise land straight in a filename under
+    --output-dir. Empty-after-slug and duplicate slugs (including a name
+    that only slugifies down to the reserved "initial") both raise --
+    trusted config, fail loud rather than silently collide/drop.
     """
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError("--states-file must contain a JSON array of state objects")
 
     states = [{"name": "initial", "actions": []}]
+    seen_slugs = {"initial"}
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ValueError(f"--states-file[{i}]: each state must be a JSON object")
@@ -152,6 +164,13 @@ def load_states_file(path):
             raise ValueError(f"--states-file[{i}]: 'name' must be a non-empty string")
         if name == "initial":
             continue  # always synthesized above, first, action-free
+
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        if not slug:
+            raise ValueError(f"--states-file[{i}]: 'name' {name!r} has no valid characters after slugifying")
+        if slug in seen_slugs:
+            raise ValueError(f"--states-file[{i}]: duplicate state slug {slug!r} (from name {name!r})")
+        seen_slugs.add(slug)
 
         actions_raw = entry.get("actions", [])
         if not isinstance(actions_raw, list):
@@ -186,7 +205,7 @@ def load_states_file(path):
                     )
                 actions.append({"action": "wait", "ms": ms})
 
-        states.append({"name": name, "actions": actions})
+        states.append({"name": slug, "actions": actions})
         if len(states) > MAX_STATES:
             raise ValueError(f"--states-file: at most {MAX_STATES} states allowed (including 'initial')")
 
@@ -556,18 +575,23 @@ def build_findings(captures, findings=None, reports=None):
     """V7 §22.4 findings.json shape: {status, viewport, findings[]}.
 
     `reports=None` (the default) is the exact pre-C4-live-vision behavior
-    -- --vision was never passed, run_vision_model never ran, and this
-    function's logic is byte-for-byte what it was before this pass:
+    -- --vision was never passed, run_vision_model never ran:
       - "NOT_RUN" when every viewport was captured cleanly. "Capture
         succeeded" and "review passed" are two different facts -- `PASS`
         would tell a downstream reader "this UI was visually inspected,
         found fine," which is false when findings[] is empty because
         nothing looked, not because something looked and found nothing.
-      - "FAIL" when capture failed for every viewport -- there is nothing
-        for even a model step to inspect, so this cannot honestly be
-        anything else.
-    This is the zero-behavior-change guarantee for every existing caller
-    that doesn't pass --vision: identical inputs, identical output.
+      - "BLOCKED" (fix round 3; was "FAIL") when capture failed for every
+        viewport -- an infra gap (nothing was even capturable), not a
+        confirmed real defect, so it gets the same "couldn't tell" status
+        as the reports-ran total-capture-failure case just below, not the
+        severity-bearing "FAIL" a real reviewed defect uses. Consumers
+        checked: classify_visual_check_result (glimmer-v2.py) never
+        reads this literal in the total-capture-failure case -- it
+        already short-circuits to INFRA_BLOCKED off visual-manifest.
+        json's own status before findings.json is even opened -- and
+        the Control Center panel (StatusBadge) already has a color for
+        "BLOCKED".
 
     `reports` (a list from run_vision_model, one entry per attempted
     viewport) means vision WAS run; status is now real, per V7 §22.4/22.5:
@@ -588,7 +612,7 @@ def build_findings(captures, findings=None, reports=None):
     if reports is None:
         findings = findings if findings is not None else []
         ok = [c for c in captures if c["status"] == "captured"]
-        status = "NOT_RUN" if (captures and ok) else "FAIL"
+        status = "NOT_RUN" if (captures and ok) else "BLOCKED"
         return {
             "status": status,
             "viewport": "multi",
@@ -763,14 +787,20 @@ def _selfcheck() -> None:
         assert set(findings_pass.keys()) >= {"status", "viewport", "findings"}
 
         findings_fail = build_findings([c_fail])
-        assert findings_fail["status"] == "FAIL"
+        # Fix round 3: total capture failure with no vision run is an infra
+        # gap, not a confirmed defect -- "BLOCKED" (was "FAIL"), aligning
+        # with classify_visual_check_result's INFRA_BLOCKED semantics and
+        # the reports-ran total-capture-failure case just below.
+        assert findings_fail["status"] == "BLOCKED"
 
-        # --- zero-behavior-change proof: --vision absent means main() calls
-        # build_findings(captures) with no findings/reports args at all, the
-        # exact same call shape as findings_pass/findings_fail above. This
-        # IS the whole proof -- no other codepath exists for --vision absent.
+        # --- zero-behavior-change proof (for the --vision-absent call shape
+        # itself, not the FAIL->BLOCKED status value fix round 3 changes):
+        # --vision absent means main() calls build_findings(captures) with
+        # no findings/reports args at all, the exact same call shape as
+        # findings_pass/findings_fail above. This IS the whole proof -- no
+        # other codepath exists for --vision absent.
         assert build_findings([c_ok])["status"] == "NOT_RUN"
-        assert build_findings([c_fail])["status"] == "FAIL"
+        assert build_findings([c_fail])["status"] == "BLOCKED"
 
         # --- request construction: toolless, image part + checks text present ---
         payload = _build_vision_payload("QkFTRTY0", "http://x/route", "1440x900", DEFAULT_CHECKS)
@@ -925,7 +955,9 @@ def _selfcheck() -> None:
             {"name": "loading", "actions": [{"action": "wait", "ms": 500}]},
         ])
         states = load_states_file(states_path)
-        assert [s["name"] for s in states] == ["initial", "dialog opened", "loading"]
+        assert [s["name"] for s in states] == ["initial", "dialog-opened", "loading"], (
+            "fix round 3: 'dialog opened' is slugified to 'dialog-opened'"
+        )
         assert states[0]["actions"] == [], "a user-supplied 'initial' entry's actions must be dropped"
         assert states[1]["actions"] == [{"action": "click", "selector": "#open"}]
         assert states[2]["actions"] == [{"action": "wait", "ms": 500}]
@@ -941,6 +973,10 @@ def _selfcheck() -> None:
             ([{"name": "x", "actions": [{"action": "wait"}]}], "wait needs ms"),
             ([{"name": "x", "actions": [{"action": "wait", "ms": -1}]}], "wait ms must be positive"),
             ([{"name": "x", "actions": [{"action": "click", "selector": "#a"}] * 11}], "too many actions"),
+            ([{"name": "!!!", "actions": []}], "empty after slugifying"),
+            ([{"name": "dialog opened", "actions": []},
+              {"name": "Dialog--Opened", "actions": []}], "duplicate slug"),
+            ([{"name": "Initial!", "actions": []}], "slugifies to the reserved 'initial'"),
         ):
             try:
                 load_states_file(_write_states(bad_obj))
@@ -962,9 +998,12 @@ def _selfcheck() -> None:
         # failure keeps earlier states' real captures), and total failure
         # (bad viewport spec) -- via an injectable (captured, error)-
         # returning capture_fn, no real browser/playwright involved. ---
+        # Names here are already slugified, as they would be coming out of
+        # load_states_file (the only real caller of capture_viewport_states) --
+        # "dialog-opened", not "dialog opened".
         three_states = [
             {"name": "initial", "actions": []},
-            {"name": "dialog opened", "actions": [{"action": "click", "selector": "#open"}]},
+            {"name": "dialog-opened", "actions": [{"action": "click", "selector": "#open"}]},
             {"name": "loading", "actions": [{"action": "wait", "ms": 100}]},
         ]
 
@@ -978,9 +1017,9 @@ def _selfcheck() -> None:
 
         entries_ok = capture_viewport_states("http://x", "1440x900", out, three_states,
                                               capture_fn=fake_states_all_ok)
-        assert [e["state"] for e in entries_ok] == ["initial", "dialog opened", "loading"]
+        assert [e["state"] for e in entries_ok] == ["initial", "dialog-opened", "loading"]
         assert all(e["viewport"] == "1440x900" and e["status"] == "captured" for e in entries_ok)
-        assert entries_ok[1]["screenshot"] == "1440x900-dialog opened.png"
+        assert entries_ok[1]["screenshot"] == "1440x900-dialog-opened.png"
         assert (out / "1440x900-loading.png").exists()
 
         def fake_states_partial(url, w, h, out_dir, slug, states):
@@ -1002,9 +1041,9 @@ def _selfcheck() -> None:
         assert all(e["status"] == "failed" and e["screenshot"] is None for e in entries_bad_vp)
 
         # --- manifest/findings state dimension ---
-        multi_manifest = build_manifest("http://x/route", entries_ok, states=["initial", "dialog opened", "loading"])
+        multi_manifest = build_manifest("http://x/route", entries_ok, states=["initial", "dialog-opened", "loading"])
         assert multi_manifest["viewports"] == ["1440x900"], "one viewport de-duped across 3 states"
-        assert multi_manifest["states"] == ["initial", "dialog opened", "loading"]
+        assert multi_manifest["states"] == ["initial", "dialog-opened", "loading"]
         assert multi_manifest["status"] == "pass"
 
         def fake_post_state_aware(url, payload, timeout_s, headers=None):
@@ -1020,9 +1059,9 @@ def _selfcheck() -> None:
             entries_ok, out, "http://x/route", DEFAULT_CHECKS, "http://model",
             post_fn=fake_post_state_aware,
         )
-        assert {f["state"] for f in findings_multi} == {"initial", "dialog opened", "loading"}
-        assert {r["state"] for r in reports_multi} == {"initial", "dialog opened", "loading"}
-        assert "dialog opened" in next(f["description"] for f in findings_multi if f["state"] == "dialog opened")
+        assert {f["state"] for f in findings_multi} == {"initial", "dialog-opened", "loading"}
+        assert {r["state"] for r in reports_multi} == {"initial", "dialog-opened", "loading"}
+        assert "dialog-opened" in next(f["description"] for f in findings_multi if f["state"] == "dialog-opened")
 
     print("glimmer-visual.py self-check: PASS")
 

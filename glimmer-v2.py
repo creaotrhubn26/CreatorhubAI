@@ -785,7 +785,8 @@ def verification_plan(m, files, level, verify_entries, session, visual_url,
     changes at all.
     """
     required = verifier_commands(m, files, level)
-    required = expand_verify_entries(required, verify_entries, session, visual_url, model_readiness_url)
+    required = expand_verify_entries(required, verify_entries, session, visual_url, model_readiness_url,
+                                      visual_requirements=sanitize_visual_requirements(plan))
     next_level = NEXT_VERIFICATION_LEVEL.get(level)
     recommended = []
     if next_level:
@@ -931,7 +932,7 @@ def validate_visual_url(raw_verify_entries, visual_url):
 
 
 def expand_verify_entries(commands, raw_entries, session, visual_url,
-                           model_readiness_url=READINESS_URL_DEFAULT):
+                           model_readiness_url=READINESS_URL_DEFAULT, visual_requirements=None):
     """Expand contract.verification / --verify entries into real subprocess
     argv lists, appended onto `commands`. Mirrors the pre-C4
     shlex.split-and-append behavior exactly for every entry EXCEPT the
@@ -942,10 +943,22 @@ def expand_verify_entries(commands, raw_entries, session, visual_url,
     verification plan that never contains "visual" takes the identical
     path through this function as the old inline loop did -- zero behavior
     change for every existing invocation shape.
+
+    Fix round 3: `visual_requirements` (already sanitize_visual_requirements-
+    capped by the caller) threads straight through to
+    build_visual_verify_command, same as the auto-added visual check
+    verification_plan builds a few lines below its own call to this
+    function. Without this, an EXPLICIT "visual" --verify/contract.
+    verification entry -- the most deliberate way a caller opts into
+    vision review -- silently dropped the Architect's own
+    visualRequirements, while the auto-added path kept them. Default
+    None degrades to build_visual_verify_command's own no-requirements
+    behavior, so every pre-existing caller is unaffected.
     """
     for raw in raw_entries:
         if raw.strip().lower() == VISUAL_VERIFY_TOKEN:
-            cmd = build_visual_verify_command(session, visual_url, model_readiness_url)
+            cmd = build_visual_verify_command(session, visual_url, model_readiness_url,
+                                               visual_requirements=visual_requirements)
         else:
             cmd = shlex.split(raw)
         if cmd and cmd not in commands:
@@ -1460,7 +1473,20 @@ def build_repair_contract(attempt_number, results, files, ws):
     exists in the workspace (conservative extraction: regex match AND an
     existing-file check, never a bare string guess)."""
     failing = next((r for r in results if not r.get("ok")), None)
-    new_failures = (failing.get("newErrorSignatures") or [])[:50] if failing else []
+    # C4 fix round 3: a failing visual check (V7 §22.5 CODE_FAIL) never has
+    # newErrorSignatures -- verify() excludes the visual check from the
+    # baseline-worktree comparison that populates that field (see verify()'s
+    # `and not is_visual` guard) -- so without this, a required visual
+    # failure handed the engineer an empty newFailures list: a blind repair
+    # round. visualBlockingFindings (classify_visual_check_result) carries
+    # the actual defect list instead.
+    if failing and failing.get("visualBlockingFindings"):
+        new_failures = [
+            f"{f.get('severity')}: {f.get('category')} — {f.get('description')}"
+            for f in failing["visualBlockingFindings"]
+        ][:50]
+    else:
+        new_failures = (failing.get("newErrorSignatures") or [])[:50] if failing else []
     allowed = list(dict.fromkeys(files))  # de-dup, preserve order
     if failing and is_test_check_command(failing.get("command", "")):
         for f in extract_existing_test_files(failing.get("outputTail", ""), ws):
@@ -3767,7 +3793,8 @@ def main():
 
             if not files:
                 commands = [["git", "diff", "--check"]]
-                commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
+                commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url,
+                                                  visual_requirements=sanitize_visual_requirements(architecture_plan))
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
                                          repo, source_root, baseline, args.toolchain_mode,
@@ -6021,6 +6048,28 @@ def _visual_selfcheck() -> None:
         default_cmd = build_visual_verify_command(session, "http://x/route")
         assert _model_base_url(READINESS_URL_DEFAULT) in default_cmd
 
+    # Fix round 3: visual_requirements threaded through expand_verify_entries
+    # for an EXPLICIT "visual" --verify/contract.verification entry -- the
+    # most deliberate opt-in path -- must reach the built command's --check
+    # list exactly like the auto-added visual check already does.
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        commands = expand_verify_entries(
+            [["git", "diff", "--check"]], ["visual"], session, "http://x/route",
+            visual_requirements=["primary action remains visible at laptop height"],
+        )
+        visual_cmd = commands[1]
+        assert "primary action remains visible at laptop height" in visual_cmd
+        for check in VISUAL_DEFAULT_CHECKS:
+            assert check in visual_cmd, "requirements must ADD to the basics, not replace them"
+
+        # No visual_requirements (default None) -> identical to the plain
+        # "visual" expansion above, byte-for-byte.
+        plain_commands = expand_verify_entries(
+            [["git", "diff", "--check"]], ["visual"], session, "http://x/route",
+        )
+        assert plain_commands[1] == build_visual_verify_command(session, "http://x/route")
+
     # --- severity classification: synthetic/injected findings.json. ---
     def _write_capture(session, manifest_status, findings):
         vdir = session / "visual"
@@ -6487,6 +6536,32 @@ def _repair_contract_selfcheck() -> None:
         }]
         rc6b = build_repair_contract(1, traversal_results, ["src/Dialog.ts"], ws)
         assert rc6b["allowedFiles"] == ["src/Dialog.ts"], rc6b["allowedFiles"]
+
+        # 6c. C4 fix round 3: a failing visual check carries no
+        #     newErrorSignatures (excluded from baseline compare) -- its
+        #     visualBlockingFindings must populate newFailures instead of
+        #     leaving the engineer a blind repair round.
+        visual_results = [{
+            "command": "glimmer-visual.py --check dialog", "ok": False, "status": "CODE_FAIL",
+            "visualBlockingFindings": [
+                {"severity": "critical", "category": "layout", "description": "dialog off-screen"},
+                {"severity": "high", "category": "contrast", "description": "text unreadable"},
+            ],
+        }]
+        rc6c = build_repair_contract(1, visual_results, [], ws)
+        assert rc6c["newFailures"] == [
+            "critical: layout — dialog off-screen",
+            "high: contrast — text unreadable",
+        ]
+
+        # 6d. visualBlockingFindings capped at 50, same as newErrorSignatures.
+        many_findings = [
+            {"severity": "high", "category": "c", "description": str(i)} for i in range(80)
+        ]
+        rc6d = build_repair_contract(
+            1, [{"command": "x", "ok": False, "visualBlockingFindings": many_findings}], [], ws
+        )
+        assert len(rc6d["newFailures"]) == 50
 
         # 7. compute_repair_writes_outside_allowed: advisory-only detection.
         contract = {"allowedFiles": ["src/Dialog.ts", "src/Dialog.test.ts"]}
