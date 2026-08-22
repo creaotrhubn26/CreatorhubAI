@@ -101,8 +101,13 @@ def canonical_session_state(raw_status: str) -> str:
     # C2 (glimmer-v7): terminal status when the architect review gate
     # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
     # or the review budget is exhausted — V7 §5.10's rule: a session in
-    # this state must never be promoted to "verified".
-    if raw_status == "needs-architect-review":
+    # this state must never be promoted to "verified". Prefix match: Task
+    # 1.3 splits the legacy "needs-architect-review" string into
+    # "-rejected"/"-budget-exhausted" variants (see classify_failure
+    # below); both must hit this explicit branch rather than fall through
+    # to the generic unknown-status fallback at the bottom of this
+    # function (same resulting value today, but only by coincidence).
+    if raw_status.startswith("needs-architect-review"):
         return "needs_review"
     if raw_status.startswith("blocked-"):
         return "blocked"
@@ -1098,9 +1103,16 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
                 result = classify_visual_check_result(result, session)
                 if events_path is not None:
                     for finding in result.get("visualBlockingFindings", []):
+                        # NIT (fix round 1): category is model-controlled
+                        # (visual model's own JSON output) -- cap it like
+                        # description just below, so a runaway/malicious
+                        # value can't bloat events.jsonl.
+                        category = finding.get("category")
+                        if category is not None:
+                            category = str(category)[:100]
                         emit_event(events_path, "visual_finding_detected", session_id,
                                    severity=finding.get("severity"),
-                                   category=finding.get("category"),
+                                   category=category,
                                    description=str(finding.get("description", ""))[:300])
                     emit_event(events_path, "visual_verification_completed", session_id,
                                status=result["status"])
@@ -1926,8 +1938,14 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 
     if plan is not None:
         print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
+        # NIT (fix round 1): packages is model-controlled (architect's own
+        # JSON output) -- cap entry count and per-entry length so a
+        # runaway/malicious value can't bloat events.jsonl.
+        packages = plan.get("packages")
+        if isinstance(packages, list):
+            packages = [str(p)[:200] for p in packages[:20]]
         emit_event(events_path, "architect_plan_created", sid,
-                   risk=plan.get("risk"), packages=plan.get("packages"))
+                   risk=plan.get("risk"), packages=packages)
     else:
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
@@ -2664,6 +2682,12 @@ def main():
             # counter added later, only when architecture_plan is actually
             # used.
             "architectReviews": ARCHITECT_REVIEW_BUDGET,
+            # Fix round 1 (LOW): budgets.maxChangedFiles (V7 §6) was
+            # recorded in contract["budgets"] (above, omit-when-unset) but
+            # never mirrored into this top-level manifest["budgets"]
+            # summary alongside the other three -- always present here,
+            # null when --max-changed-files wasn't passed.
+            "maxChangedFiles": args.max_changed_files,
         },
     }
     manifest_path = session / "manifest.json"
@@ -3033,6 +3057,29 @@ def main():
                     final_label = "ARCHITECTURE REVIEW REQUIRED — NOT VERIFIED"
                     print(f"\n[V2] {architect_outcome}: architecture review gate blocks promotion to verified.")
                     break
+
+            # Fix round 1 (HIGH): budgets.maxChangedFiles is bypassable via
+            # the architect-review revise loop above -- that loop
+            # recomputes `files` against a NEW post-revise diff, but the
+            # budget check earlier in this iteration (the cheap exit,
+            # still kept for the common no-review / no-growth case) only
+            # ran against the PRE-revise diff. Re-check the current
+            # `files` here, immediately before verify() runs, so a
+            # post-revise diff that blows the budget can never reach
+            # VERIFIED unchecked. See --architect-review-selfcheck's
+            # source-ordering assertion for the structural proof that this
+            # check is unreachable from the revise loop skipping it.
+            if changed_files_budget_exceeded(files, args.max_changed_files):
+                print(f"[V2] BUDGET EXCEEDED (post-revise): {len(files)} changed files > "
+                      f"--max-changed-files {args.max_changed_files}")
+                attempt["status"] = "changed-files-budget-exceeded"
+                manifest["attempts"].append(attempt)
+                manifest["status"] = "failed-changed-files-budget-exceeded"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                final_label = "CHANGED-FILES BUDGET EXCEEDED — NOT VERIFIED"
+                save()
+                break
 
             commands = verifier_commands(repo, files, args.verification_level)
             commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
@@ -3644,6 +3691,19 @@ def _architect_review_selfcheck() -> None:
     failure = classify_failure({"status": "needs-architect-review"}, [])
     assert failure is not None and failure["class"] == "POLICY_BLOCK"
 
+    # Fix round 1 (LOW): the two suffixed statuses main() actually writes
+    # (Task 1.3) must hit canonical_session_state's explicit prefix-match
+    # branch, not fall through to its generic unrecognized-status fallback
+    # (both currently return "needs_review", so a plain equality check
+    # can't tell them apart -- assert the branch itself is a prefix match).
+    assert canonical_session_state("needs-architect-review-rejected") == "needs_review"
+    assert canonical_session_state("needs-architect-review-budget-exhausted") == "needs_review"
+    canonical_source = inspect.getsource(canonical_session_state)
+    assert 'raw_status.startswith("needs-architect-review")' in canonical_source, (
+        "must be a prefix match, not an exact match, so the suffixed "
+        "statuses hit this branch instead of the generic fallback"
+    )
+
     # ------------------------------------------------------------
     # 4. make_review_request shape + architect_review_failure_text.
     # ------------------------------------------------------------
@@ -3799,6 +3859,27 @@ def _architect_review_selfcheck() -> None:
     assert review_call_idx < increment_idx, "increment must happen after the review actually runs"
     assert fail_open_idx < increment_idx, "increment must be unreachable from the fail-open branch"
     assert approved_rejected_idx < increment_idx, "increment must be unreachable from the approved/rejected branch"
+
+    # ------------------------------------------------------------
+    # 11. Fix round 1 (HIGH): budgets.maxChangedFiles must be re-checked
+    #     AFTER the revise loop's `files = changed_files(...)` recompute,
+    #     not just once against the pre-revise diff -- otherwise a
+    #     post-revise diff that blows the budget reaches verify() (and
+    #     potentially VERIFIED) unchecked. Structural proof via source
+    #     ordering: the LAST `changed_files_budget_exceeded(...)` call
+    #     site (the one guarding `verifier_commands(...)`) must appear
+    #     AFTER the LAST `files = changed_files(ws, baseline)` reassignment
+    #     (the one inside the revise loop's `while True:`), so it always
+    #     re-checks the post-revise diff before verify() runs.
+    # ------------------------------------------------------------
+    revise_loop_files_idx = main_source.rindex("files = changed_files(ws, baseline)")
+    post_revise_budget_idx = main_source.rindex(
+        "changed_files_budget_exceeded(files, args.max_changed_files)"
+    )
+    assert post_revise_budget_idx > revise_loop_files_idx, (
+        "the post-revise budget re-check must come after the revise loop's "
+        "`files = changed_files(...)` recompute, so it covers the post-revise diff"
+    )
 
     print("architect review self-check: PASS")
 
