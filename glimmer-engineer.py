@@ -24,6 +24,24 @@ GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
 # that count is > 0. See _plan_aware_discovery_budget below.
 GLIMMER_PLAN_CANDIDATES = os.environ.get("GLIMMER_PLAN_CANDIDATES")
 
+# Task 2.4 (V7 §5.5 second half): the normalized ArchitecturePlan dict
+# loaded once at run_engineer startup (None when no plan exists), read by
+# execute_tool's consult_architect interception. Module-level (same
+# pattern as GLIMMER_PLAN_CANDIDATES above) so execute_tool -- called with
+# its existing, unchanged signature from ~8 call sites -- doesn't need a
+# new parameter threaded through every one of them just for this one tool.
+_loaded_architecture_plan = None
+
+# Review round 1 (MED): whether run_engineer was actually invoked with
+# --architect-consult-enabled. execute_tool must gate on this too (not
+# just on a plan existing) -- offering the tool at all is conditioned on
+# BOTH per _augment_tools_with_consult_architect, and a model can still
+# emit a tool_call naming an unoffered tool (same "structurally
+# incapable, not merely un-offered" reasoning as the architect-mode
+# WRITE_TOOLS guard above). Set once at run_engineer startup, alongside
+# _loaded_architecture_plan.
+_architect_consult_enabled = False
+
 
 def _emit(event_type: str, **fields) -> None:
     # No-op when the events file isn't configured (e.g. direct standalone
@@ -1998,6 +2016,101 @@ def execute_tool(
 
         return _render_tool_envelope_message(envelope), False
 
+    # Task 2.4 (V7 §5.5 second half): consult_architect is intercepted
+    # client-side exactly like the O4 semantic tools above (SEMANTIC_
+    # TOOL_NAMES) -- it never reaches http_json. It gets its own early-
+    # return block (like the architect-mode guard just above, and the
+    # shell-policy/approval blocks further down) rather than folding into
+    # the generic post-dispatch flow later in this function, because a
+    # budget-exhausted call must produce an ok:false envelope with a real
+    # error code -- every tool that reaches the generic flow is assumed to
+    # have already succeeded. No path argument, so this runs before
+    # secure_tool_arguments/PATH_TOOLS on purpose (a no-op for this tool
+    # name anyway) and needs no cache key (each call consumes budget, so
+    # caching identical questions would silently under-count it).
+    if tool_name == "consult_architect":
+        global _consult_architect_used
+
+        # Review round 1 (MED): the SAME structural gate
+        # _augment_tools_with_consult_architect used to decide whether to
+        # offer this tool at all -- re-checked here so a model that calls
+        # it anyway (unoffered, or offered under a stale plan/flag state)
+        # is still structurally denied, not merely un-offered. No budget
+        # burn and no network call for this path -- it isn't a real
+        # consultation attempt, just an invalid call.
+        if not _architect_consult_enabled or _loaded_architecture_plan is None:
+            message = (
+                "CONSULT_NOT_OFFERED: consult_architect is not available "
+                "in this session (no architecture plan, or "
+                "--architect-consult-enabled was not passed)."
+            )
+
+            print()
+            print(f"✗ BLOCKED: consult_architect ({message})")
+
+            envelope = _build_tool_envelope(
+                ok=False,
+                tool=tool_name,
+                duration_ms=_duration_ms(),
+                error={"code": "CONSULT_NOT_OFFERED", "message": message},
+            )
+            _persist_tool_envelope(envelope)
+
+            return _render_tool_envelope_message(envelope), False
+
+        if _consult_architect_used >= CONSULT_ARCHITECT_BUDGET:
+            message = (
+                "CONSULT_BUDGET_EXHAUSTED: architect consultation budget "
+                f"({CONSULT_ARCHITECT_BUDGET}/session) is used up. "
+                "Proceed with your own best engineering judgment."
+            )
+
+            print()
+            print(f"✗ BLOCKED: consult_architect ({message})")
+
+            envelope = _build_tool_envelope(
+                ok=False,
+                tool=tool_name,
+                duration_ms=_duration_ms(),
+                error={"code": "CONSULT_BUDGET_EXHAUSTED", "message": message},
+            )
+            _persist_tool_envelope(envelope)
+
+            return _render_tool_envelope_message(envelope), False
+
+        _consult_architect_used += 1
+
+        print()
+        print(f"→ TOOL: {tool_name}")
+
+        answer, question_chars = _run_consult_architect(
+            _loaded_architecture_plan,
+            arguments.get("question", ""),
+        )
+        content = result_text({"plain_text_response": answer})
+
+        print("← RESULT:")
+        print(content[:1800])
+
+        _emit(
+            "architect_consulted",
+            questionChars=question_chars,
+            answerChars=len(answer),
+        )
+
+        evidence_id = add_evidence(ledger, tool_name, arguments, content)
+
+        envelope = _build_tool_envelope(
+            ok=True,
+            tool=tool_name,
+            duration_ms=_duration_ms(),
+            data=content,
+            evidence=[evidence_id] if evidence_id else [],
+        )
+        _persist_tool_envelope(envelope)
+
+        return _render_tool_envelope_message(envelope), False
+
     arguments = secure_tool_arguments(
         tool_name,
         arguments,
@@ -2847,6 +2960,14 @@ def _architect_mode_selfcheck() -> None:
             assert normalized["risk"] == "medium"
             assert normalized["implementationPlan"] == ["inspect hydration path", "implement hook"]
             assert "planningFailed" not in normalized
+            # Task 2.2 (V7 §5.12): "version" tolerates absence -- the model
+            # never sends one (versioning is v2.py's job, stamped after this
+            # validation step), so it must default to 1 for backward compat.
+            assert normalized["version"] == 1
+            ok_v2, normalized_v2 = validate_architecture_plan({**parsed, "version": 2})
+            assert ok_v2 and normalized_v2["version"] == 2
+            ok_bad_v, normalized_bad_v = validate_architecture_plan({**parsed, "version": "not-an-int"})
+            assert ok_bad_v and normalized_bad_v["version"] == 1  # malformed -> default, never rejects the plan
 
             written_path = _write_architecture_plan_file(normalized)
             assert written_path is not None
@@ -3902,7 +4023,51 @@ def validate_architecture_plan(data):
     if isinstance(expected_scope, dict):
         normalized["expectedScope"] = expected_scope
 
+    # Task 2.2 (V7 §5.12): plan versioning is owned by glimmer-v2.py (the
+    # trusted layer) -- it stamps the real version number onto the plan
+    # dict AFTER this validation step (run_architect_first/run_architect_
+    # replan), not the model. This is tolerant-but-honest passthrough only:
+    # absent or malformed "version" defaults to 1 (backward compat with
+    # every plan produced before this field existed) rather than rejecting
+    # the whole plan over one cosmetic field.
+    version = data.get("version", 1)
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        version = 1
+    normalized["version"] = version
+
     return True, normalized
+
+
+def _load_architecture_plan_for_engineer():
+    """Task 2.4 (V7 §5.5 second half): run_engineer's own read of
+    architecture-plan.json, independent of glimmer-v2.py's prompt-text
+    embedding (make_prompt) -- this process reads the file directly off
+    disk (same _architecture_plan_file_path() convention as the writer
+    side above) so the deterministic mid-implementation triggers and
+    consult_architect have the REAL candidateFiles/expectedScope, not
+    just the prose the model happened to receive in its prompt.
+
+    Returns None whenever there is nothing usable to trigger/consult
+    against: no session dir, no file, unreadable/malformed JSON, or a
+    planningFailed fallback plan (the fallback's own arrays are always
+    empty, so it could never legitimately fire a-file-count/candidate-
+    scope trigger anyway -- treating it as "no plan" is simpler and
+    equally correct). Never raises.
+    """
+    path = _architecture_plan_file_path()
+    if path is None or not path.exists():
+        return None
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    if not isinstance(raw, dict) or raw.get("planningFailed"):
+        return None
+
+    ok, normalized = validate_architecture_plan(raw)
+    return normalized if ok else None
 
 
 def _extract_json_object(text):
@@ -4831,6 +4996,478 @@ def run_delivery_review(task, ledger, prose_report):
 
 
 # ============================================================
+# TASK 2.4 (V7 §5.5 second half): mid-implementation consultation
+# ============================================================
+#
+# Two independent mechanisms, both advisory-only and fail-open (an
+# exception anywhere in this section must never break run_engineer's
+# loop):
+#
+#   1. Deterministic triggers (_evaluate_advisory_triggers), evaluated
+#      once per turn: inject a system-role nudge + emit
+#      architect_consult_advised. Never blocks a tool call, never fails
+#      the session.
+#   2. consult_architect tool: offered only when both an architecture
+#      plan exists and glimmer-v2.py passed --architect-consult-enabled
+#      (_augment_tools_with_consult_architect), intercepted client-side
+#      in execute_tool exactly like the O4 semantic tools, budget-limited
+#      to CONSULT_ARCHITECT_BUDGET/session.
+
+CONSULT_ARCHITECT_BUDGET = 2
+
+# Reset only by _consult_selfcheck (save/restore), same pattern as
+# _evidence_seq -- each real engineer session is its own subprocess, so
+# this only ever needs to count within one process's lifetime.
+_consult_architect_used = 0
+
+CONSULT_ARCHITECT_TOOL = {
+    "display_name": "Consult architect",
+    "tool": "consult_architect",
+    "type": "function",
+    "permissions": {"write": False},
+    "uses_cwd": False,
+    "definition": {
+        "type": "function",
+        "function": {
+            "name": "consult_architect",
+            "description": (
+                "Ask the Architect ONE targeted question about this "
+                "task's architecture plan -- e.g. whether a candidate "
+                "file is still the right one, whether a new abstraction/"
+                "dependency/service is warranted, or how to resolve a "
+                "plan-vs-reality mismatch (V7 §5.5). Read-only: never "
+                "changes anything. Budget: "
+                f"{CONSULT_ARCHITECT_BUDGET} consultations per session -- "
+                "use it deliberately for a real architectural question, "
+                "not routine questions answerable by reading the code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Your specific question for the architect "
+                            "(max 2000 chars)."
+                        ),
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+}
+
+
+def _augment_tools_with_consult_architect(metadata, tools, architecture_plan, enabled):
+    """Mutates metadata/tools IN PLACE to add consult_architect (same
+    shape get_tools() already uses for SEMANTIC_TOOL_DEFINITIONS), but
+    ONLY when both conditions hold: `enabled` (--architect-consult-
+    enabled was passed) AND `architecture_plan` is not None (a usable
+    plan actually exists for this session). No-op otherwise -- split out
+    from run_engineer as its own pure function specifically so a
+    self-check can exercise all four flag/plan combinations without a
+    live model or tool server.
+    """
+    if not enabled or architecture_plan is None:
+        return
+
+    metadata[CONSULT_ARCHITECT_TOOL["tool"]] = CONSULT_ARCHITECT_TOOL
+    tools.append(CONSULT_ARCHITECT_TOOL["definition"])
+
+
+CONSULT_ARCHITECT_SYSTEM_PROMPT = (
+    "Reasoning strength: low. You are Glimmer Architect, answering ONE "
+    "targeted question from the engineer implementing your plan. Answer "
+    "directly as the architect: no tool calls, no chain-of-thought, no "
+    "restating the whole plan back -- just your answer, in prose, at "
+    "most 400 words. If the plan doesn't resolve the question, say so "
+    "honestly and give your best architectural judgment rather than "
+    "inventing facts you don't have."
+)
+
+
+def _build_consult_architect_payload(architecture_plan, question):
+    """Pure request-builder, split out from _run_consult_architect for
+    the same reason _build_delivery_review_payload is split out from
+    run_delivery_review: a self-check can assert the constructed payload
+    has no "tools" key (the structural, not merely instructed, tool-free
+    guarantee) without needing a live model. Returns (payload,
+    question_capped)."""
+    question_capped = str(question or "")[:2000]
+
+    plan_json = json.dumps(architecture_plan or {}, ensure_ascii=False, indent=2)
+    if len(plan_json) > 8000:
+        plan_json = plan_json[:8000] + "\n...(truncated)"
+
+    payload = {
+        "model": "muse-glimmer",
+        "messages": [
+            {"role": "system", "content": CONSULT_ARCHITECT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "ARCHITECTURE PLAN:\n" + plan_json
+                    + "\n\nENGINEER QUESTION:\n" + question_capped
+                ),
+            },
+        ],
+        "max_tokens": 700,
+    }
+    # No "tools"/"tool_choice"/"parallel_tool_calls" key -- structurally
+    # toolless, same discipline as _build_delivery_review_payload.
+    return payload, question_capped
+
+
+def _run_consult_architect(architecture_plan, question):
+    """The ONE toolless model call behind consult_architect. Never
+    raises: any failure (model/network error, empty response) degrades
+    to an honest in-band answer explaining the failure, instead of
+    raising out of execute_tool -- same fail-open spirit as
+    run_delivery_review/run_architect's fallback paths. Returns
+    (answer_text, question_chars)."""
+    payload, question_capped = _build_consult_architect_payload(architecture_plan, question)
+
+    try:
+        response = chat_with_retry(payload, attempts=3)
+        answer = response["choices"][0]["message"].get("content") or ""
+        if not answer.strip():
+            answer = "(architect returned an empty answer)"
+    except Exception as exc:  # noqa: BLE001 - consult must never crash the engineer loop
+        answer = (
+            f"Architect consultation failed: {exc}. "
+            "Proceed with your own best judgment."
+        )
+
+    return answer, len(question_capped)
+
+
+def _format_advisory_nudge(detail):
+    """The one, exact, deterministic nudge wording (no model text) that
+    _evaluate_advisory_triggers' callers inject into `messages` on every
+    fire."""
+    return f"ADVISORY: {detail}. Consider consulting the architect before continuing."
+
+
+def _normalize_advisory_path(raw):
+    """Review round 1 (LOW): 3-line duplicate of glimmer-v2.py's
+    _normalize_plan_path (same reasoning there: cheap, not a security
+    boundary, just enough that "./src/x.ts", "src/x.ts/", and
+    "src//x.ts" all compare equal) -- kept local rather than imported
+    since glimmer-engineer.py and glimmer-v2.py are separate subprocess
+    entry points that don't import each other."""
+    p = str(raw).strip().replace("\\", "/").strip("/")
+    return os.path.normpath(p) if p else p
+
+
+def _evaluate_advisory_triggers(architecture_plan, changed_paths, turn, max_turns, fired):
+    """Deterministic, cheap, per-turn checks -- no model call, no I/O.
+    Each of the three trigger keys can fire AT MOST ONCE per session:
+    callers must pass the SAME `fired` set across turns; a key already in
+    `fired` is never re-evaluated or re-fired. Returns a list of (key,
+    detail) tuples for triggers that fired on THIS call (mutating `fired`
+    to record them); an empty list means nothing new fired.
+
+    Pure/deterministic given its inputs (only mutates `fired`), so this
+    is unit-testable without a real engineer loop or live model -- see
+    _consult_selfcheck.
+
+    Triggers (V7 §5.5):
+      a. total changed-file count exceeds the plan's expected scope
+         (expectedScope.maxFiles, falling back to len(candidateFiles)
+         when maxFiles isn't given) -- only when a plan exists and gives
+         a positive estimate. Fix round 2 (LOW): compares len(changed_
+         paths) (every changed file this session, edits included), not
+         just newly-created files -- aligned with glimmer-v2.py's
+         check_post_verification_consistency, which flags on
+         `len(files) > expectedScope.maxFiles` over the same total
+         changed-files set. A plan budgeted for "at most N files" is
+         blown just as much by N-1 edits + 2 new files as by N+1 new
+         files.
+      b. a changed file lands outside plan.candidateFiles -- only when a
+         plan exists AND candidateFiles is non-empty.
+      c. more than 60% of the turn budget has been used with zero
+         repository writes so far -- independent of whether a plan
+         exists.
+    """
+    fired_now = []
+
+    if architecture_plan is not None:
+        key = "new_file_count_exceeds_plan"
+        if key not in fired:
+            expected_scope = architecture_plan.get("expectedScope")
+            if not isinstance(expected_scope, dict):
+                expected_scope = {}
+            candidate_files = architecture_plan.get("candidateFiles")
+            if not isinstance(candidate_files, list):
+                candidate_files = []
+
+            estimate = expected_scope.get("maxFiles")
+            if not isinstance(estimate, int) or isinstance(estimate, bool) or estimate <= 0:
+                estimate = len(candidate_files)
+
+            changed_count = len(changed_paths)
+            if estimate > 0 and changed_count > estimate:
+                detail = (
+                    f"changed file count ({changed_count}) exceeds the "
+                    f"architecture plan's estimate ({estimate})"
+                )
+                fired.add(key)
+                fired_now.append((key, detail))
+
+        key = "edit_outside_candidate_files"
+        if key not in fired:
+            candidate_files = architecture_plan.get("candidateFiles")
+            if not isinstance(candidate_files, list):
+                candidate_files = []
+
+            candidate_paths = {
+                _normalize_advisory_path(c.get("path"))
+                for c in candidate_files
+                if isinstance(c, dict) and isinstance(c.get("path"), str) and c.get("path")
+            }
+
+            if candidate_paths:
+                outside = sorted(
+                    p for p in changed_paths
+                    if _normalize_advisory_path(p) not in candidate_paths
+                )
+                if outside:
+                    detail = (
+                        f"changed file {outside[0]!r} is outside the "
+                        "architecture plan's candidateFiles"
+                    )
+                    fired.add(key)
+                    fired_now.append((key, detail))
+
+    key = "turns_high_no_writes"
+    if key not in fired:
+        if max_turns > 0 and (turn + 1) > 0.6 * max_turns and not changed_paths:
+            detail = (
+                f"turn {turn + 1}/{max_turns} (over 60% of the turn "
+                "budget) with no repository write yet"
+            )
+            fired.add(key)
+            fired_now.append((key, detail))
+
+    return fired_now
+
+
+def _consult_selfcheck() -> None:
+    """Task 2.4 (V7 §5.5 second half) self-check. No network: the
+    budget-exhaustion path below returns before any model call is ever
+    made, and every other assertion here runs against pure functions or
+    source inspection. Run with:
+    python3 glimmer-engineer.py --consult-selfcheck
+    """
+    import inspect
+
+    # ------------------------------------------------------------
+    # 1. Trigger determinism: each of a/b/c fires exactly once, then
+    #    never again given the same (or worse) fake state.
+    # ------------------------------------------------------------
+    fired = set()
+
+    # (a) Fix round 2: total changed-file count (3) > maxFiles (2) --
+    # candidateFiles lists 3 real paths so all 3 changed files stay
+    # IN-scope (no incidental trigger-(b) fire in the same call).
+    plan = {
+        "expectedScope": {"maxFiles": 2},
+        "candidateFiles": [
+            {"path": "a.py", "reason": "x", "confidence": 0.9},
+            {"path": "b.py", "reason": "y", "confidence": 0.8},
+            {"path": "c.py", "reason": "z", "confidence": 0.7},
+        ],
+    }
+    result_a = _evaluate_advisory_triggers(plan, {"a.py", "b.py", "c.py"}, 0, 10, fired)
+    assert result_a == [
+        (
+            "new_file_count_exceeds_plan",
+            "changed file count (3) exceeds the architecture plan's estimate (2)",
+        )
+    ], result_a
+    assert "new_file_count_exceeds_plan" in fired
+
+    # Same over-threshold state again: must NOT re-fire.
+    result_a_again = _evaluate_advisory_triggers(plan, {"a.py", "b.py", "c.py"}, 0, 10, fired)
+    assert not any(k == "new_file_count_exceeds_plan" for k, _ in result_a_again), (
+        "trigger (a) must fire at most once per session"
+    )
+
+    # (b) a changed path outside candidateFiles.
+    result_b = _evaluate_advisory_triggers(plan, {"z.py"}, 0, 10, fired)
+    assert result_b == [
+        (
+            "edit_outside_candidate_files",
+            "changed file 'z.py' is outside the architecture plan's candidateFiles",
+        )
+    ], result_b
+    assert "edit_outside_candidate_files" in fired
+
+    result_b_again = _evaluate_advisory_triggers(plan, {"z.py", "y.py"}, 0, 10, fired)
+    assert not any(k == "edit_outside_candidate_files" for k, _ in result_b_again), (
+        "trigger (b) must fire at most once per session"
+    )
+
+    # (c) turn count > 60% of max_turns with zero writes -- independent of
+    # a plan existing at all (plan=None here).
+    fired_c = set()
+    result_c = _evaluate_advisory_triggers(None, set(), 6, 10, fired_c)
+    assert result_c == [
+        (
+            "turns_high_no_writes",
+            "turn 7/10 (over 60% of the turn budget) with no repository write yet",
+        )
+    ], result_c
+    assert "turns_high_no_writes" in fired_c
+
+    result_c_again = _evaluate_advisory_triggers(None, set(), 9, 10, fired_c)
+    assert result_c_again == [], "trigger (c) must fire at most once per session"
+
+    # (c) must not fire once a write has occurred.
+    fired_c2 = set()
+    result_c2 = _evaluate_advisory_triggers(None, {"x.py"}, 9, 10, fired_c2)
+    assert result_c2 == [], "trigger (c) must not fire once a write has occurred"
+
+    # A plan with no positive estimate at all (no expectedScope.maxFiles,
+    # empty candidateFiles) must never fire (a) -- no 0-vs-anything false
+    # positive.
+    fired_d = set()
+    empty_plan = {"expectedScope": {}, "candidateFiles": []}
+    result_d = _evaluate_advisory_triggers(
+        empty_plan, {"a.py", "b.py", "c.py", "d.py", "e.py"}, 0, 10, fired_d
+    )
+    assert result_d == [], "trigger (a) must not fire with a zero/absent estimate"
+
+    # Review round 1 (LOW): path normalization -- a candidateFiles entry
+    # written as "./src/x.ts" must match a changed path recorded as
+    # "src/x.ts" (no false nudge from a cosmetic path-form difference).
+    fired_e = set()
+    dotted_plan = {
+        "expectedScope": {},
+        "candidateFiles": [{"path": "./src/x.ts", "reason": "x", "confidence": 0.9}],
+    }
+    result_e = _evaluate_advisory_triggers(dotted_plan, {"src/x.ts"}, 0, 10, fired_e)
+    assert result_e == [], (
+        "'./src/x.ts' candidate must match 'src/x.ts' changed path after normalization"
+    )
+    # A genuinely different path still fires.
+    result_e2 = _evaluate_advisory_triggers(dotted_plan, {"other.ts"}, 0, 10, fired_e)
+    assert result_e2 == [
+        (
+            "edit_outside_candidate_files",
+            "changed file 'other.ts' is outside the architecture plan's candidateFiles",
+        )
+    ], result_e2
+
+    # ------------------------------------------------------------
+    # 2. Nudge message shape + real wiring into run_engineer (source
+    #    inspection, same style as _plan_aware_budget_selfcheck /
+    #    _gate_allow_write_file_selfcheck above).
+    # ------------------------------------------------------------
+    nudge = _format_advisory_nudge("some reason")
+    assert nudge == (
+        "ADVISORY: some reason. Consider consulting the architect before continuing."
+    ), nudge
+
+    engineer_source = inspect.getsource(run_engineer)
+    assert "_evaluate_advisory_triggers(" in engineer_source, (
+        "run_engineer must actually call _evaluate_advisory_triggers, not just define it"
+    )
+    assert "_format_advisory_nudge(" in engineer_source
+    assert '"architect_consult_advised"' in engineer_source
+    assert "advisory_fired" in engineer_source
+
+    # ------------------------------------------------------------
+    # 3. consult_architect tool gating: offered only when BOTH an
+    #    architecture plan exists AND --architect-consult-enabled.
+    # ------------------------------------------------------------
+    for enabled, has_plan, expect_present in (
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ):
+        metadata = {}
+        tools = []
+        fake_plan = (
+            {"objective": "x", "packages": [], "risk": "low"} if has_plan else None
+        )
+        _augment_tools_with_consult_architect(metadata, tools, fake_plan, enabled)
+        present = "consult_architect" in metadata
+        assert present == expect_present, (
+            f"enabled={enabled} has_plan={has_plan}: "
+            f"expected tool present={expect_present}, got {present}"
+        )
+        assert (len(tools) == 1) == expect_present
+
+    # ------------------------------------------------------------
+    # 4. Budget exhaustion: execute_tool returns an ok:false envelope
+    #    with error code CONSULT_BUDGET_EXHAUSTED once the budget is
+    #    used up -- and never reaches the model to get there. Requires
+    #    the tool to actually be "offered" (enabled + plan loaded) so
+    #    this exercises the budget path, not the structural gate below.
+    # ------------------------------------------------------------
+    global _consult_architect_used, _architect_consult_enabled, _loaded_architecture_plan
+    real_used = _consult_architect_used
+    real_enabled = _architect_consult_enabled
+    real_plan = _loaded_architecture_plan
+    try:
+        _consult_architect_used = CONSULT_ARCHITECT_BUDGET
+        _architect_consult_enabled = True
+        _loaded_architecture_plan = {"objective": "x", "packages": [], "risk": "low"}
+
+        result_text_out, changed = execute_tool(
+            "consult_architect",
+            {"question": "is this the right abstraction?"},
+            Path("."),
+            {"approve_all": True},
+            {},
+            [],
+        )
+        assert changed is False
+        assert "CONSULT_BUDGET_EXHAUSTED" in result_text_out, result_text_out
+        assert _consult_architect_used == CONSULT_ARCHITECT_BUDGET, (
+            "an already-exhausted budget must not keep incrementing"
+        )
+
+        # ------------------------------------------------------------
+        # 5. Review round 1 (MED): unoffered-call denial. Even with
+        #    budget remaining, a call must be denied -- with NO budget
+        #    burn and no model call -- whenever the tool wasn't actually
+        #    offered (flag off, or no plan loaded).
+        # ------------------------------------------------------------
+        for enabled, plan_loaded in ((False, True), (True, False), (False, False)):
+            _consult_architect_used = 0
+            _architect_consult_enabled = enabled
+            _loaded_architecture_plan = (
+                {"objective": "x", "packages": [], "risk": "low"} if plan_loaded else None
+            )
+
+            denied_text, denied_changed = execute_tool(
+                "consult_architect",
+                {"question": "is this the right abstraction?"},
+                Path("."),
+                {"approve_all": True},
+                {},
+                [],
+            )
+            assert denied_changed is False
+            assert "CONSULT_NOT_OFFERED" in denied_text, (
+                f"enabled={enabled} plan_loaded={plan_loaded}: {denied_text}"
+            )
+            assert _consult_architect_used == 0, (
+                "a denied (unoffered) call must not burn budget"
+            )
+    finally:
+        _consult_architect_used = real_used
+        _architect_consult_enabled = real_enabled
+        _loaded_architecture_plan = real_plan
+
+    print("consult self-check: PASS")
+
+
+# ============================================================
 # ENGINEERING LOOP
 # ============================================================
 
@@ -5422,6 +6059,7 @@ def run_engineer(
     workspace,
     max_turns,
     auto_yes,
+    architect_consult_enabled=False,
 ):
     workspace = (
         workspace
@@ -5451,6 +6089,20 @@ def run_engineer(
         )
 
     metadata, tools = get_tools()
+
+    # Task 2.4 (V7 §5.5 second half): load once, same convention as
+    # validation_allowlist below -- architecture-plan.json (when present)
+    # doesn't change mid-session. Drives both the deterministic advisory
+    # triggers (regardless of architect_consult_enabled) and, gated by
+    # that flag too, whether consult_architect is offered at all.
+    global _loaded_architecture_plan, _architect_consult_enabled
+    _loaded_architecture_plan = _load_architecture_plan_for_engineer()
+    architecture_plan = _loaded_architecture_plan
+    _architect_consult_enabled = architect_consult_enabled
+
+    _augment_tools_with_consult_architect(
+        metadata, tools, architecture_plan, architect_consult_enabled,
+    )
 
     # R5 (glimmer-v7): load once per session, not per shell_policy call —
     # repo-map.json doesn't change mid-session.
@@ -5641,6 +6293,12 @@ def run_engineer(
     ledger = []
     changed_paths = set()
 
+    # Task 2.4 (V7 §5.5 second half): the once-per-session fired-set
+    # shared by all three deterministic advisory triggers (see
+    # _evaluate_advisory_triggers above). Trigger (a) reads changed_paths
+    # directly (Fix round 2) -- no separate new-file counter needed.
+    advisory_fired = set()
+
     diff_checked = False
     validation_checked = False
 
@@ -5757,12 +6415,17 @@ def run_engineer(
             # into narrowed_to_edit_only below: once even that smaller
             # budget is exhausted, every non-edit tool — semantic ones
             # included — is withdrawn.
+            # Task 2.4: consult_architect gets the same treatment as the
+            # semantic tools -- a second union term (harmless when the
+            # tool was never added to `tools` in the first place, per
+            # _augment_tools_with_consult_architect's gating) rather than
+            # inside the literal, for the same selfcheck-extraction reason.
             allowed_before_edit = {
                 "read_file",
                 "grep_search",
                 "edit_file",
                 "write_file",
-            } | SEMANTIC_TOOL_NAMES
+            } | SEMANTIC_TOOL_NAMES | {"consult_architect"}
 
             active_tools = [
                 tool
@@ -6202,6 +6865,51 @@ def run_engineer(
             )
 
         # ----------------------------------------------------
+        # TASK 2.4: MID-IMPLEMENTATION ADVISORY TRIGGERS
+        # ----------------------------------------------------
+        #
+        # Advisory only, never blocks: wrapped in its own try/except so an
+        # exception here (a malformed plan field, anything unforeseen)
+        # can never break the engineer loop -- _evaluate_advisory_triggers
+        # is itself exception-free by construction, but this is belt-and-
+        # suspenders on top of it, same discipline as run_delivery_review.
+        try:
+            newly_fired = _evaluate_advisory_triggers(
+                architecture_plan,
+                changed_paths,
+                turn,
+                max_turns,
+                advisory_fired,
+            )
+        except Exception:  # noqa: BLE001 - advisory triggers must never break the loop
+            newly_fired = []
+
+        for _trigger_key, _trigger_detail in newly_fired:
+            nudge = _format_advisory_nudge(_trigger_detail)
+
+            # Review round 1 (LOW): "user", not "system" -- a second
+            # mid-stream system message is untested against this
+            # codebase's chat template (the only system message
+            # elsewhere is the very first one), and advisory-never-
+            # blocks means a template/role error on the NEXT turn must
+            # never be able to crash run_engineer.
+            messages.append(
+                {
+                    "role": "user",
+                    "content": nudge,
+                }
+            )
+
+            print()
+            print(f"⚠ {nudge}")
+
+            _emit(
+                "architect_consult_advised",
+                trigger=_trigger_key,
+                detail=_trigger_detail[:MAX_EVENT_FIELD],
+            )
+
+        # ----------------------------------------------------
         # DISCOVERY DECISION GATE
         # ----------------------------------------------------
 
@@ -6366,6 +7074,18 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--architect-consult-enabled",
+        action="store_true",
+        help=(
+            "Task 2.4 (V7 §5.5 second half): offer the consult_architect "
+            "tool in engineer mode. Only takes effect when an "
+            "architecture-plan.json also exists for this session -- "
+            "passed by glimmer-v2.py's invoke_engineer whenever architect "
+            "mode is active. Ignored in --mode architect."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.mode == "architect":
@@ -6391,6 +7111,7 @@ def main():
             args.workspace,
             max_turns,
             args.yes,
+            architect_consult_enabled=args.architect_consult_enabled,
         )
 
 
@@ -6433,6 +7154,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--failure-memory-selfcheck"]:
         _failure_memory_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--consult-selfcheck"]:
+        _consult_selfcheck()
         sys.exit(0)
 
     try:

@@ -222,6 +222,15 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "BUDGET_EXHAUSTED", "detail": "architect review budget exhausted (V7 §5.13)", "evidenceIds": []}
     if raw == "needs-architect-review":
         return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation or the review budget was exhausted (V7 §5.10/§5.13)", "evidenceIds": []}
+    # Task 2.3 (V7 §5.10/§5.11): TECHNICALLY_VERIFIED but one or more
+    # mandatory gates did not hold -- NEEDS_REWORK. Review round 1
+    # (Important): three genuinely distinct causes share this one raw
+    # status (scope-guard expansion, engineer rc!=0 after a passing diff,
+    # a real consistency-review rejection); describe_blocked_gates builds
+    # an honest, cause-naming detail from manifest["blockedGates"] instead
+    # of one fixed string that was wrong for two of the three.
+    if raw == "needs-architect-review-consistency-rejected":
+        return {"class": "POLICY_BLOCK", "detail": describe_blocked_gates(manifest), "evidenceIds": []}
     # Task 1.3: readiness_probe (main()'s preflight) now records this exact
     # status when the model server never becomes reachable, instead of
     # falling through to the generic "initialized" -> "failed-aborted"
@@ -254,9 +263,8 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
     # and USER_DENIED, both handled elsewhere), and envelope error codes are
     # not yet plumbed from evidence-NN.jsonl into events.jsonl/manifest
     # status for this function to observe live. This branch is forward-
-    # compatible groundwork only (same "no emit site yet" precedent as
-    # glimmer_events.EVENT_TYPES's "architect_replan_started"), exercised in
-    # _r6_selfcheck with a synthetic status.
+    # compatible groundwork only (no current call site produces this raw
+    # status), exercised in _r6_selfcheck with a synthetic status.
     if raw == "failed-tool-execution":
         return {"class": "TOOL_EXECUTION_FAILURE", "detail": "a tool call returned a non-policy execution error", "evidenceIds": []}
 
@@ -1733,11 +1741,16 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
                 "verificationPlan",
             )
         }
+        # Task 2.2 (V7 §5.12): "Engineer should always know which
+        # ArchitecturePlan version it is implementing." plan.get("version")
+        # defaults to 1 -- every plan reaching here was already stamped by
+        # run_architect_first/run_architect_replan, but this stays honest
+        # if a caller ever passes a hand-built plan dict without one.
         plan_block = (
-            "\n\nARCHITECTURE PLAN (from --architect-first Architect mode; "
-            "a hint from prior read-only exploration, not a substitute for "
-            "your own verification — if evidence contradicts it, deviate "
-            "and say why):\n"
+            f"\n\nARCHITECTURE PLAN v{plan.get('version', 1)} (from Architect "
+            "mode; a hint from prior read-only exploration, not a "
+            "substitute for your own verification — if evidence "
+            "contradicts it, deviate and say why):\n"
             + json.dumps(plan_fields, indent=2)
         )
         # C1 handoff enforcement (Fix 1, V7 spec Section 5.4; follow-up:
@@ -1800,7 +1813,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
-                     plan_candidate_count=0, review_request=None):
+                     plan_candidate_count=0, review_request=None, architect_consult_enabled=False):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -1816,6 +1829,16 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         cmd += ["--review-request", str(review_request)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
+    # Task 2.4 (V7 §5.5 second half): only ever passed True alongside a
+    # real engineer run (mode is None) that has a usable architecture
+    # plan — every caller below gates this on `architecture_plan is not
+    # None`, mirroring plan_candidate_count's own gating just above.
+    # glimmer-engineer.py itself still requires a plan to exist at
+    # startup before it offers consult_architect at all (see
+    # _augment_tools_with_consult_architect), so this flag alone can
+    # never enable the tool without one.
+    if architect_consult_enabled:
+        cmd.append("--architect-consult-enabled")
     # Architect mode has no approval path (C1 scoping): it runs unattended
     # with no interactive stdin, so it must always get --yes regardless of
     # what the caller's own --auto-approve flag says.
@@ -1843,6 +1866,92 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
             sys.stdout.write(line)
             log.write(line)
         return p.wait()
+
+
+# ============================================================
+# Task 2.1 (V7 §5.5 first half): risk-triggered architect mode
+# ============================================================
+# Deterministic score, no model involvement. Fixed points per signal,
+# each independent (any subset can fire and stacks):
+#
+#   signal                                                     points
+#   --------------------------------------------------------------
+#   contract.mode == "refactor"                                     3
+#   multi-package scope (contract.scope.package == "repository")    2
+#   candidate_count > ARCHITECT_RISK_CANDIDATE_THRESHOLD             2
+#   protected-area keyword in contract.objective                    3
+#   verification_level == "full"                                    2
+#
+# score >= ARCHITECT_RISK_THRESHOLD auto-triggers architect-first
+# (unless --no-architect was passed); see main()'s architect_trigger_mode.
+#
+# "mode == refactor": review round 1 fix -- "refactor" is now a real
+# --mode choice (and a real @glimmer/shared TaskContract.mode union
+# member, control-center branch v7-r2-architect), so this signal is
+# reachable end-to-end, not just forward-compatible dead code.
+ARCHITECT_RISK_CANDIDATE_THRESHOLD = 5
+ARCHITECT_RISK_THRESHOLD = 5
+
+# Same plain-word, exact-token style as detect_documentation_impact's
+# _DOC_IMPACT_WORDS/_word_hits, applied to the objective text via the
+# existing _segment_tokens tokenizer (skills section, above) instead of
+# a fresh regex -- exact-token match is enough here (no camelCase
+# identifiers expected in a free-text objective sentence).
+_PROTECTED_AREA_WORDS = frozenset({
+    "auth", "authentication", "payment", "payments",
+    "migration", "migrations", "schema", "security",
+})
+
+
+def validate_architect_flags(architect_first, no_architect) -> None:
+    """Task 2.1: --architect-first (manual force-on) and --no-architect
+    (explicit opt-out) are a direct contradiction of intent when both are
+    passed -- raise rather than silently picking a side. Pure/standalone
+    so it's testable without spawning main()'s full argparse/workspace
+    setup, same pattern as validate_visual_url."""
+    if architect_first and no_architect:
+        raise V2Error("--architect-first and --no-architect are mutually exclusive")
+
+
+def compute_architect_risk(contract_like, candidate_count, verification_level) -> dict:
+    """Pure, deterministic V7 §5.5 risk score for auto-triggering
+    architect-first mode. No model call, no I/O, no randomness --
+    same inputs always produce the same {"score": int, "signals": [str]}.
+
+    `contract_like` is treated defensively (never indexed directly) so a
+    partial/malformed dict can't raise. `candidate_count` is a plain int
+    supplied by the caller (main() passes len(scope.paths) -- the only
+    pre-architect proxy for "how many files this touches," since no
+    ArchitecturePlan.candidateFiles exists yet at trigger-decision time).
+    `signals` lists which rows of the table above fired, in table order.
+    """
+    contract_like = contract_like or {}
+    scope = contract_like.get("scope") or {}
+    score = 0
+    signals = []
+
+    if contract_like.get("mode") == "refactor":
+        score += 3
+        signals.append("mode_refactor")
+
+    if scope.get("package") == "repository":
+        score += 2
+        signals.append("multi_package_scope")
+
+    if isinstance(candidate_count, int) and candidate_count > ARCHITECT_RISK_CANDIDATE_THRESHOLD:
+        score += 2
+        signals.append("candidate_count_high")
+
+    objective_tokens = _segment_tokens(str(contract_like.get("objective") or ""))
+    if _PROTECTED_AREA_WORDS.intersection(objective_tokens):
+        score += 3
+        signals.append("protected_area_keyword")
+
+    if verification_level == "full":
+        score += 2
+        signals.append("verification_full")
+
+    return {"score": score, "signals": signals}
 
 
 def load_architecture_plan(session_dir):
@@ -1937,6 +2046,11 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     plan = load_architecture_plan(session)
 
     if plan is not None:
+        # Task 2.2 (V7 §5.12): the architect-first plan is always version 1
+        # -- versioning is v2.py's (the trusted layer's) responsibility,
+        # never the model's. Replans (run_architect_replan, below) stamp
+        # version N+1 the same way.
+        plan["version"] = 1
         print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
         # NIT (fix round 1): packages is model-controlled (architect's own
         # JSON output) -- cap entry count and per-entry length so a
@@ -1945,11 +2059,152 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         if isinstance(packages, list):
             packages = [str(p)[:200] for p in packages[:20]]
         emit_event(events_path, "architect_plan_created", sid,
-                   risk=plan.get("risk"), packages=packages)
+                   risk=plan.get("risk"), packages=packages, version=1)
     else:
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
     return plan
+
+
+# ============================================================
+# Task 2.2 (glimmer-v7): re-planning loop + plan versions — V7 §5.12
+# ============================================================
+# Triggered only from inside the C2 review loop below, on a REPLAN_REQUIRED
+# decision. Reuses run_architect_first's exact spawn/load machinery (same
+# mode="architect" invocation, same never-raises contract, same load_
+# architecture_plan uniform-None-on-any-failure reader) with an extended
+# prompt instead of the plain v1 prompt. Versioning itself is v2.py's
+# (the trusted layer's) responsibility, never the model's -- the plan
+# dict is stamped with plan["version"] AFTER validation/load, same spirit
+# as C1's read_candidate_evidence treating model output as untrusted.
+
+
+def make_architect_replan_prompt(contract, summary, review, from_version):
+    """V7 §5.12: the re-planning prompt. Reuses make_architect_prompt's
+    exact planning-mode text (objective + contract + repo map, byte-
+    identical prefix) and APPENDS the prior review's findings/
+    requiredChanges as evidence of why plan v{from_version} was
+    rejected, so the architect revises instead of re-deriving from
+    scratch with no memory of what failed. `review` is whatever load_
+    architect_review returned (already normalized: findings/
+    requiredChanges default to [] when absent) -- never raises on an
+    empty/None review, same tolerant-but-honest bar as architect_review_
+    failure_text.
+    """
+    review = review or {}
+    findings = review.get("findings") or []
+    required_changes = review.get("requiredChanges") or []
+
+    lines = [
+        f"ArchitecturePlan v{from_version} was rejected by pre-verification "
+        f"review (decision: {review.get('decision', 'REPLAN_REQUIRED')}). "
+        f"Produce a REVISED ArchitecturePlan (same JSON shape as before) "
+        f"that addresses this evidence of why v{from_version} failed:"
+    ]
+    if findings:
+        lines.append("Findings:")
+        lines.extend(f"  - {f}" for f in findings)
+    if required_changes:
+        lines.append("Required changes:")
+        lines.extend(f"  - {c}" for c in required_changes)
+    if not findings and not required_changes:
+        lines.append("  (review produced no specific findings/requiredChanges)")
+
+    return make_architect_prompt(contract, summary) + "\n\n" + "\n".join(lines)
+
+
+def run_architect_replan(engineer, ws, contract, summary, session, events_path, sid,
+                          review, from_version, to_version):
+    """V7 §5.12: re-invoke the architect after a REPLAN_REQUIRED decision.
+    Must never raise (same contract as run_architect_first): any failure
+    degrades to returning None, which the caller (main()'s review loop)
+    treats as a fail-CLOSED replan -- never silently continuing on the
+    just-rejected v{from_version} plan.
+    """
+    print("\n" + "=" * 72)
+    print(f" [V2] Architecture re-plan v{from_version} -> v{to_version} (REPLAN_REQUIRED)")
+    print("=" * 72)
+
+    try:
+        replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version)
+        (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
+
+        # Fix round 1 (HIGH): architecture-plan.json already holds
+        # v{from_version} (record_architecture_plan_version wrote it there
+        # as "latest" when that version was created) -- without removing
+        # it first, a dead/failed replan subprocess that writes NOTHING
+        # leaves the OLD plan sitting there, and load_architecture_plan
+        # below would happily re-load it and get stamped as v{to_version}.
+        # That is fail-OPEN (silently promoting the rejected plan under a
+        # new version number), the exact opposite of this function's
+        # documented fail-closed contract. Unlink so a failed subprocess
+        # produces a genuinely missing file -> load_architecture_plan
+        # returns None, same as run_architect_first's very first run.
+        (Path(session) / "architecture-plan.json").unlink(missing_ok=True)
+
+        rc = invoke_engineer(
+            engineer, ws, replan_prompt,
+            True,  # auto_approve forced regardless, same as run_architect_first
+            None,  # architect mode's own smaller default turn budget applies
+            session / f"architect-replan-{to_version}.log",
+            events_path, sid, mode="architect",
+        )
+        print(f"[V2] Architect replan subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - replan failure must never block the run
+        print(f"[V2] WARN: architect replan subprocess failed to run: {exc}")
+
+    # Deliberately OUTSIDE the try above, same reasoning as run_architect_
+    # first's identical comment: load_architecture_plan already degrades
+    # to None internally on any read/parse/planningFailed case.
+    plan = load_architecture_plan(session)
+
+    if plan is not None:
+        plan["version"] = to_version
+        print(f"[V2] Architect replan v{to_version} loaded: risk={plan.get('risk')!r}")
+        packages = plan.get("packages")
+        if isinstance(packages, list):
+            packages = [str(p)[:200] for p in packages[:20]]
+        emit_event(events_path, "architect_plan_created", sid,
+                   risk=plan.get("risk"), packages=packages, version=to_version)
+    else:
+        print(f"[V2] Architect replan v{to_version} produced no usable plan "
+              "(missing/invalid/failed); failing closed (never continuing on the rejected plan).")
+        # Fix round 2 (LOW): restore architecture-plan.json from the
+        # already-on-disk v{from_version} snapshot (record_architecture_
+        # plan_version wrote architecture-plan-v{from_version}.json when
+        # that version was created) -- observability only, for whoever
+        # inspects this now-terminal session's dir; the unlink above
+        # already left architecture-plan.json missing, and the caller
+        # still gets `plan is None` back and fails closed regardless of
+        # whether this restore succeeds.
+        restore_src = Path(session) / f"architecture-plan-v{from_version}.json"
+        if restore_src.exists():
+            shutil.copyfile(restore_src, Path(session) / "architecture-plan.json")
+
+    return plan
+
+
+def record_architecture_plan_version(session, manifest, plan):
+    """V7 §5.12: persist one ArchitecturePlan version. Writes
+    architecture-plan-vN.json (an additional, never-overwritten
+    snapshot -- plan history) AND re-writes architecture-plan.json (the
+    pre-existing "current plan" convention every gateway reader already
+    uses) so both stay in sync with plan["version"]. Appends one
+    {version, path, createdAt} entry to manifest["architectPlans"]
+    (oldest first). `plan` must already carry a stamped "version" key --
+    run_architect_first/run_architect_replan's job, not this function's;
+    defaults to 1 defensively if somehow missing.
+    """
+    version = plan.get("version", 1)
+    text = json.dumps(plan, indent=2)
+    versioned_name = f"architecture-plan-v{version}.json"
+    (Path(session) / versioned_name).write_text(text, encoding="utf-8")
+    (Path(session) / "architecture-plan.json").write_text(text, encoding="utf-8")
+    manifest.setdefault("architectPlans", []).append({
+        "version": version,
+        "path": versioned_name,
+        "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    })
 
 
 # ============================================================
@@ -2038,12 +2293,22 @@ def load_architect_review(session_dir, iteration, review_round):
 def classify_architect_review_decision(decision):
     """Maps one ArchitectReview decision (V7 §5.7) to what main()'s
     review sub-loop does next. Pure/deterministic — exercised directly
-    by --architect-review-selfcheck without a live model or session."""
+    by --architect-review-selfcheck without a live model or session.
+
+    Task 2.2 (V7 §5.12): REPLAN_REQUIRED is no longer terminal-rejected --
+    it routes to "replan" (re-invoke the architect for a new plan
+    version, then continue with a delta prompt, same as "revise" but
+    with a swapped-in plan) instead of stopping the run. Only
+    HUMAN_REVIEW_REQUIRED (and any unrecognized decision) still maps to
+    the terminal "rejected" outcome.
+    """
     if decision in ("APPROVED", "APPROVED_WITH_CONDITIONS"):
         return "approved"
     if decision == "REVISE_IMPLEMENTATION":
         return "revise"
-    if decision in ("REPLAN_REQUIRED", "HUMAN_REVIEW_REQUIRED"):
+    if decision == "REPLAN_REQUIRED":
+        return "replan"
+    if decision == "HUMAN_REVIEW_REQUIRED":
         return "rejected"
     return "rejected"  # unrecognized decision must never silently proceed to verify()
 
@@ -2058,6 +2323,136 @@ def architect_gates_value(outcome):
     if outcome in ("rejected", "budget_exhausted"):
         return False
     return None  # outcome is None (never ran) or "fail_open"
+
+
+def scope_guard_gate_value(scope_result):
+    """Task 2.3 (V7 §5.11): maps compute_scope_guard's result to the
+    True/False/None gate contract every other gates.* key already uses --
+    inScope True -> True, a real expansion (expandedFiles non-empty) ->
+    False, "unbounded" (scope claimed a concrete path but gave none, so
+    compute_scope_guard could not tell) -> None (indeterminate, not a
+    pass). None input (no scope_result computed yet) -> None."""
+    if not scope_result:
+        return None
+    if scope_result.get("unbounded"):
+        return None
+    return True if scope_result.get("inScope") else False
+
+
+def combine_gate_values(*values):
+    """Task 2.3 (V7 §5.11): tri-state AND across gate values -- False
+    dominates (any real failure blocks), else None dominates (any
+    indeterminate input makes the combination indeterminate too -- "null
+    wins over true"), else True only when every input is True. Used to
+    fold gates.scopeApproved from two independent signals (the existing
+    contract-scope guard + the new plan-candidateFiles consistency
+    check) into one honest value."""
+    if any(v is False for v in values):
+        return False
+    if any(v is None for v in values):
+        return None
+    return True
+
+
+def gates_block_verified(gates: dict) -> bool:
+    """V7 §5.11: the final-acceptance rule. VERIFIED requires
+    implementationComplete and verificationPassed to be exactly True
+    (both are always computable by the time this runs -- there is no
+    honest "not applicable" for either), and architectureApproved/
+    scopeApproved to each be anything OTHER than False (None =
+    not-applicable/never-ran, still allowed; only an explicit False
+    blocks). Pure/deterministic -- exercised directly by
+    --gates-selfcheck without a live model or session.
+
+    Review round 1 (Important): documentationCurrent is deliberately NOT
+    in this blocking set. detect_documentation_impact (O2 phase 1) is a
+    ONE-WAY detector -- it can only ever produce False (doc-relevant
+    change detected) or None (no impact / didn't run), NEVER True (it has
+    no way to verify docs actually ARE current). Blocking on it would mean
+    ANY routes/schema/api/config/auth-touching change is permanently
+    unable to reach VERIFIED, no matter how good the diff is -- the gate
+    computed in main()'s finally block (see gates["documentationCurrent"]
+    there) runs AFTER this function's caller already decided VERIFIED vs.
+    not, so wiring it in here would also just be decorative (the decision
+    it claims to gate has already been made). Deferred to a future round
+    where the doc gate becomes real tri-state (an actual freshness check,
+    not just an impact detector)."""
+    if gates.get("implementationComplete") is not True:
+        return True
+    if gates.get("verificationPassed") is not True:
+        return True
+    return any(gates.get(key) is False for key in
+                ("architectureApproved", "scopeApproved"))
+
+
+def blocked_gate_names(gates: dict) -> list:
+    """Review round 1 (Important): which gate(s) actually caused
+    gates_block_verified to return True, in the same checked order --
+    mirrors gates_block_verified exactly (same two hard-required keys,
+    same not-False-only set) so the two can never silently drift apart.
+    Feeds describe_blocked_gates' honest, cause-naming failure detail."""
+    blocked = []
+    if gates.get("implementationComplete") is not True:
+        blocked.append("implementationComplete")
+    if gates.get("verificationPassed") is not True:
+        blocked.append("verificationPassed")
+    for key in ("architectureApproved", "scopeApproved"):
+        if gates.get(key) is False:
+            blocked.append(key)
+    return blocked
+
+
+def describe_blocked_gates(manifest: dict) -> str:
+    """Review round 1 (Important): an honest, cause-naming detail for a
+    session that reached the VERIFIED gates check and got blocked.
+    Three genuinely distinct causes can all land on the same raw status
+    (needs-architect-review-consistency-rejected) -- a scope-guard
+    expansion, an engineer that exited non-zero after a passing diff, and
+    a real post-verification consistency-review rejection -- and they
+    must not all read as "architecture review rejected" (wrong for two
+    of the three). Reads manifest["blockedGates"] (set at the block
+    site), the LAST attempt's scopeGuard, and the top-level consistency
+    record for the actual file lists. Never raises on a
+    missing/malformed manifest -- degrades to a generic detail.
+    """
+    blocked = manifest.get("blockedGates") or []
+    attempts = manifest.get("attempts") or []
+    last_attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+    scope_guard = last_attempt.get("scopeGuard") or {}
+    consistency = manifest.get("consistency") or {}
+
+    parts = []
+    if "implementationComplete" in blocked:
+        # Controller ruling: this exact phrase, never "architecture review
+        # rejected" -- rc != 0 after a passing diff is an engineer-outcome
+        # fact, unrelated to any architect review.
+        parts.append("engineer exited non-zero after a passing diff")
+    if "scopeApproved" in blocked:
+        expanded = scope_guard.get("expandedFiles") or []
+        outside = consistency.get("outsideFiles") or []
+        if expanded and outside:
+            parts.append(
+                "scope guard expansion outside declared scope ("
+                + ", ".join(expanded)
+                + ") AND post-verification consistency review rejected files outside "
+                "the architecture plan (" + ", ".join(outside) + ")"
+            )
+        elif expanded:
+            parts.append("scope guard expansion outside declared scope: " + ", ".join(expanded))
+        elif outside:
+            parts.append(
+                "post-verification consistency review rejected files outside the "
+                "architecture plan: " + ", ".join(outside)
+            )
+        else:
+            parts.append("post-verification consistency review rejected the implementation")
+    if "architectureApproved" in blocked:
+        parts.append("architecture review gate rejected")
+    if "verificationPassed" in blocked:
+        parts.append("verification did not pass")
+    if not parts:
+        return "one or more V7 §5.11 gates blocked promotion to verified"
+    return "; ".join(parts)
 
 
 def architect_review_failure_text(review):
@@ -2134,6 +2529,75 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     return review
 
 
+def _normalize_plan_path(raw) -> str:
+    """Cheap path normalization shared by check_post_verification_
+    consistency's membership comparison -- not a security boundary (unlike
+    _resolve_candidate_path's containment check above), just enough
+    normalization that "./src/x.ts", "src/x.ts/", and "src//x.ts" all
+    compare equal. Never raises on malformed input."""
+    p = str(raw).strip().replace("\\", "/").strip("/")
+    return os.path.normpath(p) if p else p
+
+
+def check_post_verification_consistency(files: list, plan) -> dict:
+    """V7 §5.10: post-verification architecture consistency check --
+    cheap, deterministic, no model call by itself (main() decides whether
+    to spend an architect review round on a flagged result). Compares the
+    session's FINAL changed-files set against plan.candidateFiles (the
+    set of files the architect expected to touch) and, when present,
+    plan.expectedScope.maxFiles (the count the architect expected).
+
+    candidateFiles[].path and expectedScope are MODEL OUTPUT (the
+    architect wrote the plan) -- treated as advisory estimates, not a
+    contract: a flag here never blocks VERIFIED by itself (see main()'s
+    call site and gates_block_verified). Returns
+    {"flagged": bool, "outsideFiles": [...], "reason": str | None}.
+
+    No plan -> always {"flagged": False, "outsideFiles": [], "reason": None}
+    -- a deliberate no-op (nothing to compare against), not an
+    indeterminate result. Never raises: candidateFiles/expectedScope may be
+    missing, malformed, or adversarial; every malformed entry is simply
+    skipped rather than erroring.
+    """
+    if not plan:
+        return {"flagged": False, "outsideFiles": [], "reason": None}
+
+    candidate_paths = set()
+    candidates = plan.get("candidateFiles")
+    if isinstance(candidates, list):
+        for c in candidates:
+            if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip():
+                candidate_paths.add(_normalize_plan_path(c["path"]))
+
+    # Review round 1 (minor): an architect that named NO usable candidate
+    # files at all (empty/malformed candidateFiles) has given us nothing
+    # to compare against -- that is honestly "can't tell", not "every
+    # file is outside scope". Only flag on outsideFiles when there is at
+    # least one real candidate path to compare against; maxFiles is an
+    # independent, still-live signal either way.
+    outside = [] if not candidate_paths else [
+        f for f in files if _normalize_plan_path(f) not in candidate_paths
+    ]
+
+    max_files = None
+    expected_scope = plan.get("expectedScope")
+    if isinstance(expected_scope, dict):
+        raw_max = expected_scope.get("maxFiles")
+        if isinstance(raw_max, (int, float)) and not isinstance(raw_max, bool) and raw_max >= 0:
+            max_files = raw_max
+    over_budget = max_files is not None and len(files) > max_files
+
+    if not outside and not over_budget:
+        return {"flagged": False, "outsideFiles": [], "reason": None}
+
+    reasons = []
+    if outside:
+        reasons.append(f"{len(outside)} changed file(s) outside plan.candidateFiles")
+    if over_budget:
+        reasons.append(f"{len(files)} changed files exceeds expectedScope.maxFiles={max_files}")
+    return {"flagged": True, "outsideFiles": outside, "reason": "; ".join(reasons)}
+
+
 # ============================================================
 # C3 (glimmer-v7): Task Graph (tasks.json) — reconciliation doc C3 entry.
 # ============================================================
@@ -2187,6 +2651,33 @@ def derive_tasks(plan: dict) -> list:
             "status": "pending",
         })
     return tasks
+
+
+def merge_replanned_tasks(old_tasks, new_tasks):
+    """Task 2.2 fix round 1 (MED): re-deriving tasks from a NEW plan
+    version (derive_tasks always assigns fresh t1..tN ids, with no
+    stable identity across calls) must not silently discard status
+    progress already recorded against work that DIDN'T actually change.
+    Rule: a new task carries over an old task's status only when both
+    `kind` and `description` match EXACTLY (kind-scoped so an
+    implementation step and a verification step that happen to share
+    wording never cross-match). Any new task with no identical match is
+    genuinely new work introduced by the replan and starts "pending" --
+    derive_tasks' own default, untouched here. Never raises: old_tasks
+    may be None/empty (first-ever plan, nothing to carry over), in which
+    case new_tasks is returned as-is.
+    """
+    if not old_tasks:
+        return new_tasks
+    carried_status = {}
+    for t in old_tasks:
+        key = (t.get("kind"), t.get("description"))
+        carried_status.setdefault(key, t.get("status"))
+    for t in new_tasks:
+        status = carried_status.get((t.get("kind"), t.get("description")))
+        if status:
+            t["status"] = status
+    return new_tasks
 
 
 def save_tasks(session_dir, tasks) -> None:
@@ -2543,7 +3034,10 @@ def main():
     ap.add_argument("--scope-area", default=None, help="Contract scope.area: sub-path within the package this task is scoped to")
     ap.add_argument("--scope-paths", action="append", default=None,
                     help="Contract scope.paths: explicit file path this task is scoped to (repeatable)")
-    ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review"),
+    # "refactor" added review round 1 (Task 2.1 fix): makes compute_architect_risk's
+    # mode_refactor signal reachable end-to-end -- previously no --mode value
+    # could ever produce it.
+    ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review", "refactor"),
                     default="implement", help="Contract mode: the kind of work this task performs")
     ap.add_argument("--auto-approve", action="store_true")
     ap.add_argument("--repo-map-only", action="store_true")
@@ -2554,15 +3048,21 @@ def main():
     ap.add_argument("--readiness-timeout", type=int, default=180)
     ap.add_argument("--toolchain-mode", choices=("path", "linked", "none"), default="path",
                     help="path=reuse source tool binaries via env (safe default); linked=temporary ignored node_modules symlinks during trusted verification only; none=no source toolchain reuse")
-    # C1 (glimmer-v7): opt-in only, default False. Never auto-triggered by
-    # risk or anything else — TaskContract has no risk field today (risk is
-    # computed post-run, client-side, in a separate TS project), so there is
-    # nothing to gate an automatic invocation on. A human/caller must pass
-    # this explicitly. Every existing invocation (this flag omitted) takes
-    # the exact same code path as before this change.
+    # C1 (glimmer-v7): manual force-on, default False. Independent of the
+    # Task 2.1 risk-based auto-trigger below (§5.5) -- passing this always
+    # runs architect mode regardless of score.
     ap.add_argument("--architect-first", action="store_true",
                     help="Run glimmer-engineer.py --mode architect before iteration 0 and feed its "
-                         "ArchitecturePlan into the engineering prompt. Off by default; never auto-triggered.")
+                         "ArchitecturePlan into the engineering prompt. Manual force-on, independent "
+                         "of the risk-based auto-trigger (see --no-architect).")
+    # Task 2.1 (V7 §5.5): explicit opt-out of the risk-based auto-trigger
+    # (compute_architect_risk). Wins over auto-trigger (score >= threshold
+    # with this passed still runs with NO architect) but not over an
+    # explicit --architect-first -- passing both is a direct contradiction
+    # of intent and is rejected below rather than silently picking a side.
+    ap.add_argument("--no-architect", action="store_true",
+                    help="Explicitly opt out of the risk-based architect auto-trigger (V7 §5.5). "
+                         "Errors if combined with --architect-first.")
     args = ap.parse_args()
 
     ws = Path(args.workspace).expanduser().resolve()
@@ -2579,6 +3079,7 @@ def main():
         raise V2Error("--max-repairs must be 0..5")
     if args.max_changed_files is not None and not (1 <= args.max_changed_files <= 500):
         raise V2Error("--max-changed-files must be 1..500")
+    validate_architect_flags(args.architect_first, args.no_architect)
     validate_visual_url(args.verify, args.visual_url)
 
     recovery = recover_interrupted_checkpoint(ws)
@@ -2657,12 +3158,41 @@ def main():
     if args.max_changed_files is not None:
         contract["budgets"] = {"maxChangedFiles": args.max_changed_files}
 
+    # Task 2.1 (V7 §5.5): risk score always computed (even on a run that
+    # passes neither --architect-first nor --no-architect) so
+    # manifest["architectTrigger"] records the decision for every session,
+    # not just auto-triggered ones. candidate_count is the only
+    # pre-architect proxy available at this point -- see compute_
+    # architect_risk's docstring.
+    architect_candidate_count = len(scope.get("paths") or [])
+    architect_risk = compute_architect_risk(contract, architect_candidate_count, args.verification_level)
+    if args.architect_first:
+        architect_trigger_mode = "manual"
+    elif architect_risk["score"] >= ARCHITECT_RISK_THRESHOLD and not args.no_architect:
+        architect_trigger_mode = "auto"
+    else:
+        architect_trigger_mode = "off"
+    run_architect = architect_trigger_mode in ("manual", "auto")
+    if architect_trigger_mode == "auto":
+        emit_event(events_path, "architect_autotriggered", sid,
+                   score=architect_risk["score"], threshold=ARCHITECT_RISK_THRESHOLD,
+                   signals=architect_risk["signals"])
+
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
         "state": canonical_session_state("initialized"),
         "eventsFile": "events.jsonl", "contract": contract,
+        # Task 2.1 (V7 §5.5): always present, regardless of trigger mode --
+        # the deterministic decision itself is worth recording even on an
+        # "off" run (score/signals still computed, just below threshold or
+        # explicitly opted out).
+        "architectTrigger": {
+            "mode": architect_trigger_mode,
+            "score": architect_risk["score"],
+            "signals": architect_risk["signals"],
+        },
         # Task 1.4 (V7 §38): manifest completion -- additive fields only,
         # every existing reader (control-center/server/src/lib/sessions.ts)
         # tolerates unknown JSON keys already (plain JSON.parse, no schema
@@ -2767,13 +3297,15 @@ def main():
             manifest["modelReadiness"] = {"status": "SKIPPED"}
             save()
 
-        # C1 (glimmer-v7): opt-in only (--architect-first), runs once before
-        # iteration 0. architecture_plan stays None (identical to never
-        # having passed the flag) whenever it's skipped, or the architect
-        # run fails/times out/produces invalid JSON — see
+        # C1 (glimmer-v7) + Task 2.1 (V7 §5.5): runs once before iteration 0
+        # whenever run_architect is True -- manual force-on (--architect-
+        # first) or risk-based auto-trigger (architect_trigger_mode ==
+        # "auto", computed above). architecture_plan stays None (identical
+        # to run_architect being False) whenever it's skipped, or the
+        # architect run fails/times out/produces invalid JSON — see
         # run_architect_first/load_architecture_plan's uniform-None
         # degradation contract. manifest["architectPlan"] is only ever
-        # added when --architect-first was actually passed (fix round 1,
+        # added when run_architect was actually True (fix round 1,
         # Important finding: without this, there's no way to measure
         # architect-mode activity/usefulness separately from the main
         # run — the reconciliation doc requires shipping C1 "behind a
@@ -2789,7 +3321,7 @@ def main():
         # `finally` too -- see that comment) stays None in every degraded
         # case, same uniform-None-on-no-plan contract as
         # architecture_plan/candidate_evidence just above.
-        if args.architect_first:
+        if run_architect:
             architecture_plan = run_architect_first(
                 engineer, ws, contract, summary, session, events_path, sid,
             )
@@ -2798,12 +3330,18 @@ def main():
             # C2: gates/architectReviews are only ever added to the
             # manifest when a usable plan exists — with no plan there is
             # nothing to review against, so C2 never runs and these keys
-            # would otherwise be pure clutter on a --architect-first run
-            # that didn't even get a usable plan (mirrors architectPlan's
-            # own architect_first-only gating just above).
+            # would otherwise be pure clutter on a run_architect run that
+            # didn't even get a usable plan (mirrors architectPlan's own
+            # run_architect gating just above).
             if architecture_plan is not None:
                 manifest["gates"] = {"architectureApproved": None}
                 manifest["architectReviews"] = {"max": ARCHITECT_REVIEW_BUDGET, "used": 0}
+                # Task 2.2 (V7 §5.12): persist v1 into the plan-history
+                # array + write architecture-plan-v1.json alongside the
+                # existing architecture-plan.json (gateway readers keep
+                # working unchanged -- that file always holds the latest
+                # version).
+                record_architecture_plan_version(session, manifest, architecture_plan)
                 # C3: same gate as the two lines above -- tasks derive from
                 # the plan's implementationPlan/verificationPlan only when
                 # a usable plan exists. manifest["tasksFile"] mirrors the
@@ -2833,7 +3371,13 @@ def main():
                 save_tasks(session, tasks)
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
-                                 plan_candidate_count=len(candidate_evidence))
+                                 plan_candidate_count=len(candidate_evidence),
+                                 architect_consult_enabled=architecture_plan is not None)
+            # Task 2.3 (V7 §5.11): gates.implementationComplete tracks the
+            # MOST RECENT engineer invocation this iteration -- a revise
+            # round below reassigns this to revise_rc, exactly mirroring
+            # which rc evaluate_implementation_tasks was last called with.
+            last_engineer_rc = rc
             files = changed_files(ws, baseline)
             change_types = file_change_types(ws, baseline)
             for f in files:
@@ -2848,8 +3392,11 @@ def main():
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
-            # R4 Scope Guard: classify (does not block yet — staged rollout,
-            # see compute_scope_guard's docstring and task-6a-report.md).
+            # R4 Scope Guard: classify. Task 2.3 (V7 §5.11) graduates this
+            # from advisory-only to a real VERIFIED-blocking signal — see
+            # scope_guard_gate_value/gates_block_verified below, consulted
+            # only after verify() ok (a real expansion here now surfaces as
+            # gates.scopeApproved = false, not just a printed WARN).
             scope_result = compute_scope_guard(files, manifest.get("contract", {}))
             attempt["scopeGuard"] = scope_result
             if scope_result["expandedFiles"]:
@@ -2862,10 +3409,11 @@ def main():
                       f"{manifest['contract']['scope'].get('package')!r} claims a bounded scope but no "
                       "area/paths were given; cannot verify (unbounded)")
 
-            # Task 1.4 (V7 §6): budgets.maxChangedFiles -- unlike the scope
-            # guard above (classify-only, staged rollout), this DOES block:
-            # exceeding it fails the session outright, before verify() ever
-            # runs for this iteration.
+            # Task 1.4 (V7 §6): budgets.maxChangedFiles -- distinct from the
+            # scope guard above (which now blocks too, but only after
+            # verify() ok, via gates.scopeApproved): this DOES block
+            # immediately, exceeding it fails the session outright, before
+            # verify() ever runs for this iteration.
             if changed_files_budget_exceeded(files, args.max_changed_files):
                 print(f"[V2] BUDGET EXCEEDED: {len(files)} changed files > "
                       f"--max-changed-files {args.max_changed_files}")
@@ -2896,6 +3444,18 @@ def main():
                         save_tasks(session, tasks)
                         emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
                     if ok:
+                        # Review round 1 (minor): the checks genuinely ran
+                        # and passed on this path too (just against an empty
+                        # diff) -- record verificationPassed so GatesRow
+                        # isn't blank on a verified session. Merge, don't
+                        # clobber (same discipline as every other gates
+                        # writer); implementationComplete is deliberately
+                        # left unset here -- no files changed, so "any
+                        # changed files" is false and there is nothing
+                        # honest to claim either way.
+                        gates = dict(manifest.get("gates") or {})
+                        gates["verificationPassed"] = True
+                        manifest["gates"] = gates
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
@@ -2971,16 +3531,95 @@ def main():
                         architect_outcome = decision_outcome
                         break
 
-                    # decision_outcome == "revise": this IS the disagreement
-                    # V7 §5.13 budgets. Check budget before spending it -- a
-                    # revise round that would exceed it never runs.
-                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
+                    # decision_outcome in ("revise", "replan"): both ARE the
+                    # disagreement V7 §5.13 budgets -- Task 2.2 shares the
+                    # SAME budget/counter across revise and replan rounds
+                    # (no separate replan budget). Check budget before
+                    # spending it -- a round that would exceed it never runs.
+                    #
+                    # RULING (round 2): reserve the LAST budget slot for the
+                    # post-verify consistency review (V7 §5.10) -- pre-verify
+                    # disagreement spending (this revise/replan gate) may
+                    # spend at most BUDGET-1 of the shared budget, so a
+                    # high-disagreement run can never starve the post-verify
+                    # check of the one slot it needs to ever run.
+                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET - 1:
                         architect_outcome = "budget_exhausted"
                         break
                     manifest["architectReviews"]["used"] += 1
                     save()
-                    print(f"[V2] Architect review requested REVISE_IMPLEMENTATION "
-                          f"(iteration={iteration}, round={review_round}); running one bounded revise pass.")
+
+                    # Task 2.2 (V7 §5.12): REPLAN_REQUIRED re-invokes the
+                    # architect for a NEW plan version (findings from this
+                    # review appended as evidence of why the current
+                    # version failed) BEFORE the delta-prompt re-invoke
+                    # below -- which then reuses the exact same revise-
+                    # style continuation, just with `architecture_plan`
+                    # already swapped to the new version.
+                    if decision_outcome == "replan":
+                        from_version = architecture_plan.get("version", 1)
+                        to_version = from_version + 1
+                        emit_event(events_path, "architect_replan_started", sid,
+                                   fromVersion=from_version, toVersion=to_version,
+                                   reviewRound=review_round)
+                        new_plan = run_architect_replan(
+                            engineer, ws, contract, summary, session, events_path, sid,
+                            review, from_version, to_version,
+                        )
+                        if new_plan is None:
+                            # Fail-closed honesty: an invalid/failed replan
+                            # must never silently continue implementing
+                            # against the just-rejected v{from_version}
+                            # plan. Budget is already consumed above --
+                            # this is exactly the existing "rejected"
+                            # terminal path (needs-architect-review-rejected),
+                            # not a new manifest status.
+                            print(f"[V2] Replan v{from_version} -> v{to_version} produced no usable "
+                                  "plan; failing closed to architecture-review rejection.")
+                            architect_outcome = "rejected"
+                            break
+                        architecture_plan = new_plan
+                        record_architecture_plan_version(session, manifest, architecture_plan)
+                        # Fix round 1 (MED): the delta prompt below embeds
+                        # `candidate_evidence` alongside `plan=architecture_
+                        # plan` -- without refreshing it here, it would
+                        # still be v{from_version}'s pre-read candidateFiles
+                        # evidence, now mislabeled as belonging to the new
+                        # plan. read_candidate_evidence is deterministic/
+                        # cheap (v2.py re-reading files off disk, no model
+                        # call), same as the v1 call site above.
+                        candidate_evidence = read_candidate_evidence(architecture_plan, ws)
+                        # Fix round 1 (MED): risk snapshot must reflect the
+                        # NEW plan, not the stale v{from_version} one.
+                        manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
+                        # Fix round 1 (MED): re-derive tasks from the new
+                        # plan's implementationPlan/verificationPlan (ids
+                        # are NOT stable across derive_tasks calls) --
+                        # merge_replanned_tasks carries over an old task's
+                        # status onto a new task with an IDENTICAL
+                        # (kind, description) pair; anything genuinely new
+                        # starts pending. The set_implementation_tasks_
+                        # status(in_progress)/reset_verification_tasks_
+                        # status(pending) calls a few lines below still run
+                        # unchanged right after this -- they reset state
+                        # for the upcoming re-invoke exactly as a plain
+                        # REVISE_IMPLEMENTATION round already does; this
+                        # merge only makes the tasks.json/task_created
+                        # events written IN BETWEEN honestly reflect carried-
+                        # over progress instead of every task looking
+                        # brand new.
+                        if tasks is not None:
+                            tasks = merge_replanned_tasks(tasks, derive_tasks(architecture_plan))
+                            save_tasks(session, tasks)
+                            for t in tasks:
+                                emit_event(events_path, "task_created", sid,
+                                           taskId=t["id"], kind=t["kind"],
+                                           description=t["description"][:200])
+                        save()
+
+                    print(f"[V2] Architect review requested {review['decision']} "
+                          f"(iteration={iteration}, round={review_round}); running one bounded "
+                          f"{'replan+' if decision_outcome == 'replan' else ''}revise pass.")
                     # Fix round 1 (Minor 5): the real outer `iteration` and
                     # the real `checkpoint_sha` (whatever the repair loop
                     # last set, possibly still None on iteration 0) --
@@ -3015,7 +3654,9 @@ def main():
                         engineer, ws, revise_prompt, args.auto_approve, args.max_turns,
                         session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
                         events_path, sid, plan_candidate_count=len(candidate_evidence),
+                        architect_consult_enabled=architecture_plan is not None,
                     )
+                    last_engineer_rc = revise_rc
                     files = changed_files(ws, baseline)
                     change_types = file_change_types(ws, baseline)
                     for f in files:
@@ -3031,7 +3672,15 @@ def main():
                     scope_result = compute_scope_guard(files, manifest.get("contract", {}))
                     attempt["scopeGuard"] = scope_result
 
-                manifest["gates"] = {"architectureApproved": architect_gates_value(architect_outcome)}
+                # Review round 1 (minor): merge, don't clobber -- same
+                # discipline as every other gates writer (finally block's
+                # documentationCurrent merge, the post-verify consistency
+                # block just below). A wholesale reassignment here would
+                # silently wipe out any other gate key already recorded
+                # earlier this run.
+                gates = dict(manifest.get("gates") or {})
+                gates["architectureApproved"] = architect_gates_value(architect_outcome)
+                manifest["gates"] = gates
                 save()
 
                 if architect_outcome in ("rejected", "budget_exhausted"):
@@ -3108,6 +3757,96 @@ def main():
                 raise V2Error("Verifier changed repository content; refusing to continue")
 
             if ok:
+                # Task 2.3 (V7 §5.10): post-verification consistency check --
+                # cheap, deterministic, no model call by itself. Sits strictly
+                # AFTER verify() returned ok=True and BEFORE the VERIFIED
+                # promotion just below. plan.candidateFiles/expectedScope are
+                # model ESTIMATES, not a contract (see check_post_verification_
+                # consistency's docstring) -- a flag alone never blocks;
+                # only a real architect rejection of the flagged diff does.
+                consistency = check_post_verification_consistency(files, architecture_plan)
+                attempt["consistencyCheck"] = consistency
+                manifest["consistency"] = consistency
+                consistency_gate = True
+                architect_reviews = manifest.get("architectReviews")
+                if consistency["flagged"]:
+                    # Review round 1 (minor): once flagged, default to
+                    # indeterminate (None), never True -- a flagged diff
+                    # must not silently read as "clean" just because
+                    # architecture_plan/architectReviews happened to be
+                    # missing. Only an actual review decision below can
+                    # promote this to True (approved) or demote it to
+                    # False (rejected/unrecognized).
+                    consistency_gate = None
+                    if (architecture_plan is not None and architect_reviews is not None
+                            and architect_reviews["used"] < ARCHITECT_REVIEW_BUDGET):
+                        # Fix round 2 (MED): write through manifest["architectReviews"]
+                        # directly, the same way the pre-verify site above
+                        # does, instead of through the `architect_reviews`
+                        # local alias. Both mutate the same dict object at
+                        # runtime, but --architect-review-selfcheck /
+                        # --architect-replan-selfcheck's structural guard
+                        # counts literal occurrences of that increment
+                        # expression to prove there are exactly the two
+                        # legitimate increment sites (pre-verify revise/
+                        # replan loop, this post-verify consistency review)
+                        # and no others; an aliased write is invisible to
+                        # that count and silently defeats the guard.
+                        manifest["architectReviews"]["used"] += 1
+                        save()
+                        post_review = run_architect_review(
+                            engineer, ws, architecture_plan, files, change_types, baseline,
+                            session, events_path, sid, iteration, review_round + 1,
+                        )
+                        attempt.setdefault("architectReviews", []).append(
+                            {"round": review_round + 1, "review": post_review,
+                             "trigger": "post_verification_consistency"}
+                        )
+                        if post_review is not None:
+                            consistency_gate = (
+                                classify_architect_review_decision(post_review["decision"]) == "approved"
+                            )
+                        # else: post_review is None (fail-open) -- consistency_gate
+                        # stays the None set just above; never ran, can't tell.
+                    # else: no budget left / no plan to review against --
+                    # honesty, not a block (V7 §5.10's plan is an estimate,
+                    # not a contract): record the flag, leave scopeApproved
+                    # indeterminate (null), let VERIFIED proceed.
+
+                gates = dict(manifest.get("gates") or {})
+                gates["implementationComplete"] = bool(files) and last_engineer_rc == 0
+                gates["verificationPassed"] = True
+                gates["scopeApproved"] = combine_gate_values(
+                    scope_guard_gate_value(scope_result), consistency_gate
+                )
+                manifest["gates"] = gates
+
+                if gates_block_verified(gates):
+                    # V7 §5.10/§5.11: tests passed but one or more mandatory
+                    # gates did not hold; must never be promoted to VERIFIED.
+                    # Terminal, same as the pre-verify architect-review
+                    # rejection path above (budget for any review round
+                    # spent above is already consumed). Review round 1
+                    # (Important): three genuinely distinct causes can land
+                    # here (a scope-guard expansion, an engineer that
+                    # exited non-zero after a passing diff, a real
+                    # consistency-review rejection) -- record WHICH gate(s)
+                    # actually blocked so classify_failure can build an
+                    # honest, cause-naming detail instead of one fixed
+                    # string that was wrong for two of the three causes.
+                    blocked_gates = blocked_gate_names(gates)
+                    attempt["blockedGates"] = blocked_gates
+                    manifest["blockedGates"] = blocked_gates
+                    attempt["status"] = "needs-architect-review-consistency-rejected"
+                    manifest["attempts"].append(attempt)
+                    manifest["status"] = "needs-architect-review-consistency-rejected"
+                    manifest["state"] = canonical_session_state(manifest["status"])
+                    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                    save()
+                    final_label = "NOT VERIFIED — GATE BLOCKED (" + ", ".join(blocked_gates) + ")"
+                    print(f"\n[V2] gates blocked promotion to verified: {blocked_gates}")
+                    break
+
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
@@ -3655,6 +4394,106 @@ def _architect_first_selfcheck() -> None:
     print("architect-first self-check: PASS")
 
 
+def _architect_risk_selfcheck() -> None:
+    """Task 2.1 (V7 §5.5): proves compute_architect_risk's scoring table
+    signal-by-signal, a combination that crosses ARCHITECT_RISK_THRESHOLD,
+    a case that stays below it, and the --architect-first/--no-architect
+    flag-interaction rules (validate_architect_flags). No model, no
+    session, no subprocess. Run with:
+    python3 glimmer-v2.py --architect-risk-selfcheck
+    """
+    base_contract = {
+        "objective": "add a dashboard widget",
+        "scope": {"package": "frontend"},
+        "mode": "implement",
+    }
+
+    # 1. Zero signals -> score 0, no signals, well below threshold.
+    zero = compute_architect_risk(base_contract, 0, "minimal")
+    assert zero == {"score": 0, "signals": []}
+    assert zero["score"] < ARCHITECT_RISK_THRESHOLD
+
+    # 2. Each signal individually.
+    refactor = compute_architect_risk({**base_contract, "mode": "refactor"}, 0, "minimal")
+    assert refactor == {"score": 3, "signals": ["mode_refactor"]}
+
+    multi_pkg = compute_architect_risk(
+        {**base_contract, "scope": {"package": "repository"}}, 0, "minimal")
+    assert multi_pkg == {"score": 2, "signals": ["multi_package_scope"]}
+
+    high_candidates = compute_architect_risk(
+        base_contract, ARCHITECT_RISK_CANDIDATE_THRESHOLD + 1, "minimal")
+    assert high_candidates == {"score": 2, "signals": ["candidate_count_high"]}
+    # Exactly-at-threshold does NOT fire (strictly greater-than).
+    at_candidate_threshold = compute_architect_risk(
+        base_contract, ARCHITECT_RISK_CANDIDATE_THRESHOLD, "minimal")
+    assert at_candidate_threshold == {"score": 0, "signals": []}
+
+    protected = compute_architect_risk(
+        {**base_contract, "objective": "migrate the auth schema"}, 0, "minimal")
+    assert protected == {"score": 3, "signals": ["protected_area_keyword"]}
+    # Substring, not whole-token, must NOT false-positive (e.g. "author").
+    no_false_positive = compute_architect_risk(
+        {**base_contract, "objective": "credit the author of this module"}, 0, "minimal")
+    assert no_false_positive == {"score": 0, "signals": []}
+
+    full_verify = compute_architect_risk(base_contract, 0, "full")
+    assert full_verify == {"score": 2, "signals": ["verification_full"]}
+    # "standard" is not "full" -- no signal.
+    assert compute_architect_risk(base_contract, 0, "standard") == {"score": 0, "signals": []}
+
+    # 3. Combination crossing the threshold: mode_refactor (3) +
+    # multi_package_scope (2) == 5 == ARCHITECT_RISK_THRESHOLD. Order of
+    # signals in the output follows table order regardless of which
+    # fields were set on the input.
+    combo = compute_architect_risk(
+        {"objective": "x", "scope": {"package": "repository"}, "mode": "refactor"}, 0, "minimal")
+    assert combo["score"] == 5 == ARCHITECT_RISK_THRESHOLD
+    assert combo["signals"] == ["mode_refactor", "multi_package_scope"]
+
+    # 4. Below threshold: any single signal alone (max single signal is 3)
+    # never reaches the threshold on its own.
+    assert refactor["score"] < ARCHITECT_RISK_THRESHOLD
+    assert protected["score"] < ARCHITECT_RISK_THRESHOLD
+
+    # 5. All five signals stack additively, in table order.
+    everything = compute_architect_risk(
+        {
+            "objective": "migrate the payment schema",
+            "scope": {"package": "repository"},
+            "mode": "refactor",
+        },
+        ARCHITECT_RISK_CANDIDATE_THRESHOLD + 5,
+        "full",
+    )
+    assert everything == {
+        "score": 12,
+        "signals": [
+            "mode_refactor", "multi_package_scope", "candidate_count_high",
+            "protected_area_keyword", "verification_full",
+        ],
+    }
+
+    # 6. Defensive against malformed/partial input -- never raises.
+    assert compute_architect_risk(None, 0, None) == {"score": 0, "signals": []}
+    assert compute_architect_risk({}, "not-an-int", "full") == {"score": 2, "signals": ["verification_full"]}
+
+    # 7. Flag-interaction rules (validate_architect_flags): --no-architect
+    # wins over the auto-trigger (a separate, main()-side score check --
+    # not this function's concern), but --architect-first + --no-architect
+    # together is an explicit contradiction and must raise.
+    validate_architect_flags(False, False)  # no-op, no error
+    validate_architect_flags(True, False)   # --architect-first alone, fine
+    validate_architect_flags(False, True)   # --no-architect alone, fine
+    try:
+        validate_architect_flags(True, True)
+        assert False, "expected V2Error for --architect-first + --no-architect"
+    except V2Error as exc:
+        assert "mutually exclusive" in str(exc)
+
+    print("architect-risk self-check: PASS")
+
+
 def _architect_review_selfcheck() -> None:
     """C2 (glimmer-v7): proves the pre-verification review's core
     invariants without a live model or a full main() run — decision
@@ -3670,7 +4509,10 @@ def _architect_review_selfcheck() -> None:
     assert classify_architect_review_decision("APPROVED") == "approved"
     assert classify_architect_review_decision("APPROVED_WITH_CONDITIONS") == "approved"
     assert classify_architect_review_decision("REVISE_IMPLEMENTATION") == "revise"
-    assert classify_architect_review_decision("REPLAN_REQUIRED") == "rejected"
+    # Task 2.2 (V7 §5.12): REPLAN_REQUIRED is no longer terminal-rejected --
+    # see --architect-replan-selfcheck for the full re-planning-loop
+    # coverage (version bump, budget sharing, invalid-replan fail-closed).
+    assert classify_architect_review_decision("REPLAN_REQUIRED") == "replan"
     assert classify_architect_review_decision("HUMAN_REVIEW_REQUIRED") == "rejected"
     assert classify_architect_review_decision("NOT_A_REAL_DECISION") == "rejected"  # never silently proceed
 
@@ -3837,20 +4679,31 @@ def _architect_review_selfcheck() -> None:
 
     # ------------------------------------------------------------
     # 10. Fix round 1 (Important 1+2): budget increments ONLY on a
-    #     REVISE_IMPLEMENTATION disagreement round -- a plain APPROVED/
-    #     APPROVED_WITH_CONDITIONS review, and a fail-open (no usable
-    #     review output) round, must both be free. Otherwise repeated
-    #     approvals across repair iterations pre-block later iterations
-    #     (Important 1), and persistent review-machinery failure burns
-    #     budget until fail-open degrades into fail-closed (Important 2).
-    #     Structural proof via source ordering: the ONE increment site
+    #     disagreement round (REVISE_IMPLEMENTATION OR, since Task 2.2,
+    #     REPLAN_REQUIRED -- same shared counter, see --architect-replan-
+    #     selfcheck) -- a plain APPROVED/APPROVED_WITH_CONDITIONS review,
+    #     and a fail-open (no usable review output) round, must both be
+    #     free. Otherwise repeated approvals across repair iterations
+    #     pre-block later iterations (Important 1), and persistent
+    #     review-machinery failure burns budget until fail-open degrades
+    #     into fail-closed (Important 2). Structural proof via source
+    #     ordering: the FIRST increment site (the one this proof checks)
     #     is only reachable after the review call AND after both the
     #     fail-open break and the approved/rejected break have already
-    #     had their chance to fire -- i.e. only on the remaining case,
-    #     "revise".
+    #     had their chance to fire -- i.e. only on the remaining cases,
+    #     "revise"/"replan".
+    #
+    #     Fix round 2 (MED): exactly TWO increment sites are legitimate
+    #     in the whole file -- (1) this pre-verify revise/replan loop,
+    #     and (2) Task 2.3's post-verify consistency review (C2.3, a few
+    #     hundred lines below) -- both now write through the identical
+    #     literal expression (no more `architect_reviews` local alias at
+    #     the second site) so this count actually proves what it claims;
+    #     an aliased write would be invisible to a literal-string count.
     # ------------------------------------------------------------
-    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1, (
-        "budget must increment in exactly one place"
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 2, (
+        "budget must increment in exactly the two legitimate places: the "
+        "pre-verify revise/replan loop and the post-verify consistency review"
     )
     increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
     review_call_idx = main_source.index("review = run_architect_review(")
@@ -3882,6 +4735,302 @@ def _architect_review_selfcheck() -> None:
     )
 
     print("architect review self-check: PASS")
+
+
+def _architect_replan_selfcheck() -> None:
+    """Task 2.2 (glimmer-v7, V7 §5.12): re-planning loop + plan versions.
+    Covers decision routing (REPLAN_REQUIRED no longer terminal-rejected),
+    the replan prompt builder, version-increment + plan-history
+    persistence, run_architect_replan's invalid-plan fail-closed
+    contract, and source-ordering proofs that replan shares the review
+    loop's existing budget and that the architect_replan_started emit
+    site actually lives inside that loop. No live model needed -- same
+    fixture/monkeypatch style as --architect-review-selfcheck.
+    Run with: python3 glimmer-v2.py --architect-replan-selfcheck
+    """
+    import inspect
+
+    # ------------------------------------------------------------
+    # 1. Decision routing: REPLAN_REQUIRED routes to a NEW "replan"
+    #    outcome, not "rejected" -- it is no longer terminal.
+    # ------------------------------------------------------------
+    assert classify_architect_review_decision("REPLAN_REQUIRED") == "replan"
+    assert classify_architect_review_decision("HUMAN_REVIEW_REQUIRED") == "rejected"
+    assert classify_architect_review_decision("REVISE_IMPLEMENTATION") == "revise"
+
+    # ------------------------------------------------------------
+    # 2. make_architect_replan_prompt: reuses make_architect_prompt
+    #    verbatim as a prefix, appends findings/requiredChanges as
+    #    evidence of why v{from_version} failed; never raises on an
+    #    empty/missing review.
+    # ------------------------------------------------------------
+    contract = {
+        "objective": "restore a session after reload",
+        "scope": {"package": "repository"},
+        "mode": "implement",
+        "constraints": {},
+        "verification": [],
+        "repairBudget": 0,
+    }
+    summary = "repo summary text"
+    base_prompt = make_architect_prompt(contract, summary)
+
+    review = {
+        "decision": "REPLAN_REQUIRED",
+        "findings": ["duplicate state introduced"],
+        "requiredChanges": ["reuse existing store"],
+    }
+    replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version=1)
+    assert replan_prompt.startswith(base_prompt)
+    assert "v1" in replan_prompt
+    assert "duplicate state introduced" in replan_prompt
+    assert "reuse existing store" in replan_prompt
+
+    # Never raises / never empty on a missing or findings-less review.
+    empty_prompt = make_architect_replan_prompt(contract, summary, {}, from_version=2)
+    assert empty_prompt.startswith(base_prompt) and empty_prompt != base_prompt
+    assert make_architect_replan_prompt(contract, summary, None, from_version=2) == empty_prompt
+
+    # ------------------------------------------------------------
+    # 3. record_architecture_plan_version: writes architecture-plan-vN.json
+    #    (never overwritten by a later version -- real history) AND keeps
+    #    architecture-plan.json pointed at the LATEST version (existing
+    #    gateway-reader convention, unchanged file name/location).
+    #    Appends exactly one manifest["architectPlans"] entry per call.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+        manifest = {}
+
+        plan_v1 = {"objective": "x", "packages": [], "risk": "low", "version": 1}
+        record_architecture_plan_version(session_dir, manifest, plan_v1)
+        assert json.loads((session_dir / "architecture-plan-v1.json").read_text())["version"] == 1
+        assert json.loads((session_dir / "architecture-plan.json").read_text())["version"] == 1
+        assert manifest["architectPlans"] == [
+            {"version": 1, "path": "architecture-plan-v1.json",
+             "createdAt": manifest["architectPlans"][0]["createdAt"]}
+        ]
+        assert manifest["architectPlans"][0]["createdAt"]  # non-empty ISO timestamp
+
+        plan_v2 = {"objective": "x", "packages": [], "risk": "low", "version": 2}
+        record_architecture_plan_version(session_dir, manifest, plan_v2)
+        assert json.loads((session_dir / "architecture-plan-v2.json").read_text())["version"] == 2
+        # "latest" file now reflects v2 -- overwritten, not appended.
+        assert json.loads((session_dir / "architecture-plan.json").read_text())["version"] == 2
+        # v1's own versioned snapshot is untouched -- history, not overwritten.
+        assert json.loads((session_dir / "architecture-plan-v1.json").read_text())["version"] == 1
+        assert [e["version"] for e in manifest["architectPlans"]] == [1, 2]
+
+    # ------------------------------------------------------------
+    # 4. run_architect_replan: uniform-None-on-failure contract (same
+    #    shape as run_architect_first/load_architecture_plan). Monkeypatch
+    #    invoke_engineer (module-global swapped back in `finally`, same
+    #    pattern as --repomap-cache-selfcheck's _build_repo_map_uncached
+    #    swap) so no live model/subprocess is needed.
+    # ------------------------------------------------------------
+    real_invoke_engineer = globals()["invoke_engineer"]
+    try:
+        # 4a. Engineer subprocess "succeeds" but writes nothing usable
+        #     (e.g. crashed mid-write, or never got session dir) ->
+        #     load_architecture_plan degrades to None -> replan returns
+        #     None. This IS the fail-closed contract: caller must never
+        #     fall back to silently continuing on the rejected plan.
+        #
+        #     Fix round 1 (HIGH): PRE-SEED architecture-plan.json with the
+        #     REJECTED v{from_version} plan first, exactly like the real
+        #     session dir has it (record_architecture_plan_version already
+        #     wrote it there as "latest" when v1 was created) -- without
+        #     this seed, an empty temp dir would return None regardless of
+        #     whether run_architect_replan unlinks it, giving this
+        #     assertion no teeth. With the seed present, a dead subprocess
+        #     that writes nothing must still yield None -- proving the
+        #     unlink-before-invoke fix, not just an empty-dir coincidence.
+        globals()["invoke_engineer"] = lambda *a, **k: 0
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            events_path = session_dir / "events.jsonl"
+            (session_dir / "architecture-plan.json").write_text(
+                json.dumps({
+                    "objective": "restore a session after reload",
+                    "packages": ["frontend"], "risk": "medium", "version": 1,
+                }),
+                encoding="utf-8",
+            )
+            result = run_architect_replan(
+                Path("fake-engineer"), session_dir, contract, summary, session_dir,
+                events_path, "sid-replan-fail", review, from_version=1, to_version=2,
+            )
+            assert result is None, (
+                "a dead replan subprocess must never re-load and re-stamp "
+                "the OLD (rejected) plan as the new version -- fail-closed, "
+                "not fail-open"
+            )
+            assert not (session_dir / "architecture-plan.json").exists(), (
+                "the stale v{from_version} file must be gone, not silently reused"
+            )
+
+        # 4a2. Fix round 2 (LOW): same dead-subprocess failure, but now
+        #      the real session-dir shape -- record_architecture_plan_
+        #      version's versioned snapshot (architecture-plan-v1.json)
+        #      is ALSO on disk, not just the "latest" pointer. A failed
+        #      replan must restore architecture-plan.json FROM that
+        #      snapshot (observability for the now-terminal session dir)
+        #      while still returning None (caller still fails closed --
+        #      this restore is purely for whoever inspects the dir after).
+        globals()["invoke_engineer"] = lambda *a, **k: 0
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            events_path = session_dir / "events.jsonl"
+            v1_plan_text = json.dumps({
+                "objective": "restore a session after reload",
+                "packages": ["frontend"], "risk": "medium", "version": 1,
+            })
+            (session_dir / "architecture-plan.json").write_text(v1_plan_text, encoding="utf-8")
+            (session_dir / "architecture-plan-v1.json").write_text(v1_plan_text, encoding="utf-8")
+            result = run_architect_replan(
+                Path("fake-engineer"), session_dir, contract, summary, session_dir,
+                events_path, "sid-replan-fail-restore", review, from_version=1, to_version=2,
+            )
+            assert result is None, "a dead replan subprocess must still fail closed"
+            assert (session_dir / "architecture-plan.json").exists(), (
+                "architecture-plan.json must be restored from the v{from_version} "
+                "snapshot after a failed replan, for observability"
+            )
+            assert json.loads((session_dir / "architecture-plan.json").read_text()) == json.loads(v1_plan_text)
+            # The versioned snapshot itself is untouched (read from, not consumed).
+            assert json.loads((session_dir / "architecture-plan-v1.json").read_text()) == json.loads(v1_plan_text)
+
+        # 4b. Engineer subprocess writes a genuinely valid plan -> replan
+        #     returns it, stamped with the NEW version (never the model's
+        #     own claim, if any -- v2.py's stamp always wins).
+        def _fake_invoke_writes_plan(engineer, ws, prompt, auto_approve, max_turns,
+                                      log_path, events_path, sid, mode=None,
+                                      plan_candidate_count=0, review_request=None):
+            Path(ws).joinpath("architecture-plan.json").write_text(
+                json.dumps({
+                    "objective": "restore a session after reload",
+                    "packages": ["frontend"],
+                    "risk": "medium",
+                    "version": 999,  # deliberately wrong -- must be overwritten
+                }),
+                encoding="utf-8",
+            )
+            return 0
+
+        globals()["invoke_engineer"] = _fake_invoke_writes_plan
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            events_path = session_dir / "events.jsonl"
+            new_plan = run_architect_replan(
+                Path("fake-engineer"), session_dir, contract, summary, session_dir,
+                events_path, "sid-replan-ok", review, from_version=1, to_version=2,
+            )
+            assert new_plan is not None
+            assert new_plan["version"] == 2, "v2.py's stamp must win over any model-claimed version"
+            assert new_plan["risk"] == "medium"
+    finally:
+        globals()["invoke_engineer"] = real_invoke_engineer
+
+    # ------------------------------------------------------------
+    # 5. Source-ordering proofs on main()'s review loop.
+    # ------------------------------------------------------------
+    main_source = inspect.getsource(main)
+
+    # 5a. The architect_replan_started emit site must sit INSIDE the
+    #     review loop (between its `while True:` opening and the
+    #     post-loop gates assignment) -- not, say, buried unreachably
+    #     inside run_architect_replan itself (a different function, so
+    #     it would never appear in main_source at all if misplaced).
+    loop_start_idx = main_source.index("while True:", main_source.index("review_round = 0"))
+    # NOT the plan-creation-time `{"architectureApproved": None}` (an
+    # earlier, unrelated occurrence of the same prefix) -- the specific
+    # post-loop assignment that closes out the review sub-loop. Task 2.3
+    # review round 1 changed this from a wholesale `manifest["gates"] = {...}`
+    # to a merge-not-clobber assignment; anchor on the merge's own key
+    # write instead of the old literal.
+    gates_idx = main_source.index('gates["architectureApproved"] = architect_gates_value(architect_outcome)')
+    replan_emit_idx = main_source.index('emit_event(events_path, "architect_replan_started"')
+    assert loop_start_idx < replan_emit_idx < gates_idx, (
+        "architect_replan_started must be emitted from inside the review loop"
+    )
+
+    # 5b. Replan is gated behind the SAME shared budget increment as
+    #     revise -- no separate replan-only increment site. Fix round 2
+    #     (MED): exactly TWO legitimate increment sites exist in the
+    #     whole file (the pre-verify revise/replan loop this replan
+    #     branch lives in, and Task 2.3's post-verify consistency
+    #     review) -- `.index()` below finds the FIRST one (this loop's),
+    #     which is what the replan branch must be reachable after.
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 2
+    increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
+    replan_branch_idx = main_source.index('if decision_outcome == "replan":')
+    assert increment_idx < replan_branch_idx, (
+        "replan must be gated behind the SAME shared budget increment as revise, "
+        "not a separate/unbudgeted path"
+    )
+
+    # 5c. Invalid-replan fail-closed: the "new_plan is None" branch sets
+    #     architect_outcome = "rejected" (the EXISTING terminal path,
+    #     never a new/silent-continue status), and that assignment is
+    #     only reachable after the shared budget increment -- i.e. the
+    #     budget is already spent by the time a replan can fail closed.
+    fail_closed_idx = main_source.index("if new_plan is None:")
+    rejected_after_replan_idx = main_source.index('architect_outcome = "rejected"', fail_closed_idx)
+    assert increment_idx < fail_closed_idx < rejected_after_replan_idx, (
+        "invalid-replan fail-closed must be reachable only after budget consumption"
+    )
+
+    # 5d. Fix round 1 (MED x2): after the plan swap, candidate_evidence,
+    #     manifest["architectPlan"], and tasks must all be refreshed
+    #     against the NEW plan -- not left stale from v{from_version}.
+    #     Structural proof: all three refresh sites appear AFTER
+    #     `architecture_plan = new_plan` (the swap itself).
+    swap_idx = main_source.index("architecture_plan = new_plan")
+    evidence_refresh_idx = main_source.index(
+        "candidate_evidence = read_candidate_evidence(architecture_plan, ws)", swap_idx
+    )
+    architect_plan_manifest_refresh_idx = main_source.index(
+        'manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)', swap_idx
+    )
+    tasks_merge_idx = main_source.index(
+        "tasks = merge_replanned_tasks(tasks, derive_tasks(architecture_plan))", swap_idx
+    )
+    assert swap_idx < evidence_refresh_idx, "candidate_evidence must be re-read against the NEW plan"
+    assert swap_idx < architect_plan_manifest_refresh_idx, "architectPlan risk snapshot must reflect the NEW plan"
+    assert swap_idx < tasks_merge_idx, "tasks must be re-derived from the NEW plan"
+
+    # ------------------------------------------------------------
+    # 6. merge_replanned_tasks: carries over status for an IDENTICAL
+    #    (kind, description) pair; genuinely new tasks start pending;
+    #    never raises on old_tasks=None/[] (first-ever plan).
+    # ------------------------------------------------------------
+    old_tasks = [
+        {"id": "t1", "kind": "implementation", "description": "inspect hydration path", "status": "complete"},
+        {"id": "t2", "kind": "implementation", "description": "add restoration hook", "status": "failed"},
+        {"id": "t3", "kind": "verification", "description": "frontend_typecheck", "status": "complete"},
+    ]
+    new_tasks = [
+        {"id": "t1", "kind": "implementation", "description": "inspect hydration path", "status": "pending"},
+        {"id": "t2", "kind": "implementation", "description": "add a NEW retry layer", "status": "pending"},
+        {"id": "t3", "kind": "verification", "description": "frontend_typecheck", "status": "pending"},
+    ]
+    merged = merge_replanned_tasks(old_tasks, new_tasks)
+    assert merged[0]["status"] == "complete", "identical description -> status carried over"
+    assert merged[1]["status"] == "pending", "genuinely new work -> starts pending, nothing to carry"
+    assert merged[2]["status"] == "complete", "verification task carried over the same way"
+    assert merge_replanned_tasks(None, new_tasks) == new_tasks, "no old tasks -> new_tasks returned as-is"
+    assert merge_replanned_tasks([], new_tasks) == new_tasks
+
+    # kind-scoped: an implementation and a verification task sharing the
+    # exact same description text must NEVER cross-match.
+    cross_kind_old = [{"id": "t1", "kind": "implementation", "description": "run lint", "status": "complete"}]
+    cross_kind_new = [{"id": "t1", "kind": "verification", "description": "run lint", "status": "pending"}]
+    assert merge_replanned_tasks(cross_kind_old, cross_kind_new)[0]["status"] == "pending", (
+        "kind must be part of the match key -- an implementation task's status "
+        "must never leak onto a same-worded verification task"
+    )
+
+    print("architect replan self-check: PASS")
 
 
 def _tasks_selfcheck() -> None:
@@ -4176,6 +5325,242 @@ def _doc_impact_selfcheck() -> None:
     assert len(tasks_clean) == 1, "no doc task on a clean change"
 
     print("doc-impact (O2 phase 1) self-check: PASS")
+
+
+def _gates_selfcheck() -> None:
+    """Task 2.3 (glimmer-v7, V7 §5.10/§5.11): post-verification consistency
+    check + the completed 5-key gates object. Covers
+    check_post_verification_consistency's four required cases (clean,
+    outside-files flagged, maxFiles exceeded, no plan -> no-op), the
+    scope_guard_gate_value/combine_gate_values/gates_block_verified
+    composition matrix (each False blocks VERIFIED, None does not), and a
+    source-ordering proof that the consistency check runs strictly between
+    the changed-files verify() call and the VERIFIED promotion. Run with:
+    python3 glimmer-v2.py --gates-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. check_post_verification_consistency
+    # ------------------------------------------------------------
+    # No plan -> deterministic no-op, never an indeterminate result.
+    assert check_post_verification_consistency(["a.ts"], None) == {
+        "flagged": False, "outsideFiles": [], "reason": None,
+    }
+    assert check_post_verification_consistency([], {}) == {
+        "flagged": False, "outsideFiles": [], "reason": None,
+    }
+
+    # Clean: every changed file is a candidate; normalization tolerates a
+    # "./" prefix on either side.
+    clean_plan = {"candidateFiles": [{"path": "./src/a.ts"}, {"path": "src/b.ts"}]}
+    clean = check_post_verification_consistency(["src/a.ts", "src/b.ts"], clean_plan)
+    assert clean == {"flagged": False, "outsideFiles": [], "reason": None}
+
+    # Outside files: a changed file with no matching candidateFiles entry.
+    outside_plan = {"candidateFiles": [{"path": "src/a.ts"}]}
+    outside = check_post_verification_consistency(["src/a.ts", "src/unexpected.ts"], outside_plan)
+    assert outside["flagged"] is True
+    assert outside["outsideFiles"] == ["src/unexpected.ts"]
+    assert "outside plan.candidateFiles" in outside["reason"]
+
+    # maxFiles exceeded: every file IS a listed candidate, but the count
+    # alone exceeds expectedScope.maxFiles -- outsideFiles stays empty,
+    # flagged is still True, for a distinct reason.
+    budget_plan = {
+        "candidateFiles": [{"path": "a.ts"}, {"path": "b.ts"}, {"path": "c.ts"}],
+        "expectedScope": {"maxFiles": 2},
+    }
+    over_budget = check_post_verification_consistency(["a.ts", "b.ts", "c.ts"], budget_plan)
+    assert over_budget["flagged"] is True
+    assert over_budget["outsideFiles"] == []
+    assert "maxFiles=2" in over_budget["reason"]
+
+    # Review round 1 (minor): empty/malformed candidateFiles (model
+    # output, hostile input) never raises, and must NOT guarantee a flag
+    # by itself -- an architect that named zero usable candidate files
+    # has given us nothing to compare against, which is honestly "can't
+    # tell", not "everything is outside scope". maxFiles stays a live,
+    # independent signal regardless.
+    malformed = check_post_verification_consistency(
+        ["a.ts"], {"candidateFiles": "not-a-list", "expectedScope": "not-a-dict"}
+    )
+    assert malformed == {"flagged": False, "outsideFiles": [], "reason": None}
+    no_usable_entries = check_post_verification_consistency(
+        ["a.ts"], {"candidateFiles": [{"path": 123}, "not-a-dict", {"path": "  "}]}
+    )
+    assert no_usable_entries == {"flagged": False, "outsideFiles": [], "reason": None}
+
+    # ...but maxFiles alone still flags even when candidateFiles is
+    # entirely unusable -- the two checks are independent.
+    malformed_over_budget = check_post_verification_consistency(
+        ["a.ts", "b.ts", "c.ts"],
+        {"candidateFiles": "not-a-list", "expectedScope": {"maxFiles": 1}},
+    )
+    assert malformed_over_budget["flagged"] is True
+    assert malformed_over_budget["outsideFiles"] == []
+    assert "maxFiles=1" in malformed_over_budget["reason"]
+
+    # Path normalization (minor fix): leading/trailing slashes and
+    # double slashes are tolerated, not just a bare "./" prefix.
+    normalized_plan = {"candidateFiles": [{"path": "/src/a.ts/"}]}
+    assert check_post_verification_consistency(["src//a.ts"], normalized_plan) == {
+        "flagged": False, "outsideFiles": [], "reason": None,
+    }
+
+    # ------------------------------------------------------------
+    # 2. scope_guard_gate_value
+    # ------------------------------------------------------------
+    assert scope_guard_gate_value(None) is None
+    assert scope_guard_gate_value({"inScope": True, "expandedFiles": []}) is True
+    assert scope_guard_gate_value({"inScope": False, "expandedFiles": ["x.ts"]}) is False
+    assert scope_guard_gate_value({"inScope": False, "expandedFiles": [], "unbounded": True}) is None
+
+    # ------------------------------------------------------------
+    # 3. combine_gate_values -- False dominates, then None, else True.
+    # ------------------------------------------------------------
+    assert combine_gate_values(True, True) is True
+    assert combine_gate_values(True, False) is False
+    assert combine_gate_values(False, None) is False
+    assert combine_gate_values(True, None) is None
+    assert combine_gate_values(None, None) is None
+    assert combine_gate_values() is True  # vacuous AND
+
+    # ------------------------------------------------------------
+    # 4. gates_block_verified: implementationComplete/verificationPassed
+    #    must be exactly True; architectureApproved/scopeApproved may be
+    #    True OR None, only False blocks. documentationCurrent is
+    #    deliberately NOT in the blocking set (review round 1, Important)
+    #    -- it can only ever be False or None, never True, so wiring it
+    #    in would make EVERY doc-relevant change permanently unable to
+    #    reach VERIFIED; also its producer runs in main()'s finally block,
+    #    strictly AFTER this function's caller already decided VERIFIED
+    #    vs. not, so it would be decorative even if wired in.
+    # ------------------------------------------------------------
+    all_true = {
+        "implementationComplete": True, "architectureApproved": True,
+        "verificationPassed": True, "scopeApproved": True, "documentationCurrent": True,
+    }
+    assert gates_block_verified(all_true) is False, "V7 §5.11's own worked example must pass"
+
+    # Absent optional gate keys (no plan, no doc impact) default to None via
+    # dict.get -- never-ran/not-applicable, must not block.
+    assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
+
+    for optional_key in ("architectureApproved", "scopeApproved"):
+        blocked = dict(all_true, **{optional_key: False})
+        assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
+        nulled = dict(all_true, **{optional_key: None})
+        assert gates_block_verified(nulled) is False, f"{optional_key}=None must NOT block VERIFIED"
+
+    # documentationCurrent=False must NOT block -- the one property the
+    # real path can never exhibit otherwise (its producer never runs
+    # before this decision), proven directly here.
+    assert gates_block_verified(dict(all_true, documentationCurrent=False)) is False, (
+        "documentationCurrent must never block VERIFIED -- phase 1's detector can only "
+        "ever produce False/None, never True, and its producer runs after this decision anyway"
+    )
+    assert gates_block_verified(dict(all_true, documentationCurrent=None)) is False
+
+    assert gates_block_verified(dict(all_true, implementationComplete=False)) is True
+    assert gates_block_verified(dict(all_true, implementationComplete=None)) is True, (
+        "implementationComplete has no honest null -- it is always computable once verify() ran"
+    )
+    assert gates_block_verified(dict(all_true, verificationPassed=False)) is True
+    assert gates_block_verified(dict(all_true, verificationPassed=None)) is True
+
+    # ------------------------------------------------------------
+    # 4b. blocked_gate_names / describe_blocked_gates (review round 1,
+    #     Important): honest, cause-naming detail per distinct cause.
+    # ------------------------------------------------------------
+    assert blocked_gate_names(all_true) == []
+    assert blocked_gate_names(dict(all_true, implementationComplete=False)) == ["implementationComplete"]
+    assert blocked_gate_names(dict(all_true, scopeApproved=False)) == ["scopeApproved"]
+    assert blocked_gate_names(dict(all_true, architectureApproved=False, scopeApproved=False)) == [
+        "architectureApproved", "scopeApproved",
+    ]
+    # documentationCurrent=False must never show up as a blocked gate --
+    # it isn't in gates_block_verified's checked set at all.
+    assert blocked_gate_names(dict(all_true, documentationCurrent=False)) == []
+
+    # Controller ruling: implementationComplete's detail must say exactly
+    # this, never "architecture review rejected".
+    impl_blocked = {"blockedGates": ["implementationComplete"], "attempts": [], "consistency": {}}
+    assert describe_blocked_gates(impl_blocked) == "engineer exited non-zero after a passing diff"
+
+    # scopeApproved blocked via a real scope-guard expansion (consistency
+    # clean) -- names the actual expanded files, not "architecture review
+    # rejected".
+    scope_only = {
+        "blockedGates": ["scopeApproved"],
+        "attempts": [{"scopeGuard": {"expandedFiles": ["src/unexpected.ts"]}}],
+        "consistency": {"outsideFiles": []},
+    }
+    scope_detail = describe_blocked_gates(scope_only)
+    assert "scope guard expansion" in scope_detail and "src/unexpected.ts" in scope_detail
+    assert "architecture review rejected" not in scope_detail
+
+    # scopeApproved blocked via a real consistency-review rejection
+    # (scope guard clean) -- names the actual outside files.
+    consistency_only = {
+        "blockedGates": ["scopeApproved"],
+        "attempts": [{"scopeGuard": {"expandedFiles": []}}],
+        "consistency": {"outsideFiles": ["src/extra.ts"]},
+    }
+    consistency_detail = describe_blocked_gates(consistency_only)
+    assert "consistency review rejected" in consistency_detail and "src/extra.ts" in consistency_detail
+
+    # Both causes at once -- both named, not collapsed into one.
+    both = {
+        "blockedGates": ["scopeApproved"],
+        "attempts": [{"scopeGuard": {"expandedFiles": ["a.ts"]}}],
+        "consistency": {"outsideFiles": ["b.ts"]},
+    }
+    both_detail = describe_blocked_gates(both)
+    assert "a.ts" in both_detail and "b.ts" in both_detail
+
+    # Never raises on a missing/malformed manifest.
+    assert describe_blocked_gates({}) == "one or more V7 §5.11 gates blocked promotion to verified"
+
+    # ------------------------------------------------------------
+    # 5. Source-ordering proof: the consistency check must run strictly
+    #    between the changed-files verify() call and the VERIFIED
+    #    promotion, so a flagged/rejected diff can never slip past it.
+    # ------------------------------------------------------------
+    import inspect
+    main_source = inspect.getsource(main)
+    verify_call_idx = main_source.rindex(
+        "ok, results = verify(ws, commands, args.timeout, session, iteration,"
+    )
+    consistency_call_idx = main_source.index("consistency = check_post_verification_consistency(files, architecture_plan)")
+    gates_block_idx = main_source.index("if gates_block_verified(gates):")
+    verified_label_idx = main_source.rindex('final_label = "VERIFIED"')
+    assert verify_call_idx < consistency_call_idx, (
+        "the consistency check must run AFTER verify() -- it inspects the FINAL changed-files set"
+    )
+    assert consistency_call_idx < gates_block_idx < verified_label_idx, (
+        "gates_block_verified's decision must be made, and consulted, BEFORE the VERIFIED promotion"
+    )
+
+    # 5b. Review round 1 (minor): once flagged, consistency_gate's default
+    #     must be None, never True -- a flagged diff with no plan/budget
+    #     to review against must read as indeterminate, not clean. Proven
+    #     structurally: the ONLY `consistency_gate = None` assignment that
+    #     sits directly inside the `if consistency["flagged"]:` block
+    #     (immediately after it, before any nested budget/plan check) is
+    #     the real default -- there is no `consistency_gate = True`
+    #     anywhere after that same `if` line.
+    flagged_if_idx = main_source.index('if consistency["flagged"]:')
+    default_none_idx = main_source.index("consistency_gate = None", flagged_if_idx)
+    plan_check_idx = main_source.index("if (architecture_plan is not None and architect_reviews is not None", flagged_if_idx)
+    assert flagged_if_idx < default_none_idx < plan_check_idx, (
+        "consistency_gate must default to None immediately upon flagging, "
+        "before checking whether a review can actually run"
+    )
+    assert "consistency_gate = True" not in main_source[flagged_if_idx:], (
+        "once flagged, consistency_gate must never be reset to True except via an "
+        "actual approved review decision"
+    )
+
+    print("gates (Task 2.3, V7 §5.10/§5.11) self-check: PASS")
 
 
 def _visual_selfcheck() -> None:
@@ -4559,8 +5944,14 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--architect-first-selfcheck"]:
         _architect_first_selfcheck()
         raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-risk-selfcheck"]:
+        _architect_risk_selfcheck()
+        raise SystemExit(0)
     if sys.argv[1:] == ["--architect-review-selfcheck"]:
         _architect_review_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-replan-selfcheck"]:
+        _architect_replan_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--tasks-selfcheck"]:
         _tasks_selfcheck()
@@ -4570,6 +5961,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--doc-impact-selfcheck"]:
         _doc_impact_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--gates-selfcheck"]:
+        _gates_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--skills-selfcheck"]:
         _skills_selfcheck()
