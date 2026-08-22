@@ -8,7 +8,7 @@ import type {
   ArchitecturePlan, ArchitectReview, DeliveryReview, ArchitectEscalation, DeliveryPacket,
   GlimmerTask, HumanAcceptance,
   FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
-  EvidenceIndexEntry, EvidenceEntryResponse,
+  EvidenceIndexEntry, EvidenceEntryResponse, ApprovalRequest,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -27,6 +27,11 @@ export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   if (raw === "initialized") return "preflight";
   if (raw === "verified" || raw === "no-change-verified") return "verified";
   if (raw === "no-change-unverified") return "needs_review";
+  // Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string
+  // directly into manifest.json while it's blocked polling approvals.json
+  // for a YELLOW-classified action, and reverts it as soon as the wait
+  // resolves -- see glimmer-v2.py's canonical_session_state, kept in sync.
+  if (raw === "waiting-for-approval") return "waiting_for_approval";
   // C2 (glimmer-v7): terminal status when the architect review gate rejects
   // the implementation or the review budget is exhausted — must never be
   // promoted to "verified". Prefix match: Task 1.3 splits the legacy
@@ -160,6 +165,12 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   // `finally` block -- same optional-pass-through discipline as gates/
   // architectPlan/failure above (absent on sessions predating this task).
   if (m.statuses) session.statuses = m.statuses;
+  // Task 8.3 (V7 §14/§35): manifest.json's transient pendingApproval field
+  // -- present only while glimmer-engineer.py is actually blocked waiting
+  // on approvals.json (status is "waiting_for_approval" at the same
+  // moment). Same optional-pass-through discipline as gates/architectPlan/
+  // failure above.
+  if (m.pendingApproval) session.pendingApproval = m.pendingApproval;
   return session;
 }
 
@@ -358,6 +369,46 @@ export async function writeTaskOverride(
   await fs.writeFile(tmpPath, JSON.stringify(next), "utf-8");
   await fs.rename(tmpPath, finalPath);
   return record;
+}
+
+// --- approvals (Task 8.3, V7 §14/§35: YELLOW human-approval boundary) -----
+// approvals.json is written by BOTH processes at different, non-
+// overlapping times -- glimmer-engineer.py (request_approval_and_wait)
+// creates the "pending" entry the moment a YELLOW action needs a human
+// decision, THEN only polls (read-only) while it waits; the gateway routes
+// below add the resolution (status/resolvedAt/approvedBy) once a human
+// clicks Approve/Deny. Same read-modify-write-over-the-whole-file, write-
+// to-temp-then-rename discipline as task-overrides.json above -- there is
+// at most one pending approval per session in practice.
+export function readApprovals(id: string): Promise<Record<string, ApprovalRequest> | null> {
+  return readSessionJsonFile<Record<string, ApprovalRequest>>(id, "approvals.json");
+}
+
+// Idempotent by design: resolving an approvalId that's already resolved
+// (a double-click, or a retried request) returns the EXISTING record
+// unchanged rather than overwriting resolvedAt/approvedBy -- a second
+// "approve" can't un-resolve a "denied" decision or reset its timestamp.
+export async function resolveApproval(
+  id: string, approvalId: string, action: "approve" | "deny", approvedBy: string,
+): Promise<ApprovalRequest | null> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
+  const existing = (await readApprovals(real)) ?? {};
+  const record = existing[approvalId];
+  if (!record) return null; // no matching pending request -- 404 at the route
+  if (record.status !== "pending") return record; // already resolved -- idempotent no-op
+  const resolved: ApprovalRequest = {
+    ...record,
+    status: action === "approve" ? "approved" : "denied",
+    resolvedAt: new Date().toISOString(),
+    approvedBy,
+  };
+  const next = { ...existing, [approvalId]: resolved };
+  const finalPath = path.join(sessionsDir(), real, "approvals.json");
+  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
+  await fs.writeFile(tmpPath, JSON.stringify(next), "utf-8");
+  await fs.rename(tmpPath, finalPath);
+  return resolved;
 }
 
 // Review round 1 (Important 3): true when an override's captured

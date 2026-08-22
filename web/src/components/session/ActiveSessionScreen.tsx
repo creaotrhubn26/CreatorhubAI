@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
+import { StatusBadge } from "../common/StatusBadge";
 import { useSharedSessionEvents, useSharedLastEventAt } from "../../api/useSessionEvents";
 import { deriveSessionState } from "../../state/deriveSessionState";
 import { formatElapsed, lastActivityLabel, isStalled } from "../../state/liveness";
@@ -73,6 +75,63 @@ function LivenessLine({
   );
 }
 
+// V7 §35 risk vocabulary -- distinct from failureSeverityColor above (that
+// one colors terminal outcomes; this colors a still-pending decision).
+const RISK_COLOR: Record<string, string> = {
+  low: "var(--gray)", medium: "var(--amber)", high: "var(--red)", critical: "var(--red)",
+};
+
+// Task 8.3 (V7 §14/§35): the YELLOW human-approval boundary. Rendered
+// whenever session.pendingApproval is present -- which is exactly when
+// session.status is "waiting_for_approval" (glimmer-engineer.py sets both
+// together, see request_approval_and_wait's manifest patch, and clears
+// both together the moment the wait resolves). Approve/Deny follow the
+// same one-shot, gateway-owned, second-click-is-a-no-op conventions as
+// TasksPanel's task-override buttons.
+function ApprovalCard({ sessionId, approval }: { sessionId: string; approval: NonNullable<GlimmerSession["pendingApproval"]> }) {
+  const queryClient = useQueryClient();
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+  const approveMutation = useMutation({
+    mutationFn: () => glimmerApi.approveApproval(sessionId, approval.approvalId),
+    onSuccess: invalidate,
+  });
+  const denyMutation = useMutation({
+    mutationFn: () => glimmerApi.denyApproval(sessionId, approval.approvalId),
+    onSuccess: invalidate,
+  });
+  const pending = approveMutation.isPending || denyMutation.isPending;
+  const resolved = approval.status !== "pending";
+
+  return (
+    <div className="row" style={{ flexDirection: "column", alignItems: "stretch", gap: 6, border: "1px solid var(--amber)", borderRadius: 8, padding: 12, margin: "12px 0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <StatusBadge status="waiting_for_approval" />
+        <strong>{approval.action}</strong>
+        <span style={{ color: RISK_COLOR[approval.risk] ?? "var(--gray)" }}>{approval.risk} risk</span>
+      </div>
+      <p style={{ fontSize: 13, margin: 0 }}>{approval.reason}</p>
+      {approval.proposedChanges.length > 0 && (
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          proposed changes: {approval.proposedChanges.join(", ")}
+        </div>
+      )}
+      {(approveMutation.isError || denyMutation.isError) && (
+        <div style={{ fontSize: 12, color: "var(--red)" }}>Unavailable — could not record this decision.</div>
+      )}
+      {resolved ? (
+        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>
+          {approval.status}{approval.approvedBy ? ` by ${approval.approvedBy}` : ""}
+        </p>
+      ) : (
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => approveMutation.mutate()} disabled={pending}>Approve</button>
+          <button onClick={() => denyMutation.mutate()} disabled={pending}>Deny</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
@@ -130,6 +189,7 @@ export function ActiveSessionScreen() {
       )}
       <h1>{session.task}</h1>
       <LivenessLine isRunning={isRunning} startedAt={startedAtBase} lastEventAt={lastEventAt} />
+      {session.pendingApproval && id && <ApprovalCard sessionId={id} approval={session.pendingApproval} />}
       <div className="toolbar">
         <Link to={`/sessions/${id}/diff`}>View diff</Link>
         <Link to={`/sessions/${id}/verification`}>Verification Center</Link>

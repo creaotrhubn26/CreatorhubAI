@@ -273,11 +273,38 @@ export interface GlimmerSession {
   // time from facts already on this object plus an opt-in visual/ dir read
   // -- see FinalStatus's own field comments for the exact per-field mapping).
   finalStatus: FinalStatus;
+  // Task 8.3 (V7 §14/§35): mirrored from manifest.json's own transient
+  // "pendingApproval" field -- present ONLY while glimmer-engineer.py is
+  // actually blocked polling approvals.json for a YELLOW action (status is
+  // "waiting_for_approval" at the same time). Cleared the moment the wait
+  // resolves (approved/denied/timeout), when the engineer process patches
+  // manifest.json back to its prior status/state.
+  pendingApproval?: ApprovalRequest & { approvalId: string };
 }
 
 export interface HumanAcceptance {
   accepted: boolean;
   acceptedAt: string;
+}
+
+// Task 8.3 (V7 §14/§35) -- YELLOW human-approval boundary. Written by
+// glimmer-engineer.py (request_approval_and_wait) the moment a YELLOW-
+// classified action (classify_yellow: dependency install, migration
+// keyword, large scope expansion) needs a human decision -- status starts
+// "pending". Resolved by the gateway's own POST /sessions/:id/approvals/
+// :approvalId/approve|deny (adds status/resolvedAt/approvedBy), same "two
+// processes, one sidecar file, each writes only its own half" discipline
+// as task-overrides.json/TaskOverride. proposedChanges/risk/reason are
+// deterministic fields only -- no chain-of-thought, no model text.
+export interface ApprovalRequest {
+  action: string;
+  reason: string;
+  proposedChanges: string[];
+  risk: "low" | "medium" | "high" | "critical";
+  requestedAt: string;
+  status: "pending" | "approved" | "denied";
+  resolvedAt?: string;
+  approvedBy?: string;
 }
 
 // V7 §5.3 ArchitecturePlan — opt-in architect-mode output, written to
@@ -884,6 +911,17 @@ export interface DocumentationVerifiedEvent extends GlimmerEventBase {
   status: string;
 }
 
+// Task 8.3 (V7 §14/§35): emitted by glimmer-engineer.py's
+// request_approval_and_wait, once per approval request, right before the
+// poll loop over approvals.json starts. Deterministic fields only.
+export interface ApprovalRequestedEvent extends GlimmerEventBase {
+  type: "approval_requested";
+  approvalId: string;
+  action: string;
+  reason: string;
+  risk: ApprovalRequest["risk"];
+}
+
 export type GlimmerEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
@@ -920,7 +958,8 @@ export type GlimmerEvent =
   | ArchitectConsultedEvent
   | DocumentationImpactDetectedEvent
   | DocumentationStaleDetectedEvent
-  | DocumentationVerifiedEvent;
+  | DocumentationVerifiedEvent
+  | ApprovalRequestedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -936,6 +975,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",
   "architect_consult_advised", "architect_consulted",
+  "approval_requested",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {

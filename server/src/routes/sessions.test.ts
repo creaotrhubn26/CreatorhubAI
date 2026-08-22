@@ -885,6 +885,96 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
   });
 });
 
+// Task 8.3 (V7 §14/§35): human approve/deny for a YELLOW-classified action
+// glimmer-engineer.py is currently blocked on (approvals.json). Gateway-
+// owned resolution, exactly like the task-override routes above.
+describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () => {
+  const pendingApproval = {
+    action: "modify_dependencies",
+    reason: "engineer requested a dependency-install command: npm install left-pad",
+    proposedChanges: ["package.json", "package-lock.json"],
+    risk: "medium",
+    requestedAt: "2026-08-22T00:00:00.000Z",
+    status: "pending",
+  };
+
+  it("writes approvals.json on approve and reflects it on a re-read", async () => {
+    const id = "20260823-000001-glimmer-approval-approve";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+
+    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "daniel" });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ approvalId: "appr-1", status: "approved", approvedBy: "daniel" });
+    expect(typeof res.body.resolvedAt).toBe("string");
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "approvals.json"), "utf-8"));
+    expect(onDisk["appr-1"]).toMatchObject({ status: "approved", approvedBy: "daniel" });
+  });
+
+  it("writes approvals.json on deny, defaulting approvedBy when omitted", async () => {
+    const id = "20260823-000002-glimmer-approval-deny";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-2": pendingApproval }));
+
+    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-2/deny`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ approvalId: "appr-2", status: "denied" });
+    expect(typeof res.body.approvedBy).toBe("string");
+    expect(res.body.approvedBy.length).toBeGreaterThan(0);
+  });
+
+  it("404s for an unknown session id", async () => {
+    const res = await request(app).post("/api/sessions/does-not-exist/approvals/appr-1/approve");
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for an approvalId that was never requested", async () => {
+    const id = "20260823-000003-glimmer-approval-bad-id";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+
+    const res = await request(app).post(`/api/sessions/${id}/approvals/does-not-exist/approve`);
+    expect(res.status).toBe(404);
+  });
+
+  it("double-approve is idempotent: the second call returns the same record, not a re-resolved one", async () => {
+    const id = "20260823-000004-glimmer-approval-double";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+
+    const first = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "daniel" });
+    expect(first.status).toBe(200);
+    const second = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "someone-else" });
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body); // unchanged -- not re-resolved to "someone-else"/a new timestamp
+
+    // A denial after an approval is already recorded is equally a no-op.
+    const third = await request(app).post(`/api/sessions/${id}/approvals/appr-1/deny`);
+    expect(third.body).toEqual(first.body);
+  });
+
+  it("GET /api/sessions/:id exposes pendingApproval + status waiting_for_approval from manifest.json", async () => {
+    const id = "20260823-000005-glimmer-approval-session";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      status: "waiting-for-approval", workspace: "/tmp/ws", branch: "main", baseline: "abc123",
+      task: "add widget", attempts: [], updatedAt: "2026-08-23T00:00:00.000Z",
+      pendingApproval: { approvalId: "appr-1", ...pendingApproval },
+    }));
+
+    const res = await request(app).get(`/api/sessions/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("waiting_for_approval");
+    expect(res.body.pendingApproval).toMatchObject({ approvalId: "appr-1", action: "modify_dependencies" });
+  });
+});
+
 describe("GET /api/sessions/:id/visual/manifest", () => {
   const manifest = {
     route: "http://localhost:5183/role-room",

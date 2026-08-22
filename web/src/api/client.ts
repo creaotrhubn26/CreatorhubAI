@@ -3,6 +3,7 @@ import type {
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, DeliveryPacket, GlimmerTask, HumanAcceptance,
   CreateWorkspaceResult,
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
+  ApprovalRequest,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -42,6 +43,18 @@ export const glimmerApi = {
     request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/skip`, { method: "POST" }),
   approveTask: (id: string, taskId: string) =>
     request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/approve`, { method: "POST" }),
+  // Task 8.3 (V7 §14/§35) -- human approve/deny for a YELLOW-classified
+  // action glimmer-engineer.py is currently blocked on (approvals.json).
+  // One-shot per approvalId: a second click on an already-resolved id is a
+  // gateway-side no-op (see resolveApproval), not an error.
+  approveApproval: (id: string, approvalId: string) =>
+    request<{ approvalId: string } & ApprovalRequest>(
+      `/api/sessions/${id}/approvals/${approvalId}/approve`, { method: "POST" },
+    ),
+  denyApproval: (id: string, approvalId: string) =>
+    request<{ approvalId: string } & ApprovalRequest>(
+      `/api/sessions/${id}/approvals/${approvalId}/deny`, { method: "POST" },
+    ),
   // V7 §22.16 -- bypasses the generic request() helper (which throws on any
   // non-2xx) because 404 here is the honest, common "never ran
   // glimmer-visual.py" case a panel needs to render as "Not run", not an
