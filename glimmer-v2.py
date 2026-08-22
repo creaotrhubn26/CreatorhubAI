@@ -1996,20 +1996,40 @@ def build_skills_block(contract, plan, skills=None, skills_dir=None) -> str:
     )
 
 
-def _first_focus_task(tasks):
-    """Task 4.2 (V7 task list, "Task focus"): the single active task
-    Engineer should work on next -- the FIRST priority=="required" task
-    still status=="pending", in `tasks`' own list order. derive_tasks
-    builds `tasks` as a strict sequential chain (implementation steps
-    first, each depending on the previous; verification steps after,
-    each depending on the last implementation step -- see its own
-    docstring: "deliberately not a DAG/priority model"), so list order
-    already IS dependency order here; no separate topological sort is
-    needed. Returns None when there is no such task (nothing pending,
-    nothing required, or tasks is None/empty) -- make_prompt then omits
-    the FOCUS block entirely."""
+def _first_focus_task(tasks, in_repair: bool = False):
+    """Task 4.2 (V7 task list, "Task focus") + fix round 1 (IMPORTANT 4):
+    the single active task Engineer should work on next.
+
+    `in_repair` is True exactly when make_prompt was called with a
+    repair_contract (a REPAIR N round, not the first attempt): focus the
+    NEWEST kind=="repair" task (last in list order -- create_repair_task
+    ids are allocated monotonically via _next_task_id, so the newest
+    repair task is always last) instead of the first-pending-required
+    rule below. A repair round exists to fix ONE specific failing check;
+    pointing Engineer at whatever plan-derived task happens to be first-
+    pending-required (likely already "complete" or unrelated to the
+    failure that triggered this round) would be actively misleading.
+    Falls through to the general rule if no repair task exists yet
+    (shouldn't happen when in_repair is True, but never crash over it).
+
+    Otherwise (iteration 0, no repair round): the FIRST priority==
+    "required" task still status=="pending", in `tasks`' own list order.
+    derive_tasks builds `tasks` as a strict sequential chain
+    (implementation steps first, each depending on the previous;
+    verification steps after, each depending on the last implementation
+    step -- see its own docstring: "deliberately not a DAG/priority
+    model"), so list order already IS dependency order here; no separate
+    topological sort is needed.
+
+    Returns None when there is no such task (nothing pending, nothing
+    required, or tasks is None/empty) -- make_prompt then omits the FOCUS
+    block entirely."""
     if not tasks:
         return None
+    if in_repair:
+        repair_tasks = [t for t in tasks if t.get("kind") == "repair"]
+        if repair_tasks:
+            return repair_tasks[-1]
     for t in tasks:
         if t.get("priority") == "required" and t.get("status") == "pending":
             return t
@@ -2155,7 +2175,7 @@ a genuine fix may still require another file if the evidence supports it.
     # _first_focus_task) -- a fully in-flight/complete task list omits
     # this block too, same as "no plan at all".
     focus_block = ""
-    focus_task = _first_focus_task(tasks)
+    focus_task = _first_focus_task(tasks, in_repair=repair_contract is not None)
     if focus_task is not None:
         focus_block = (
             "\n\nFOCUS TASK (V7 task list — work on this task first; other "
@@ -3031,8 +3051,19 @@ def derive_tasks(plan: dict) -> list:
         = None (evidence: a real verify() result FUZZY-matched to this
         task's description via _match_verify_result -- no single command
         string is known yet at derivation time). priority starts
-        "required" and is refined to "required"/"recommended" once a real
-        verify() result's tier is known (see evaluate_verification_tasks).
+        "recommended" (fix round 1, CRITICAL: starting it "required"
+        deadlocked required_tasks_resolved forever whenever a plan named a
+        check verify() never actually ran under that exact wording -- an
+        honestly-unmatched task then stayed priority="required"+status=
+        "pending" for the rest of the session, permanently blocking
+        gates.tasksResolved with no way to ever resolve). It is promoted
+        to "required" ONLY once a real verify() result actually matches it
+        AND that result's own tier is "required" (see
+        evaluate_verification_tasks) -- i.e. required-ness is now
+        confirmed by evidence, never assumed at plan time. Implementation
+        and repair tasks are unaffected -- they stay "required" from
+        creation (see create_repair_task); only plan-derived VERIFICATION
+        tasks start optimistic-then-confirmed like this.
     Repair tasks (kind="repair", created by create_repair_task once a
     required-tier check actually fails) and documentation tasks (kind=
     "documentation", created by documentation_task) use this same
@@ -3082,7 +3113,7 @@ def derive_tasks(plan: dict) -> list:
             "dependsOn": [last_impl_id] if last_impl_id else [],
             "status": "pending",
             "source": "architect_plan",
-            "priority": "required",
+            "priority": "recommended",
             "evidenceIds": [],
             "affectedFiles": [],
             "blockingReason": None,
@@ -3093,31 +3124,88 @@ def derive_tasks(plan: dict) -> list:
     return tasks
 
 
+_TASK_ID_RE = re.compile(r"^t(\d+)$")
+
+
+def _next_task_id(tasks) -> int:
+    """Fix round 1 (IMPORTANT 3): monotonic id allocator -- parse every
+    existing "tN" id in `tasks`, take the max N, return N+1 (1 when
+    `tasks` is None/empty/has no parseable id). Used by every dynamic-task
+    creator (create_repair_task, documentation_task) and by
+    merge_replanned_tasks below, instead of the old `len(tasks) + 1`,
+    which silently assumed ids stay contiguous with list length -- false
+    the moment a dynamic task (repair/documentation) has ever been
+    appended and a replan then re-derives a shorter or longer plan-task
+    prefix, which could reuse an id already in use. Ignores any
+    non-"tN"-shaped id rather than raising -- robust against hand-built
+    fixtures in tests."""
+    max_n = 0
+    for t in (tasks or []):
+        m = _TASK_ID_RE.match(str(t.get("id", "")))
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return max_n + 1
+
+
 def merge_replanned_tasks(old_tasks, new_tasks):
-    """Task 2.2 fix round 1 (MED): re-deriving tasks from a NEW plan
-    version (derive_tasks always assigns fresh t1..tN ids, with no
-    stable identity across calls) must not silently discard status
-    progress already recorded against work that DIDN'T actually change.
-    Rule: a new task carries over an old task's status only when both
-    `kind` and `description` match EXACTLY (kind-scoped so an
-    implementation step and a verification step that happen to share
-    wording never cross-match). Any new task with no identical match is
-    genuinely new work introduced by the replan and starts "pending" --
-    derive_tasks' own default, untouched here. Never raises: old_tasks
-    may be None/empty (first-ever plan, nothing to carry over), in which
-    case new_tasks is returned as-is.
+    """Task 2.2 fix round 1 (MED) + Task 4.1 fix round 1 (IMPORTANT 3):
+    re-deriving tasks from a NEW plan version (derive_tasks always assigns
+    fresh t1..tN ids, with no stable identity across calls) must not
+    silently discard status progress already recorded against work that
+    DIDN'T actually change -- and must not silently DROP dynamic tasks
+    (repair/documentation/system) a prior repair round or the doc-impact
+    detector already created, which belong to the SESSION, not to any one
+    plan version.
+
+    Two rules, applied together:
+      1. Carry-over: a new plan-derived task inherits status, priority,
+         blockingReason, evidenceIds, and createdAt from an old task with
+         an IDENTICAL (kind, description) pair (kind-scoped so an
+         implementation step and a verification step sharing wording never
+         cross-match) -- updatedAt is bumped to now on any such carry, an
+         honest "this object's state changed at this moment" fact even
+         though status itself may be unchanged. A new task with no
+         identical match is genuinely new work introduced by the replan
+         and starts exactly as derive_tasks built it (untouched here).
+         `old_tasks` entries with no "source" key (pre-Task-4.1 test
+         fixtures / a plan-derived task, since derive_tasks always sets
+         source="architect_plan") default to "architect_plan" for rule 2.
+      2. Preservation: every old task whose source is NOT "architect_plan"
+         (a repair task, a documentation task, or any future "system"
+         task) is carried forward WHOLESALE into the merged list -- fix
+         round 1 (IMPORTANT 3): the old version of this function only
+         ever returned `new_tasks`, so any repair/documentation task
+         created before a replan was silently discarded the moment
+         REPLAN_REQUIRED fired. Preserved tasks are re-numbered via
+         _next_task_id (continuing from the new plan-derived tasks' own
+         max id) so they can never collide with a new plan task's id, even
+         when the new plan derives more/fewer steps than the old one did.
+
+    Never raises: old_tasks may be None/empty (first-ever plan, nothing to
+    carry over or preserve), in which case new_tasks is returned as-is.
     """
     if not old_tasks:
         return new_tasks
-    carried_status = {}
+    carried = {}
     for t in old_tasks:
         key = (t.get("kind"), t.get("description"))
-        carried_status.setdefault(key, t.get("status"))
+        carried.setdefault(key, t)
+    now = _task_timestamp()
     for t in new_tasks:
-        status = carried_status.get((t.get("kind"), t.get("description")))
-        if status:
-            t["status"] = status
-    return new_tasks
+        prior = carried.get((t.get("kind"), t.get("description")))
+        if prior is None:
+            continue
+        for field in ("status", "priority", "blockingReason", "evidenceIds", "createdAt"):
+            if field in prior:
+                t[field] = prior[field]
+        t["updatedAt"] = now
+
+    preserved = [t for t in old_tasks if t.get("source", "architect_plan") != "architect_plan"]
+    next_id = _next_task_id(new_tasks)
+    for t in preserved:
+        t["id"] = f"t{next_id}"
+        next_id += 1
+    return new_tasks + preserved
 
 
 def save_tasks(session_dir, tasks) -> None:
@@ -3194,7 +3282,13 @@ def set_implementation_tasks_status(tasks, status: str, blocking_reason: str | N
         return
     now = _task_timestamp()
     for t in tasks:
-        if (t.get("completion") or {}).get("type") == "files_changed":
+        # Fix round 1 (MINOR 9): v1 fallback -- a task with NO completion
+        # contract at all (an archived pre-Round-4 tasks.json loaded back
+        # into a live `tasks` list; glimmer-v2.py itself never does this
+        # today, but a defensive tolerance) falls back to the old
+        # kind=="implementation" rule instead of silently never matching.
+        if (t.get("completion") or {}).get("type") == "files_changed" or (
+                not t.get("completion") and t.get("kind") == "implementation"):
             t["status"] = status
             t["blockingReason"] = blocking_reason
             t["updatedAt"] = now
@@ -3217,7 +3311,10 @@ def reset_verification_tasks_status(tasks) -> None:
         return
     now = _task_timestamp()
     for t in tasks:
-        if (t.get("completion") or {}).get("type") == "check_passed":
+        # Fix round 1 (MINOR 9): v1 fallback, same reasoning as
+        # set_implementation_tasks_status above.
+        if (t.get("completion") or {}).get("type") == "check_passed" or (
+                not t.get("completion") and t.get("kind") == "verification"):
             t["status"] = "pending"
             t["updatedAt"] = now
 
@@ -3324,18 +3421,31 @@ def evaluate_verification_tasks(tasks, results: list) -> None:
     match also refines `priority` to "required"/"recommended" from the
     matched result's own tier — derive_tasks can't know this at plan time
     (verification_plan's required/recommended split isn't computed until
-    main()'s per-iteration verify() call), so it starts "required" and is
-    corrected here once real tier evidence exists. No-op when `tasks` is
-    None."""
+    main()'s per-iteration verify() call), so it starts "recommended" (fix
+    round 1, CRITICAL) and is promoted to "required" here once real tier
+    evidence exists. No-op when `tasks` is None."""
     if tasks is None:
         return
     now = _task_timestamp()
     for t in tasks:
         completion = t.get("completion") or {}
-        if completion.get("type") != "check_passed":
+        # Fix round 1 (MINOR 9): v1 fallback -- a task with no completion
+        # contract at all falls back to the old kind=="verification" rule
+        # (same reasoning as set_implementation_tasks_status).
+        if completion.get("type") != "check_passed" and not (
+                not t.get("completion") and t.get("kind") == "verification"):
             continue
         check = completion.get("check")
         if check:
+            # ponytail: exact string match against THIS round's results only
+            # -- if a later repair round's verifier command set no longer
+            # contains the literal failedCheck string (verification_level
+            # changed, the plan/contract's verify list changed, the command
+            # itself got reworded), this repair task can never match again
+            # and is permanently stranded at "in_progress", blocking
+            # gates.tasksResolved forever. Upgrade path if that's ever hit
+            # in practice: fall back to _match_verify_result (fuzzy) when
+            # the exact match misses, same as a plan-derived task.
             match = next((r for r in results if r.get("command") == check), None)
         else:
             match = _match_verify_result(t["description"], results)
@@ -3577,34 +3687,53 @@ def create_repair_task(next_id: int, repair_contract: dict) -> dict:
     }
 
 
-def _superseded_by_repair(task: dict, tasks: list) -> bool:
-    """Task 4.2 helper: is `task` (a required task currently sitting at
-    status=="failed") honestly resolved because a repair task created FOR
-    IT already reached "complete"? Used only by required_tasks_resolved.
+_BLOCKING_REASON_CHECK_FAILED_PREFIX = "check failed: "
 
-    In the common case this never actually fires: once a repair round's
-    verify() call passes, evaluate_verification_tasks re-matches the SAME
-    plan-derived verification task (fuzzy, by description) against the
-    new passing result and flips it straight to "complete" itself -- no
-    supersede needed. This function exists for the narrower honest edge
-    case where that fuzzy re-match doesn't land (e.g. a tie, or the
-    description no longer resembles any current result) while the repair
-    task -- EXACT-matched against the literal failedCheck command it was
-    created for -- correctly reached "complete". Rather than let a stale
-    fuzzy-matched task block session completion when the underlying check
-    demonstrably passed, this asks the exact same question
-    evaluate_verification_tasks itself would ask: does the repair task's
-    createdBecause command fuzzy-match `task`'s own description? If so,
-    they are about the same check, and the repair task's own "complete"
-    status is trusted in `task`'s place."""
+
+def _failed_check_command(task: dict) -> str | None:
+    """Fix round 1 (IMPORTANT 2) helper: the exact command a check_passed
+    task most recently failed on, extracted from the blockingReason
+    evaluate_verification_tasks stamps on a CODE_FAIL match ("check
+    failed: <command>" -- see that function). None for anything else
+    (task never failed that way, or blockingReason is plain prose from a
+    different kind of failure -- e.g. an implementation task's "engineer
+    exited non-zero"/"engineer made no file changes")."""
+    reason = task.get("blockingReason")
+    if isinstance(reason, str) and reason.startswith(_BLOCKING_REASON_CHECK_FAILED_PREFIX):
+        return reason[len(_BLOCKING_REASON_CHECK_FAILED_PREFIX):]
+    return None
+
+
+def _superseded_by_repair(task: dict, tasks: list) -> bool:
+    """Task 4.2 helper, rewritten fix round 1 (IMPORTANT 2): is `task` (a
+    required task currently sitting at status=="failed") honestly resolved
+    because a repair task created for the SAME exact check already
+    reached "complete"? Used only by required_tasks_resolved.
+
+    Fix round 1: the original version compared the repair task's
+    createdBecause command against `task`'s prose description via the
+    FUZZY _match_verify_result -- reproduced fail-open against a real
+    session fixture (an unrelated implementation task's prose token-
+    overlapped a repair task's createdBecause purely on shared words,
+    wrongly "superseding" a failure that was never actually fixed).
+    Fuzzy matching has no place in a supersede decision, so this now
+    compares EXACT command strings only: `task` must itself be a
+    check_passed task that failed against a KNOWN command (blockingReason
+    == "check failed: <command>", stamped by evaluate_verification_tasks
+    -- see _failed_check_command). An implementation task's blockingReason
+    is always plain prose ("engineer exited non-zero" / "engineer made no
+    file changes"), never that shape, so it can never be superseded this
+    way, by construction -- only a failed verification/repair task can be.
+    A repair task supersedes `task` only when its OWN completion.check
+    (not createdBecause, which is display-only) equals that exact command
+    and its status is "complete"."""
+    failed_command = _failed_check_command(task)
+    if failed_command is None:
+        return False
     for other in tasks:
         if other.get("kind") != "repair" or other.get("status") != "complete":
             continue
-        became_because = other.get("createdBecause")
-        if not became_because:
-            continue
-        probe_result = [{"command": became_because, "status": "PASS"}]
-        if _match_verify_result(task.get("description", ""), probe_result) is not None:
+        if (other.get("completion") or {}).get("check") == failed_command:
             return True
     return False
 
@@ -4113,13 +4242,48 @@ def main():
                         # diff) -- record verificationPassed so GatesRow
                         # isn't blank on a verified session. Merge, don't
                         # clobber (same discipline as every other gates
-                        # writer); implementationComplete is deliberately
-                        # left unset here -- no files changed, so "any
-                        # changed files" is false and there is nothing
-                        # honest to claim either way.
+                        # writer).
                         gates = dict(manifest.get("gates") or {})
                         gates["verificationPassed"] = True
+                        # Fix round 1 (MODERATE 5): implementationComplete is
+                        # null/not-applicable here, NOT False -- a no-change
+                        # session is a legitimate "nothing needed doing"
+                        # terminal (no engineer run produced this diff at
+                        # all, so there is nothing honest to claim True OR
+                        # False about it), same as architectureApproved/
+                        # scopeApproved already read null when their own
+                        # mechanism never ran. Because gates_block_verified's
+                        # documented invariant is that implementationComplete
+                        # is ALWAYS a real True/False by the time it's called
+                        # (never an honest null), this path does NOT route
+                        # the promotion decision through gates_block_verified
+                        # itself -- only gates.tasksResolved actually applies
+                        # to a no-change session, and is checked directly,
+                        # below, the same True/False/None contract every
+                        # other gate here follows.
+                        gates["implementationComplete"] = None
+                        gates["tasksResolved"] = required_tasks_resolved(tasks) if tasks is not None else None
                         manifest["gates"] = gates
+
+                        if gates["tasksResolved"] is False:
+                            # Fix round 1 (MODERATE 5): "no bypass" -- a
+                            # required task left unresolved (e.g. a prior
+                            # repair round's task never actually completed)
+                            # must block promotion here exactly like it
+                            # blocks the real-diff VERIFIED path below.
+                            blocked_gates = ["tasksResolved"]
+                            attempt["blockedGates"] = blocked_gates
+                            manifest["blockedGates"] = blocked_gates
+                            attempt["status"] = "needs-architect-review-consistency-rejected"
+                            manifest["attempts"].append(attempt)
+                            manifest["status"] = "needs-architect-review-consistency-rejected"
+                            manifest["state"] = canonical_session_state(manifest["status"])
+                            emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                            final_label = "NOT VERIFIED — GATE BLOCKED (tasksResolved)"
+                            print("\n[V2] gates blocked promotion to verified: ['tasksResolved']")
+                            save()
+                            break
+
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
@@ -4616,7 +4780,7 @@ def main():
             # the SAME evaluate_verification_tasks call that already runs
             # after every verify() this session -- no separate evaluator.
             if tasks is not None:
-                repair_task = create_repair_task(len(tasks) + 1, repair_contract)
+                repair_task = create_repair_task(_next_task_id(tasks), repair_contract)
                 tasks.append(repair_task)
                 save_tasks(session, tasks)
                 emit_event(events_path, "task_created", sid,
@@ -4681,8 +4845,15 @@ def main():
             # No tasks.json is ever created just for this -- same
             # zero-behavior-change-without-a-plan contract C3 itself uses.
             if tasks is not None:
-                tasks.append(documentation_task(len(tasks) + 1, doc_impacts))
+                doc_task = documentation_task(_next_task_id(tasks), doc_impacts)
+                tasks.append(doc_task)
                 save_tasks(session, tasks)
+                # Fix round 1 (MINOR 10): this dynamic task creation was the
+                # one C3/O2 call site that never emitted task_created at all.
+                emit_event(events_path, "task_created", sid,
+                           taskId=doc_task["id"], kind=doc_task["kind"],
+                           description=doc_task["description"][:200],
+                           source=doc_task["source"], priority=doc_task["priority"])
 
         manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
         save()
@@ -5957,7 +6128,11 @@ def _tasks_selfcheck() -> None:
                      "blockingReason", "createdAt", "updatedAt", "completion"):
             assert key in t, f"{key!r} missing from derived task {t['id']!r}"
         assert t["source"] == "architect_plan"
-        assert t["priority"] == "required"
+        # Fix round 1 (CRITICAL 1): implementation tasks start "required";
+        # verification tasks start "recommended" and are only promoted to
+        # "required" once real verify() evidence confirms a required-tier
+        # match (see section 12 below) -- never assumed at derivation time.
+        assert t["priority"] == ("required" if t["kind"] == "implementation" else "recommended")
         assert t["evidenceIds"] == [] and t["affectedFiles"] == []
         assert t["blockingReason"] is None
     impl_task, verify_task = model_tasks[0], model_tasks[2]
@@ -6048,20 +6223,25 @@ def _tasks_selfcheck() -> None:
     still_in_progress = [{"priority": "required", "status": "in_progress", "description": "a"}]
     assert required_tasks_resolved(still_in_progress) is False
 
-    genuinely_failed = [{"priority": "required", "status": "failed", "description": "run typecheck"}]
+    genuinely_failed = [{"priority": "required", "status": "failed", "description": "run typecheck",
+                          "blockingReason": "check failed: npm run typecheck"}]
     assert required_tasks_resolved(genuinely_failed) is False, (
         "a failed required task with no repair task to supersede it must block"
     )
 
-    # Superseded case: the original verification task never got a fuzzy
-    # re-match (stayed "failed"), but an EXACT-matched repair task for the
-    # very same check reached "complete" -- required_tasks_resolved must
-    # trust the repair task's evidence and treat the original as resolved.
+    # Superseded case (fix round 1, IMPORTANT 2: EXACT evidence, not fuzzy
+    # description matching): the original task's blockingReason names the
+    # exact failing command, and a repair task whose completion.check is
+    # that SAME exact command reached "complete" -- required_tasks_resolved
+    # must trust that exact-matched evidence and treat the original as
+    # resolved.
     superseded = [
         {"priority": "required", "status": "failed", "kind": "verification",
-         "description": "Run the typecheck to confirm no type errors"},
+         "description": "Run the typecheck to confirm no type errors",
+         "blockingReason": "check failed: npm run typecheck"},
         {"priority": "required", "status": "complete", "kind": "repair",
-         "createdBecause": "npm run typecheck"},
+         "createdBecause": "npm run typecheck",
+         "completion": {"type": "check_passed", "check": "npm run typecheck"}},
     ]
     assert required_tasks_resolved(superseded) is True
 
@@ -6069,11 +6249,25 @@ def _tasks_selfcheck() -> None:
     # or failed repair task must never supersede anything.
     not_yet_superseded = [
         {"priority": "required", "status": "failed", "kind": "verification",
-         "description": "Run the typecheck to confirm no type errors"},
+         "description": "Run the typecheck to confirm no type errors",
+         "blockingReason": "check failed: npm run typecheck"},
         {"priority": "required", "status": "in_progress", "kind": "repair",
-         "createdBecause": "npm run typecheck"},
+         "createdBecause": "npm run typecheck",
+         "completion": {"type": "check_passed", "check": "npm run typecheck"}},
     ]
     assert required_tasks_resolved(not_yet_superseded) is False
+
+    # A DIFFERENT command's repair task completing must NOT supersede --
+    # exact match only, no partial/fuzzy credit.
+    wrong_check_superseded = [
+        {"priority": "required", "status": "failed", "kind": "verification",
+         "description": "Run the typecheck to confirm no type errors",
+         "blockingReason": "check failed: npm run typecheck"},
+        {"priority": "required", "status": "complete", "kind": "repair",
+         "createdBecause": "npm run lint",
+         "completion": {"type": "check_passed", "check": "npm run lint"}},
+    ]
+    assert required_tasks_resolved(wrong_check_superseded) is False
 
     # ------------------------------------------------------------
     # 11. Task 4.2: make_prompt's FOCUS block -- additive, byte-identical
@@ -6109,6 +6303,141 @@ def _tasks_selfcheck() -> None:
     assert "FOCUS TASK" not in make_prompt(focus_contract, "repo summary", 0, tasks=[])
     no_pending = [dict(focus_tasks[0], status="complete"), dict(focus_tasks[1], status="complete")]
     assert "FOCUS TASK" not in make_prompt(focus_contract, "repo summary", 0, tasks=no_pending)
+
+    # ------------------------------------------------------------
+    # 12. Fix round 1 (CRITICAL 1): replay-style proof that the priority-
+    #     inversion actually breaks the deadlock -- an honestly-unmatched
+    #     plan-derived verification task must NEVER block
+    #     required_tasks_resolved, but the SAME task, once real evidence
+    #     matches it to a required-tier result, must actually count.
+    # ------------------------------------------------------------
+    replay_plan = {
+        "implementationPlan": ["add the thing"],
+        "verificationPlan": ["a check nothing ever runs"],
+    }
+    replay_tasks = derive_tasks(replay_plan)
+    set_implementation_tasks_status(replay_tasks, "in_progress")
+    evaluate_implementation_tasks(replay_tasks, ["a.ts"], 0)  # implementation: done
+    evaluate_verification_tasks(replay_tasks, [{"command": "npm run something-else", "status": "PASS"}])
+    verify_task = replay_tasks[1]
+    assert verify_task["status"] == "pending" and verify_task["priority"] == "recommended", (
+        "an honestly-unmatched verification task must stay recommended+pending, not required+pending"
+    )
+    assert required_tasks_resolved(replay_tasks) is True, (
+        "CRITICAL fix: an unmatched prose verification task must NOT deadlock session completion"
+    )
+
+    # Now a real result actually matches it (required tier, by default) --
+    # required_tasks_resolved must react to the NEWLY confirmed evidence.
+    evaluate_verification_tasks(
+        replay_tasks, [{"command": "npm run a-check-nothing-ever-runs", "status": "CODE_FAIL"}])
+    assert verify_task["priority"] == "required" and verify_task["status"] == "failed"
+    assert required_tasks_resolved(replay_tasks) is False, (
+        "once matched to a required-tier result, a failing verification task must actually block"
+    )
+    evaluate_verification_tasks(
+        replay_tasks, [{"command": "npm run a-check-nothing-ever-runs", "status": "PASS"}])
+    assert verify_task["status"] == "complete"
+    assert required_tasks_resolved(replay_tasks) is True
+
+    # ------------------------------------------------------------
+    # 13. Fix round 1 (IMPORTANT 2): _superseded_by_repair must use EXACT
+    #     evidence, not fuzzy prose matching -- the reviewer's reproduced
+    #     false-positive ("login modal" implementation task token-
+    #     overlapping an unrelated "auth test" repair task's
+    #     createdBecause) must NOT resolve.
+    # ------------------------------------------------------------
+    login_modal_failed = {
+        "priority": "required", "status": "failed", "kind": "implementation",
+        "description": "Fix the login modal auth test flow",
+        "blockingReason": "engineer exited non-zero",
+    }
+    unrelated_repair = {
+        "priority": "required", "status": "complete", "kind": "repair",
+        "createdBecause": "npm run auth-test",
+        "completion": {"type": "check_passed", "check": "npm run auth-test"},
+    }
+    false_positive_case = [login_modal_failed, unrelated_repair]
+    assert _superseded_by_repair(login_modal_failed, false_positive_case) is False, (
+        "an implementation task's plain-prose blockingReason must never be treated as a "
+        "check command -- fuzzy token overlap with an unrelated repair task must not supersede it"
+    )
+    assert required_tasks_resolved(false_positive_case) is False, (
+        "the false-positive case must NOT resolve -- login_modal_failed is still genuinely broken"
+    )
+
+    # The exact-match path DOES still work when the failed task really is
+    # the same check_passed contract the repair task was created for.
+    real_failure = {
+        "priority": "required", "status": "failed", "kind": "verification",
+        "blockingReason": "check failed: npm run auth-test",
+        "completion": {"type": "check_passed", "check": "npm run auth-test"},
+    }
+    assert _superseded_by_repair(real_failure, [real_failure, unrelated_repair]) is True
+
+    # ------------------------------------------------------------
+    # 14. Fix round 1 (IMPORTANT 3): replan preserves dynamic (repair)
+    #     tasks instead of silently dropping them, and never reuses an id.
+    # ------------------------------------------------------------
+    pre_replan = derive_tasks(plan)  # t1..t5 (2 implementation, 3 verification)
+    pre_replan_repair = create_repair_task(_next_task_id(pre_replan), {"failedCheck": "npm run lint"})
+    pre_replan.append(pre_replan_repair)
+    assert pre_replan_repair["id"] == "t6"
+
+    replanned = derive_tasks({
+        "implementationPlan": ["inspect hydration path", "add restoration hook", "add a NEW retry layer"],
+        "verificationPlan": ["frontend_typecheck", "lint", "nonexistent_check"],
+    })  # now t1..t6 -- would collide with the repair task's OLD id "t6"
+    merged = merge_replanned_tasks(pre_replan, replanned)
+    repair_after_merge = [t for t in merged if t.get("kind") == "repair"]
+    assert len(repair_after_merge) == 1, "replan must not drop the repair task"
+    assert repair_after_merge[0]["createdBecause"] == "npm run lint"
+    ids = [t["id"] for t in merged]
+    assert len(ids) == len(set(ids)), f"merged task list has duplicate ids: {ids}"
+    assert repair_after_merge[0]["id"] not in [t["id"] for t in replanned], (
+        "the preserved repair task's id must not collide with any new plan-derived task's id"
+    )
+
+    # Carry-over now also carries priority/blockingReason/evidenceIds/
+    # createdAt (fix round 1, MINOR 7), and bumps updatedAt.
+    old_with_extras = [{
+        "id": "t1", "kind": "implementation", "description": "inspect hydration path",
+        "status": "failed", "priority": "required", "blockingReason": "engineer exited non-zero",
+        "evidenceIds": ["ev-1"], "createdAt": "2020-01-01T00:00:00+00:00",
+    }]
+    new_from_replan = derive_tasks({"implementationPlan": ["inspect hydration path"]})
+    merged_extras = merge_replanned_tasks(old_with_extras, new_from_replan)
+    assert merged_extras[0]["status"] == "failed"
+    assert merged_extras[0]["blockingReason"] == "engineer exited non-zero"
+    assert merged_extras[0]["evidenceIds"] == ["ev-1"]
+    assert merged_extras[0]["createdAt"] == "2020-01-01T00:00:00+00:00"
+    assert merged_extras[0]["updatedAt"] != "2020-01-01T00:00:00+00:00", "updatedAt must be bumped on carry"
+
+    # ------------------------------------------------------------
+    # 15. Fix round 1 (IMPORTANT 4): during a repair round (repair_contract
+    #     is not None), FOCUS must point at the NEWEST repair task, not
+    #     the first pending required plan-derived task.
+    # ------------------------------------------------------------
+    repair_focus_tasks = derive_tasks({
+        "implementationPlan": ["add the thing"],
+        "verificationPlan": ["typecheck"],
+    })
+    repair_focus_tasks.append(
+        create_repair_task(_next_task_id(repair_focus_tasks), {"failedCheck": "npm run typecheck"})
+    )
+    in_repair_prompt = make_prompt(
+        focus_contract, "repo summary", 1, failure="boom", checkpoint_sha="deadbeef",
+        repair_contract={"attempt": 1, "failedCheck": "npm run typecheck", "newFailures": [], "allowedFiles": []},
+        tasks=repair_focus_tasks,
+    )
+    assert "FOCUS TASK" in in_repair_prompt
+    assert '"kind": "repair"' in in_repair_prompt, "FOCUS during a repair round must be the repair task"
+    assert '"kind": "implementation"' not in in_repair_prompt
+
+    # Same tasks, but NOT a repair round (repair_contract=None) -- FOCUS
+    # falls back to the ordinary first-pending-required rule.
+    not_repair_prompt = make_prompt(focus_contract, "repo summary", 0, tasks=repair_focus_tasks)
+    assert '"kind": "implementation"' in not_repair_prompt
 
     print("task graph (C3) self-check: PASS")
 
@@ -6205,7 +6534,7 @@ def _doc_impact_selfcheck() -> None:
         gates["documentationCurrent"] = False if doc_impacts else None
         manifest["gates"] = gates
         if doc_impacts and tasks is not None:
-            tasks.append(documentation_task(len(tasks) + 1, doc_impacts))
+            tasks.append(documentation_task(_next_task_id(tasks), doc_impacts))
         return doc_impacts
 
     manifest = {"gates": {"architectureApproved": True}}
@@ -6481,6 +6810,42 @@ def _gates_selfcheck() -> None:
     assert "consistency_gate = True" not in main_source[flagged_if_idx:], (
         "once flagged, consistency_gate must never be reset to True except via an "
         "actual approved review decision"
+    )
+
+    # ------------------------------------------------------------
+    # 6. Fix round 1 (MODERATE 5): the no-change-verified path (`if not
+    #    files:` branch) must compute gates.tasksResolved (via
+    #    required_tasks_resolved) and actually block promotion on it --
+    #    "no bypass" -- while implementationComplete stays null/not-
+    #    applicable there (a no-change session has nothing honest to claim
+    #    True or False about it), not routed through gates_block_verified
+    #    itself (whose documented invariant requires implementationComplete
+    #    to always be a real True/False). Structural proof, since exercising
+    #    this branch live needs a real session/subprocess.
+    # ------------------------------------------------------------
+    no_change_if_idx = main_source.index("if not files:")
+    no_change_ok_idx = main_source.index("if ok:", no_change_if_idx)
+    impl_null_idx = main_source.index('gates["implementationComplete"] = None', no_change_ok_idx)
+    tasks_resolved_idx = main_source.index(
+        'gates["tasksResolved"] = required_tasks_resolved(tasks) if tasks is not None else None',
+        no_change_ok_idx,
+    )
+    tasks_resolved_check_idx = main_source.index('if gates["tasksResolved"] is False:', no_change_ok_idx)
+    no_change_verified_label_idx = main_source.index('"no-change-verified"', tasks_resolved_check_idx)
+    assert no_change_if_idx < no_change_ok_idx < impl_null_idx < tasks_resolved_idx < tasks_resolved_check_idx, (
+        "the no-change path must compute implementationComplete=null and tasksResolved, "
+        "in that order, before deciding whether tasksResolved blocks"
+    )
+    assert tasks_resolved_check_idx < no_change_verified_label_idx, (
+        "the tasksResolved==False block must be checked BEFORE the no-change-verified success path -- no bypass"
+    )
+    # This path must NOT reuse gates_block_verified (which would wrongly
+    # block on implementationComplete=null, a real property only THIS
+    # path can have) -- confirm no such call exists between the two ok:
+    # branches (this one and the real-diff VERIFIED one below it).
+    real_diff_ok_idx = main_source.index("if ok:", no_change_verified_label_idx)
+    assert "gates_block_verified(gates)" not in main_source[no_change_ok_idx:real_diff_ok_idx], (
+        "the no-change path must check tasksResolved directly, not via gates_block_verified"
     )
 
     print("gates (Task 2.3, V7 §5.10/§5.11) self-check: PASS")
