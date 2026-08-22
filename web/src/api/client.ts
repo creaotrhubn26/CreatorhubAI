@@ -77,15 +77,22 @@ export const glimmerApi = {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? ""; // last entry may be a partial line split across chunks
-      for (const line of lines) processLine(line);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // last entry may be a partial line split across chunks
+        for (const line of lines) processLine(line);
+      }
+      processLine(buffer); // flush a final frame with no trailing newline
+    } finally {
+      // An error-frame throw (or any other exit) must not leave the body
+      // undrained — cancelling closes the connection so the server's
+      // disconnect-abort actually stops upstream generation.
+      reader.cancel().catch(() => {});
     }
-    processLine(buffer); // flush a final frame with no trailing newline
 
     // A connection that drops (or a server bug) before the done frame must
     // not read as "the model finished and said nothing/this much" — it's an

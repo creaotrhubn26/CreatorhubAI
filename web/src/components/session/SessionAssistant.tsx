@@ -58,6 +58,10 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
   // save-on-change against this load.
   if (chatState.sid !== sessionId) {
     setChatState(loadState(sessionId));
+    // The old session's in-flight ask (if any) is discarded by the
+    // same-session guard — the new panel must not inherit its disabled
+    // "Asking…" state.
+    setPending(false);
   }
 
   // Persist on every turn change, including pending/errored turns — never

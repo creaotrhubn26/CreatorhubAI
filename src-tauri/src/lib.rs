@@ -7,10 +7,11 @@
 //!
 //! Gateway location: resolved from the `GLIMMER_GATEWAY_DIR` env var, falling
 //! back to `<repo>/server` (baked in at compile time via `CARGO_MANIFEST_DIR`,
-//! since `src-tauri/` lives at the repo root). This requires the repo
-//! checkout + a built server (`npm --prefix server run build`) + `node` on
-//! PATH — see the report for why a bundled sidecar is future work, not this
-//! pass.
+//! since `src-tauri/` lives at the repo root) — so a bundled .app still
+//! needs the repo checkout with a built server (`npm --prefix server run
+//! build`). Node itself is bundled: `node_binary()` prefers the sidecar
+//! shipped via `bundle.externalBin` (see scripts/prepare-sidecar.sh),
+//! falling back to `node` on PATH in dev.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -86,14 +87,15 @@ fn spawn_gateway() -> Option<Child> {
 }
 
 /// Prefer the bundled node sidecar (Tauri places `externalBin` entries next
-/// to the app executable — `Contents/MacOS/node` on macOS), falling back to
-/// `node` on PATH so `tauri dev` and repo-checkout runs keep working without
-/// the ~80MB binary present (it's gitignored; produced by
+/// to the app executable — `Contents/MacOS/glimmer-node` on macOS; named
+/// glimmer-node so a linux package never shadows /usr/bin/node), falling
+/// back to `node` on PATH so `tauri dev` and repo-checkout runs keep working
+/// without the ~50MB binary present (it's gitignored; produced by
 /// `scripts/prepare-sidecar.sh` before a bundling build).
 fn node_binary() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sidecar = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+            let sidecar = dir.join(if cfg!(windows) { "glimmer-node.exe" } else { "glimmer-node" });
             if sidecar.exists() {
                 return sidecar;
             }
