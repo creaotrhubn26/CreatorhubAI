@@ -46,6 +46,41 @@ GLIMMER_VISUAL = Path(__file__).resolve().parent / "glimmer-visual.py"
 VISUAL_VERIFY_TOKEN = "visual"
 VISUAL_DEFAULT_VIEWPORTS = ("1440x900", "390x844")
 
+# V7 §22.18 deterministic visual requiredness: area words / extensions that
+# mark a contract scope or changed-files set as UI-area work, same
+# token/extension-match convention as select_skills (below) and O2's
+# detect_documentation_impact -- plain deterministic keyword matching, no
+# model judgment. Deliberately small and web-generic (not framework-
+# specific); extend if a real UI area keeps missing this.
+VISUAL_AREA_WORDS = {
+    "frontend", "ui", "web", "client", "app", "mobile", "component",
+    "components", "view", "views", "page", "pages", "screen", "screens",
+}
+VISUAL_AREA_EXTENSIONS = {
+    ".tsx", ".jsx", ".css", ".scss", ".less", ".html", ".vue", ".svelte",
+}
+# V7 §22.10: cap on ArchitecturePlan.visualRequirements -- untrusted model
+# output (same discipline run_architect_first already applies to
+# plan.packages before it ever reaches an event/log/prompt).
+MAX_VISUAL_REQUIREMENTS = 20
+MAX_VISUAL_REQUIREMENT_CHARS = 300
+# Mirrors glimmer-visual.py's own DEFAULT_CHECKS verbatim -- not imported,
+# per that script's "stays standalone" module docstring (same mirrored-
+# not-imported convention as _extract_json_object elsewhere in this
+# codebase). glimmer-visual.py's own --check is a full override of its
+# defaults when given at all (its DEFAULT_CHECKS comment: "used only when
+# the caller doesn't pass --check at all") -- v2.py needs the literal
+# check text here so an ArchitecturePlan's visualRequirements can join the
+# basics as EXTRA checks (V7 §22.10: "part of the verification contract",
+# not a replacement for it) without changing that override semantics.
+VISUAL_DEFAULT_CHECKS = (
+    "no clipped or cut-off elements",
+    "no unexpected overlapping elements",
+    "all visible text is readable",
+    "no elements rendered outside the viewport",
+    "no horizontal overflow",
+)
+
 IGNORE_DIRS = {
     ".git", "node_modules", ".next", ".turbo", ".cache", "coverage",
     "dist", "build", "out", ".output", ".venv", "venv", "__pycache__",
@@ -696,8 +731,37 @@ def verifier_commands(m, files, level):
 NEXT_VERIFICATION_LEVEL = {"minimal": "standard", "standard": "full", "full": None}
 
 
+def visual_requiredness(level, visual_url, contract, files, plan):
+    """V7 §22.18 deterministic rule table for where the visual check lands.
+    Pure decision function (no side effects, no command-building) so the
+    rule table is independently testable from verification_plan's
+    command-assembly plumbing below.
+
+    | --visual-url | level      | frontend-area match OR plan.visualRequirements | outcome     |
+    |--------------|------------|--------------------------------------------------|--------------|
+    | absent       | any        | any                                                | "absent"     |
+    | present      | minimal    | any                                                | "recommended"|
+    | present      | standard+  | no                                                 | "recommended"|
+    | present      | standard+  | yes                                                | "required"   |
+
+    "absent" preserves the existing honest convention verbatim: no
+    --visual-url means no auto-added visual check at all (an explicit
+    "visual" --verify/contract.verification entry still fails loud via
+    validate_visual_url, unrelated to this function). "required" only at
+    standard+ -- minimal level never auto-requires a visual check,
+    regardless of scope/plan, though it can still be recommended.
+    """
+    if not visual_url:
+        return "absent"
+    visual_requirements = sanitize_visual_requirements(plan)
+    frontend_match = visual_scope_matches_frontend(contract, files)
+    if level in ("standard", "full") and (frontend_match or visual_requirements):
+        return "required"
+    return "recommended"
+
+
 def verification_plan(m, files, level, verify_entries, session, visual_url,
-                       model_readiness_url=READINESS_URL_DEFAULT):
+                       model_readiness_url=READINESS_URL_DEFAULT, contract=None, plan=None):
     """V7 §18: split the verification plan into required (gates VERIFIED --
     exactly what verifier_commands+expand_verify_entries has always built
     for `level`, plus any explicit --verify/contract.verification entries)
@@ -705,7 +769,21 @@ def verification_plan(m, files, level, verify_entries, session, visual_url,
     e.g. minimal's recommended is standard's lint; standard's recommended is
     full's test+build). Recommended commands are run (see verify()'s `tier`
     param) but never gate VERIFIED -- see the main() call site's `if ok:`
-    guard and gates_block_verified, neither of which ever reads them."""
+    guard and gates_block_verified, neither of which ever reads them.
+
+    V7 §22.18 (Task 3.3): on top of that existing split, deterministically
+    place an AUTO visual check (i.e. one the caller didn't already spell
+    out via --verify/contract.verification's literal "visual" token) into
+    required or recommended per visual_requiredness's rule table above.
+    `contract`/`plan` are optional (default None) so every pre-3.3 caller
+    -- including --verification-plan-selfcheck's existing calls, which
+    never pass them -- is unaffected: visual_scope_matches_frontend(None,
+    files) and sanitize_visual_requirements(None) both degrade to no
+    match/[], so with no contract/plan this reduces to "recommended
+    whenever --visual-url is set, absent otherwise" -- and when
+    --visual-url is also None (every existing self-check call), nothing
+    changes at all.
+    """
     required = verifier_commands(m, files, level)
     required = expand_verify_entries(required, verify_entries, session, visual_url, model_readiness_url)
     next_level = NEXT_VERIFICATION_LEVEL.get(level)
@@ -713,6 +791,22 @@ def verification_plan(m, files, level, verify_entries, session, visual_url,
     if next_level:
         required_keys = {tuple(c) for c in required}
         recommended = [c for c in verifier_commands(m, files, next_level) if tuple(c) not in required_keys]
+
+    # An explicit "visual" --verify/contract.verification entry already
+    # expanded into `required` above (expand_verify_entries) -- never
+    # auto-add a second one on top of it.
+    already_visual = any(is_visual_check_command(c) for c in required)
+    outcome = visual_requiredness(level, visual_url, contract, files, plan)
+    if outcome != "absent" and not already_visual:
+        visual_cmd = build_visual_verify_command(
+            session, visual_url, model_readiness_url,
+            visual_requirements=sanitize_visual_requirements(plan),
+        )
+        if outcome == "required":
+            required.append(visual_cmd)
+        else:
+            recommended.append(visual_cmd)
+
     return {"required": required, "recommended": recommended}
 
 
@@ -726,7 +820,51 @@ def _model_base_url(readiness_url):
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_DEFAULT):
+def sanitize_visual_requirements(plan):
+    """V7 §22.10: ArchitecturePlan.visualRequirements is optional, untrusted
+    model output -- v2 (the trusted layer) treats it exactly like
+    run_architect_first already treats plan.packages before it reaches an
+    event/prompt: tolerant of absence (no field, wrong type, `plan` itself
+    None -- all -> []), and capped so a runaway/malicious value can't
+    bloat the vision model's own contract text (MAX_VISUAL_REQUIREMENTS
+    entries, MAX_VISUAL_REQUIREMENT_CHARS each). Non-string / blank
+    entries are dropped rather than coerced -- same "don't fabricate
+    substance" principle glimmer-visual.py's own _coerce_finding applies
+    to the vision model's findings."""
+    if not plan:
+        return []
+    raw = plan.get("visualRequirements")
+    if not isinstance(raw, list):
+        return []
+    return [
+        v.strip()[:MAX_VISUAL_REQUIREMENT_CHARS]
+        for v in raw[:MAX_VISUAL_REQUIREMENTS]
+        if isinstance(v, str) and v.strip()
+    ]
+
+
+def visual_scope_matches_frontend(contract, files):
+    """V7 §22.18 deterministic requiredness: is this a UI-area session?
+    Reuses select_skills' own two signals (scope area/paths token match,
+    changed-file extension match) rather than inventing a third matching
+    convention -- a contract scope of e.g. "frontend"/"ui"/"web client"
+    tokenizes and hits VISUAL_AREA_WORDS the same way select_skills'
+    area_hit does, and a changed .tsx/.css/... file hits VISUAL_AREA_
+    EXTENSIONS the same way its filetype_hit does. Never raises: a
+    missing/malformed contract or files list degrades to False (no
+    match), never an exception."""
+    try:
+        scope_tokens = set(_segment_tokens(_skills_scope_text(contract)))
+        if scope_tokens & VISUAL_AREA_WORDS:
+            return True
+        exts = {os.path.splitext(str(f))[1].lower() for f in (files or [])}
+        return bool(exts & VISUAL_AREA_EXTENSIONS)
+    except Exception:  # noqa: BLE001 -- a requiredness check must never crash the verification plan
+        return False
+
+
+def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_DEFAULT,
+                                 visual_requirements=None):
     """C4 (glimmer-v7): real subprocess argv for the visual capture check,
     targeting sessions/<id>/visual/ (V7 §22.14 evidence store layout).
     Creates the output directory up front so glimmer-visual.py -- which is
@@ -749,6 +887,11 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
     here could improve on. No opt-out flag -- "visual" in the plan is
     already the opt-in; capture-only mode stays available by running
     glimmer-visual.py directly without --vision.
+
+    V7 §22.10: `visual_requirements` (already sanitize_visual_requirements-
+    capped by the caller) become extra --check entries alongside
+    glimmer-visual.py's own DEFAULT_CHECKS -- the Architect's UX
+    constraints join the vision contract instead of replacing it.
     """
     out_dir = session / "visual"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -756,6 +899,15 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
     for vp in VISUAL_DEFAULT_VIEWPORTS:
         cmd += ["--viewport", vp]
     cmd += ["--vision", "--model-url", _model_base_url(model_readiness_url)]
+    if visual_requirements:
+        # glimmer-visual.py's --check replaces its own defaults when given
+        # at all -- send the basics explicitly alongside the extras so
+        # visualRequirements genuinely ADD to the contract instead of
+        # silently dropping the V7 §22.2 basics.
+        for check in VISUAL_DEFAULT_CHECKS:
+            cmd += ["--check", check]
+        for req in visual_requirements:
+            cmd += ["--check", req]
     return cmd
 
 
@@ -799,6 +951,25 @@ def expand_verify_entries(commands, raw_entries, session, visual_url,
         if cmd and cmd not in commands:
             commands.append(cmd)
     return commands
+
+
+def visual_state_count(session):
+    """V7 §22.7/Task 3.3: best-effort, read-only peek at visual-manifest.
+    json's "states" list for the visual_verification_started/completed
+    events' `stateCount` field. Deterministic and side-effect-free: reads
+    the same file classify_visual_check_result reads right after this,
+    so both events derive stateCount from one snapshot. Never raises --
+    missing/unreadable/malformed manifest (a genuine capture failure, or
+    simply nothing written yet) returns None so the caller can omit the
+    field rather than fabricate a count; every manifest glimmer-visual.py
+    itself ever writes (pre- or post-3.3) always has a "states" list
+    (default ["initial"]), so this is 1 for every single-state run."""
+    try:
+        manifest_doc = json.loads((Path(session) / "visual" / "visual-manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    states = manifest_doc.get("states")
+    return len(states) if isinstance(states, list) else None
 
 
 def classify_visual_check_result(result, session):
@@ -1132,8 +1303,15 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             # running app under test isn't rebuilt per git worktree).
             is_visual = is_visual_check_command(cmd)
             if is_visual:
+                # V7 §22.7 (Task 3.3): one deterministic read of visual-
+                # manifest.json's states, shared by both events below --
+                # run_verifier_command (just above) already ran
+                # glimmer-visual.py to completion, so the manifest it
+                # wrote is on disk by now for either event to read.
+                state_count = visual_state_count(session)
                 if events_path is not None:
-                    emit_event(events_path, "visual_verification_started", session_id, command=label)
+                    emit_event(events_path, "visual_verification_started", session_id,
+                               command=label, stateCount=state_count)
                 result = classify_visual_check_result(result, session)
                 if events_path is not None:
                     for finding in result.get("visualBlockingFindings", []):
@@ -1149,7 +1327,7 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
                                    category=category,
                                    description=str(finding.get("description", ""))[:300])
                     emit_event(events_path, "visual_verification_completed", session_id,
-                               status=result["status"])
+                               status=result["status"], stateCount=state_count)
 
             if result["status"] == "CODE_FAIL" and not is_visual:
                 if baseline_ws is None:
@@ -3900,9 +4078,15 @@ def main():
             # V7 §18: verification_plan splits required (gates VERIFIED,
             # identical commands verifier_commands+expand_verify_entries has
             # always built for this level) from recommended (the next tier
-            # up's extra commands -- run but never gating).
+            # up's extra commands -- run but never gating). V7 §22.18/§22.10
+            # (Task 3.3): contract + architecture_plan feed the deterministic
+            # visual-requiredness rule table and visualRequirements passthrough
+            # -- architecture_plan is None whenever --architect-first wasn't
+            # used, which visual_requiredness/sanitize_visual_requirements
+            # both already treat identically to "no plan at all".
             plan = verification_plan(repo, files, args.verification_level, args.verify,
-                                      session, args.visual_url, args.model_readiness_url)
+                                      session, args.visual_url, args.model_readiness_url,
+                                      contract=manifest.get("contract"), plan=architecture_plan)
             commands = plan["required"]
             attempt["verificationPlan"] = {
                 "required": [shlex.join(c) for c in plan["required"]],
@@ -5964,6 +6148,94 @@ def _visual_selfcheck() -> None:
     validate_visual_url(["npm run typecheck"], None)
     validate_visual_url([], None)
 
+    # --- V7 §22.10: sanitize_visual_requirements -- tolerant absence,
+    # cap count/length, drop non-string/blank entries. ---
+    assert sanitize_visual_requirements(None) == []
+    assert sanitize_visual_requirements({}) == []
+    assert sanitize_visual_requirements({"visualRequirements": "not-a-list"}) == []
+    assert sanitize_visual_requirements({"visualRequirements": [
+        "reuse existing modal shell", 123, "", "   ", None,
+    ]}) == ["reuse existing modal shell"]
+    long_req = "x" * 500
+    assert sanitize_visual_requirements({"visualRequirements": [long_req]}) == [
+        long_req[:MAX_VISUAL_REQUIREMENT_CHARS]
+    ]
+    too_many_reqs = [f"req {i}" for i in range(30)]
+    capped = sanitize_visual_requirements({"visualRequirements": too_many_reqs})
+    assert capped == too_many_reqs[:MAX_VISUAL_REQUIREMENTS]
+
+    # build_visual_verify_command: no visualRequirements -> byte-identical
+    # to the pre-3.3 command (no --check at all, glimmer-visual.py's own
+    # DEFAULT_CHECKS apply).
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        plain_cmd = build_visual_verify_command(session, "http://x/route")
+        assert "--check" not in plain_cmd
+
+        # visualRequirements present -> the basics are sent explicitly
+        # ALONGSIDE the extras (glimmer-visual.py's own --check would
+        # otherwise silently replace its defaults).
+        with_reqs = build_visual_verify_command(
+            session, "http://x/route", visual_requirements=["primary action remains visible at laptop height"],
+        )
+        assert with_reqs.count("--check") == len(VISUAL_DEFAULT_CHECKS) + 1
+        for check in VISUAL_DEFAULT_CHECKS:
+            assert check in with_reqs
+        assert "primary action remains visible at laptop height" in with_reqs
+
+    # --- V7 §22.18: visual_requiredness rule table. ---
+    frontend_contract = {"scope": {"package": "frontend"}}
+    backend_contract = {"scope": {"package": "backend"}}
+    plan_with_reqs = {"visualRequirements": ["reuse existing modal shell"]}
+
+    # Absent URL -> "absent" no matter what, existing honest convention.
+    assert visual_requiredness("standard", None, frontend_contract, ["a.tsx"], None) == "absent"
+    assert visual_requiredness("full", None, frontend_contract, ["a.tsx"], plan_with_reqs) == "absent"
+
+    # minimal level never auto-requires, even with a frontend match/plan.
+    assert visual_requiredness("minimal", "http://x", frontend_contract, ["a.tsx"], plan_with_reqs) == "recommended"
+
+    # standard+, no frontend match, no plan -> recommended (URL given, but
+    # nothing marks this a UI-area session).
+    assert visual_requiredness("standard", "http://x", backend_contract, ["a.py"], None) == "recommended"
+    assert visual_requiredness("full", "http://x", backend_contract, ["a.py"], None) == "recommended"
+
+    # standard+, frontend scope area match (no plan) -> required.
+    assert visual_requiredness("standard", "http://x", frontend_contract, ["a.py"], None) == "required"
+
+    # standard+, no area match but a .tsx changed file -> required (filetype match).
+    assert visual_requiredness("standard", "http://x", backend_contract, ["src/App.tsx"], None) == "required"
+
+    # standard+, no scope/filetype match but plan.visualRequirements present -> required.
+    assert visual_requiredness("standard", "http://x", backend_contract, ["a.py"], plan_with_reqs) == "required"
+
+    # Never raises on a malformed contract/files.
+    assert visual_requiredness("standard", "http://x", "not-a-dict", None, None) == "recommended"
+
+    # --- V7 §22.7: visual_state_count -- the value both visual_verification_
+    # started/completed events carry as stateCount. ---
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert visual_state_count(session) is None, "no manifest written yet -> None, not fabricated"
+
+        vdir = session / "visual"
+        vdir.mkdir(parents=True)
+        (vdir / "visual-manifest.json").write_text(json.dumps({
+            "route": "/x", "viewports": ["1440x900"], "states": ["initial"],
+            "status": "pass", "captures": [], "findings": [],
+        }), encoding="utf-8")
+        assert visual_state_count(session) == 1
+
+        (vdir / "visual-manifest.json").write_text(json.dumps({
+            "route": "/x", "viewports": ["1440x900"],
+            "states": ["initial", "dialog opened", "loading"],
+            "status": "pass", "captures": [], "findings": [],
+        }), encoding="utf-8")
+        assert visual_state_count(session) == 3
+
+        (vdir / "visual-manifest.json").write_text("not valid json", encoding="utf-8")
+        assert visual_state_count(session) is None, "malformed manifest -> None, never raises"
+
     print("visual (C4) self-check: PASS")
 
 
@@ -6347,6 +6619,64 @@ def _verification_plan_selfcheck() -> None:
     assert "recommendedResults" not in inspect.getsource(blocked_gate_names)
     main_source = inspect.getsource(main)
     assert 'if ok and plan["recommended"]:' in main_source
+
+    # --- V7 §22.18 (Task 3.3): visual requiredness composes with the
+    # required[]/recommended[] split above. contract/plan default to None
+    # (existing calls above never pass them) -- with visual_url also None
+    # there, nothing changed; these new cases exercise contract/plan. A
+    # real tempdir is needed here (unlike every call above): whenever
+    # visual_url is actually set, build_visual_verify_command creates
+    # session/"visual" for real -- fake_session is deliberately a
+    # nonexistent path, fine for the visual_url=None calls above but not
+    # once a visual command actually gets built.
+    frontend_contract = {"scope": {"package": "frontend"}}
+    backend_contract = {"scope": {"package": "backend"}}
+    plan_with_reqs = {"visualRequirements": ["reuse existing modal shell"]}
+
+    with tempfile.TemporaryDirectory() as td:
+        real_session = Path(td)
+
+        # No --visual-url at all -> unaffected, even at standard+ with a
+        # frontend contract (the existing honest NOT_RUN convention).
+        p = verification_plan(m, files, "standard", [], real_session, None, contract=frontend_contract)
+        assert not any(is_visual_check_command(c) for c in p["required"] + p["recommended"])
+
+        # --visual-url given, standard level, frontend-area contract ->
+        # visual joins required[], appended after the language-level
+        # checks already there (typecheck/lint), not replacing any of them.
+        p = verification_plan(m, files, "standard", [], real_session, "http://x/route",
+                               contract=frontend_contract)
+        assert joined(p["required"])[:3] == ["git diff --check", "npm run typecheck", "npm run lint"]
+        assert is_visual_check_command(p["required"][-1])
+        assert not any(is_visual_check_command(c) for c in p["recommended"])
+
+        # --visual-url given, standard level, NO frontend match, no plan ->
+        # visual stays recommended, never required.
+        p = verification_plan(m, files, "standard", [], real_session, "http://x/route",
+                               contract=backend_contract)
+        assert not any(is_visual_check_command(c) for c in p["required"])
+        assert any(is_visual_check_command(c) for c in p["recommended"])
+
+        # minimal level never auto-requires, even with a frontend contract
+        # -- only ever recommended.
+        p = verification_plan(m, files, "minimal", [], real_session, "http://x/route",
+                               contract=frontend_contract)
+        assert not any(is_visual_check_command(c) for c in p["required"])
+        assert any(is_visual_check_command(c) for c in p["recommended"])
+
+        # plan.visualRequirements alone (no frontend contract match) is
+        # enough to promote to required[] at standard+, AND flows into the
+        # built command as extra --check entries.
+        p = verification_plan(m, files, "standard", [], real_session, "http://x/route",
+                               contract=backend_contract, plan=plan_with_reqs)
+        visual_cmd = next(c for c in p["required"] if is_visual_check_command(c))
+        assert "reuse existing modal shell" in visual_cmd
+
+        # Explicit "visual" in --verify already expands into required[] --
+        # never auto-add a second visual command on top of it.
+        p = verification_plan(m, files, "standard", ["visual"], real_session, "http://x/route",
+                               contract=frontend_contract)
+        assert sum(1 for c in p["required"] + p["recommended"] if is_visual_check_command(c)) == 1
 
     print("verification plan (V7 §18) self-check: PASS")
 
