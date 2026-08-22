@@ -3459,6 +3459,12 @@ def main():
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
+                        # V7 §20: verification freeze -- verifiedAt lets the
+                        # gateway detect (read-time, not enforced by any
+                        # daemon here) whether the workspace was written to
+                        # again after this VERIFIED promotion. See the
+                        # "verified" promotion below for the other site.
+                        manifest["verifiedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                         manifest["state"] = canonical_session_state(manifest["status"])
                         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                         success = True
@@ -3850,6 +3856,15 @@ def main():
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
+                # V7 §20: verification freeze -- the orchestrator process
+                # exits shortly after this, so there is no daemon left to
+                # notice a later write. verifiedAt is the fact the gateway
+                # needs to detect staleness itself, read-time, on its next
+                # GET (see control-center/server/src/lib/sessions.ts
+                # readSession's computeStale option): if the workspace picks
+                # up uncommitted changes after this timestamp, the session
+                # reads back as "stale" until a fresh run re-verifies it.
+                manifest["verifiedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 manifest["state"] = canonical_session_state(manifest["status"])
                 emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
