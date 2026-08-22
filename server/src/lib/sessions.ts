@@ -6,7 +6,7 @@ import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
   ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
-  FinalStatus, FinalGateStatus, VisualManifest, VisualFindings,
+  FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -263,8 +263,111 @@ export function readDeliveryReview(id: string): Promise<DeliveryReview | null> {
   return readSessionJsonFile<DeliveryReview>(id, "delivery-review.json");
 }
 
-export function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
-  return readSessionJsonFile<GlimmerTask[]>(id, "tasks.json");
+// Task 4.1 (V7 R4): glimmer-v2.py's save_tasks now writes a versioned
+// wrapper -- {"schemaVersion": 2, "tasks": GlimmerTask[]} -- instead of a
+// bare array, so a reader can tell a full-model (Round-4) task list apart
+// from an older archived session's flat v1 array. Both shapes resolve to
+// the same flat GlimmerTask[] the /sessions/:id/tasks route has always
+// returned; a v1 array is returned as-is, a v2 wrapper is unwrapped, and
+// anything else (malformed JSON already became null upstream; a valid but
+// unrecognized shape) reads back as null, same "no readable artifact"
+// convention every other opt-in read here follows.
+export async function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
+  const raw = await readSessionJsonFile<GlimmerTask[] | { schemaVersion: number; tasks: GlimmerTask[] }>(
+    id, "tasks.json"
+  );
+  if (raw === null) return null;
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object" && Array.isArray((raw as { tasks: unknown }).tasks)) {
+    return (raw as { tasks: GlimmerTask[] }).tasks;
+  }
+  return null;
+}
+
+// --- task overrides (Task 4.3: human skip/approve) -------------------------
+// task-overrides.json is gateway-owned, exactly like human-acceptance.json:
+// written ONLY by the /sessions/:id/tasks/:taskId/skip|approve routes below —
+// glimmer-v2.py never writes it (it only READS it, to fold a skip into
+// required_tasks_resolved — see glimmer-v2.py's load_task_overrides). Shape:
+// {taskId: {action, at}}. This keeps "task resolved" (orchestrator-derived
+// evidence) and "human decided to skip/approve" two genuinely separate
+// facts, same discipline as the accepted/verified split for §14.
+export function readTaskOverrides(id: string): Promise<Record<string, TaskOverride> | null> {
+  return readSessionJsonFile<Record<string, TaskOverride>>(id, "task-overrides.json");
+}
+
+// Read-modify-write over the whole file (there is no per-task file, and
+// sessions rarely have more than a handful of tasks) — a second call for the
+// same taskId simply replaces its prior override; deliberately no undo/
+// toggle, per the brief's "keep simple, one-shot buttons" instruction.
+//
+// Review round 1 (Important 3): taskFacts (kind/description, captured from
+// the task as it exists RIGHT NOW, at the route that already read
+// tasks.json to validate taskId) are stamped onto the record so a later
+// reader can tell whether "this id" still means the same task -- ids are
+// NOT stable across a replan. See TaskOverride's own comment and
+// applyTaskOverrides below.
+//
+// Review round 1 (Moderate 6): write-to-temp-then-rename instead of a
+// direct writeFile -- a crash/kill mid-write must never leave a torn/
+// truncated task-overrides.json for readTaskOverrides to trip over (it
+// would silently read back as {} via its JSON.parse-catch, quietly
+// dropping every override recorded so far). rename() is atomic on the
+// same filesystem, and the temp file lives in the same directory so it
+// always is.
+export async function writeTaskOverride(
+  id: string, taskId: string, action: TaskOverride["action"], taskFacts: { kind: GlimmerTask["kind"]; description: string },
+): Promise<TaskOverride> {
+  const real = resolveSessionId(id);
+  // Review round 1 (Minor 8b): this function is reachable directly (not
+  // only through the route, which already validates the id via
+  // readSessionTasks), and it WRITES to a path derived from `real` --
+  // same guard every other id-derived filesystem write in this module
+  // gets, not inherited implicitly from a caller.
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
+  const existing = (await readTaskOverrides(real)) ?? {};
+  const record: TaskOverride = { action, at: new Date().toISOString(), ...taskFacts };
+  const next = { ...existing, [taskId]: record };
+  const finalPath = path.join(sessionsDir(), real, "task-overrides.json");
+  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
+  await fs.writeFile(tmpPath, JSON.stringify(next), "utf-8");
+  await fs.rename(tmpPath, finalPath);
+  return record;
+}
+
+// Review round 1 (Important 3): true when an override's captured
+// kind/description (if any -- absent on a legacy pre-round-1 record)
+// still match the task currently holding this id. A mismatch means the
+// id was recycled (e.g. merge_replanned_tasks renumbering after a
+// replan) for an unrelated task -- the override belongs to a task that
+// no longer exists under this id.
+function overrideMatchesTask(override: TaskOverride, task: GlimmerTask): boolean {
+  if (override.kind === undefined && override.description === undefined) return true; // legacy record -- trust the id alone
+  return override.kind === task.kind && override.description === task.description;
+}
+
+// Pure display transform consumed by GET /sessions/:id/tasks — never mutates
+// tasks.json (which glimmer-v2.py alone owns), only the response shape.
+// "skip" reads as an honest status="skipped"/priority="optional" (the human
+// decided this task doesn't need to happen); "approve" reads as
+// status="complete" (the human manually signed off the task's completion,
+// chiefly for completion.type=="manual" tasks with no automatic evaluator).
+// Either way the raw fact is preserved on `override` so the UI can badge it
+// as a human decision rather than orchestrator-derived evidence.
+export function applyTaskOverrides(tasks: GlimmerTask[], overrides: Record<string, TaskOverride> | null): GlimmerTask[] {
+  if (!overrides) return tasks;
+  return tasks.map((t) => {
+    const override = overrides[t.id];
+    if (!override) return t;
+    // Review round 1 (Important 3): id reused by a replan -- ignore the
+    // override (never misapply a stale human decision to the wrong
+    // task), but keep the raw fact visible via staleOverride so a human
+    // can tell why a Skip/Approve they remember seems to have vanished.
+    if (!overrideMatchesTask(override, t)) return { ...t, staleOverride: override };
+    if (override.action === "skip") return { ...t, status: "skipped", priority: "optional", override };
+    if (override.action === "approve") return { ...t, status: "complete", override };
+    return t; // Review round 1 (Moderate 5): unrecognized action -- fail OPEN to unchanged, never guess a display.
+  });
 }
 
 // V7 §22.14 visual evidence store -- glimmer-visual.py's --output-dir is

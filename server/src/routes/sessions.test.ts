@@ -560,6 +560,17 @@ describe("GET /api/sessions/:id/tasks", () => {
     expect(res.body).toEqual(tasks);
   });
 
+  it("unwraps a Task 4.1 v2 {schemaVersion, tasks} tasks.json to the same flat array", async () => {
+    const id = "20260822-000017-glimmer-tasks-v2";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify({ schemaVersion: 2, tasks }));
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(tasks);
+  });
+
   it("returns 404 when no tasks.json was ever written (opt-in artifact)", async () => {
     const id = "20260818-000014-glimmer-tasks-missing";
     await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
@@ -587,6 +598,114 @@ describe("GET /api/sessions/:id/tasks", () => {
     const res = await request(app).get(`/api/sessions/${id}/tasks`);
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
+  });
+});
+
+// Task 4.3: human skip/approve, the task-level counterpart to §14's
+// /sessions/:id/accept. Gateway-owned (task-overrides.json) -- these routes
+// never touch tasks.json itself.
+describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
+  const tasks = [
+    { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
+    { id: "t2", description: "Run tests", kind: "verification", dependsOn: ["t1"], status: "pending", priority: "required" },
+  ];
+
+  it("writes task-overrides.json on skip and reflects it on a re-read", async () => {
+    const id = "20260822-000018-glimmer-task-skip";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const res = await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ taskId: "t1", action: "skip" });
+    expect(typeof res.body.at).toBe("string");
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "task-overrides.json"), "utf-8"));
+    expect(onDisk).toEqual({
+      t1: { action: "skip", at: res.body.at, kind: "implementation", description: "Add hook" },
+    });
+  });
+
+  it("writes task-overrides.json on approve, independent of other tasks' overrides", async () => {
+    const id = "20260822-000019-glimmer-task-approve";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    const res = await request(app).post(`/api/sessions/${id}/tasks/t2/approve`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ taskId: "t2", action: "approve" });
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "task-overrides.json"), "utf-8"));
+    expect(onDisk.t1).toMatchObject({ action: "skip" });
+    expect(onDisk.t2).toMatchObject({ action: "approve" });
+  });
+
+  it("404s for an unknown session id", async () => {
+    const res = await request(app).post("/api/sessions/does-not-exist/tasks/t1/skip");
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for a taskId that isn't in this session's tasks.json", async () => {
+    const id = "20260822-000020-glimmer-task-bad-id";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const res = await request(app).post(`/api/sessions/${id}/tasks/does-not-exist/skip`);
+    expect(res.status).toBe(404);
+
+    // And the sidecar must not have been written for the rejected call.
+    await expect(fs.readFile(path.join(dir, "task-overrides.json"), "utf-8")).rejects.toThrow();
+  });
+
+  it("GET /sessions/:id/tasks merges overrides: skip -> status skipped + priority optional, approve -> status complete", async () => {
+    const id = "20260822-000021-glimmer-task-merge";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    await request(app).post(`/api/sessions/${id}/tasks/t2/approve`);
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(200);
+    const t1 = res.body.find((t: any) => t.id === "t1");
+    const t2 = res.body.find((t: any) => t.id === "t2");
+    expect(t1).toMatchObject({ status: "skipped", priority: "optional" });
+    expect(t1.override).toMatchObject({ action: "skip" });
+    expect(t2).toMatchObject({ status: "complete", priority: "required" });
+    expect(t2.override).toMatchObject({ action: "approve" });
+  });
+
+  // Review round 1 (Important 3): replay a replan renumbering ids -- an
+  // override recorded for the OLD "t2" (a "Run tests" verification task)
+  // must not silently apply to a NEW, unrelated task that happens to be
+  // renumbered to the same id "t2" afterward (merge_replanned_tasks can do
+  // this; ids are not stable across a replan).
+  it("does not apply an override whose id was recycled by a replan for a different task", async () => {
+    const id = "20260822-000022-glimmer-task-id-recycled";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const skipRes = await request(app).post(`/api/sessions/${id}/tasks/t2/skip`);
+    expect(skipRes.body).toMatchObject({ taskId: "t2", action: "skip" });
+
+    // Simulate a replan: t2 now names a completely different task.
+    const replannedTasks = [
+      tasks[0],
+      { id: "t2", description: "Add telemetry for the new flow", kind: "implementation", dependsOn: ["t1"], status: "pending", priority: "required" },
+    ];
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(replannedTasks));
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    const newT2 = res.body.find((t: any) => t.id === "t2");
+    expect(newT2.status).toBe("pending"); // NOT "skipped" -- the stale override must not apply
+    expect(newT2.override).toBeUndefined();
+    expect(newT2.staleOverride).toMatchObject({ action: "skip" });
   });
 });
 

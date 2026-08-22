@@ -185,6 +185,20 @@ export interface GlimmerSession {
     implementationComplete?: boolean | null;
     verificationPassed?: boolean | null;
     scopeApproved?: boolean | null;
+    // Task 4.2 (V7 session completion rule): required_tasks_resolved(tasks)
+    // -- true when every priority=="required" task in tasks.json reached a
+    // resolved terminal state, false when one didn't (blocks VERIFIED, same
+    // as architectureApproved/scopeApproved), null when no tasks.json exists
+    // for this session (C3's task graph never ran -- not applicable).
+    tasksResolved?: boolean | null;
+    // Review round 1 (Important 1): set to "human" ONLY when at least one
+    // required task's resolution came from a task-overrides.json skip/
+    // approve rather than orchestrator-derived evidence (see glimmer-
+    // v2.py's any_task_resolved_by_human_override). Absent when
+    // tasksResolved is false/null, or when every required task resolved
+    // on real evidence alone -- a human decision must stay visibly
+    // distinct from evidence, never blended into a plain "✓".
+    tasksResolvedBy?: "human";
   };
   architectPlan?: { used: boolean; risk: string | null };
   // Task 2.1 (V7 §5.5): how architect mode was decided for this run —
@@ -424,13 +438,83 @@ export interface VisualVerification {
 // change-impact detector finds routes/schema/api/config/auth touched --
 // nothing in glimmer-v2.py's task writers ever flips it to complete/failed,
 // because phase 1 has no way to verify documentation currency. A human
-// closes it out of band.
+// closes it out of band. Task 4.1 (V7 R4) adds "repair": an auto-created
+// task per repair round (see create_repair_task in glimmer-v2.py).
+//
+// Task 4.1: the fields below source/priority/evidenceIds/affectedFiles/
+// blockingReason/createdAt/updatedAt/completion/createdBecause are ALL
+// optional, so an archived tasks.json written before this task (v1: no
+// wrapper, no completion contract) still satisfies this type unchanged --
+// same back-compat convention gates/architectPlan already use. tasks.json
+// itself is now versioned {"schemaVersion": 2, "tasks": GlimmerTask[]} --
+// see readSessionTasks (server/src/lib/sessions.ts), which unwraps that
+// AND still tolerates a bare v1 array from an older session.
+// Task 4.3: a human skip/approve decision recorded in the gateway-owned
+// task-overrides.json sidecar (same trust model as human-acceptance.json --
+// glimmer-v2.py never writes it, only the CC gateway route does). "skip"
+// means the human decided a required task doesn't need to happen; "approve"
+// means the human manually signed off a task's completion (chiefly for
+// completion.type=="manual" tasks, which have no automatic evaluator).
+// Review round 1 (Important 3): kind/description are captured at write
+// time (the task as it existed when the human clicked) so a later reader
+// can tell whether "this id" still means the same task -- task ids are
+// NOT stable across a replan (merge_replanned_tasks/derive_tasks can
+// renumber), so trusting the id alone risks silently applying a stale
+// human decision to an unrelated task that happens to reuse the id.
+// Absent on an override written before this round (legacy record) --
+// treated as "can't check, trust the id" by both applyTaskOverrides and
+// glimmer-v2.py's required_tasks_resolved.
+export interface TaskOverride {
+  action: "skip" | "approve";
+  at: string;
+  kind?: GlimmerTask["kind"];
+  description?: string;
+}
+
 export interface GlimmerTask {
   id: string;
   description: string;
-  kind: "implementation" | "verification" | "documentation";
+  kind: "implementation" | "verification" | "documentation" | "repair";
   dependsOn: string[];
-  status: "pending" | "in_progress" | "complete" | "failed";
+  // "skipped" (Task 4.3) is a DISPLAY-only status the gateway's GET
+  // /sessions/:id/tasks route produces when a human skip override exists --
+  // glimmer-v2.py itself never writes this value to tasks.json.
+  status: "pending" | "in_progress" | "complete" | "failed" | "skipped";
+  // Task 4.1: who/what created this task.
+  source?: "architect_plan" | "verification" | "repair" | "documentation" | "system";
+  // Task 4.1: required tasks block gates.tasksResolved (and therefore
+  // VERIFIED) when unresolved; recommended/optional never do -- see
+  // required_tasks_resolved in glimmer-v2.py.
+  priority?: "required" | "recommended" | "optional";
+  evidenceIds?: string[];
+  affectedFiles?: string[];
+  blockingReason?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  // Task 4.1: the completion CONTRACT evaluators dispatch on, instead of a
+  // hardcoded per-kind rule. check is only meaningful for type=="check_passed":
+  // null means fuzzy-match the task's own description against a verify()
+  // result (every plan-derived verification task); a literal command string
+  // means exact-match that command (every repair task).
+  completion?: {
+    type: "files_changed" | "check_passed" | "manual" | "docs";
+    check?: string | null;
+  };
+  // Task 4.1: why a dynamically-created task exists (repair: the failing
+  // check's command; documentation: the impacted-areas list) -- see V7's
+  // "Dynamic task creation" section.
+  createdBecause?: string | null;
+  // Task 4.3: present only on the GET /sessions/:id/tasks route's merged
+  // response, when a human skip/approve override exists for this task --
+  // never written to tasks.json itself. See applyTaskOverrides (server/src/
+  // lib/sessions.ts).
+  override?: TaskOverride;
+  // Review round 1 (Important 3): present instead of `override` when a
+  // recorded override's id matched but its kind/description didn't -- the
+  // id was reused by a replan for a different task, so the override is
+  // honestly ignored rather than silently misapplied. See
+  // applyTaskOverrides.
+  staleOverride?: TaskOverride;
 }
 
 interface GlimmerEventBase {
@@ -573,6 +657,10 @@ export interface TaskCreatedEvent extends GlimmerEventBase {
   taskId: string;
   kind: GlimmerTask["kind"];
   description: string;
+  // Task 4.1: additive -- absent on an event emitted by a pre-Round-4
+  // orchestrator (archived session).
+  source?: GlimmerTask["source"];
+  priority?: GlimmerTask["priority"];
 }
 export interface TaskStatusChangedEvent extends GlimmerEventBase {
   type: "task_status_changed";
@@ -583,6 +671,16 @@ export interface TaskStatusChangedEvent extends GlimmerEventBase {
 export interface TaskListCompletedEvent extends GlimmerEventBase {
   type: "task_list_completed";
   taskCount: number;
+}
+// Review round 1 (Important 1): emitted by glimmer-v2.py at gate-
+// computation time (both gates["tasksResolved"] call sites in main())
+// whenever a required task's resolution actually came from a human's
+// task-overrides.json skip/approve, not orchestrator-derived evidence --
+// see any_task_resolved_by_human_override. One event per such task.
+export interface TaskOverrideAppliedEvent extends GlimmerEventBase {
+  type: "task_override_applied";
+  taskId: string;
+  action: "skip" | "approve";
 }
 export interface VisualVerificationStartedEvent extends GlimmerEventBase {
   type: "visual_verification_started";
@@ -653,6 +751,7 @@ export type GlimmerEvent =
   | TaskCreatedEvent
   | TaskStatusChangedEvent
   | TaskListCompletedEvent
+  | TaskOverrideAppliedEvent
   | VisualVerificationStartedEvent
   | VisualFindingDetectedEvent
   | VisualVerificationCompletedEvent
@@ -670,7 +769,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "architect_planning_started", "architect_plan_created",
   "architect_review_requested", "architect_review_completed",
   "architect_replan_started", "architect_autotriggered",
-  "task_created", "task_status_changed", "task_list_completed",
+  "task_created", "task_status_changed", "task_list_completed", "task_override_applied",
   "visual_verification_started", "visual_finding_detected",
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",

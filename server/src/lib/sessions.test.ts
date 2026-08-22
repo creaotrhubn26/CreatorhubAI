@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import {
-  parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus,
+  parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus, applyTaskOverrides,
 } from "./sessions.js";
 import { computeDiffHash } from "./git.js";
 import type { ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask } from "@glimmer/shared";
@@ -387,6 +387,17 @@ describe("opt-in orchestrator artifact reads", () => {
     expect(await sessionsIsolated.readSessionTasks(id)).toBeNull();
   });
 
+  it("readSessionTasks unwraps the Task 4.1 v2 {schemaVersion, tasks} wrapper", async () => {
+    const id = "20260822-000037-glimmer-tasks-v2";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "tasks.json"),
+      JSON.stringify({ schemaVersion: 2, tasks: REAL_TASKS })
+    );
+    expect(await sessionsIsolated.readSessionTasks(id)).toEqual(REAL_TASKS);
+  });
+
   it("readArchitectReviews globs and sorts architect-review-NN-MM.json", async () => {
     const id = "20260817-000037-glimmer-reviews";
     const dir = path.join(contractStateRoot, "sessions", id);
@@ -701,5 +712,59 @@ describe("session-level verification freeze (V7 §20)", () => {
     expect(session?.status).toBe("needs_review");
 
     await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), POST_VERIFY_CONTENT);
+  });
+});
+
+// Task 4.3 review round 1 (Important 3 + Moderate 5): applyTaskOverrides is
+// a pure display transform, unit-tested directly here rather than only
+// through the HTTP routes (server/src/routes/sessions.test.ts covers the
+// route/merge integration).
+describe("applyTaskOverrides (Task 4.3, review round 1: id-stability + fail-open)", () => {
+  const task: GlimmerTask = {
+    id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required",
+  };
+
+  it("applies skip/approve when the override's captured kind+description match the current task", () => {
+    const [skipped] = applyTaskOverrides([task], {
+      t1: { action: "skip", at: "2026-01-01T00:00:00Z", kind: "implementation", description: "Add hook" },
+    });
+    expect(skipped).toMatchObject({ status: "skipped", priority: "optional" });
+    expect(skipped.override).toMatchObject({ action: "skip" });
+    expect(skipped.staleOverride).toBeUndefined();
+
+    const [approved] = applyTaskOverrides([task], {
+      t1: { action: "approve", at: "2026-01-01T00:00:00Z", kind: "implementation", description: "Add hook" },
+    });
+    expect(approved).toMatchObject({ status: "complete" });
+    expect(approved.override).toMatchObject({ action: "approve" });
+  });
+
+  it("trusts the id alone for a legacy override with no kind/description captured", () => {
+    const [t] = applyTaskOverrides([task], { t1: { action: "skip", at: "2026-01-01T00:00:00Z" } });
+    expect(t).toMatchObject({ status: "skipped" });
+    expect(t.staleOverride).toBeUndefined();
+  });
+
+  it("ignores a stale override whose id was recycled by a replan (kind/description no longer match)", () => {
+    // Same id "t1", but this override was recorded for a DIFFERENT task
+    // that used to hold id t1 before a replan renumbered the task list.
+    const [t] = applyTaskOverrides([task], {
+      t1: { action: "skip", at: "2026-01-01T00:00:00Z", kind: "verification", description: "Run the old tests" },
+    });
+    expect(t.status).toBe("pending"); // unchanged -- override NOT applied
+    expect(t.override).toBeUndefined();
+    expect(t.staleOverride).toMatchObject({ action: "skip" });
+  });
+
+  it("fails open on an unrecognized override action -- returns the task unchanged", () => {
+    const [t] = applyTaskOverrides([task], {
+      // @ts-expect-error -- deliberately an invalid action, proving the runtime fail-open path
+      t1: { action: "bogus", at: "2026-01-01T00:00:00Z" },
+    });
+    expect(t).toEqual(task);
+  });
+
+  it("returns tasks unchanged when overrides is null", () => {
+    expect(applyTaskOverrides([task], null)).toEqual([task]);
   });
 });

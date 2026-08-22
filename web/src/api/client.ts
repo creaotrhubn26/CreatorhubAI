@@ -1,7 +1,7 @@
 import type {
   DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance, CreateWorkspaceResult,
-  VisualVerification,
+  VisualVerification, TaskOverride,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -26,6 +26,13 @@ export const glimmerApi = {
   getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),
   getSessionTasks: (id: string) => request<GlimmerTask[]>(`/api/sessions/${id}/tasks`),
+  // Task 4.3 — human skip/approve, gateway-owned (see server/src/lib/
+  // sessions.ts writeTaskOverride). One-shot: a second click just replaces
+  // the prior override, no undo.
+  skipTask: (id: string, taskId: string) =>
+    request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/skip`, { method: "POST" }),
+  approveTask: (id: string, taskId: string) =>
+    request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/approve`, { method: "POST" }),
   // V7 §22.16 -- bypasses the generic request() helper (which throws on any
   // non-2xx) because 404 here is the honest, common "never ran
   // glimmer-visual.py" case a panel needs to render as "Not run", not an
