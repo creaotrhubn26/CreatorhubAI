@@ -423,8 +423,14 @@ export async function readArchitectReviews(id: string): Promise<ArchitectReview[
 // malformed file resolves to null via readSessionJsonFile). Never
 // iteration-numbered (unlike evidence-NN.jsonl) since it's shared across
 // the whole session.
-export function readEvidenceIndex(id: string): Promise<EvidenceIndexEntry[] | null> {
-  return readSessionJsonFile<EvidenceIndexEntry[]>(id, "evidence-index.json");
+export async function readEvidenceIndex(id: string): Promise<EvidenceIndexEntry[] | null> {
+  const raw = await readSessionJsonFile<unknown>(id, "evidence-index.json");
+  // Fix round 1 (NIT): readSessionJsonFile only proves valid JSON, not
+  // that it's the array shape this file is always written as -- a
+  // corrupt/partial write (e.g. truncated mid-`os.replace`) could parse
+  // to a non-array value that would otherwise reach a caller expecting
+  // .length/.map to exist.
+  return Array.isArray(raw) ? (raw as EvidenceIndexEntry[]) : null;
 }
 
 // Response body is capped well under evidence-NN.jsonl's own persist-time
@@ -432,9 +438,35 @@ export function readEvidenceIndex(id: string): Promise<EvidenceIndexEntry[] | nu
 // a second, independent cap on what the gateway ever sends a browser for
 // one entry, same "cap again at the boundary that actually serves it"
 // discipline as ARCHITECT_REVIEW_DIFF_MAX_CHARS elsewhere in this file.
-const EVIDENCE_ENTRY_CONTENT_MAX_CHARS = 4000;
+// Applied to both `content` and (Fix round 1, MED) `arguments`.
+const EVIDENCE_ENTRY_FIELD_MAX_CHARS = 4000;
 
 const EVIDENCE_FILE_RE = /^evidence-\d+\.jsonl$/;
+
+// Fix round 1 (MED): write_file/edit_file arguments carry the ENTIRE
+// written/edited file content (glimmer-engineer.py's own new_content/
+// old_string fields) -- serving that verbatim through this endpoint would
+// leak full file bodies where only "what tool ran, on what path" is
+// meant to be visible. Same redaction shape run_engineer's own
+// display_args/tool_started event already applies to WRITE_TOOLS.
+const EVIDENCE_WRITE_TOOL_NAMES = new Set(["write_file", "edit_file"]);
+
+function cappedEvidenceArguments(tool: string | undefined, args: unknown): unknown {
+  if (tool && EVIDENCE_WRITE_TOOL_NAMES.has(tool) && args && typeof args === "object" && !Array.isArray(args)) {
+    const obj = args as Record<string, unknown>;
+    return { path: obj.path, keys: Object.keys(obj) };
+  }
+  if (args === undefined) return args;
+  let json: string;
+  try {
+    json = JSON.stringify(args);
+  } catch {
+    return args; // not JSON-serializable (shouldn't happen for parsed JSON) -- pass through as-is
+  }
+  return json.length > EVIDENCE_ENTRY_FIELD_MAX_CHARS
+    ? json.slice(0, EVIDENCE_ENTRY_FIELD_MAX_CHARS) + "...(truncated)"
+    : args;
+}
 
 // One persisted evidence-NN.jsonl line by id (Task 5.1's get_evidence
 // tool reads this same family of files client-side; this is the
@@ -475,13 +507,14 @@ export async function readEvidenceEntry(id: string, evidenceId: string): Promise
       // tool_envelope entries (kind: "tool_envelope") do not, so this can
       // never resolve to the wrong record shape.
       if (record?.id !== evidenceId) continue;
+      const tool = typeof record.tool === "string" ? record.tool : undefined;
       const content = typeof record.content === "string" ? record.content : undefined;
       return {
         id: evidenceId,
-        tool: typeof record.tool === "string" ? record.tool : undefined,
-        arguments: record.arguments,
-        content: content !== undefined && content.length > EVIDENCE_ENTRY_CONTENT_MAX_CHARS
-          ? content.slice(0, EVIDENCE_ENTRY_CONTENT_MAX_CHARS) + "\n\n[truncated]"
+        tool,
+        arguments: cappedEvidenceArguments(tool, record.arguments),
+        content: content !== undefined && content.length > EVIDENCE_ENTRY_FIELD_MAX_CHARS
+          ? content.slice(0, EVIDENCE_ENTRY_FIELD_MAX_CHARS) + "\n\n[truncated]"
           : content,
       };
     }

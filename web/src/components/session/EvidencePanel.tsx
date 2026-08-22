@@ -12,13 +12,15 @@ export function EvidencePanel({ sessionId }: { sessionId: string }) {
 
   // Opt-in artifact, written incrementally during the run — not a live
   // stream to poll, but it can still change while the session is active,
-  // so this refetches like the other session-detail panels rather than
-  // being a pure fetch-once.
+  // so this refetches on the same interval as the other live session-detail
+  // panels (VisualVerificationPanel, ActiveSessionScreen's own session/
+  // analysis polling) rather than being a pure fetch-once.
   const { data } = useQuery({
     queryKey: ["evidence-index", sessionId],
     queryFn: () => glimmerApi.getEvidenceIndex(sessionId),
     enabled: !!sessionId,
     retry: false,
+    refetchInterval: 4000,
   });
 
   const { data: entry, isLoading: entryLoading } = useQuery({

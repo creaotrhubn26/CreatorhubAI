@@ -597,6 +597,46 @@ describe("GET /api/sessions/:id/evidence", () => {
     expect(res.body.content.endsWith("[truncated]")).toBe(true);
   });
 
+  it("?id= redacts write_file/edit_file arguments to path+keys (never echoes full file content)", async () => {
+    const id = "20260822-000006-glimmer-evidence-write-redact";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const wholeFileContent = "line 1\n".repeat(2000);
+    await fs.writeFile(
+      path.join(dir, "evidence-00.jsonl"),
+      JSON.stringify({
+        id: "sess-1-ev-1", tool: "write_file",
+        arguments: { path: "src/big.ts", content: wholeFileContent },
+        content: "wrote src/big.ts",
+      }) + "\n"
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
+    expect(res.status).toBe(200);
+    expect(res.body.arguments).toEqual({ path: "src/big.ts", keys: ["path", "content"] });
+    expect(JSON.stringify(res.body.arguments)).not.toContain("line 1");
+  });
+
+  it("?id= caps non-write-tool arguments at 4000 characters", async () => {
+    const id = "20260822-000007-glimmer-evidence-args-cap";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const hugePattern = "x".repeat(5000);
+    await fs.writeFile(
+      path.join(dir, "evidence-00.jsonl"),
+      JSON.stringify({
+        id: "sess-1-ev-1", tool: "grep_search",
+        arguments: { pattern: hugePattern }, content: "no matches",
+      }) + "\n"
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.arguments).toBe("string");
+    expect(res.body.arguments.length).toBeLessThan(JSON.stringify({ pattern: hugePattern }).length);
+    expect(res.body.arguments.endsWith("...(truncated)")).toBe(true);
+  });
+
   it("?id= returns 404 for an unknown evidence id", async () => {
     const id = "20260822-000004-glimmer-evidence-entry-missing";
     const dir = path.join(stateRoot, "sessions", id);

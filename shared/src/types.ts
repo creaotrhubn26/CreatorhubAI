@@ -634,17 +634,22 @@ export interface ModelRetryEvent extends GlimmerEventBase {
   attempt: number;
   strategy: string;
 }
-// context_selected: only systemBytes/taskBytes are cheaply available at
-// glimmer-engineer.py's run_engineer start today — skills/evidence arrive
-// already merged into `task` by glimmer-v2.py's make_prompt, with no
-// separate byte count crossing that subprocess boundary. skillsBytes/
-// evidenceBytes are reserved here for Round 5 once that split exists.
+// context_selected (Task 5.1, V7 §7 context tiers): tier0Chars (system +
+// task -- permanent, never compacted), tier1Chars (active tool-result
+// history live in the conversation), tier2Refs (how many Tier1 messages
+// have been pushed out to Tier2 "retrievable via get_evidence" stubs so
+// far), tier3Note (a static description of what's cold/on-disk -- never
+// a byte count, Tier3 is never loaded). Emitted once at run start and
+// again only when compaction actually moves something to Tier2 (never
+// per-turn). Fix round 1 (MED): replaces the Round-1 systemBytes/
+// taskBytes/skillsBytes/evidenceBytes shape, which glimmer-engineer.py
+// never actually emits past Task 5.1.
 export interface ContextSelectedEvent extends GlimmerEventBase {
   type: "context_selected";
-  systemBytes: number;
-  taskBytes: number;
-  skillsBytes?: number;
-  evidenceBytes?: number;
+  tier0Chars: number;
+  tier1Chars: number;
+  tier2Refs: number;
+  tier3Note: string;
 }
 export interface ArchitectPlanningStartedEvent extends GlimmerEventBase {
   type: "architect_planning_started";
