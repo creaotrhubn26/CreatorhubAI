@@ -1729,7 +1729,11 @@ def rank_candidates(files, signals):
             score += 0.4
             reasons.append("scope-path-match")
 
-        if repo_map and scope_package:
+        # Fix round 1 (LOW): .get("packages", []) rather than trusting
+        # repo_map to always carry a "packages" list -- best_package
+        # indexes m["packages"] directly and would KeyError on a
+        # malformed/partial repo_map dict otherwise.
+        if repo_map and scope_package and repo_map.get("packages", []):
             pkg = best_package(repo_map, path)
             if pkg and scope_package in (pkg.get("name"), pkg.get("dir")):
                 score += 0.2
@@ -1771,16 +1775,24 @@ def _rerank_plan_candidates(architecture_plan, contract, repo_map, ws, events_pa
     membership, never list order, so reordering here is safe. Never
     raises: any failure leaves candidateFiles in the architect's original
     order and skips the event (same degrade-quietly discipline as the
-    rest of the C1/C2 plan-handling code)."""
+    rest of the C1/C2 plan-handling code).
+
+    Fix round 1 (LOW): returns the computed {path: score} dict (None on
+    any early-return/failure) so the caller can thread it into
+    read_candidate_evidence right after -- a SINGLE rank_candidates call
+    per plan, not two independent ones over two different file-list
+    windows (which could redundantly git-log the same path twice and,
+    worse, score it differently depending on which list it landed in the
+    first 20 of)."""
     try:
         if not architecture_plan:
-            return
+            return None
         candidates = architecture_plan.get("candidateFiles")
         if not isinstance(candidates, list) or not candidates:
-            return
+            return None
         paths = [c.get("path") for c in candidates if isinstance(c, dict) and isinstance(c.get("path"), str)]
         if not paths:
-            return
+            return None
 
         signals = {
             "scope": contract.get("scope") or {},
@@ -1794,8 +1806,11 @@ def _rerank_plan_candidates(architecture_plan, contract, repo_map, ws, events_pa
 
         for r in ranked[:CANDIDATE_SELECTED_TOP_N]:
             emit_event(events_path, "candidate_selected", sid, file=r["path"], reasons=r["reasons"])
+
+        return {r["path"]: r["score"] for r in ranked}
     except Exception as exc:  # noqa: BLE001 - ranking/event-emission must never break the run
         print(f"[V2] WARN: candidate ranking failed: {exc}")
+        return None
 
 
 def _collect_plan_evidence_targets(plan):
@@ -1839,7 +1854,7 @@ def _collect_plan_evidence_targets(plan):
     return targets
 
 
-def read_candidate_evidence(plan, ws, contract=None, repo_map=None):
+def read_candidate_evidence(plan, ws, rank_by_path=None):
     """C1 handoff enforcement (Fix 1): pre-read the architect plan's
     candidateFiles AND existingPatterns[].evidence directly from disk --
     deterministic, zero model cost -- so the engineer doesn't have to
@@ -1853,15 +1868,23 @@ def read_candidate_evidence(plan, ws, contract=None, repo_map=None):
     candidateFiles/existingPatterns, nothing resolves) -- callers never
     need to special-case "no evidence".
 
-    Selection: `contract` (and, optionally, `repo_map`) are Task 5.3
-    additions -- when passed, rank_candidates' deterministic score (V7
-    §27) becomes the PRIMARY sort key (highest first), with the original
-    numeric-"confidence" ordering as the tie-break. Both default to
-    None, in which case behavior is byte-identical to before Task 5.3:
-    entries with a numeric "confidence" (candidateFiles only) sort first
-    (highest confidence first, per V7 Section 5.3's example shape);
-    entries without one keep their original relative order after those
-    (sorted() is stable) -- which naturally preserves "candidateFiles
+    Selection: `rank_by_path` (Task 5.3, a {path: score} dict) is an
+    OPTIONAL pre-computed rank_candidates result -- when passed, its
+    score becomes the PRIMARY sort key (highest first), with the
+    original numeric-"confidence" ordering as the tie-break. Fix round 1
+    (LOW): this function used to take `contract`/`repo_map` and run its
+    own independent rank_candidates call -- since _rerank_plan_candidates
+    (main()'s call site right before this one) already ranks the SAME
+    plan's candidateFiles, that was a second, redundant computation that
+    could score the same path differently (a second, different 20-file
+    git-log recency window) purely from being invoked with a different
+    file list/order. Callers now compute rank_candidates ONCE
+    (_rerank_plan_candidates) and thread its score dict through here.
+    Defaults to None, in which case behavior is byte-identical to before
+    Task 5.3: entries with a numeric "confidence" (candidateFiles only)
+    sort first (highest confidence first, per V7 Section 5.3's example
+    shape); entries without one keep their original relative order after
+    those (sorted() is stable) -- which naturally preserves "candidateFiles
     first, then existingPatterns evidence in order" for the common
     no-confidence case. At most PLAN_EVIDENCE_MAX_FILES are read, same
     caps and same pipeline regardless of which field a path came from.
@@ -1877,19 +1900,6 @@ def read_candidate_evidence(plan, ws, contract=None, repo_map=None):
         conf = c.get("confidence")
         has_conf = isinstance(conf, (int, float)) and not isinstance(conf, bool)
         return (0 if has_conf else 1, -conf if has_conf else 0)
-
-    rank_by_path = {}
-    if contract is not None:
-        signals = {
-            "scope": contract.get("scope") or {},
-            "ws": ws,
-            "repo_map": repo_map,
-            "objective": contract.get("objective"),
-        }
-        rank_by_path = {
-            r["path"]: r["score"]
-            for r in rank_candidates([t["path"] for t in usable], signals)
-        }
 
     if rank_by_path:
         usable.sort(key=lambda c: (-rank_by_path.get(c["path"], 0.0), _confidence_key(c)))
@@ -4407,11 +4417,11 @@ def main():
             )
             manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
             # Task 5.3 (V7 §27): reorder candidateFiles by deterministic
-            # score before anything reads it -- read_candidate_evidence's
-            # own ranking (right below) and the prompt embedding both see
-            # the same order.
-            _rerank_plan_candidates(architecture_plan, contract, repo, ws, events_path, sid)
-            candidate_evidence = read_candidate_evidence(architecture_plan, ws, contract=contract, repo_map=repo)
+            # score before anything reads it, computed ONCE (Fix round 1,
+            # LOW) and threaded into read_candidate_evidence rather than
+            # re-ranked a second time there.
+            rank_by_path = _rerank_plan_candidates(architecture_plan, contract, repo, ws, events_path, sid)
+            candidate_evidence = read_candidate_evidence(architecture_plan, ws, rank_by_path=rank_by_path)
             # C2: gates/architectReviews are only ever added to the
             # manifest when a usable plan exists — with no plan there is
             # nothing to review against, so C2 never runs and these keys
@@ -4749,9 +4759,10 @@ def main():
                         architecture_plan = new_plan
                         record_architecture_plan_version(session, manifest, architecture_plan)
                         # Task 5.3: reorder the NEW plan's candidateFiles
-                        # before anything reads it, same as the v1 call
-                        # site above.
-                        _rerank_plan_candidates(architecture_plan, contract, repo, ws, events_path, sid)
+                        # before anything reads it, same single-pass
+                        # ranking (Fix round 1, LOW) as the v1 call site
+                        # above.
+                        rank_by_path = _rerank_plan_candidates(architecture_plan, contract, repo, ws, events_path, sid)
                         # Fix round 1 (MED): the delta prompt below embeds
                         # `candidate_evidence` alongside `plan=architecture_
                         # plan` -- without refreshing it here, it would
@@ -4760,7 +4771,7 @@ def main():
                         # plan. read_candidate_evidence is deterministic/
                         # cheap (v2.py re-reading files off disk, no model
                         # call), same as the v1 call site above.
-                        candidate_evidence = read_candidate_evidence(architecture_plan, ws, contract=contract, repo_map=repo)
+                        candidate_evidence = read_candidate_evidence(architecture_plan, ws, rank_by_path=rank_by_path)
                         # Fix round 1 (MED): risk snapshot must reflect the
                         # NEW plan, not the stale v{from_version} one.
                         manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
@@ -6263,7 +6274,7 @@ def _architect_replan_selfcheck() -> None:
     #     `architecture_plan = new_plan` (the swap itself).
     swap_idx = main_source.index("architecture_plan = new_plan")
     evidence_refresh_idx = main_source.index(
-        "candidate_evidence = read_candidate_evidence(architecture_plan, ws, contract=contract, repo_map=repo)",
+        "candidate_evidence = read_candidate_evidence(architecture_plan, ws, rank_by_path=rank_by_path)",
         swap_idx,
     )
     architect_plan_manifest_refresh_idx = main_source.index(
@@ -8129,6 +8140,11 @@ def _candidate_ranking_selfcheck() -> None:
     assert by_path2["frontend/a.ts"]["reasons"] == ["package-match:frontend"]
     assert by_path2["backend/b.ts"]["score"] == 0.0
 
+    # Fix round 1 (LOW): a malformed repo_map missing "packages" entirely
+    # must never KeyError -- rank_candidates guards with .get("packages", []).
+    malformed_ranked = rank_candidates(["frontend/a.ts"], {"scope": {"package": "@app/frontend"}, "repo_map": {}})
+    assert malformed_ranked[0]["score"] == 0.0
+
     # ------------------------------------------------------------
     # 3. Deterministic tie-break: equal (zero) scores sort by path asc,
     #    not input order.
@@ -8192,22 +8208,36 @@ def _candidate_ranking_selfcheck() -> None:
             {"path": "fresh.ts", "confidence": 0.1},
         ]}
         contract = {"scope": {}, "objective": "touch up fresh"}
-        _rerank_plan_candidates(plan, contract, None, ws, str(events_path), "sess-rank")
+        rank_by_path = _rerank_plan_candidates(plan, contract, None, ws, str(events_path), "sess-rank")
 
         assert [c["path"] for c in plan["candidateFiles"]] == ["fresh.ts", "old.ts"], (
             "candidateFiles must be reordered by rank score (fresh.ts scores higher), "
             "original per-entry fields (confidence) preserved"
         )
         assert plan["candidateFiles"][0]["confidence"] == 0.1, "reorder must not touch each entry's own fields"
+        # Fix round 1 (LOW, single-pass ranking): the computed {path: score}
+        # map is returned so the caller can thread it into
+        # read_candidate_evidence instead of ranking a second time there.
+        assert rank_by_path == {"fresh.ts": 0.4, "old.ts": 0.0}, (
+            f"expected fresh.ts=0.4 (recency+keyword), old.ts=0.0, got {rank_by_path!r}"
+        )
 
         events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
         selected = [e for e in events if e["type"] == "candidate_selected"]
         assert len(selected) == 2, "one candidate_selected event per ranked candidate (both under CANDIDATE_SELECTED_TOP_N)"
         assert selected[0]["file"] == "fresh.ts" and isinstance(selected[0]["reasons"], list)
 
-        # Never raises on a plan with no usable candidateFiles.
-        _rerank_plan_candidates(None, contract, None, ws, str(events_path), "sess-rank")
-        _rerank_plan_candidates({"candidateFiles": "not-a-list"}, contract, None, ws, str(events_path), "sess-rank")
+        # read_candidate_evidence honors the SAME pre-computed rank_by_path
+        # -- no second rank_candidates call (and no second, possibly
+        # different, 20-file git-log window) happens inside it.
+        evidence = read_candidate_evidence(plan, ws, rank_by_path=rank_by_path)
+        assert [e["path"] for e in evidence] == ["fresh.ts", "old.ts"], (
+            "read_candidate_evidence must order by the threaded-through rank_by_path"
+        )
+
+        # Never raises on a plan with no usable candidateFiles -- returns None.
+        assert _rerank_plan_candidates(None, contract, None, ws, str(events_path), "sess-rank") is None
+        assert _rerank_plan_candidates({"candidateFiles": "not-a-list"}, contract, None, ws, str(events_path), "sess-rank") is None
 
     print("candidate ranking (V7 §27) self-check: PASS")
 

@@ -1264,6 +1264,34 @@ def _evidence_file_path():
 _evidence_seq = 0
 
 
+def _head_tail_cap(text, max_chars, marker):
+    """Shared head+tail cap: keep the first ~72% and last ~28% of `text`
+    (matching compact_tool_result_for_model's existing split), with a
+    marker line noting how much was omitted in between -- instead of a
+    plain head-only truncation.
+
+    Fix round 1 (HIGH): before this, _persist_evidence capped head-only
+    while compact_tool_result_for_model kept head+tail, so swapping a
+    Tier1 message for a Tier2 "retrievable via get_evidence" stub could
+    silently lose the tail content the model had already seen this turn
+    (get_evidence would resolve to a strictly smaller excerpt than what
+    it replaced). Both call sites -- and get_evidence's own read-back --
+    now share this one shape, so a Tier1->Tier2 swap never loses tail
+    context, only the middle the compaction marker already discloses."""
+    if len(text) <= max_chars:
+        return text
+    head_size = int(max_chars * 0.72)
+    tail_size = max_chars - head_size
+    omitted = len(text) - max_chars
+    return (
+        text[:head_size]
+        + "\n\n"
+        + f"<<< {marker}; {omitted} CHARACTERS OMITTED >>>"
+        + "\n\n"
+        + text[-tail_size:]
+    )
+
+
 def _persist_evidence(tool_name, arguments, content):
     """Append one evidence-NN.jsonl line with a stable, citable id.
 
@@ -1293,7 +1321,9 @@ def _persist_evidence(tool_name, arguments, content):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": tool_name,
         "arguments": arguments,
-        "content": content[:MAX_EVIDENCE_RESULT],
+        # Fix round 1 (HIGH): head+tail cap (see _head_tail_cap), not a
+        # head-only slice -- see that helper's docstring for why.
+        "content": _head_tail_cap(content, MAX_EVIDENCE_RESULT, "EVIDENCE COMPACTED"),
     }
     try:
         with path.open("a", encoding="utf-8") as f:
@@ -1341,7 +1371,32 @@ _EVIDENCE_KIND_BY_TOOL = {
 # error_signatures() there) -- upgrade to share that logic if this proves
 # too noisy in practice.
 _FAILURE_PATH_RE = re.compile(r"^\s*([./]?[\w][\w./-]*\.\w+):\d+", re.MULTILINE)
-_FAILURE_TEXT_MARKERS = ("error", "fail", "traceback", "exception")
+
+# Fix round 1 (LOW): gate failure classification on the tool's OWN
+# structured exit-status marker, not prose-sniffing for words like
+# "error"/"fail" (which false-positives on a clean "0 failures" pass and
+# false-negatives on a real crash with no such word). exec_shell_command's
+# real implementation (llama.cpp/tools/server/server-tools.cpp) always
+# appends exactly "\n[exit code: N]" (optionally "... [exit due to timed
+# out]") to its plain_text_response -- deterministic and always present,
+# so this is real exit status, not a heuristic over output text.
+_SHELL_EXIT_CODE_RE = re.compile(r"\[exit code: (-?\d+)\](?:\s*\[exit due to timed out\])?\s*$")
+
+
+def _shell_exit_code(text):
+    """Parse exec_shell_command's trailing "[exit code: N]" marker.
+    Returns the int exit code, or None if the marker is missing/
+    malformed (e.g. text from a different tool, or a hand-built test
+    fixture) -- never raises."""
+    if not text:
+        return None
+    m = _SHELL_EXIT_CODE_RE.search(text.strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
 
 def _extract_test_paths_from_related_tests_result(text):
@@ -1359,12 +1414,10 @@ def _extract_test_paths_from_related_tests_result(text):
 def _extract_failure_file_paths(text):
     """Deterministic, best-effort scan for '<path>:<line>' occurrences in
     shell-command output (the same shape compiler/test error signatures
-    take) -- the failure->file relatesTo edge. Only scans text that
-    already looks failure-shaped (cheap marker check first) and caps at
-    20 distinct paths."""
-    low = (text or "").lower()
-    if not any(marker in low for marker in _FAILURE_TEXT_MARKERS):
-        return []
+    take) -- the failure->file relatesTo edge. Callers only invoke this
+    once _shell_exit_code has already confirmed a real nonzero exit (see
+    _index_evidence_entry) -- this function itself does no prose-based
+    gating, just path extraction, capped at 20 distinct paths."""
     paths = []
     seen = set()
     for m in _FAILURE_PATH_RE.finditer(text or ""):
@@ -1404,10 +1457,18 @@ def _append_evidence_index_entry(evidence_id, kind, tool_name, path_value, relat
             entry["relatesTo"] = relates_to
         existing.append(entry)
 
-        idx_path.write_text(
+        # Fix round 1 (LOW): write-to-temp-then-replace, not a direct
+        # write_text -- a crash/kill mid-write must never leave a torn
+        # evidence-index.json for the next append (or the CC gateway) to
+        # read back as corrupt/empty. os.replace is atomic on both POSIX
+        # and Windows (same discipline control-center's task-overrides.json
+        # write already uses).
+        tmp_path = idx_path.with_name(f"{idx_path.name}.tmp-{os.getpid()}")
+        tmp_path.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp_path, idx_path)
     except Exception as exc:  # noqa: BLE001 - index is best-effort only
         print(f"[glimmer-engineer] failed to update evidence index: {exc}")
 
@@ -1424,10 +1485,12 @@ def _index_evidence_entry(evidence_id, tool_name, arguments, content):
         for test_path in _extract_test_paths_from_related_tests_result(content):
             relates_to.append({"path": test_path, "kind": "test"})
     elif tool_name == "exec_shell_command":
-        failure_paths = _extract_failure_file_paths(content)
-        if failure_paths:
+        # Fix round 1 (LOW): gate on the tool's own real exit status, not
+        # output prose -- see _shell_exit_code's docstring.
+        exit_code = _shell_exit_code(content)
+        if exit_code is not None and exit_code != 0:
             kind = "failure"
-            for p in failure_paths:
+            for p in _extract_failure_file_paths(content):
                 relates_to.append({"path": p, "kind": "file"})
 
     _append_evidence_index_entry(evidence_id, kind, tool_name, path_value, relates_to or None)
@@ -1439,6 +1502,17 @@ def add_evidence(
     arguments,
     content,
 ):
+    # Fix round 1 (MED): get_evidence is a pure Tier2 READ of an already-
+    # persisted entry -- recording its own result as NEW evidence (and
+    # indexing it into evidence-index.json) would self-amplify the store
+    # with a duplicate node/record for every retrieval, never a genuinely
+    # new observation. Checked before the `interesting` set below (which
+    # still includes it via SEMANTIC_TOOL_NAMES, unchanged, for every
+    # OTHER purpose -- caching, budget-set membership for tools it IS
+    # exempted from at the increment sites in run_engineer).
+    if tool_name == "get_evidence":
+        return None
+
     interesting = {
         "read_file",
         "file_glob_search",
@@ -1934,10 +2008,15 @@ def _find_evidence_by_id(evidence_id):
                         except json.JSONDecodeError:
                             continue
                         if record.get("id") == evidence_id:
-                            content = str(record.get("content") or "")
-                            if len(content) > MAX_EVIDENCE_RESULT:
-                                content = content[:MAX_EVIDENCE_RESULT] + "\n\n[evidence truncated]"
-                            return content
+                            # Already capped head+tail at persist time
+                            # (_persist_evidence uses _head_tail_cap too)
+                            # -- returned verbatim, not re-capped here.
+                            # Re-applying _head_tail_cap on top of its own
+                            # output would compound (the capped output can
+                            # itself exceed max_chars by the marker's own
+                            # overhead, so a second pass would slice
+                            # through the marker/content a second time).
+                            return str(record.get("content") or "")
             except OSError:
                 continue
     except Exception:  # noqa: BLE001 - a retrieval miss must never crash the session
@@ -2095,13 +2174,13 @@ SEMANTIC_TOOL_DEFINITIONS = [
             "function": {
                 "name": "get_evidence",
                 "description": (
-                    "Retrieve the full previously recorded result of an "
-                    "earlier tool call by its evidence id (the "
-                    "'[evidence <id> ...]' ids you see in your own "
-                    "conversation, and any id cited in the ARCHITECTURE "
-                    "PLAN's pre-read evidence). Use this instead of "
-                    "re-running read_file/grep_search/etc. when you "
-                    "already know the exact evidence id you need."
+                    "Retrieve a previously recorded tool result by its "
+                    "evidence id (the '[evidence <id> ...]' ids you see "
+                    "in your own conversation). Returns a head+tail "
+                    "excerpt capped to a few thousand characters, not "
+                    "necessarily the complete original result. Use this "
+                    "instead of re-running read_file/grep_search/etc. "
+                    "when you already know the exact evidence id you need."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3775,22 +3854,7 @@ def compact_tool_result_for_model(
     else:
         max_chars = 8000
 
-    if len(text) <= max_chars:
-        return text
-
-    head_size = int(max_chars * 0.72)
-    tail_size = max_chars - head_size
-
-    omitted = len(text) - max_chars
-
-    return (
-        text[:head_size]
-        + "\n\n"
-        + "<<< TOOL RESULT COMPACTED FOR MODEL CONTEXT; "
-        + f"{omitted} CHARACTERS OMITTED >>>"
-        + "\n\n"
-        + text[-tail_size:]
-    )
+    return _head_tail_cap(text, max_chars, "TOOL RESULT COMPACTED FOR MODEL CONTEXT")
 
 
 # ============================================================
@@ -3817,7 +3881,7 @@ def _tier1_chars(messages):
     return total
 
 
-def _compact_tier1_to_tier2(messages, tool_evidence_by_call_id, budget_chars=None):
+def _compact_tier1_to_tier2(messages, tool_evidence_by_call_id, budget_chars=None, protected_call_ids=None):
     """Task 5.1 (V7 §7/§8): when Tier1 (active tool-result history)
     exceeds its budget share, replace the OLDEST eligible tool-role
     messages with a one-line Tier2 stub -- but ONLY for a message whose
@@ -3826,22 +3890,38 @@ def _compact_tier1_to_tier2(messages, tool_evidence_by_call_id, budget_chars=Non
     compact_tool_result_for_model already applied at append time; no new
     way to lose it is introduced here).
 
+    Fix round 1 (MED, recency protection): `protected_call_ids` (e.g. the
+    CURRENT turn's own tool_call_ids) are never stubbed regardless of
+    budget -- a message the model just produced this turn must still be
+    plainly readable on the very next turn, not already swapped for a
+    retrieval pointer before the model has had a chance to reason over it.
+
+    Caller contract (see run_engineer's call site): this must NOT be
+    called at all while engineer_phase == "narrowed_to_edit_only" -- that
+    phase's active_tools is {edit_file, write_file} only, so get_evidence
+    isn't offered and a stub created there would be unrecoverable for the
+    rest of the run. This function itself doesn't know the phase; the
+    caller is the enforcement point.
+
     ponytail: recomputes _tier1_chars(messages) from scratch on every
     loop iteration (O(turns^2) over the whole run) -- turns per session
     are capped in the tens (ENGINEER_MAX_TURNS_DEFAULT-scale), so this is
     fine; revisit only if that budget ever grows by orders of magnitude.
 
     Returns the number of messages just replaced (0 when Tier1 is
-    already under budget, or when every remaining tool message lacks a
-    persisted evidence id or is already a stub).
+    already under budget, or when every remaining eligible tool message
+    lacks a persisted evidence id, is already a stub, or is protected).
     """
     limit = int((budget_chars if budget_chars is not None else CONTEXT_BUDGET_CHARS) * TIER1_BUDGET_PCT)
+    protected = protected_call_ids or ()
     replaced = 0
 
     for msg in messages:
         if _tier1_chars(messages) <= limit:
             break
         if msg.get("role") != "tool":
+            continue
+        if msg.get("tool_call_id") in protected:
             continue
         content = msg.get("content")
         if not isinstance(content, str) or content.startswith(_TIER2_STUB_PREFIX):
@@ -3932,7 +4012,13 @@ def _context_tiers_selfcheck() -> None:
             assert evidence_id is not None
 
             found = _find_evidence_by_id(evidence_id)
-            assert found == big_content[:MAX_EVIDENCE_RESULT], "get_evidence must return the capped content"
+            # Fix round 1 (HIGH): head+tail cap, matching compact_tool_
+            # result_for_model's shape -- not the old head-only slice,
+            # which silently dropped the tail a Tier1 message the model
+            # had already seen this turn would still have carried.
+            expected_capped = _head_tail_cap(big_content, MAX_EVIDENCE_RESULT, "EVIDENCE COMPACTED")
+            assert found == expected_capped, "get_evidence must return the head+tail-capped content"
+            assert found.endswith("z" * 1960), "tail must be preserved, not silently dropped"
 
             missing = _find_evidence_by_id("sess-tiers-ev-999")
             assert missing.startswith("EVIDENCE_NOT_FOUND")
@@ -3942,12 +4028,80 @@ def _context_tiers_selfcheck() -> None:
             )
             assert _execute_semantic_tool_result == {"plain_text_response": found}
 
+            # ------------------------------------------------------------
+            # 4b. Fix round 1 (MED): get_evidence must never self-amplify
+            #     the evidence store/index -- a retrieval is not a new
+            #     observation.
+            # ------------------------------------------------------------
+            idx_path_before = _evidence_index_file_path()
+            entries_before = json.loads(idx_path_before.read_text(encoding="utf-8"))
+            ledger_ge = []
+            result_ge = add_evidence(ledger_ge, "get_evidence", {"id": evidence_id}, found)
+            assert result_ge is None, "get_evidence must never be assigned a NEW evidence id"
+            assert ledger_ge == [], "get_evidence must never append to the ledger"
+            entries_after = json.loads(idx_path_before.read_text(encoding="utf-8"))
+            assert entries_after == entries_before, "get_evidence must never add an evidence-index.json entry"
+
             GLIMMER_EVENTS_PATH = None
             GLIMMER_SESSION_ID = None
             _evidence_file_path.cache_clear()
             assert _find_evidence_by_id("anything").startswith("EVIDENCE_NOT_FOUND"), (
                 "no session dir must degrade to a not-found string, never raise"
             )
+
+        # ------------------------------------------------------------
+        # 5. Fix round 1 (MED, recency protection): protected_call_ids
+        #    are never stubbed regardless of budget.
+        # ------------------------------------------------------------
+        protect_case = [
+            {"role": "tool", "tool_call_id": "old1", "content": "o" * 500},
+            {"role": "tool", "tool_call_id": "new1", "content": "n" * 500},
+        ]
+        replaced_protected = _compact_tier1_to_tier2(
+            protect_case, {"old1": "sess-ev-1", "new1": "sess-ev-2"},
+            budget_chars=100, protected_call_ids={"new1"},
+        )
+        assert replaced_protected == 1, "only the unprotected message may be stubbed"
+        assert protect_case[0]["content"] == _tier1_stub("sess-ev-1")
+        assert protect_case[1]["content"] == "n" * 500, (
+            "a protected (this-turn) call id must never be stubbed even far over budget"
+        )
+
+        # ------------------------------------------------------------
+        # 6. Fix round 1 (HIGH): structural proof that compaction is
+        #    gated on engineer_phase -- narrowed_to_edit_only offers
+        #    get_evidence to no one (active_tools == {edit_file,
+        #    write_file} there, per the router above it), so a stub
+        #    created in that phase would be permanently unrecoverable
+        #    for the rest of the run.
+        # ------------------------------------------------------------
+        import inspect
+        engineer_source = inspect.getsource(run_engineer)
+        assert (
+            '        if engineer_phase != "narrowed_to_edit_only":\n'
+            '            _newly_compacted = _compact_tier1_to_tier2(\n'
+            '                messages, tool_evidence_by_call_id,\n'
+            '                protected_call_ids={c["id"] for c in tool_calls},\n'
+            '            )\n'
+        ) in engineer_source, (
+            "compaction must be structurally gated on "
+            "engineer_phase != narrowed_to_edit_only, with this turn's "
+            "own call ids protected"
+        )
+
+        # ------------------------------------------------------------
+        # 7. Fix round 1 (MED): get_evidence is structurally exempted
+        #    from both discovery_calls/post_gate_inspection_calls budget
+        #    increments (context recovery, not new exploration).
+        # ------------------------------------------------------------
+        assert (
+            "                and tool_name in discovery_tools\n"
+            '                and tool_name != "get_evidence"\n'
+        ) in engineer_source
+        assert (
+            "                and tool_name in post_gate_inspection_tools\n"
+            '                and tool_name != "get_evidence"\n'
+        ) in engineer_source
 
     finally:
         GLIMMER_EVENTS_PATH = real_events_path
@@ -3983,9 +4137,22 @@ def _evidence_index_selfcheck() -> None:
         ]
         assert _extract_test_paths_from_related_tests_result("No related test files found for 'x'.") == []
 
-        failure_text = "src/foo.ts:12:3 - error TS2322: Type mismatch\nsrc/bar.ts:5:1 - error TS2304: not found"
+        # Fix round 1 (LOW): failure_text now ends with exec_shell_
+        # command's OWN real "[exit code: N]" marker (llama.cpp/tools/
+        # server/server-tools.cpp always appends exactly this) -- the
+        # deterministic exit-status signal _shell_exit_code parses,
+        # rather than sniffing for words like "error"/"fail".
+        failure_text = (
+            "src/foo.ts:12:3 - error TS2322: Type mismatch\n"
+            "src/bar.ts:5:1 - error TS2304: not found\n[exit code: 2]"
+        )
         assert _extract_failure_file_paths(failure_text) == ["src/foo.ts", "src/bar.ts"]
         assert _extract_failure_file_paths("all tests passed, 0 failures") == []
+
+        assert _shell_exit_code(failure_text) == 2
+        assert _shell_exit_code("no output at all") is None, "text with no marker must degrade to None, never raise"
+        assert _shell_exit_code("some output\n[exit code: 0]") == 0
+        assert _shell_exit_code("timed out\n[exit code: -1] [exit due to timed out]") == -1
 
         # ------------------------------------------------------------
         # 2. Incremental build: read_file (kind=file, path), find_related_
@@ -4031,6 +4198,28 @@ def _evidence_index_selfcheck() -> None:
                 {"path": "src/foo.ts", "kind": "file"},
                 {"path": "src/bar.ts", "kind": "file"},
             ]
+
+            # ------------------------------------------------------------
+            # 2b. Fix round 1 (LOW): gate on the REAL exit status, not
+            #     prose -- a successful (exit code 0) command whose
+            #     output happens to contain error-shaped "path:line" text
+            #     (e.g. grep matching the word "error" in a filename)
+            #     must NOT be reclassified to "failure".
+            # ------------------------------------------------------------
+            clean_but_error_shaped_text = (
+                "src/errors.ts:1:1 - grep matched the word error here\n[exit code: 0]"
+            )
+            id_clean = add_evidence(
+                ledger, "exec_shell_command", {"command": "grep -rn error src"},
+                clean_but_error_shaped_text,
+            )
+            entries_after_clean = json.loads(idx_path.read_text(encoding="utf-8"))
+            by_id_after_clean = {e["id"]: e for e in entries_after_clean}
+            assert by_id_after_clean[id_clean]["kind"] == "shell", (
+                "exit code 0 must never be reclassified to 'failure' just because "
+                "the output text LOOKS failure-shaped"
+            )
+            assert "relatesTo" not in by_id_after_clean[id_clean]
 
             # ------------------------------------------------------------
             # 3. Malformed existing index file: tolerated, not fatal --
@@ -7370,9 +7559,18 @@ def run_engineer(
             # global from a PREVIOUS call this turn) to this message.
             tool_evidence_ids = []
 
+            # Fix round 1 (MED): get_evidence is context RECOVERY (reading
+            # back something already discovered/stubbed), not new
+            # exploration -- it stays a member of discovery_tools/
+            # post_gate_inspection_tools (SEMANTIC_TOOL_NAMES, so it's
+            # still OFFERED wherever those sets gate active_tools) but is
+            # exempted here, at the increment sites, from burning either
+            # budget. Otherwise a model recovering a Tier2 stub mid-
+            # narrowing would be charged as if it were browsing new files.
             if (
                 engineer_phase != "writing"
                 and tool_name in discovery_tools
+                and tool_name != "get_evidence"
             ):
                 discovery_calls += 1
 
@@ -7382,6 +7580,7 @@ def run_engineer(
                     "narrowed_to_edit_only",
                 )
                 and tool_name in post_gate_inspection_tools
+                and tool_name != "get_evidence"
             ):
                 post_gate_inspection_calls += 1
 
@@ -7610,18 +7809,30 @@ def run_engineer(
         # something actually moved to Tier2 -- an unconditional per-turn
         # emission was explicitly ruled out as too noisy (V7 §7's
         # "emit... whenever compaction moves items to Tier2").
-        _newly_compacted = _compact_tier1_to_tier2(
-            messages, tool_evidence_by_call_id,
-        )
-        if _newly_compacted:
-            tier2_ref_count += _newly_compacted
-            _emit(
-                "context_selected",
-                tier0Chars=len(system) + len(task),
-                tier1Chars=_tier1_chars(messages),
-                tier2Refs=tier2_ref_count,
-                tier3Note=TIER3_COLD_NOTE,
+        #
+        # Fix round 1 (HIGH): skipped entirely once engineer_phase ==
+        # "narrowed_to_edit_only" -- that phase's active_tools is
+        # {edit_file, write_file} only (see the router above), so
+        # get_evidence is not offered there. A stub created in that phase
+        # would be permanently unrecoverable for the rest of the run,
+        # exactly when the model most needs its evidence to make the
+        # final edit. This turn's own tool_call_ids are also protected
+        # (Fix round 1, MED) so a message never gets stubbed before the
+        # model has had a turn to read it.
+        if engineer_phase != "narrowed_to_edit_only":
+            _newly_compacted = _compact_tier1_to_tier2(
+                messages, tool_evidence_by_call_id,
+                protected_call_ids={c["id"] for c in tool_calls},
             )
+            if _newly_compacted:
+                tier2_ref_count += _newly_compacted
+                _emit(
+                    "context_selected",
+                    tier0Chars=len(system) + len(task),
+                    tier1Chars=_tier1_chars(messages),
+                    tier2Refs=tier2_ref_count,
+                    tier3Note=TIER3_COLD_NOTE,
+                )
 
         # ----------------------------------------------------
         # TASK 2.4: MID-IMPLEMENTATION ADVISORY TRIGGERS
