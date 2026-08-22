@@ -117,6 +117,18 @@ export interface GlimmerSession {
     // no impact or detector didn't run. Never true — phase 1 cannot verify
     // documentation currency, only flag the need.
     documentationCurrent?: boolean | null;
+    // Task 2.3 (V7 §5.11): the remaining two of the five final-acceptance
+    // gates. implementationComplete/verificationPassed are always
+    // computable once a session reaches the post-verify promotion decision
+    // (never optional/absent there — but the field itself is optional on
+    // this type for older archived sessions/manifests predating this
+    // task). scopeApproved folds the existing contract-scope guard AND the
+    // new plan.candidateFiles/expectedScope.maxFiles consistency check —
+    // true only when both hold, null when either is indeterminate, false
+    // when either found a real violation.
+    implementationComplete?: boolean | null;
+    verificationPassed?: boolean | null;
+    scopeApproved?: boolean | null;
   };
   architectPlan?: { used: boolean; risk: string | null };
   failure?: { class: string; detail: string; evidenceIds: string[] };

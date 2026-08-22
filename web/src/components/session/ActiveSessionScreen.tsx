@@ -11,6 +11,7 @@ import { RepairCycleStepper } from "./RepairCycleStepper";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
 import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
+import { GatesRow } from "./GatesRow";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 
 // Non-success terminal states where a `failure` cause (if present) is worth
@@ -145,6 +146,7 @@ export function ActiveSessionScreen() {
           : "Not yet accepted"}
       </p>
       <RepairCycleStepper session={session} />
+      <GatesRow gates={session.gates} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
