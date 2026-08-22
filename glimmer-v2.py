@@ -2169,6 +2169,17 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path, 
     else:
         print(f"[V2] Architect replan v{to_version} produced no usable plan "
               "(missing/invalid/failed); failing closed (never continuing on the rejected plan).")
+        # Fix round 2 (LOW): restore architecture-plan.json from the
+        # already-on-disk v{from_version} snapshot (record_architecture_
+        # plan_version wrote architecture-plan-v{from_version}.json when
+        # that version was created) -- observability only, for whoever
+        # inspects this now-terminal session's dir; the unlink above
+        # already left architecture-plan.json missing, and the caller
+        # still gets `plan is None` back and fails closed regardless of
+        # whether this restore succeeds.
+        restore_src = Path(session) / f"architecture-plan-v{from_version}.json"
+        if restore_src.exists():
+            shutil.copyfile(restore_src, Path(session) / "architecture-plan.json")
 
     return plan
 
@@ -3525,7 +3536,14 @@ def main():
                     # SAME budget/counter across revise and replan rounds
                     # (no separate replan budget). Check budget before
                     # spending it -- a round that would exceed it never runs.
-                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
+                    #
+                    # RULING (round 2): reserve the LAST budget slot for the
+                    # post-verify consistency review (V7 §5.10) -- pre-verify
+                    # disagreement spending (this revise/replan gate) may
+                    # spend at most BUDGET-1 of the shared budget, so a
+                    # high-disagreement run can never starve the post-verify
+                    # check of the one slot it needs to ever run.
+                    if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET - 1:
                         architect_outcome = "budget_exhausted"
                         break
                     manifest["architectReviews"]["used"] += 1
@@ -3762,7 +3780,19 @@ def main():
                     consistency_gate = None
                     if (architecture_plan is not None and architect_reviews is not None
                             and architect_reviews["used"] < ARCHITECT_REVIEW_BUDGET):
-                        architect_reviews["used"] += 1
+                        # Fix round 2 (MED): write through manifest["architectReviews"]
+                        # directly, the same way the pre-verify site above
+                        # does, instead of through the `architect_reviews`
+                        # local alias. Both mutate the same dict object at
+                        # runtime, but --architect-review-selfcheck /
+                        # --architect-replan-selfcheck's structural guard
+                        # counts literal occurrences of that increment
+                        # expression to prove there are exactly the two
+                        # legitimate increment sites (pre-verify revise/
+                        # replan loop, this post-verify consistency review)
+                        # and no others; an aliased write is invisible to
+                        # that count and silently defeats the guard.
+                        manifest["architectReviews"]["used"] += 1
                         save()
                         post_review = run_architect_review(
                             engineer, ws, architecture_plan, files, change_types, baseline,
@@ -4657,13 +4687,23 @@ def _architect_review_selfcheck() -> None:
     #     pre-block later iterations (Important 1), and persistent
     #     review-machinery failure burns budget until fail-open degrades
     #     into fail-closed (Important 2). Structural proof via source
-    #     ordering: the ONE increment site is only reachable after the
-    #     review call AND after both the fail-open break and the
-    #     approved/rejected break have already had their chance to fire --
-    #     i.e. only on the remaining cases, "revise"/"replan".
+    #     ordering: the FIRST increment site (the one this proof checks)
+    #     is only reachable after the review call AND after both the
+    #     fail-open break and the approved/rejected break have already
+    #     had their chance to fire -- i.e. only on the remaining cases,
+    #     "revise"/"replan".
+    #
+    #     Fix round 2 (MED): exactly TWO increment sites are legitimate
+    #     in the whole file -- (1) this pre-verify revise/replan loop,
+    #     and (2) Task 2.3's post-verify consistency review (C2.3, a few
+    #     hundred lines below) -- both now write through the identical
+    #     literal expression (no more `architect_reviews` local alias at
+    #     the second site) so this count actually proves what it claims;
+    #     an aliased write would be invisible to a literal-string count.
     # ------------------------------------------------------------
-    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1, (
-        "budget must increment in exactly one place"
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 2, (
+        "budget must increment in exactly the two legitimate places: the "
+        "pre-verify revise/replan loop and the post-verify consistency review"
     )
     increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
     review_call_idx = main_source.index("review = run_architect_review(")
@@ -4829,6 +4869,37 @@ def _architect_replan_selfcheck() -> None:
                 "the stale v{from_version} file must be gone, not silently reused"
             )
 
+        # 4a2. Fix round 2 (LOW): same dead-subprocess failure, but now
+        #      the real session-dir shape -- record_architecture_plan_
+        #      version's versioned snapshot (architecture-plan-v1.json)
+        #      is ALSO on disk, not just the "latest" pointer. A failed
+        #      replan must restore architecture-plan.json FROM that
+        #      snapshot (observability for the now-terminal session dir)
+        #      while still returning None (caller still fails closed --
+        #      this restore is purely for whoever inspects the dir after).
+        globals()["invoke_engineer"] = lambda *a, **k: 0
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            events_path = session_dir / "events.jsonl"
+            v1_plan_text = json.dumps({
+                "objective": "restore a session after reload",
+                "packages": ["frontend"], "risk": "medium", "version": 1,
+            })
+            (session_dir / "architecture-plan.json").write_text(v1_plan_text, encoding="utf-8")
+            (session_dir / "architecture-plan-v1.json").write_text(v1_plan_text, encoding="utf-8")
+            result = run_architect_replan(
+                Path("fake-engineer"), session_dir, contract, summary, session_dir,
+                events_path, "sid-replan-fail-restore", review, from_version=1, to_version=2,
+            )
+            assert result is None, "a dead replan subprocess must still fail closed"
+            assert (session_dir / "architecture-plan.json").exists(), (
+                "architecture-plan.json must be restored from the v{from_version} "
+                "snapshot after a failed replan, for observability"
+            )
+            assert json.loads((session_dir / "architecture-plan.json").read_text()) == json.loads(v1_plan_text)
+            # The versioned snapshot itself is untouched (read from, not consumed).
+            assert json.loads((session_dir / "architecture-plan-v1.json").read_text()) == json.loads(v1_plan_text)
+
         # 4b. Engineer subprocess writes a genuinely valid plan -> replan
         #     returns it, stamped with the NEW version (never the model's
         #     own claim, if any -- v2.py's stamp always wins).
@@ -4884,10 +4955,13 @@ def _architect_replan_selfcheck() -> None:
     )
 
     # 5b. Replan is gated behind the SAME shared budget increment as
-    #     revise -- no second/separate increment site (still exactly one
-    #     in the whole file), and the replan branch is only reachable
-    #     AFTER that one increment has already run.
-    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1
+    #     revise -- no separate replan-only increment site. Fix round 2
+    #     (MED): exactly TWO legitimate increment sites exist in the
+    #     whole file (the pre-verify revise/replan loop this replan
+    #     branch lives in, and Task 2.3's post-verify consistency
+    #     review) -- `.index()` below finds the FIRST one (this loop's),
+    #     which is what the replan branch must be reachable after.
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 2
     increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
     replan_branch_idx = main_source.index('if decision_outcome == "replan":')
     assert increment_idx < replan_branch_idx, (

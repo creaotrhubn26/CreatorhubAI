@@ -5160,7 +5160,7 @@ def _normalize_advisory_path(raw):
     return os.path.normpath(p) if p else p
 
 
-def _evaluate_advisory_triggers(architecture_plan, new_file_count, changed_paths, turn, max_turns, fired):
+def _evaluate_advisory_triggers(architecture_plan, changed_paths, turn, max_turns, fired):
     """Deterministic, cheap, per-turn checks -- no model call, no I/O.
     Each of the three trigger keys can fire AT MOST ONCE per session:
     callers must pass the SAME `fired` set across turns; a key already in
@@ -5173,10 +5173,17 @@ def _evaluate_advisory_triggers(architecture_plan, new_file_count, changed_paths
     _consult_selfcheck.
 
     Triggers (V7 §5.5):
-      a. new-file count exceeds the plan's expected scope (expectedScope.
-         maxFiles, falling back to len(candidateFiles) when maxFiles
-         isn't given) -- only when a plan exists and gives a positive
-         estimate.
+      a. total changed-file count exceeds the plan's expected scope
+         (expectedScope.maxFiles, falling back to len(candidateFiles)
+         when maxFiles isn't given) -- only when a plan exists and gives
+         a positive estimate. Fix round 2 (LOW): compares len(changed_
+         paths) (every changed file this session, edits included), not
+         just newly-created files -- aligned with glimmer-v2.py's
+         check_post_verification_consistency, which flags on
+         `len(files) > expectedScope.maxFiles` over the same total
+         changed-files set. A plan budgeted for "at most N files" is
+         blown just as much by N-1 edits + 2 new files as by N+1 new
+         files.
       b. a changed file lands outside plan.candidateFiles -- only when a
          plan exists AND candidateFiles is non-empty.
       c. more than 60% of the turn budget has been used with zero
@@ -5199,9 +5206,10 @@ def _evaluate_advisory_triggers(architecture_plan, new_file_count, changed_paths
             if not isinstance(estimate, int) or isinstance(estimate, bool) or estimate <= 0:
                 estimate = len(candidate_files)
 
-            if estimate > 0 and new_file_count > estimate:
+            changed_count = len(changed_paths)
+            if estimate > 0 and changed_count > estimate:
                 detail = (
-                    f"new file count ({new_file_count}) exceeds the "
+                    f"changed file count ({changed_count}) exceeds the "
                     f"architecture plan's estimate ({estimate})"
                 )
                 fired.add(key)
@@ -5258,43 +5266,45 @@ def _consult_selfcheck() -> None:
     # 1. Trigger determinism: each of a/b/c fires exactly once, then
     #    never again given the same (or worse) fake state.
     # ------------------------------------------------------------
+    fired = set()
+
+    # (a) Fix round 2: total changed-file count (3) > maxFiles (2) --
+    # candidateFiles lists 3 real paths so all 3 changed files stay
+    # IN-scope (no incidental trigger-(b) fire in the same call).
     plan = {
         "expectedScope": {"maxFiles": 2},
         "candidateFiles": [
             {"path": "a.py", "reason": "x", "confidence": 0.9},
             {"path": "b.py", "reason": "y", "confidence": 0.8},
+            {"path": "c.py", "reason": "z", "confidence": 0.7},
         ],
     }
-
-    fired = set()
-
-    # (a) new_file_count (3) > maxFiles (2).
-    result_a = _evaluate_advisory_triggers(plan, 3, set(), 0, 10, fired)
+    result_a = _evaluate_advisory_triggers(plan, {"a.py", "b.py", "c.py"}, 0, 10, fired)
     assert result_a == [
         (
             "new_file_count_exceeds_plan",
-            "new file count (3) exceeds the architecture plan's estimate (2)",
+            "changed file count (3) exceeds the architecture plan's estimate (2)",
         )
     ], result_a
     assert "new_file_count_exceeds_plan" in fired
 
-    # Same (worse) over-threshold state again: must NOT re-fire.
-    result_a_again = _evaluate_advisory_triggers(plan, 5, set(), 0, 10, fired)
+    # Same over-threshold state again: must NOT re-fire.
+    result_a_again = _evaluate_advisory_triggers(plan, {"a.py", "b.py", "c.py"}, 0, 10, fired)
     assert not any(k == "new_file_count_exceeds_plan" for k, _ in result_a_again), (
         "trigger (a) must fire at most once per session"
     )
 
     # (b) a changed path outside candidateFiles.
-    result_b = _evaluate_advisory_triggers(plan, 0, {"c.py"}, 0, 10, fired)
+    result_b = _evaluate_advisory_triggers(plan, {"z.py"}, 0, 10, fired)
     assert result_b == [
         (
             "edit_outside_candidate_files",
-            "changed file 'c.py' is outside the architecture plan's candidateFiles",
+            "changed file 'z.py' is outside the architecture plan's candidateFiles",
         )
     ], result_b
     assert "edit_outside_candidate_files" in fired
 
-    result_b_again = _evaluate_advisory_triggers(plan, 0, {"c.py", "d.py"}, 0, 10, fired)
+    result_b_again = _evaluate_advisory_triggers(plan, {"z.py", "y.py"}, 0, 10, fired)
     assert not any(k == "edit_outside_candidate_files" for k, _ in result_b_again), (
         "trigger (b) must fire at most once per session"
     )
@@ -5302,7 +5312,7 @@ def _consult_selfcheck() -> None:
     # (c) turn count > 60% of max_turns with zero writes -- independent of
     # a plan existing at all (plan=None here).
     fired_c = set()
-    result_c = _evaluate_advisory_triggers(None, 0, set(), 6, 10, fired_c)
+    result_c = _evaluate_advisory_triggers(None, set(), 6, 10, fired_c)
     assert result_c == [
         (
             "turns_high_no_writes",
@@ -5311,12 +5321,12 @@ def _consult_selfcheck() -> None:
     ], result_c
     assert "turns_high_no_writes" in fired_c
 
-    result_c_again = _evaluate_advisory_triggers(None, 0, set(), 9, 10, fired_c)
+    result_c_again = _evaluate_advisory_triggers(None, set(), 9, 10, fired_c)
     assert result_c_again == [], "trigger (c) must fire at most once per session"
 
     # (c) must not fire once a write has occurred.
     fired_c2 = set()
-    result_c2 = _evaluate_advisory_triggers(None, 0, {"x.py"}, 9, 10, fired_c2)
+    result_c2 = _evaluate_advisory_triggers(None, {"x.py"}, 9, 10, fired_c2)
     assert result_c2 == [], "trigger (c) must not fire once a write has occurred"
 
     # A plan with no positive estimate at all (no expectedScope.maxFiles,
@@ -5324,7 +5334,9 @@ def _consult_selfcheck() -> None:
     # positive.
     fired_d = set()
     empty_plan = {"expectedScope": {}, "candidateFiles": []}
-    result_d = _evaluate_advisory_triggers(empty_plan, 5, set(), 0, 10, fired_d)
+    result_d = _evaluate_advisory_triggers(
+        empty_plan, {"a.py", "b.py", "c.py", "d.py", "e.py"}, 0, 10, fired_d
+    )
     assert result_d == [], "trigger (a) must not fire with a zero/absent estimate"
 
     # Review round 1 (LOW): path normalization -- a candidateFiles entry
@@ -5335,12 +5347,12 @@ def _consult_selfcheck() -> None:
         "expectedScope": {},
         "candidateFiles": [{"path": "./src/x.ts", "reason": "x", "confidence": 0.9}],
     }
-    result_e = _evaluate_advisory_triggers(dotted_plan, 0, {"src/x.ts"}, 0, 10, fired_e)
+    result_e = _evaluate_advisory_triggers(dotted_plan, {"src/x.ts"}, 0, 10, fired_e)
     assert result_e == [], (
         "'./src/x.ts' candidate must match 'src/x.ts' changed path after normalization"
     )
     # A genuinely different path still fires.
-    result_e2 = _evaluate_advisory_triggers(dotted_plan, 0, {"other.ts"}, 0, 10, fired_e)
+    result_e2 = _evaluate_advisory_triggers(dotted_plan, {"other.ts"}, 0, 10, fired_e)
     assert result_e2 == [
         (
             "edit_outside_candidate_files",
@@ -6281,10 +6293,10 @@ def run_engineer(
     ledger = []
     changed_paths = set()
 
-    # Task 2.4 (V7 §5.5 second half): new-file count for trigger (a), and
-    # the once-per-session fired-set shared by all three deterministic
-    # advisory triggers (see _evaluate_advisory_triggers above).
-    new_file_count = 0
+    # Task 2.4 (V7 §5.5 second half): the once-per-session fired-set
+    # shared by all three deterministic advisory triggers (see
+    # _evaluate_advisory_triggers above). Trigger (a) reads changed_paths
+    # directly (Fix round 2) -- no separate new-file counter needed.
     advisory_fired = set()
 
     diff_checked = False
@@ -6777,14 +6789,6 @@ def run_engineer(
                                 )
                             )
 
-                            # Task 2.4: write_file is new-file-only in this
-                            # codebase (secure_tool_arguments rejects an
-                            # existing path), so every successful call is
-                            # exactly one new file -- the count trigger
-                            # (a) needs.
-                            if tool_name == "write_file":
-                                new_file_count += 1
-
                     if (
                         tool_name
                         == "exec_shell_command"
@@ -6872,7 +6876,6 @@ def run_engineer(
         try:
             newly_fired = _evaluate_advisory_triggers(
                 architecture_plan,
-                new_file_count,
                 changed_paths,
                 turn,
                 max_turns,
