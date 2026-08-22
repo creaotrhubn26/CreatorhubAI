@@ -1929,6 +1929,13 @@ def _persist_tool_envelope(envelope):
     data = record.get("data")
     if isinstance(data, str) and len(data) > MAX_EVIDENCE_RESULT:
         record["data"] = data[:MAX_EVIDENCE_RESULT] + "\n\n[envelope data truncated]"
+    # error.message can embed a model-controlled token verbatim (e.g. the
+    # blocked executable name from shlex) — cap it too, on a copied dict so
+    # the envelope returned to the caller is untouched.
+    error = record.get("error")
+    if isinstance(error, dict) and isinstance(error.get("message"), str) and len(error["message"]) > MAX_EVIDENCE_RESULT:
+        record["error"] = dict(error)
+        record["error"]["message"] = error["message"][:MAX_EVIDENCE_RESULT] + "\n\n[envelope error truncated]"
     record["kind"] = "tool_envelope"
     record["sessionId"] = GLIMMER_SESSION_ID
     record["timestamp"] = datetime.now(timezone.utc).isoformat()
