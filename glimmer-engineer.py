@@ -7202,7 +7202,7 @@ def run_consult_escalation(request_path):
     """
     request = _load_consult_request(request_path) if request_path else None
     question = str((request or {}).get("question") or "").strip()
-    plan = (request or {}).get("architecturePlan") if request else None
+    plan = (request or {}).get("architecturePlan")
 
     if not question:
         _write_escalation_file({
@@ -7233,6 +7233,122 @@ def run_consult_escalation(request_path):
 
     _write_escalation_file({"question": question_capped, "answer": answer})
     _emit("architect_consulted", questionChars=len(question_capped), answerChars=len(answer))
+
+
+def _consult_escalation_selfcheck() -> None:
+    """Task 8.2 (V7 §23.15) — proves run_consult_escalation's success,
+    model-down, and empty-answer paths by monkeypatching chat_with_retry
+    (same no-live-llama-server style as _model_provider_selfcheck/
+    _recovery_ladder_selfcheck), plus that `--mode consult` is
+    structurally toolless -- checked against the REAL _build_consult_
+    architect_payload output and the REAL main() dispatch source, not a
+    hand-written re-implementation of what "read-only" should mean
+    (round-7 review lesson: assert against real computation, never a
+    parallel model of it). Run with:
+    python3 glimmer-engineer.py --consult-escalation-selfcheck
+    """
+    import inspect
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+    real_chat_with_retry = chat_with_retry
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-esc"
+            request_path = session_dir / "escalation-request.json"
+            escalation_path = session_dir / "architect-escalation.json"
+
+            request_path.write_text(json.dumps({
+                "architecturePlan": {"objective": "x", "packages": [], "risk": "low"},
+                "question": "Is this architecturally sound?",
+            }))
+
+            # ------------------------------------------------------------
+            # 1. Success: writes the real {"question", "answer"} pair --
+            #    genuine model output, never marked consultationFailed.
+            # ------------------------------------------------------------
+            def fake_ok(payload, attempts=3, role=None):
+                assert role == "consult", "run_consult_escalation must call chat_with_retry with role='consult'"
+                return {"choices": [{"message": {"content": "Approved, proceed as-is."}}]}
+
+            globals()["chat_with_retry"] = fake_ok
+            run_consult_escalation(request_path)
+            written = json.loads(escalation_path.read_text(encoding="utf-8"))
+            assert written == {
+                "question": "Is this architecturally sound?",
+                "answer": "Approved, proceed as-is.",
+            }, written
+            assert "consultationFailed" not in written, "real model output must never be marked failed"
+
+            # ------------------------------------------------------------
+            # 2. Model unreachable: consultationFailed recorded, function
+            #    never raises -- the caller (glimmer-v2.py's own
+            #    run_architect_escalation) only ever reads the exit code/
+            #    file, so session outcome is unaffected either way.
+            # ------------------------------------------------------------
+            def fake_down(payload, attempts=3, role=None):
+                raise ConnectionRefusedError("model server unreachable")
+
+            globals()["chat_with_retry"] = fake_down
+            run_consult_escalation(request_path)  # must not raise
+            written = json.loads(escalation_path.read_text(encoding="utf-8"))
+            assert written.get("consultationFailed") is True
+            assert "model server unreachable" in written["reason"]
+
+            # ------------------------------------------------------------
+            # 3. Empty/whitespace answer: honestly degraded, never
+            #    fabricated as a real consultation.
+            # ------------------------------------------------------------
+            def fake_blank(payload, attempts=3, role=None):
+                return {"choices": [{"message": {"content": "   "}}]}
+
+            globals()["chat_with_retry"] = fake_blank
+            run_consult_escalation(request_path)
+            written = json.loads(escalation_path.read_text(encoding="utf-8"))
+            assert written.get("consultationFailed") is True
+            assert "empty answer" in written["reason"]
+    finally:
+        globals()["chat_with_retry"] = real_chat_with_retry
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+
+    # ------------------------------------------------------------
+    # 4. Structurally toolless: the REAL request-builder never offers
+    #    tools (same discipline _delivery_review_selfcheck already
+    #    proves for _build_delivery_review_payload), and the REAL
+    #    main() dispatch for --mode consult never reaches get_tools/
+    #    execute_tool/run_engineer/run_architect -- read-only by
+    #    construction, not by a re-implemented allow-list.
+    # ------------------------------------------------------------
+    payload, _ = _build_consult_architect_payload(
+        {"objective": "x", "packages": [], "risk": "low"}, "q"
+    )
+    assert "tools" not in payload
+    assert "functions" not in payload
+    assert "tool_choice" not in payload
+    assert "parallel_tool_calls" not in payload
+
+    consult_body = inspect.getsource(run_consult_escalation)
+    for forbidden in ("get_tools(", "execute_tool(", "WRITE_TOOLS", "run_engineer(", "run_architect("):
+        assert forbidden not in consult_body, (
+            f"run_consult_escalation must never reference {forbidden!r} -- it has no tool loop at all"
+        )
+
+    main_source = inspect.getsource(main)
+    consult_dispatch_start = main_source.index('if args.mode == "consult":')
+    consult_dispatch_end = main_source.index('elif args.mode == "architect":', consult_dispatch_start)
+    consult_dispatch = main_source[consult_dispatch_start:consult_dispatch_end]
+    assert "run_consult_escalation(args.consult_request)" in consult_dispatch
+    for forbidden in ("get_tools(", "execute_tool(", "run_engineer(", "run_architect("):
+        assert forbidden not in consult_dispatch, f"--mode consult's dispatch must never reach {forbidden!r}"
+
+    print("consult escalation (Task 8.2, V7 §23.15) self-check: PASS")
 
 
 def _format_advisory_nudge(detail):
@@ -9576,6 +9692,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--consult-selfcheck"]:
         _consult_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--consult-escalation-selfcheck"]:
+        _consult_escalation_selfcheck()
         sys.exit(0)
 
     if sys.argv[1:] == ["--context-tiers-selfcheck"]:
