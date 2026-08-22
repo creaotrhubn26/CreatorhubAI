@@ -361,6 +361,9 @@ export interface ArchitectPlanCreatedEvent extends GlimmerEventBase {
   type: "architect_plan_created";
   risk?: ArchitecturePlanRisk;
   packages?: string[];
+  // Task 2.2 fix round 1 (LOW): 1 for the architect-first plan, N+1 per
+  // replan — matches ArchitecturePlan.version.
+  version?: number;
 }
 export interface ArchitectReviewRequestedEvent extends GlimmerEventBase {
   type: "architect_review_requested";
