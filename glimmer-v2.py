@@ -2460,12 +2460,14 @@ a genuine fix may still require another file if the evidence supports it.
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
-                     plan_candidate_count=0, review_request=None, architect_consult_enabled=False):
+                     plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
+                     consult_request=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
         # sets this — reuses this same spawn shape (same env plumbing,
         # same stdout/log tee) instead of a second subprocess helper.
+        # Task 8.2 additively reuses it a second time for mode="consult".
         cmd += ["--mode", mode]
     if review_request is not None:
         # C2 (glimmer-v7): only ever set alongside mode="architect" —
@@ -2474,6 +2476,10 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         # branches on this flag's presence). No new mode string, so every
         # existing architect read-only guard still applies unchanged.
         cmd += ["--review-request", str(review_request)]
+    if consult_request is not None:
+        # Task 8.2 (V7 §23.15): only ever set alongside mode="consult" —
+        # see run_architect_escalation below.
+        cmd += ["--consult-request", str(consult_request)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     # Task 2.4 (V7 §5.5 second half): only ever passed True alongside a
@@ -4773,6 +4779,326 @@ def compute_statuses(manifest: dict, session_dir) -> dict:
 
 
 # ============================================================
+# Task 8.2 (V7 §23.15): architect escalation for a delivery-review high/
+# critical concern. Purely deterministic TRIGGER (a severity match on the
+# review's own concerns[].severity -- no model judgment in the decision
+# to escalate, only in the resulting consultation), evaluated in main()'s
+# `finally` block, strictly AFTER every real terminal status is already
+# decided -- this can only ever add a second-opinion artifact, never
+# change session outcome. Reuses glimmer-engineer.py's existing consult_
+# architect model-call machinery via a new, minimal `--mode consult`
+# subprocess (see run_architect_escalation) rather than its live
+# consult_architect TOOL, whose CONSULT_ARCHITECT_BUDGET counter lives
+# and dies inside the (different, already-finished) engineering
+# subprocess's own memory.
+# ============================================================
+
+ESCALATION_SEVERITIES = {"high", "critical"}
+# Cheap, deterministic cap on how many concerns feed the escalation
+# question -- keeps the prompt small and focused, same reasoning as
+# ARCHITECT_REVIEW_DIFF_MAX_CHARS capping the review diff above.
+ESCALATION_MAX_CONCERNS = 3
+
+
+def compute_architect_escalation_trigger(delivery_review, architect_enabled) -> bool:
+    """V7 §23.15: True only when BOTH architect_enabled (this session had
+    architect mode on -- main()'s own `run_architect`, manual --architect-
+    first or the risk-based auto-trigger) AND delivery_review carries at
+    least one concern with severity "high" or "critical". False for every
+    other combination, including delivery_review being None (missing,
+    never generated, or unreadable) -- there is nothing real to escalate
+    without a concern to point at, and an architect-disabled session
+    never gets a second architect opinion it never asked for in the first
+    place."""
+    if not architect_enabled or not isinstance(delivery_review, dict):
+        return False
+    concerns = delivery_review.get("concerns")
+    if not isinstance(concerns, list):
+        return False
+    return any(
+        isinstance(c, dict) and c.get("severity") in ESCALATION_SEVERITIES
+        for c in concerns
+    )
+
+
+def build_escalation_question(delivery_review) -> str:
+    """Deterministic prompt text built ONLY from delivery_review's own
+    high/critical concerns (capped at ESCALATION_MAX_CONCERNS) -- no
+    other session data folded in, so this stays a small, focused
+    second-opinion ask rather than a second full architect review."""
+    concerns = [
+        c for c in (delivery_review.get("concerns") or [])
+        if isinstance(c, dict) and c.get("severity") in ESCALATION_SEVERITIES
+    ]
+    lines = [
+        f"[{c.get('severity')}/{c.get('category')}] {c.get('description', '')}"
+        for c in concerns[:ESCALATION_MAX_CONCERNS]
+    ]
+    return (
+        "The delivery self-review flagged the following high/critical "
+        "concern(s) about this session's implementation. Does this "
+        "indicate the implementation is architecturally unsound and "
+        "needs rework, or is the current approach still acceptable?\n\n"
+        + "\n".join(lines)
+    )[:2000]
+
+
+def load_architect_escalation(session_dir):
+    """Load architect-escalation.json (written by glimmer-engineer.py's
+    `--mode consult`, see run_architect_escalation below). Same uniform-
+    None-on-any-degraded-case contract as load_delivery_review: file
+    missing, unreadable, not valid JSON, or not a JSON object all return
+    None -- callers treat None as "no escalation for this session"
+    (never triggered, or the trigger fired but the subprocess never got
+    as far as writing anything at all)."""
+    path = Path(session_dir) / "architect-escalation.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, session, events_path, sid):
+    """V7 §23.15: exactly ONE architect consultation over a high/critical
+    delivery-review concern, spawned only when the caller's own compute_
+    architect_escalation_trigger already returned True. No re-review
+    loop: one question, one answer, written to architect-escalation.json
+    regardless of what the answer says -- §23.15 asks for a second
+    opinion, not a second gate that could block anything.
+
+    Must never affect session outcome: called only from main()'s
+    unconditional `finally` block, strictly after every real terminal
+    status is already decided. Any failure (subprocess spawn error, the
+    subprocess producing no output at all) degrades to a
+    consultationFailed architect-escalation.json rather than raising --
+    same fail-open contract as run_architect_first/run_architect_review.
+    A model-down failure INSIDE the subprocess is glimmer-engineer.py's
+    own run_consult_escalation's job to record honestly; this function's
+    own except/no-output guard below only covers failures that happen
+    OUTSIDE that subprocess (or before it can write anything).
+    """
+    print("\n" + "=" * 72)
+    print(" [V2] Architect escalation: high/critical delivery-review concern")
+    print("=" * 72)
+
+    request_path = session / "escalation-request.json"
+    escalation_path = session / "architect-escalation.json"
+    rc = None
+    try:
+        request_path.write_text(
+            json.dumps({
+                "architecturePlan": architecture_plan,
+                "question": build_escalation_question(delivery_review),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        rc = invoke_engineer(
+            engineer, ws,
+            "Answer the architect escalation question in --consult-request.",
+            True,  # consult mode has no approval path -- same as architect mode
+            None,  # consult mode makes exactly one model call; no turn budget to set
+            session / "architect-escalation.log",
+            events_path, sid, mode="consult", consult_request=request_path,
+        )
+        print(f"[V2] Architect escalation subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - escalation must never affect session outcome
+        print(f"[V2] WARN: architect escalation subprocess failed to run: {exc}")
+        escalation_path.write_text(
+            json.dumps({
+                "consultationFailed": True,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }, indent=2),
+            encoding="utf-8",
+        )
+        return
+
+    if not escalation_path.exists():
+        # Subprocess never ran, crashed before writing, or the spawn
+        # itself raised above -- either way, no consultation artifact
+        # exists yet. Recorded honestly (never silent) so a session that
+        # triggered escalation always ends up with SOME architect-
+        # escalation.json, even a failed one.
+        escalation_path.write_text(
+            json.dumps({
+                "consultationFailed": True,
+                "reason": f"architect escalation subprocess (exit {rc}) produced no output",
+            }, indent=2),
+            encoding="utf-8",
+        )
+
+
+# ============================================================
+# Task 8.2 (V7 §23.16): final delivery packet -- a concise, entirely-
+# derived-from-existing-facts JSON handoff document, assembled exactly
+# once per session in the SAME unconditional `finally` block that already
+# assembles manifest["statuses"]. Every field is either a deterministic
+# session fact already on `manifest`/on disk, or (customerReadiness/
+# limitations/forwardPlan/confidence) the DeliveryReview's own model
+# output, carried through with an explicit "model-output" provenance tag
+# -- the same convention @glimmer/shared's SessionAssistantAnswer.
+# provenance already uses for the one other model-output-carrying API
+# response. Never fabricates: an artifact that never existed for this
+# session (no delivery-review.json, no architecture plan) reads back as
+# a real null, not an invented default.
+# ============================================================
+
+def compute_delivery_packet(manifest: dict, delivery_review) -> dict:
+    """Pure function of already-computed facts -- manifest (which by the
+    finally-block call site already carries statuses/gates/attempts/
+    finalChangedFiles/orchestratorUpdatedFiles/architectPlan) plus the
+    DeliveryReview dict already loaded by the caller (or None). Same
+    "called by both main() and its own selfcheck" discipline as
+    compute_statuses."""
+    statuses = manifest.get("statuses") or {}
+    gates = manifest.get("gates") or {}
+    architect_plan_record = manifest.get("architectPlan")
+
+    attempts = manifest.get("attempts") or []
+    last_attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+
+    if isinstance(delivery_review, dict):
+        review_failed = bool(delivery_review.get("reviewFailed"))
+        customer_readiness = {
+            "value": delivery_review.get("customerReadiness"),
+            "provenance": "model-output",
+        }
+        limitations = {
+            "unresolvedItems": delivery_review.get("unresolvedItems") or [],
+            "intentionallyNotChanged": delivery_review.get("intentionallyNotChanged") or [],
+            "concerns": delivery_review.get("concerns") or [],
+            "provenance": "model-output",
+        }
+        forward_plan = {
+            "nextSteps": delivery_review.get("nextSteps") or [],
+            "provenance": "model-output",
+        }
+        confidence = dict(delivery_review.get("confidence") or {})
+        confidence["provenance"] = "model-output"
+        if review_failed:
+            # _fallback_delivery_review's degrade path -- still a REAL file
+            # on disk, just not a real review. Labeled rather than passed
+            # through silently, so a packet reader can't mistake a
+            # generation failure for genuine (if pessimistic) judgment.
+            customer_readiness["reviewFailed"] = True
+            limitations["reviewFailed"] = True
+            forward_plan["reviewFailed"] = True
+            confidence["reviewFailed"] = True
+    else:
+        customer_readiness = None
+        limitations = None
+        forward_plan = None
+        confidence = None
+
+    return {
+        "task": manifest.get("task"),
+        "planRef": {
+            "architectUsed": bool(architect_plan_record and architect_plan_record.get("used")),
+            "architectureApproved": gates.get("architectureApproved"),
+        } if architect_plan_record is not None else None,
+        "changedFiles": manifest.get("finalChangedFiles") or [],
+        "orchestratorUpdatedFiles": manifest.get("orchestratorUpdatedFiles") or [],
+        "verification": {
+            "status": statuses.get("technical", "NOT_RUN"),
+            "results": last_attempt.get("verificationResults"),
+        },
+        "visual": statuses.get("visual", "not_run"),
+        "statuses": statuses,
+        "customerReadiness": customer_readiness,
+        "limitations": limitations,
+        "forwardPlan": forward_plan,
+        "confidence": confidence,
+        # The gateway (control-center), not this orchestrator, records a
+        # human's actual accept decision (human-acceptance.json, written
+        # later by POST /sessions/:id/accept) -- this packet is generated
+        # once, at session close-out, strictly BEFORE any human could have
+        # reviewed it. "pending" is therefore the one honest constant
+        # here, never a fabricated guess at a future human decision.
+        "humanReviewStatus": "pending",
+    }
+
+
+def render_packet_summary(packet: dict) -> str:
+    """Deterministic plain-text rendering of `packet` -- NO model call,
+    matching V7 §23.16/§23.17's "concise delivery packet" prose shape.
+    Every line is a straight lookup on already-computed packet fields; an
+    absent (None) section renders as "Unavailable" rather than being
+    silently skipped, so the summary always has the same fixed shape
+    regardless of which artifacts this session actually produced."""
+    lines = ["DELIVERY PACKET", "=" * 40]
+    lines.append(f"Task: {packet.get('task') or 'Unavailable'}")
+
+    plan_ref = packet.get("planRef")
+    if plan_ref is None:
+        lines.append("Architecture: not engaged for this session")
+    else:
+        lines.append(
+            f"Architecture: used={plan_ref['architectUsed']} "
+            f"approved={plan_ref['architectureApproved']}"
+        )
+
+    changed = packet.get("changedFiles") or []
+    lines.append(f"Changed files ({len(changed)}): " + (", ".join(changed) if changed else "none"))
+
+    orch_files = packet.get("orchestratorUpdatedFiles") or []
+    if orch_files:
+        lines.append(f"Orchestrator-updated files: {', '.join(orch_files)}")
+
+    verification = packet.get("verification") or {}
+    lines.append(f"Verification: {verification.get('status', 'NOT_RUN')}")
+    lines.append(f"Visual: {packet.get('visual', 'not_run')}")
+
+    readiness = packet.get("customerReadiness")
+    lines.append(f"Customer readiness: {readiness['value'] if readiness else 'Unavailable'}")
+
+    limitations = packet.get("limitations")
+    if limitations:
+        unresolved = limitations.get("unresolvedItems") or []
+        lines.append(
+            f"Known limitations ({len(unresolved)}): "
+            + ("; ".join(unresolved) if unresolved else "none reported")
+        )
+    else:
+        lines.append("Known limitations: Unavailable")
+
+    forward = packet.get("forwardPlan")
+    if forward:
+        steps = forward.get("nextSteps") or []
+        lines.append(
+            f"Plan forward ({len(steps)}): "
+            + ("; ".join(s.get("action", "") for s in steps if isinstance(s, dict)) if steps else "none proposed")
+        )
+    else:
+        lines.append("Plan forward: Unavailable")
+
+    confidence = packet.get("confidence")
+    lines.append(f"Confidence: {confidence.get('level') if confidence else 'Unavailable'}")
+
+    lines.append(f"Human review status: {packet.get('humanReviewStatus') or 'Unavailable'}")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_delivery_packet(manifest, session_dir, delivery_review):
+    """Assembles + writes delivery-packet.json and packet-summary.txt to
+    session_dir (V7 §23.16). Never raises: a write failure here must not
+    break session finalization -- same fail-tolerant discipline as the
+    rest of the `finally` block's bookkeeping writes. Returns the
+    assembled packet dict regardless of whether the write succeeded."""
+    packet = compute_delivery_packet(manifest, delivery_review)
+    try:
+        (Path(session_dir) / "delivery-packet.json").write_text(
+            json.dumps(packet, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (Path(session_dir) / "packet-summary.txt").write_text(
+            render_packet_summary(packet), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"[V2] WARN: failed to write delivery packet: {exc}")
+    return packet
+
+
+# ============================================================
 # Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation"): the
 # ADR store lives at <workspace>/docs/decisions/ADR-NNNN.md, one file per
 # decision, a simple frontmatter block (not a real YAML parser -- stdlib
@@ -5628,6 +5954,12 @@ def main():
     # ever runs (e.g. readiness_probe failing below), which would otherwise
     # be a NameError in finally.
     tasks = None
+    # Task 8.2 (V7 §23.15): same NameError-in-finally hazard as `tasks`
+    # above -- the finally block's architect-escalation check reads
+    # architecture_plan on EVERY exit path (it's an escalation input, not
+    # a gate), including a V2Error raised before the real assignment
+    # inside the try (just below `if run_architect:`) ever runs.
+    architecture_plan = None
     # Task 1.2: shared across every evaluate_*_tasks call site below so
     # task_list_completed fires at most once per session (see
     # emit_task_transitions's docstring).
@@ -6543,6 +6875,21 @@ def main():
         # that never got that far reads back as "not_run" for those three
         # legs here, which IS the honest fact).
         manifest["statuses"] = compute_statuses(manifest, session)
+
+        # Task 8.2 (V7 §23.15/§23.16): both read the SAME already-written
+        # delivery-review.json exactly once more here (compute_statuses
+        # above already read it too, internally, for the "delivery" leg --
+        # this second cheap read just avoids threading an extra parameter
+        # through compute_statuses's own signature for one more consumer).
+        _delivery_review_final = load_delivery_review(session)
+        if compute_architect_escalation_trigger(_delivery_review_final, run_architect):
+            run_architect_escalation(
+                engineer, ws, architecture_plan, _delivery_review_final,
+                session, events_path, sid,
+            )
+        write_delivery_packet(manifest, session, _delivery_review_final)
+        emit_event(events_path, "delivery_packet_created", sid)
+
         save()
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
         # the canonical manifest["state"], not the raw manifest["status"].
@@ -9158,6 +9505,204 @@ def _quality_gates_selfcheck() -> None:
     print("quality gates (Task 8.1, V7 §23.10/§23.11) self-check: PASS")
 
 
+def _delivery_packet_selfcheck() -> None:
+    """Task 8.2 (V7 §23.14-23.16): proves delivery-packet assembly
+    (including absent-artifact honesty), the architect-escalation trigger
+    matrix (disabled architect / no concerns / low-severity-only / a
+    single high or critical concern), and run_architect_escalation's
+    fail-tolerance (spawn failure and "subprocess ran but wrote nothing"
+    both degrade to a consultationFailed record, never raise, session
+    outcome untouched), plus delivery_packet_created's event-vocabulary
+    membership. Run with: python3 glimmer-v2.py --delivery-packet-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. compute_delivery_packet: full fixture -- every field traces back
+    #    to a real manifest/delivery_review fact, model-derived fields
+    #    carry "model-output" provenance.
+    # ------------------------------------------------------------
+    manifest = {
+        "task": "add widget",
+        "finalChangedFiles": ["src/widget.ts"],
+        "orchestratorUpdatedFiles": ["docs/graph.json"],
+        "architectPlan": {"used": True, "risk": "low"},
+        "gates": {"architectureApproved": True},
+        "attempts": [{"verificationResults": [{"ok": True}]}],
+        "statuses": {
+            "technical": "VERIFIED", "architecture": "approved", "documentation": "not_run",
+            "visual": "PASS", "delivery": "ready_with_known_limitations", "overall": "ready_with_known_limitations",
+        },
+    }
+    review = {
+        "customerReadiness": "ready_with_known_limitations",
+        "unresolvedItems": ["recovery feedback is subtle"],
+        "intentionallyNotChanged": ["left the legacy adapter alone"],
+        "concerns": [{"severity": "medium", "category": "ux", "description": "x", "evidenceIds": []}],
+        "nextSteps": [{"priority": "recommended_next", "action": "add progress state"}],
+        "confidence": {"level": "high", "reason": "well tested"},
+    }
+    packet = compute_delivery_packet(manifest, review)
+    assert packet["task"] == "add widget"
+    assert packet["planRef"] == {"architectUsed": True, "architectureApproved": True}
+    assert packet["changedFiles"] == ["src/widget.ts"]
+    assert packet["orchestratorUpdatedFiles"] == ["docs/graph.json"]
+    assert packet["verification"] == {"status": "VERIFIED", "results": [{"ok": True}]}
+    assert packet["visual"] == "PASS"
+    assert packet["statuses"] == manifest["statuses"]
+    assert packet["customerReadiness"] == {"value": "ready_with_known_limitations", "provenance": "model-output"}
+    assert packet["limitations"]["unresolvedItems"] == ["recovery feedback is subtle"]
+    assert packet["limitations"]["intentionallyNotChanged"] == ["left the legacy adapter alone"]
+    assert packet["limitations"]["provenance"] == "model-output"
+    assert "reviewFailed" not in packet["limitations"], "a real (non-degraded) review must not be mislabeled"
+    assert packet["forwardPlan"] == {
+        "nextSteps": [{"priority": "recommended_next", "action": "add progress state"}],
+        "provenance": "model-output",
+    }
+    assert packet["confidence"] == {"level": "high", "reason": "well tested", "provenance": "model-output"}
+    assert packet["humanReviewStatus"] == "pending"
+
+    # ------------------------------------------------------------
+    # 2. Absent-artifact honesty: no architecture plan, no delivery
+    #    review at all -- every derived field is a real None, never a
+    #    fabricated default; changedFiles/orchestratorUpdatedFiles absent
+    #    on manifest degrade to an honest empty list (a real "nothing
+    #    happened" fact, not a missing-artifact case).
+    # ------------------------------------------------------------
+    bare_manifest = {"task": "t", "attempts": [], "statuses": {}}
+    bare_packet = compute_delivery_packet(bare_manifest, None)
+    assert bare_packet["planRef"] is None
+    assert bare_packet["changedFiles"] == []
+    assert bare_packet["orchestratorUpdatedFiles"] == []
+    assert bare_packet["verification"] == {"status": "NOT_RUN", "results": None}
+    assert bare_packet["customerReadiness"] is None
+    assert bare_packet["limitations"] is None
+    assert bare_packet["forwardPlan"] is None
+    assert bare_packet["confidence"] is None
+    assert bare_packet["humanReviewStatus"] == "pending", "always a real fact, never fabricated absence"
+
+    # A reviewFailed (fallback) review is a REAL file, not an absent one --
+    # its fields are present, just labeled.
+    failed_review = {
+        "customerReadiness": "not_customer_ready", "reviewFailed": True,
+        "reviewFailureReason": "model never produced valid JSON",
+        "confidence": {"level": "low", "reason": "delivery review generation failed"},
+    }
+    failed_packet = compute_delivery_packet(bare_manifest, failed_review)
+    assert failed_packet["customerReadiness"] == {
+        "value": "not_customer_ready", "provenance": "model-output", "reviewFailed": True,
+    }
+    assert failed_packet["confidence"]["reviewFailed"] is True
+
+    # ------------------------------------------------------------
+    # 3. render_packet_summary: deterministic, no model call; absent
+    #    sections render "Unavailable", present sections render their
+    #    real values.
+    # ------------------------------------------------------------
+    text = render_packet_summary(packet)
+    assert "Task: add widget" in text
+    assert "Customer readiness: ready_with_known_limitations" in text
+    assert "Confidence: high" in text
+    bare_text = render_packet_summary(bare_packet)
+    assert "Customer readiness: Unavailable" in bare_text
+    assert "Known limitations: Unavailable" in bare_text
+    assert "Plan forward: Unavailable" in bare_text
+    assert "Confidence: Unavailable" in bare_text
+    assert "Architecture: not engaged for this session" in bare_text
+
+    # ------------------------------------------------------------
+    # 4. compute_architect_escalation_trigger: the full matrix.
+    # ------------------------------------------------------------
+    high_review = {"concerns": [{"severity": "high", "category": "architecture", "description": "x"}]}
+    critical_review = {"concerns": [{"severity": "critical", "category": "architecture", "description": "x"}]}
+    low_review = {"concerns": [{"severity": "low", "category": "ux", "description": "x"}]}
+    no_concerns_review = {"concerns": []}
+
+    assert compute_architect_escalation_trigger(high_review, True) is True
+    assert compute_architect_escalation_trigger(critical_review, True) is True
+    assert compute_architect_escalation_trigger(high_review, False) is False, "disabled architect must never escalate"
+    assert compute_architect_escalation_trigger(low_review, True) is False, "low severity alone must not escalate"
+    assert compute_architect_escalation_trigger(no_concerns_review, True) is False
+    assert compute_architect_escalation_trigger(None, True) is False, "no review at all -> nothing to escalate"
+    assert compute_architect_escalation_trigger({"concerns": "not-a-list"}, True) is False
+
+    question = build_escalation_question(high_review)
+    assert "high/architecture" in question and "x" in question
+
+    # ------------------------------------------------------------
+    # 5. load_architect_escalation: real file / missing / malformed --
+    #    same uniform-None-on-any-degraded-case contract as
+    #    load_delivery_review.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert load_architect_escalation(session) is None
+        (session / "architect-escalation.json").write_text("not json {{{", encoding="utf-8")
+        assert load_architect_escalation(session) is None
+        (session / "architect-escalation.json").write_text(
+            json.dumps({"question": "q", "answer": "a"}), encoding="utf-8"
+        )
+        assert load_architect_escalation(session) == {"question": "q", "answer": "a"}
+
+    # ------------------------------------------------------------
+    # 6. run_architect_escalation fail-tolerance: a spawn failure (invoke_
+    #    engineer raises) and a "ran but wrote nothing" degradation both
+    #    produce an honest consultationFailed architect-escalation.json,
+    #    never raise out of this function.
+    # ------------------------------------------------------------
+    real_invoke_engineer = invoke_engineer
+
+    def _raising_invoke_engineer(*args, **kwargs):
+        raise RuntimeError("model server unreachable")
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        globals()["invoke_engineer"] = _raising_invoke_engineer
+        try:
+            run_architect_escalation(
+                Path("/nonexistent/glimmer-engineer.py"), Path(td), None, high_review,
+                session, session / "events.jsonl", "s1",
+            )
+        finally:
+            globals()["invoke_engineer"] = real_invoke_engineer
+        written = load_architect_escalation(session)
+        assert written is not None and written.get("consultationFailed") is True
+        assert "model server unreachable" in written["reason"]
+
+    def _noop_invoke_engineer(*args, **kwargs):
+        return 0  # subprocess "succeeds" but (model down, degraded silently) writes nothing
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        globals()["invoke_engineer"] = _noop_invoke_engineer
+        try:
+            run_architect_escalation(
+                Path("/nonexistent/glimmer-engineer.py"), Path(td), None, high_review,
+                session, session / "events.jsonl", "s1",
+            )
+        finally:
+            globals()["invoke_engineer"] = real_invoke_engineer
+        written = load_architect_escalation(session)
+        assert written is not None and written.get("consultationFailed") is True, (
+            "a subprocess that exits 0 but writes no architect-escalation.json "
+            "must still be recorded as a failed consultation, never silence"
+        )
+
+    # ------------------------------------------------------------
+    # 7. Event vocabulary: delivery_packet_created is a real, emittable
+    #    event type (glimmer_events.EVENT_TYPES membership + a real
+    #    round-trip through emit_event).
+    # ------------------------------------------------------------
+    import glimmer_events
+    assert "delivery_packet_created" in glimmer_events.EVENT_TYPES
+    with tempfile.TemporaryDirectory() as td:
+        events_path = Path(td) / "events.jsonl"
+        emit_event(str(events_path), "delivery_packet_created", "s1")
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])["type"] == "delivery_packet_created"
+
+    print("delivery packet + architect escalation (Task 8.2, V7 §23.14-23.16) self-check: PASS")
+
+
 def _visual_selfcheck() -> None:
     """C4 (glimmer-v7): proves the vision-verification plumbing without a
     live browser or a live model call.
@@ -10434,6 +10979,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--quality-gates-selfcheck"]:
         _quality_gates_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--delivery-packet-selfcheck"]:
+        _delivery_packet_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--skills-selfcheck"]:
         _skills_selfcheck()

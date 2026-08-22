@@ -50,6 +50,11 @@ EVENT_TYPES = {
     # per key per session), "architect_consulted" for each actual
     # consult_architect tool call (budget-limited).
     "architect_consult_advised", "architect_consulted",
+    # Task 8.2 (V7 §23.16): emitted once by glimmer-v2.py's `finally`
+    # block, right after delivery-packet.json/packet-summary.txt are
+    # written, on every exit path (mirrors session_completed's own
+    # unconditional emission just after it).
+    "delivery_packet_created",
 }
 
 
@@ -148,6 +153,7 @@ def _selfcheck() -> None:
             ("documentation_verified", {"nodeId": "api-users", "status": "CURRENT"}),
             ("architect_consult_advised", {"trigger": "turns_high_no_writes", "detail": "turn 7/10 (over 60% of the turn budget) with no repository write yet"}),
             ("architect_consulted", {"questionChars": 42, "answerChars": 210}),
+            ("delivery_packet_created", {}),
         ]
         for t, fields in new_type_samples:
             emit(path, t, "s2", **fields)

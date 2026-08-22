@@ -4227,11 +4227,13 @@ def _architect_review_selfcheck() -> None:
     assert isinstance(call_kwargs.get("mode"), ast.Constant) and call_kwargs["mode"].value == "architect", (
         "run_architect's one execute_tool call site must pass mode=\"architect\" unconditionally"
     )
-    # main()'s --mode choices must still be exactly engineer/architect —
-    # C2's review capability is a sub-mode of "architect", not a third
-    # --mode value.
-    assert 'choices=("engineer", "architect")' in inspect.getsource(main), (
-        "C2 must not add a new --mode value; review is a sub-mode of architect"
+    # main()'s --mode choices must still treat C2's review capability as
+    # a sub-mode of "architect", not a distinct --mode value of its own —
+    # unlike Task 8.2's later "consult" (a genuinely different, tool-free
+    # one-call mode with no read-only repo-exploration loop at all, so it
+    # earns its own --mode value rather than piggybacking on architect's).
+    assert 'choices=("engineer", "architect", "consult")' in inspect.getsource(main), (
+        "C2 must not add a new --mode value for review; review is a sub-mode of architect"
     )
 
     # ------------------------------------------------------------
@@ -7128,6 +7130,111 @@ def _run_consult_architect(architecture_plan, question):
     return answer, len(question_capped)
 
 
+# ============================================================
+# Task 8.2 (V7 §23.15): architect escalation for a delivery-review high/
+# critical concern. A tiny standalone `--mode consult` subprocess --
+# deliberately NOT the live engineer loop's consult_architect TOOL above
+# (that budget counter lives and dies inside a DIFFERENT subprocess's
+# memory: the engineering run that already finished by the time
+# glimmer-v2.py decides to escalate). Reuses _build_consult_architect_
+# payload -- the exact same request shape the live tool sends -- but
+# talks to chat_with_retry directly rather than through _run_consult_
+# architect, because that function's own fail-open contract swallows a
+# model/network failure into an in-band answer string; this caller needs
+# a REAL success/failure signal so it can write an honest
+# consultationFailed record (V7 §23.15's "model down -> consultation_
+# failed, session outcome unchanged") instead of silently reporting a
+# failure message as if it were the architect's real answer.
+# ============================================================
+
+def _escalation_file_path():
+    """Same session-dir-derivation convention as _delivery_review_file_
+    path -- the parent of GLIMMER_EVENTS_PATH. Returns None when no
+    session dir is available (standalone invocation)."""
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return None
+    return Path(GLIMMER_EVENTS_PATH).parent / "architect-escalation.json"
+
+
+def _write_escalation_file(output):
+    """Write architect-escalation.json (real consultation or a
+    consultationFailed marker) to the session dir. Never raises. Returns
+    the path written, or None when no session dir is available or the
+    write failed."""
+    path = _escalation_file_path()
+    if path is None:
+        print(
+            "[glimmer-engineer] no session dir available (standalone "
+            "invocation); architect-escalation.json not written."
+        )
+        return None
+    try:
+        path.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Wrote: {path}")
+        return path
+    except OSError as exc:
+        print(f"[glimmer-engineer] failed to write architect-escalation.json: {exc}")
+        return None
+
+
+def _load_consult_request(path):
+    """Load the escalation request glimmer-v2.py writes ({"architecturePlan":
+    plan-or-null, "question": str}) -- same uniform-None-on-any-degraded-
+    case contract as _load_review_request: missing file, unreadable, not
+    valid JSON, or not an object all degrade to None."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_consult_escalation(request_path):
+    """V7 §23.15: the ONE toolless model call behind `--mode consult`.
+    Never raises: any failure (missing/malformed request, model/network
+    error, empty answer) writes a consultationFailed architect-
+    escalation.json instead of raising -- glimmer-v2.py's own caller
+    (run_architect_escalation) treats this subprocess's exit code as
+    advisory only and never depends on it for session outcome.
+    """
+    request = _load_consult_request(request_path) if request_path else None
+    question = str((request or {}).get("question") or "").strip()
+    plan = (request or {}).get("architecturePlan") if request else None
+
+    if not question:
+        _write_escalation_file({
+            "consultationFailed": True,
+            "reason": "missing/invalid escalation request (no question)",
+        })
+        return
+
+    payload, question_capped = _build_consult_architect_payload(plan, question)
+    try:
+        response = chat_with_retry(payload, attempts=3, role="consult")
+        answer = response["choices"][0]["message"].get("content") or ""
+        if not answer.strip():
+            raise ValueError("architect returned an empty answer")
+    except Exception as exc:  # noqa: BLE001 - model-down must degrade honestly, never crash
+        print(f"[glimmer-engineer] architect escalation failed: {exc}")
+        _write_escalation_file({
+            "consultationFailed": True,
+            "reason": f"{type(exc).__name__}: {exc}",
+        })
+        return
+
+    print()
+    print("════════════════════════════════════")
+    print("ARCHITECT ESCALATION")
+    print("════════════════════════════════════")
+    print(answer[:1800])
+
+    _write_escalation_file({"question": question_capped, "answer": answer})
+    _emit("architect_consulted", questionChars=len(question_capped), answerChars=len(answer))
+
+
 def _format_advisory_nudge(detail):
     """The one, exact, deterministic nudge wording (no model text) that
     _evaluate_advisory_triggers' callers inject into `messages` on every
@@ -9339,14 +9446,17 @@ def main():
     # that flag explicitly.
     parser.add_argument(
         "--mode",
-        choices=("engineer", "architect"),
+        choices=("engineer", "architect", "consult"),
         default="engineer",
         help=(
             "engineer (default): the existing full read/write "
             "engineering loop, unchanged. "
             "architect: read-only planning mode (V7 §5) — explores the "
             "repository with a read-only tool set and writes "
-            "architecture-plan.json instead of editing files."
+            "architecture-plan.json instead of editing files. "
+            "consult: V7 §23.15 architect escalation -- exactly ONE "
+            "toolless model call (--consult-request required), writing "
+            "architect-escalation.json. No repository access at all."
         ),
     )
 
@@ -9366,6 +9476,18 @@ def main():
     )
 
     parser.add_argument(
+        "--consult-request",
+        type=Path,
+        default=None,
+        help=(
+            "Task 8.2 (V7 §23.15): only meaningful with --mode consult. "
+            "Path to a JSON file written by glimmer-v2.py: "
+            '{"architecturePlan": plan-or-null, "question": str}. Required '
+            "for --mode consult; ignored otherwise."
+        ),
+    )
+
+    parser.add_argument(
         "--architect-consult-enabled",
         action="store_true",
         help=(
@@ -9379,7 +9501,12 @@ def main():
 
     args = parser.parse_args()
 
-    if args.mode == "architect":
+    if args.mode == "consult":
+        # Task 8.2: no workspace access, no tool loop, no turn budget --
+        # exactly one toolless model call. args.prompt/args.workspace are
+        # still required by argparse but unused here.
+        run_consult_escalation(args.consult_request)
+    elif args.mode == "architect":
         max_turns = (
             args.max_turns
             if args.max_turns is not None
