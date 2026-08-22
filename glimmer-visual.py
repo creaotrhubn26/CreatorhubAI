@@ -321,6 +321,12 @@ def _http_post_json(url, payload, timeout_s, headers=None):
     return json.loads(raw)
 
 
+# Round 6 (V7 §16/§31, glimmer-engineer.py's ModelProvider/MODEL_ROLES):
+# this is a SEPARATE model-runtime provider from glimmer-engineer.py's, by
+# design -- this script stays standalone (see the module docstring above).
+# `model_url` here (a plain CLI arg, not looked up in MODEL_ROLES) already
+# IS this provider's routing seam: whoever invokes glimmer-visual.py picks
+# the vision endpoint per call, same effect as a "vision" role would have.
 def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
                        timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None,
                        state="initial"):
