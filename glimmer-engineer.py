@@ -2969,6 +2969,20 @@ def _architect_mode_selfcheck() -> None:
             ok_bad_v, normalized_bad_v = validate_architecture_plan({**parsed, "version": "not-an-int"})
             assert ok_bad_v and normalized_bad_v["version"] == 1  # malformed -> default, never rejects the plan
 
+            # Task 3.4: visualRequirements tolerates absence (-> []) and, when
+            # present, is capped both by count and per-item length, with
+            # non-string/blank junk dropped rather than passed through.
+            assert normalized["visualRequirements"] == []
+            oversized_requirements = [f"requirement {i}" for i in range(30)]
+            oversized_requirements[0] = "x" * 500
+            oversized_requirements.append(None)  # type: ignore[list-item]
+            ok_vr, normalized_vr = validate_architecture_plan({**parsed, "visualRequirements": oversized_requirements})
+            assert ok_vr
+            assert len(normalized_vr["visualRequirements"]) == MAX_VISUAL_REQUIREMENTS
+            assert len(normalized_vr["visualRequirements"][0]) == MAX_VISUAL_REQUIREMENT_CHARS
+            ok_vr_bad, normalized_vr_bad = validate_architecture_plan({**parsed, "visualRequirements": "not a list"})
+            assert ok_vr_bad and normalized_vr_bad["visualRequirements"] == []
+
             written_path = _write_architecture_plan_file(normalized)
             assert written_path is not None
             assert written_path.name == "architecture-plan.json"
@@ -2999,6 +3013,7 @@ def _architect_mode_selfcheck() -> None:
             assert fallback["risk"] in ARCHITECT_PLAN_RISK_VALUES
             for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
                 assert fallback[field] == []
+            assert fallback["visualRequirements"] == []
 
             written_fallback = _write_architecture_plan_file(fallback)
             assert written_fallback is not None
@@ -3827,6 +3842,13 @@ ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS = (
     "uncertainties",
 )
 
+# Task 3.4: visualRequirements is validated separately (see
+# validate_architecture_plan) because it feeds the visual verification
+# contract file rather than just prompt text, so it gets a count + per-item
+# length cap the fields above don't have.
+MAX_VISUAL_REQUIREMENTS = 20
+MAX_VISUAL_REQUIREMENT_CHARS = 300
+
 ARCHITECT_SYSTEM_PROMPT = (
     "Reasoning strength: high. "
     "You are Glimmer Architect: a read-only architecture-planning agent "
@@ -3916,6 +3938,7 @@ def _fallback_architecture_plan(objective, reason):
 
     for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
         plan[field] = []
+    plan["visualRequirements"] = []  # same shape as a successful plan (see validate_architecture_plan)
 
     return plan
 
@@ -4018,6 +4041,24 @@ def validate_architecture_plan(data):
     for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
         value = data.get(field, [])
         normalized[field] = value if isinstance(value, list) else []
+
+    # Task 3.4 (V7 §22.10/22.18): visualRequirements -- UI-affecting
+    # requirements the architect flags, which flow into the visual
+    # verification contract (Task 3.3). Unlike ARCHITECT_PLAN_OPTIONAL_
+    # ARRAY_FIELDS above (passed through as-is), this list feeds an
+    # automation contract file, not just prompt text, so it gets the
+    # stricter per-item tolerant-but-honest treatment _coerce_finding uses
+    # elsewhere: non-string/blank entries are dropped rather than passed
+    # through, and the whole list is capped (count + per-item length) so
+    # one runaway model response can't blow up the contract file. Absent
+    # entirely -> [], same convention as every other optional array field.
+    visual_requirements_raw = data.get("visualRequirements", [])
+    visual_requirements = []
+    if isinstance(visual_requirements_raw, list):
+        for item in visual_requirements_raw[:MAX_VISUAL_REQUIREMENTS]:
+            if isinstance(item, str) and item.strip():
+                visual_requirements.append(item.strip()[:MAX_VISUAL_REQUIREMENT_CHARS])
+    normalized["visualRequirements"] = visual_requirements
 
     expected_scope = data.get("expectedScope")
     if isinstance(expected_scope, dict):
