@@ -67,6 +67,10 @@ function describe(e: GlimmerEvent): string {
     case "repair_started": return `REPAIR ${e.iteration}`;
     case "parser_recovery": return `PEG retry (attempt ${e.attempt})`;
     case "session_completed": return `SESSION ${e.status}`;
+    // Generic fallback: any event type this build doesn't have a
+    // dedicated case for yet (including new V7 types) still renders a
+    // readable row instead of crashing/going blank.
+    default: return `EVENT ${e.type}`;
   }
 }
 
@@ -107,6 +111,10 @@ function eventDetails(e: GlimmerEvent): Record<string, unknown> {
     case "repair_started": return { ...base, iteration: e.iteration };
     case "parser_recovery": return { ...base, attempt: e.attempt, payloadPath: e.payloadPath };
     case "session_completed": return { ...base, status: e.status };
+    // Generic fallback: dump every field the event actually carries
+    // (base plus whatever else is on it) rather than hand-listing fields
+    // per type — covers new V7 types with no per-type case yet.
+    default: return { ...base, ...(e as unknown as Record<string, unknown>) };
   }
 }
 

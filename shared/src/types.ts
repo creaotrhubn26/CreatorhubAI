@@ -312,6 +312,99 @@ export interface SessionCompletedEvent extends GlimmerEventBase {
   status: GlimmerSessionStatus;
 }
 
+// V7 event vocabulary expansion (Task 1.2 — §5.14, §22.15, task events,
+// §23.13). Mirrors glimmer_events.py's EVENT_TYPES additions one-for-one.
+export interface SessionCreatedEvent extends GlimmerEventBase {
+  type: "session_created";
+  taskSummary: string;
+  workspace: string;
+}
+export interface SkillLoadedEvent extends GlimmerEventBase {
+  type: "skill_loaded";
+  name: string;
+  path: string;
+}
+export interface ModelRetryEvent extends GlimmerEventBase {
+  type: "model_retry";
+  attempt: number;
+  strategy: string;
+}
+// context_selected: only systemBytes/taskBytes are cheaply available at
+// glimmer-engineer.py's run_engineer start today — skills/evidence arrive
+// already merged into `task` by glimmer-v2.py's make_prompt, with no
+// separate byte count crossing that subprocess boundary. skillsBytes/
+// evidenceBytes are reserved here for Round 5 once that split exists.
+export interface ContextSelectedEvent extends GlimmerEventBase {
+  type: "context_selected";
+  systemBytes: number;
+  taskBytes: number;
+  skillsBytes?: number;
+  evidenceBytes?: number;
+}
+export interface ArchitectPlanningStartedEvent extends GlimmerEventBase {
+  type: "architect_planning_started";
+}
+export interface ArchitectPlanCreatedEvent extends GlimmerEventBase {
+  type: "architect_plan_created";
+  risk?: string;
+  packages?: string[];
+}
+export interface ArchitectReviewRequestedEvent extends GlimmerEventBase {
+  type: "architect_review_requested";
+  iteration: number;
+  reviewRound: number;
+}
+export interface ArchitectReviewCompletedEvent extends GlimmerEventBase {
+  type: "architect_review_completed";
+  iteration: number;
+  reviewRound: number;
+  decision: string;
+}
+// architect_replan_started: type defined for the V7 replan flow — no
+// glimmer-v2.py emit site exists yet (no replan path is implemented), so
+// this carries no required fields beyond the base until Round 5 wires one.
+export interface ArchitectReplanStartedEvent extends GlimmerEventBase {
+  type: "architect_replan_started";
+}
+export interface TaskCreatedEvent extends GlimmerEventBase {
+  type: "task_created";
+  taskId: string;
+  kind: GlimmerTask["kind"];
+  description: string;
+}
+export interface TaskStatusChangedEvent extends GlimmerEventBase {
+  type: "task_status_changed";
+  taskId: string;
+  status: GlimmerTask["status"];
+  previousStatus: GlimmerTask["status"];
+}
+export interface TaskListCompletedEvent extends GlimmerEventBase {
+  type: "task_list_completed";
+  taskCount: number;
+}
+export interface VisualVerificationStartedEvent extends GlimmerEventBase {
+  type: "visual_verification_started";
+  command: string;
+}
+export interface VisualFindingDetectedEvent extends GlimmerEventBase {
+  type: "visual_finding_detected";
+  severity: string;
+  category?: string;
+  description: string;
+}
+export interface VisualVerificationCompletedEvent extends GlimmerEventBase {
+  type: "visual_verification_completed";
+  status: VerificationCheckResult["status"];
+}
+export interface DeliveryReviewStartedEvent extends GlimmerEventBase {
+  type: "delivery_review_started";
+}
+export interface DeliveryReviewCompletedEvent extends GlimmerEventBase {
+  type: "delivery_review_completed";
+  customerReadiness: DeliveryReviewCustomerReadiness;
+  confidence: "low" | "medium" | "high";
+}
+
 export type GlimmerEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
@@ -324,13 +417,38 @@ export type GlimmerEvent =
   | ScopeExpandedEvent
   | RepairStartedEvent
   | ParserRecoveryEvent
-  | SessionCompletedEvent;
+  | SessionCompletedEvent
+  | SessionCreatedEvent
+  | SkillLoadedEvent
+  | ModelRetryEvent
+  | ContextSelectedEvent
+  | ArchitectPlanningStartedEvent
+  | ArchitectPlanCreatedEvent
+  | ArchitectReviewRequestedEvent
+  | ArchitectReviewCompletedEvent
+  | ArchitectReplanStartedEvent
+  | TaskCreatedEvent
+  | TaskStatusChangedEvent
+  | TaskListCompletedEvent
+  | VisualVerificationStartedEvent
+  | VisualFindingDetectedEvent
+  | VisualVerificationCompletedEvent
+  | DeliveryReviewStartedEvent
+  | DeliveryReviewCompletedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
   "verification_started", "verification_completed", "agent_state_changed",
   "candidate_selected", "scope_expanded", "repair_started",
   "parser_recovery", "session_completed",
+  "session_created", "skill_loaded", "model_retry", "context_selected",
+  "architect_planning_started", "architect_plan_created",
+  "architect_review_requested", "architect_review_completed",
+  "architect_replan_started",
+  "task_created", "task_status_changed", "task_list_completed",
+  "visual_verification_started", "visual_finding_detected",
+  "visual_verification_completed",
+  "delivery_review_started", "delivery_review_completed",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {
