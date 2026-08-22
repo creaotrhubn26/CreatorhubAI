@@ -23,6 +23,18 @@ EVENT_TYPES = {
     "verification_started", "verification_completed", "agent_state_changed",
     "candidate_selected", "scope_expanded", "repair_started",
     "parser_recovery", "session_completed",
+    # V7 event vocabulary expansion (Task 1.2 — §5.14, §22.15, task events,
+    # §23.13). "architect_replan_started" has no emit site yet: no replan
+    # path exists in glimmer-v2.py today (see run_architect_review), so the
+    # type is defined here for Round 5 to wire up, not emitted anywhere.
+    "session_created", "skill_loaded", "model_retry", "context_selected",
+    "architect_planning_started", "architect_plan_created",
+    "architect_review_requested", "architect_review_completed",
+    "architect_replan_started",
+    "task_created", "task_status_changed", "task_list_completed",
+    "visual_verification_started", "visual_finding_detected",
+    "visual_verification_completed",
+    "delivery_review_started", "delivery_review_completed",
 }
 
 
@@ -91,7 +103,43 @@ def _selfcheck() -> None:
             assert rec["id"] not in seen_ids, "duplicate/colliding event id"
             seen_ids.add(rec["id"])
 
-        print("glimmer_events self-check: PASS (3/3)")
+        # 4. V7 event vocabulary expansion (Task 1.2): a representative new
+        # type from each family (core/architect/task/visual/self-review)
+        # emits successfully and round-trips with its fields intact.
+        new_type_samples = [
+            ("session_created", {"taskSummary": "add widget", "workspace": "/tmp/ws"}),
+            ("skill_loaded", {"name": "frontend", "path": "/skills/frontend.md"}),
+            ("model_retry", {"attempt": 2, "strategy": "same_turn"}),
+            ("context_selected", {"systemBytes": 100, "taskBytes": 200}),
+            ("architect_planning_started", {}),
+            ("architect_plan_created", {"risk": "low"}),
+            ("architect_review_requested", {"iteration": 0, "reviewRound": 1}),
+            ("architect_review_completed", {"iteration": 0, "reviewRound": 1, "decision": "APPROVED"}),
+            ("task_created", {"taskId": "t1", "kind": "implementation"}),
+            ("task_status_changed", {"taskId": "t1", "status": "complete", "previousStatus": "in_progress"}),
+            ("task_list_completed", {"taskCount": 2}),
+            ("visual_verification_started", {"command": "glimmer-visual.py"}),
+            ("visual_finding_detected", {"severity": "high", "description": "cut off"}),
+            ("visual_verification_completed", {"status": "PASS"}),
+            ("delivery_review_started", {}),
+            ("delivery_review_completed", {"customerReadiness": "ready_to_ship", "confidence": "high"}),
+        ]
+        for t, fields in new_type_samples:
+            emit(path, t, "s2", **fields)
+        with open(path) as f:
+            new_lines = f.readlines()[-len(new_type_samples):]
+        for (t, fields), line in zip(new_type_samples, new_lines):
+            rec = json.loads(line)
+            assert rec["type"] == t, f"expected {t!r}, got {rec['type']!r}"
+            for k, v in fields.items():
+                assert rec[k] == v, f"{t}: field {k!r} mismatch"
+        # architect_replan_started has no emit site yet (no replan path
+        # exists) but must still be a valid, emittable type.
+        emit(path, "architect_replan_started", "s2")
+        with open(path) as f:
+            assert json.loads(f.readlines()[-1])["type"] == "architect_replan_started"
+
+        print("glimmer_events self-check: PASS (4/4)")
 
 
 if __name__ == "__main__":

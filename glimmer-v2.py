@@ -101,8 +101,13 @@ def canonical_session_state(raw_status: str) -> str:
     # C2 (glimmer-v7): terminal status when the architect review gate
     # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
     # or the review budget is exhausted — V7 §5.10's rule: a session in
-    # this state must never be promoted to "verified".
-    if raw_status == "needs-architect-review":
+    # this state must never be promoted to "verified". Prefix match: Task
+    # 1.3 splits the legacy "needs-architect-review" string into
+    # "-rejected"/"-budget-exhausted" variants (see classify_failure
+    # below); both must hit this explicit branch rather than fall through
+    # to the generic unknown-status fallback at the bottom of this
+    # function (same resulting value today, but only by coincidence).
+    if raw_status.startswith("needs-architect-review"):
         return "needs_review"
     if raw_status.startswith("blocked-"):
         return "blocked"
@@ -175,6 +180,21 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
     they are only consulted for terminal states this function doesn't
     otherwise recognize, never allowed to override a genuine success/no-op
     status.
+
+    Task 1.3 (V7 §40) note on USER_DENIED: glimmer-engineer.py's tool-result
+    envelope (Task 1.1) can carry error.code == "USER_DENIED" when a human
+    declines a write/shell tool call via the interactive approve() prompt.
+    That envelope is deliberately NEVER routed into a tool_blocked event (no
+    _emit("tool_blocked", ...) call exists at that denial site) and so can
+    never spuriously match the tool_blocked branch below and be classified as
+    POLICY_BLOCK — a controller ruling from Task 1.1: a human saying no is
+    not an automated policy block, it is closer to USER_CANCELLED (someone
+    with authority stopped the run) or, in the gateway flow, simply doesn't
+    happen at all (--auto-approve is always passed for UI-launched runs, see
+    runner.ts). If a session terminates as a direct result of a denial, its
+    real terminal status is whatever raw status classification set (or
+    "cancelled-sigterm" if the human then aborts the run) — this function
+    intentionally adds no separate USER_DENIED-keyed branch.
     """
     raw = manifest.get("status") or ""
 
@@ -191,8 +211,33 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "CODE_FAIL", "detail": "repair budget exhausted with failing checks remaining", "evidenceIds": []}
     if raw == "failed-verifier-mutated-repo":
         return {"class": "POLICY_BLOCK", "detail": "verifier command mutated the repository", "evidenceIds": []}
+    # Task 1.3: the architect-review gate (C2, V7 §5.10/§5.13) has two
+    # distinct terminal causes that main() now writes as distinct raw
+    # statuses (previously both collapsed into the single "needs-architect-
+    # review" string, below, kept for backward compatibility with archived
+    # sessions predating this task).
+    if raw == "needs-architect-review-rejected":
+        return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation (V7 §5.10)", "evidenceIds": []}
+    if raw == "needs-architect-review-budget-exhausted":
+        return {"class": "BUDGET_EXHAUSTED", "detail": "architect review budget exhausted (V7 §5.13)", "evidenceIds": []}
     if raw == "needs-architect-review":
         return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation or the review budget was exhausted (V7 §5.10/§5.13)", "evidenceIds": []}
+    # Task 1.3: readiness_probe (main()'s preflight) now records this exact
+    # status when the model server never becomes reachable, instead of
+    # falling through to the generic "initialized" -> "failed-aborted"
+    # catch-all in main()'s finally block.
+    if raw == "failed-model-unavailable":
+        return {"class": "MODEL_UNAVAILABLE", "detail": "model server was not reachable at readiness_probe (V7 §16)", "evidenceIds": []}
+    # Task 1.3: verify() genuinely ran (args.verify was set) and returned
+    # ok=False on the no-changed-files path -- a real verification failure,
+    # distinct from "no-change-unverified" (verification was never
+    # requested at all, see the sibling branch main() still writes).
+    if raw == "failed-verification":
+        return {"class": "VERIFICATION_FAILURE", "detail": "verify() returned a failing result", "evidenceIds": []}
+    # Task 1.4 (V7 §6): TaskContract budgets.maxChangedFiles, enforced
+    # deterministically post-diff in main()'s repair loop.
+    if raw == "failed-changed-files-budget-exceeded":
+        return {"class": "SCOPE_FAILURE", "detail": "changed files exceeded the task contract's budgets.maxChangedFiles", "evidenceIds": []}
     if raw == "failed-aborted":
         return {"class": "ORCHESTRATION_ABORTED",
                 "detail": "orchestration raised an error before completing any attempt "
@@ -201,6 +246,19 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
                 "evidenceIds": []}
     if raw.startswith("cancelled"):
         return {"class": "USER_CANCELLED", "detail": "session terminated by SIGTERM/interrupt before reaching a terminal state", "evidenceIds": []}
+    # Task 1.3: TOOL_EXECUTION_FAILURE covers a tool-result envelope (Task
+    # 1.1) with ok=False and a non-policy, non-denial error.code -- e.g. an
+    # exception during tool dispatch rather than a policy/approval decision.
+    # No current glimmer-engineer.py call site ever produces such an
+    # envelope (execute_tool's only ok=False codes today are POLICY_BLOCK
+    # and USER_DENIED, both handled elsewhere), and envelope error codes are
+    # not yet plumbed from evidence-NN.jsonl into events.jsonl/manifest
+    # status for this function to observe live. This branch is forward-
+    # compatible groundwork only (same "no emit site yet" precedent as
+    # glimmer_events.EVENT_TYPES's "architect_replan_started"), exercised in
+    # _r6_selfcheck with a synthetic status.
+    if raw == "failed-tool-execution":
+        return {"class": "TOOL_EXECUTION_FAILURE", "detail": "a tool call returned a non-policy execution error", "evidenceIds": []}
 
     blocked = [e for e in events if e.get("type") == "tool_blocked"]
     if blocked:
@@ -285,6 +343,15 @@ def changed_files(ws, baseline):
     return sorted(set(tracked + untracked))
 
 
+def changed_files_budget_exceeded(files: list, max_changed_files) -> bool:
+    """Task 1.4 (V7 §6): TaskContract budgets.maxChangedFiles, enforced
+    deterministically post-diff. max_changed_files is None (unbounded) when
+    --max-changed-files was never passed -- always False in that case, same
+    "omitted = orchestrator default" contract every other optional budget
+    field already follows."""
+    return max_changed_files is not None and len(files) > max_changed_files
+
+
 def _expected_prefixes(scope: dict) -> list:
     """Python port of repoAnalysis.ts's expectedPrefixes(). glimmer-v2.py has
     no repoMap object at this call site (that's a control-center-only
@@ -364,6 +431,17 @@ def _scope_guard_selfcheck() -> None:
         {"scope": {"paths": ["src/dialog"]}},
     )
     assert r["inScope"] is False and r["expandedFiles"] == ["src/dialog-old/b.ts"]
+
+    # Task 1.4 (V7 §6): budgets.maxChangedFiles enforcement -- simulate a
+    # changed-file list over/at/under the budget.
+    assert changed_files_budget_exceeded(["a", "b", "c"], 2) is True
+    assert changed_files_budget_exceeded(["a", "b"], 2) is False
+    assert changed_files_budget_exceeded(["a", "b", "c"], 3) is False  # at budget, not exceeded
+    assert changed_files_budget_exceeded([], 1) is False
+    # None (--max-changed-files never passed) is always unbounded.
+    assert changed_files_budget_exceeded(["a", "b", "c", "d", "e"], None) is False
+    r = classify_failure({"status": "failed-changed-files-budget-exceeded"}, [])
+    assert r["class"] == "SCOPE_FAILURE"
 
     print("scope guard boundary-match self-check: PASS")
 
@@ -1020,7 +1098,24 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             # running app under test isn't rebuilt per git worktree).
             is_visual = is_visual_check_command(cmd)
             if is_visual:
+                if events_path is not None:
+                    emit_event(events_path, "visual_verification_started", session_id, command=label)
                 result = classify_visual_check_result(result, session)
+                if events_path is not None:
+                    for finding in result.get("visualBlockingFindings", []):
+                        # NIT (fix round 1): category is model-controlled
+                        # (visual model's own JSON output) -- cap it like
+                        # description just below, so a runaway/malicious
+                        # value can't bloat events.jsonl.
+                        category = finding.get("category")
+                        if category is not None:
+                            category = str(category)[:100]
+                        emit_event(events_path, "visual_finding_detected", session_id,
+                                   severity=finding.get("severity"),
+                                   category=category,
+                                   description=str(finding.get("description", ""))[:300])
+                    emit_event(events_path, "visual_verification_completed", session_id,
+                               status=result["status"])
 
             if result["status"] == "CODE_FAIL" and not is_visual:
                 if baseline_ws is None:
@@ -1420,12 +1515,20 @@ def _parse_skill_file(path: Path):
     }
 
 
-def load_skills(skills_dir=None) -> list:
+def load_skills(skills_dir=None, events_path=None, session_id=None) -> list:
     """Load every *.md skill file from skills_dir (default SKILLS_ROOT),
     sorted by filename for a stable base ordering (specificity sorting
     happens later, in select_skills). Never raises: a missing/unreadable
     dir, or any single unreadable/malformed file, is skipped -- worst
-    case this returns []."""
+    case this returns [].
+
+    Task 1.2: events_path/session_id are optional and default to None so
+    every existing call site (select_skills/build_skills_block/make_prompt,
+    and every test that calls this directly) is byte-for-byte unaffected.
+    Only main()'s one dedicated session-start call passes them, emitting
+    one skill_loaded event per skill actually found on disk -- distinct
+    from (and unrelated to) the per-iteration area/filetype *selection*
+    select_skills does later against the contract/plan."""
     d = Path(skills_dir) if skills_dir is not None else SKILLS_ROOT
     try:
         if not d.is_dir():
@@ -1442,6 +1545,9 @@ def load_skills(skills_dir=None) -> list:
             parsed = None
         if parsed:
             skills.append(parsed)
+            if events_path is not None and session_id is not None:
+                emit_event(events_path, "skill_loaded", session_id,
+                           name=parsed["name"], path=str(f))
     return skills
 
 
@@ -1804,6 +1910,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     print("\n" + "=" * 72)
     print(" [V2] --architect-first: running Architect mode before iteration 0")
     print("=" * 72)
+    emit_event(events_path, "architect_planning_started", sid)
 
     try:
         architect_prompt = make_architect_prompt(contract, summary)
@@ -1831,6 +1938,14 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 
     if plan is not None:
         print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
+        # NIT (fix round 1): packages is model-controlled (architect's own
+        # JSON output) -- cap entry count and per-entry length so a
+        # runaway/malicious value can't bloat events.jsonl.
+        packages = plan.get("packages")
+        if isinstance(packages, list):
+            packages = [str(p)[:200] for p in packages[:20]]
+        emit_event(events_path, "architect_plan_created", sid,
+                   risk=plan.get("risk"), packages=packages)
     else:
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
@@ -1982,6 +2097,8 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     print("\n" + "=" * 72)
     print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
     print("=" * 72)
+    emit_event(events_path, "architect_review_requested", sid,
+               iteration=iteration, reviewRound=review_round)
 
     request_path = session / f"review-request-{iteration:02d}-{review_round:02d}.json"
 
@@ -2009,7 +2126,12 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     except Exception as exc:  # noqa: BLE001 - review failure must never block the run
         print(f"[V2] WARN: architect review subprocess failed to run: {exc}")
 
-    return load_architect_review(session, iteration, review_round)
+    review = load_architect_review(session, iteration, review_round)
+    if review is not None:
+        emit_event(events_path, "architect_review_completed", sid,
+                   iteration=iteration, reviewRound=review_round,
+                   decision=review["decision"])
+    return review
 
 
 # ============================================================
@@ -2079,6 +2201,41 @@ def save_tasks(session_dir, tasks) -> None:
             json.dumps(tasks, indent=2), encoding="utf-8")
     except OSError as exc:
         print(f"[V2] WARN: failed to write tasks.json: {exc}")
+
+
+def snapshot_task_statuses(tasks) -> dict:
+    """Task 1.2: id -> status snapshot taken immediately before a call to
+    evaluate_implementation_tasks/evaluate_verification_tasks that may
+    mutate `tasks` in place -- feed the result to emit_task_transitions
+    right after that call to get an honest before/after diff. {} when
+    `tasks` is None (no plan, C3 inactive)."""
+    return {t["id"]: t["status"] for t in tasks} if tasks else {}
+
+
+def emit_task_transitions(events_path, sid, tasks, before: dict,
+                           list_completed_flag=None) -> None:
+    """Task 1.2 (§ task events): diff `before` (from snapshot_task_
+    statuses, taken just before an evaluate_*_tasks() call) against the
+    current statuses and emit task_status_changed for each id that
+    actually moved -- never for one that stayed pending/unmatched, same
+    honesty discipline as the evaluators themselves. Emits
+    task_list_completed once every task is non-pending; `list_completed_
+    flag` (a caller-owned single-element list, e.g. [False]) suppresses
+    repeat emissions across the several evaluate_*_tasks call sites in
+    one session once that has already fired. No-op when `tasks` is None.
+    """
+    if tasks is None:
+        return
+    for t in tasks:
+        prev = before.get(t["id"])
+        if prev is not None and prev != t["status"]:
+            emit_event(events_path, "task_status_changed", sid,
+                       taskId=t["id"], status=t["status"], previousStatus=prev)
+    already = list_completed_flag is not None and list_completed_flag[0]
+    if tasks and not already and all(t["status"] != "pending" for t in tasks):
+        emit_event(events_path, "task_list_completed", sid, taskCount=len(tasks))
+        if list_completed_flag is not None:
+            list_completed_flag[0] = True
 
 
 def set_implementation_tasks_status(tasks, status: str) -> None:
@@ -2359,6 +2516,12 @@ def main():
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--engineer", default=str(ENGINEER_DEFAULT))
     ap.add_argument("--max-repairs", type=int, default=2)
+    # Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles. None (the
+    # default) means unbounded, same "omitted = orchestrator default"
+    # contract every other optional contract field already follows.
+    ap.add_argument("--max-changed-files", type=int, default=None,
+                    help="Contract budgets.maxChangedFiles: fail the session (SCOPE_FAILURE) if more than "
+                         "this many files change. 1..500. Omitted = unbounded.")
     ap.add_argument("--verification-level", choices=("minimal", "standard", "full"), default="standard")
     ap.add_argument("--verify", action="append", default=[])
     # C4 (glimmer-v7): only consulted when the literal token "visual" is
@@ -2414,6 +2577,8 @@ def main():
         raise V2Error(f"Existing engineer missing: {engineer}")
     if args.max_repairs < 0 or args.max_repairs > 5:
         raise V2Error("--max-repairs must be 0..5")
+    if args.max_changed_files is not None and not (1 <= args.max_changed_files <= 500):
+        raise V2Error("--max-changed-files must be 1..500")
     validate_visual_url(args.verify, args.visual_url)
 
     recovery = recover_interrupted_checkpoint(ws)
@@ -2441,10 +2606,19 @@ def main():
     session = STATE_ROOT / f"{sid}-{b.replace('/', '-')}"
     session.mkdir()
     events_path = session / "events.jsonl"
+    emit_event(events_path, "session_created", sid,
+               taskSummary=_truncate_bytes(task, 500, "..."), workspace=str(ws))
 
     repo = build_repo_map(ws)
     (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
     summary = repo_summary(repo)
+
+    # Task 1.2: skill_loaded events, once per session -- separate from (and
+    # ahead of) build_skills_block's own per-iteration load_skills() calls
+    # inside make_prompt, which pass no events_path/session_id and so never
+    # re-emit these. The returned list is intentionally unused here; this
+    # call exists purely to log what's on disk at session start.
+    load_skills(events_path=events_path, session_id=sid)
 
     # Task Contract (glimmer-v7 R2): one source of truth for scope/mode/constraints,
     # shared verbatim (field-for-field with @glimmer/shared TaskContract) between
@@ -2477,6 +2651,11 @@ def main():
     }
     if args.max_turns is not None:
         contract["maxTurns"] = args.max_turns
+    # Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles -- optional,
+    # omitted entirely when not passed (mirrors maxTurns's own omit-when-
+    # unset contract just above).
+    if args.max_changed_files is not None:
+        contract["budgets"] = {"maxChangedFiles": args.max_changed_files}
 
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
@@ -2484,6 +2663,32 @@ def main():
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
         "state": canonical_session_state("initialized"),
         "eventsFile": "events.jsonl", "contract": contract,
+        # Task 1.4 (V7 §38): manifest completion -- additive fields only,
+        # every existing reader (control-center/server/src/lib/sessions.ts)
+        # tolerates unknown JSON keys already (plain JSON.parse, no schema
+        # validation).
+        "model": {"endpoint": args.model_readiness_url},
+        # Mirrors contract["constraints"] verbatim minus "minimalChange"
+        # (that one isn't a permission, it's a style constraint) -- these
+        # are project-wide hard constants, never configurable via CLI
+        # flags, so there is exactly one source of truth for both keys.
+        "permissions": {k: v for k, v in contract["constraints"].items() if k != "minimalChange"},
+        "budgets": {
+            "maxTurns": args.max_turns,
+            "maxRepairs": args.max_repairs,
+            # The review-disagreement ceiling (V7 §5.13), always recorded
+            # here regardless of --architect-first -- distinct from the
+            # separate manifest["architectReviews"] = {"max", "used"} usage
+            # counter added later, only when architecture_plan is actually
+            # used.
+            "architectReviews": ARCHITECT_REVIEW_BUDGET,
+            # Fix round 1 (LOW): budgets.maxChangedFiles (V7 §6) was
+            # recorded in contract["budgets"] (above, omit-when-unset) but
+            # never mirrored into this top-level manifest["budgets"]
+            # summary alongside the other three -- always present here,
+            # null when --max-changed-files wasn't passed.
+            "maxChangedFiles": args.max_changed_files,
+        },
     }
     manifest_path = session / "manifest.json"
 
@@ -2492,9 +2697,11 @@ def main():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     save()
-    # session_created isn't a real EVENT_TYPES variant; agent_state_changed is
-    # the closest real type. state= is now the canonical GlimmerSessionStatus
-    # value (R3) — manifest["state"] mirrors what "initialized" maps to.
+    # Task 1.2: session_created (emitted right after session.mkdir() above)
+    # is the real V7 event for this moment; agent_state_changed here still
+    # marks the "initialized" state transition (R3) — the two are distinct
+    # events, not a substitute for one another. state= is the canonical
+    # GlimmerSessionStatus value that manifest["state"] mirrors.
     emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
 
     print("=" * 72)
@@ -2534,9 +2741,27 @@ def main():
     # ever runs (e.g. readiness_probe failing below), which would otherwise
     # be a NameError in finally.
     tasks = None
+    # Task 1.2: shared across every evaluate_*_tasks call site below so
+    # task_list_completed fires at most once per session (see
+    # emit_task_transitions's docstring).
+    task_list_completed_flag = [False]
     try:
         if not args.skip_model_readiness:
-            manifest["modelReadiness"] = readiness_probe(args.model_readiness_url, args.readiness_timeout)
+            # Task 1.3 (V7 §40): readiness_probe raises V2Error on a hard
+            # failure (model server never became reachable within the
+            # timeout) -- record that as its own honest terminal status
+            # here, before re-raising, instead of letting it fall through
+            # unclassified to the generic "initialized" -> "failed-aborted"
+            # catch-all in the `finally` block below (which still exists
+            # for every OTHER pre-loop setup failure).
+            try:
+                manifest["modelReadiness"] = readiness_probe(args.model_readiness_url, args.readiness_timeout)
+            except V2Error:
+                manifest["status"] = "failed-model-unavailable"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                save()
+                raise
             save()
         else:
             manifest["modelReadiness"] = {"status": "SKIPPED"}
@@ -2587,6 +2812,10 @@ def main():
                 tasks = derive_tasks(architecture_plan)
                 manifest["tasksFile"] = "tasks.json"
                 save_tasks(session, tasks)
+                for t in tasks:
+                    emit_event(events_path, "task_created", sid,
+                               taskId=t["id"], kind=t["kind"],
+                               description=t["description"][:200])
             save()
 
         for iteration in range(args.max_repairs + 1):
@@ -2612,8 +2841,10 @@ def main():
                            changeType=change_types.get(f, "modified"))
             # C3: engineer-return -- deterministic evidence point 2/3.
             if tasks is not None:
+                task_snapshot = snapshot_task_statuses(tasks)
                 evaluate_implementation_tasks(tasks, files, rc)
                 save_tasks(session, tasks)
+                emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
@@ -2631,6 +2862,22 @@ def main():
                       f"{manifest['contract']['scope'].get('package')!r} claims a bounded scope but no "
                       "area/paths were given; cannot verify (unbounded)")
 
+            # Task 1.4 (V7 §6): budgets.maxChangedFiles -- unlike the scope
+            # guard above (classify-only, staged rollout), this DOES block:
+            # exceeding it fails the session outright, before verify() ever
+            # runs for this iteration.
+            if changed_files_budget_exceeded(files, args.max_changed_files):
+                print(f"[V2] BUDGET EXCEEDED: {len(files)} changed files > "
+                      f"--max-changed-files {args.max_changed_files}")
+                attempt["status"] = "changed-files-budget-exceeded"
+                manifest["attempts"].append(attempt)
+                manifest["status"] = "failed-changed-files-budget-exceeded"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                final_label = "CHANGED-FILES BUDGET EXCEEDED — NOT VERIFIED"
+                save()
+                break
+
             if not files:
                 commands = [["git", "diff", "--check"]]
                 commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
@@ -2644,8 +2891,10 @@ def main():
                     # applies here too so tasks.json stays honest even on
                     # the no-changed-files path.
                     if tasks is not None:
+                        task_snapshot = snapshot_task_statuses(tasks)
                         evaluate_verification_tasks(tasks, results)
                         save_tasks(session, tasks)
+                        emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
                     if ok:
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
@@ -2656,6 +2905,18 @@ def main():
                         final_label = "NO CHANGE REQUIRED — VERIFIED"
                         save()
                         break
+                    # Task 1.3 (V7 §40): verify() genuinely ran here and
+                    # returned ok=False -- a real VERIFICATION_FAILURE, kept
+                    # distinct from the "verification was never requested"
+                    # case below (same raw status previously covered both).
+                    attempt["status"] = "no-change-verification-failed"
+                    manifest["attempts"].append(attempt)
+                    manifest["status"] = "failed-verification"
+                    manifest["state"] = canonical_session_state(manifest["status"])
+                    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                    final_label = "VERIFICATION FAILED — NOT VERIFIED"
+                    save()
+                    break
                 attempt["status"] = "no-change-unverified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "no-change-unverified"
@@ -2761,8 +3022,10 @@ def main():
                         emit_event(events_path, "file_changed", sid, path=f,
                                    changeType=change_types.get(f, "modified"))
                     if tasks is not None:
+                        task_snapshot = snapshot_task_statuses(tasks)
                         evaluate_implementation_tasks(tasks, files, revise_rc)
                         save_tasks(session, tasks)
+                        emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
                     attempt["changedFiles"] = files
                     attempt["diffHashBeforeVerify"] = diff_hash(ws, baseline)
                     scope_result = compute_scope_guard(files, manifest.get("contract", {}))
@@ -2775,15 +3038,48 @@ def main():
                     # V7 §5.10: tests-pass + architect-rejects must never be
                     # promoted to "verified" -- stop the whole loop here,
                     # before verify() ever runs for this iteration.
-                    attempt["status"] = "needs-architect-review"
+                    # Task 1.3 (V7 §40): distinct raw status per outcome, so
+                    # classify_failure can tell an architect rejection
+                    # (POLICY_BLOCK) apart from the review budget itself
+                    # being exhausted (BUDGET_EXHAUSTED) -- these used to
+                    # share one "needs-architect-review" string.
+                    architect_raw_status = (
+                        "needs-architect-review-budget-exhausted"
+                        if architect_outcome == "budget_exhausted"
+                        else "needs-architect-review-rejected"
+                    )
+                    attempt["status"] = architect_raw_status
                     manifest["attempts"].append(attempt)
-                    manifest["status"] = "needs-architect-review"
+                    manifest["status"] = architect_raw_status
                     manifest["state"] = canonical_session_state(manifest["status"])
                     emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                     save()
                     final_label = "ARCHITECTURE REVIEW REQUIRED — NOT VERIFIED"
                     print(f"\n[V2] {architect_outcome}: architecture review gate blocks promotion to verified.")
                     break
+
+            # Fix round 1 (HIGH): budgets.maxChangedFiles is bypassable via
+            # the architect-review revise loop above -- that loop
+            # recomputes `files` against a NEW post-revise diff, but the
+            # budget check earlier in this iteration (the cheap exit,
+            # still kept for the common no-review / no-growth case) only
+            # ran against the PRE-revise diff. Re-check the current
+            # `files` here, immediately before verify() runs, so a
+            # post-revise diff that blows the budget can never reach
+            # VERIFIED unchecked. See --architect-review-selfcheck's
+            # source-ordering assertion for the structural proof that this
+            # check is unreachable from the revise loop skipping it.
+            if changed_files_budget_exceeded(files, args.max_changed_files):
+                print(f"[V2] BUDGET EXCEEDED (post-revise): {len(files)} changed files > "
+                      f"--max-changed-files {args.max_changed_files}")
+                attempt["status"] = "changed-files-budget-exceeded"
+                manifest["attempts"].append(attempt)
+                manifest["status"] = "failed-changed-files-budget-exceeded"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                final_label = "CHANGED-FILES BUDGET EXCEEDED — NOT VERIFIED"
+                save()
+                break
 
             commands = verifier_commands(repo, files, args.verification_level)
             commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
@@ -2798,8 +3094,10 @@ def main():
             attempt["diffHashAfterVerify"] = after
             # C3: post-verify -- deterministic evidence point 3/3.
             if tasks is not None:
+                task_snapshot = snapshot_task_statuses(tasks)
                 evaluate_verification_tasks(tasks, results)
                 save_tasks(session, tasks)
+                emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
             if before != after:
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
@@ -2948,6 +3246,21 @@ def _r6_selfcheck() -> None:
     # something more useful than UNKNOWN, and must NOT be swallowed by the
     # generic "failed-" prefix branches above it.
     assert classify_failure({"status": "failed-aborted"}, [])["class"] == "ORCHESTRATION_ABORTED"
+
+    # Task 1.3 (V7 §40): the 4 new deterministic classes, plus the two new
+    # architect-review-gate raw statuses main() now writes instead of the
+    # single legacy "needs-architect-review" string (kept below for
+    # backward compat with archived sessions predating this task).
+    assert classify_failure({"status": "needs-architect-review-rejected"}, [])["class"] == "POLICY_BLOCK"
+    assert classify_failure({"status": "needs-architect-review-budget-exhausted"}, [])["class"] == "BUDGET_EXHAUSTED"
+    assert classify_failure({"status": "needs-architect-review"}, [])["class"] == "POLICY_BLOCK"
+    assert classify_failure({"status": "failed-model-unavailable"}, [])["class"] == "MODEL_UNAVAILABLE"
+    assert classify_failure({"status": "failed-verification"}, [])["class"] == "VERIFICATION_FAILURE"
+    assert classify_failure({"status": "failed-tool-execution"}, [])["class"] == "TOOL_EXECUTION_FAILURE"
+    # Task 1.4 (V7 §6): budgets.maxChangedFiles enforcement also classifies
+    # as SCOPE_FAILURE (same class as the pre-existing scope_expanded event
+    # branch below, different raw-status producer).
+    assert classify_failure({"status": "failed-changed-files-budget-exceeded"}, [])["class"] == "SCOPE_FAILURE"
 
     # A real, verified archived session can still carry tool_blocked events
     # (20260817-183716-glimmer-smoke-test-r1 has 2) — success must win
@@ -3378,6 +3691,19 @@ def _architect_review_selfcheck() -> None:
     failure = classify_failure({"status": "needs-architect-review"}, [])
     assert failure is not None and failure["class"] == "POLICY_BLOCK"
 
+    # Fix round 1 (LOW): the two suffixed statuses main() actually writes
+    # (Task 1.3) must hit canonical_session_state's explicit prefix-match
+    # branch, not fall through to its generic unrecognized-status fallback
+    # (both currently return "needs_review", so a plain equality check
+    # can't tell them apart -- assert the branch itself is a prefix match).
+    assert canonical_session_state("needs-architect-review-rejected") == "needs_review"
+    assert canonical_session_state("needs-architect-review-budget-exhausted") == "needs_review"
+    canonical_source = inspect.getsource(canonical_session_state)
+    assert 'raw_status.startswith("needs-architect-review")' in canonical_source, (
+        "must be a prefix match, not an exact match, so the suffixed "
+        "statuses hit this branch instead of the generic fallback"
+    )
+
     # ------------------------------------------------------------
     # 4. make_review_request shape + architect_review_failure_text.
     # ------------------------------------------------------------
@@ -3533,6 +3859,27 @@ def _architect_review_selfcheck() -> None:
     assert review_call_idx < increment_idx, "increment must happen after the review actually runs"
     assert fail_open_idx < increment_idx, "increment must be unreachable from the fail-open branch"
     assert approved_rejected_idx < increment_idx, "increment must be unreachable from the approved/rejected branch"
+
+    # ------------------------------------------------------------
+    # 11. Fix round 1 (HIGH): budgets.maxChangedFiles must be re-checked
+    #     AFTER the revise loop's `files = changed_files(...)` recompute,
+    #     not just once against the pre-revise diff -- otherwise a
+    #     post-revise diff that blows the budget reaches verify() (and
+    #     potentially VERIFIED) unchecked. Structural proof via source
+    #     ordering: the LAST `changed_files_budget_exceeded(...)` call
+    #     site (the one guarding `verifier_commands(...)`) must appear
+    #     AFTER the LAST `files = changed_files(ws, baseline)` reassignment
+    #     (the one inside the revise loop's `while True:`), so it always
+    #     re-checks the post-revise diff before verify() runs.
+    # ------------------------------------------------------------
+    revise_loop_files_idx = main_source.rindex("files = changed_files(ws, baseline)")
+    post_revise_budget_idx = main_source.rindex(
+        "changed_files_budget_exceeded(files, args.max_changed_files)"
+    )
+    assert post_revise_budget_idx > revise_loop_files_idx, (
+        "the post-revise budget re-check must come after the revise loop's "
+        "`files = changed_files(...)` recompute, so it covers the post-revise diff"
+    )
 
     print("architect review self-check: PASS")
 
