@@ -39,6 +39,16 @@ describe("buildTaskContract", () => {
     expect(contract.advanced).toBeUndefined();
   });
 
+  // Task 1.4 (V7 §6): budgets.maxChangedFiles.
+  it("omits `budgets` entirely when maxChangedFiles is untouched", () => {
+    expect(buildTaskContract(BASE).budgets).toBeUndefined();
+  });
+
+  it("carries maxChangedFiles into contract.budgets.maxChangedFiles", () => {
+    const contract = buildTaskContract({ ...BASE, maxChangedFiles: 25 });
+    expect(contract.budgets).toEqual({ maxChangedFiles: 25 });
+  });
+
   it("omits toolchainMode when it is left at the default 'path' (behaviorally identical to omitting it)", () => {
     const contract = buildTaskContract({ ...BASE, toolchainMode: "path" });
     expect(contract.advanced).toBeUndefined();

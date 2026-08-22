@@ -132,6 +132,8 @@ describe("mapManifestStatus", () => {
     ["failed-aborted", "failed"],
     ["cancelled-sigterm", "cancelled"],
     ["needs-architect-review", "needs_review"],
+    ["needs-architect-review-rejected", "needs_review"],
+    ["needs-architect-review-budget-exhausted", "needs_review"],
     ["something-nobody-has-seen", "needs_review"],
   ])("maps %s -> %s", (raw, expected) => {
     expect(mapManifestStatus(raw)).toBe(expected);

@@ -146,6 +146,48 @@ describe("buildArgs", () => {
   });
 });
 
+// Task 1.4 (V7 §6): budgets.maxChangedFiles.
+describe("budgets.maxChangedFiles", () => {
+  it("maps budgets.maxChangedFiles to --max-changed-files", () => {
+    const args = buildArgs({ ...CONTRACT, budgets: { maxChangedFiles: 25 } }, "/tmp/ws");
+    expect(args).toContain("--max-changed-files");
+    expect(args[args.indexOf("--max-changed-files") + 1]).toBe("25");
+  });
+
+  it("omits --max-changed-files when budgets is absent (zero behavior change when untouched)", () => {
+    const args = buildArgs(CONTRACT, "/tmp/ws");
+    expect(args).not.toContain("--max-changed-files");
+  });
+
+  it("silently drops an out-of-range maxChangedFiles instead of forwarding it (defense in depth beyond route validation)", () => {
+    const tooLow = buildArgs({ ...CONTRACT, budgets: { maxChangedFiles: 0 } }, "/tmp/ws");
+    expect(tooLow).not.toContain("--max-changed-files");
+    const tooHigh = buildArgs({ ...CONTRACT, budgets: { maxChangedFiles: 501 } }, "/tmp/ws");
+    expect(tooHigh).not.toContain("--max-changed-files");
+  });
+
+  it("cannot be flag-injected via a non-numeric value", () => {
+    const args = buildArgs({ ...CONTRACT, budgets: { maxChangedFiles: "10; rm -rf /" as any } }, "/tmp/ws");
+    expect(args).not.toContain("--max-changed-files");
+    expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
+  });
+
+  it("accepts the boundary values 1 and 500", () => {
+    expect(validateAdvanced({ ...CONTRACT, budgets: { maxChangedFiles: 1 } })).toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, budgets: { maxChangedFiles: 500 } })).toBeNull();
+  });
+
+  it("rejects values outside 1..500", () => {
+    expect(validateAdvanced({ ...CONTRACT, budgets: { maxChangedFiles: 0 } })).not.toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, budgets: { maxChangedFiles: 501 } })).not.toBeNull();
+    expect(validateAdvanced({ ...CONTRACT, budgets: { maxChangedFiles: 1.5 } })).not.toBeNull();
+  });
+
+  it("accepts a contract with no budgets at all", () => {
+    expect(validateAdvanced(CONTRACT)).toBeNull();
+  });
+});
+
 describe("validateAdvanced", () => {
   it("accepts a contract with no advanced fields at all", () => {
     expect(validateAdvanced(CONTRACT)).toBeNull();
