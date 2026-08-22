@@ -3196,7 +3196,31 @@ def _architect_review_selfcheck() -> None:
         "diff": "--- a/a.ts\n+++ b/a.ts\n",
     })
     assert "a.ts" in msg and "medium" in msg and "--- a/a.ts" in msg
+    assert "DERIVED TASK LIST" not in msg, "no taskList in the request -> no section, unchanged pre-Task-4.3 message"
     assert _build_review_task_message({}) is not None  # never raises on empty input
+
+    # Task 4.3 ("Architect task-list review"): when glimmer-v2.py's
+    # make_review_request carries a taskList (only on the session's first
+    # review — see that function's docstring), it must show up in the
+    # same review turn's message, not a second model call.
+    msg_with_tasks = _build_review_task_message({
+        "architecturePlan": {"risk": "low"},
+        "changedFiles": [],
+        "diff": "",
+        "taskList": [
+            {"id": "t1", "kind": "implementation", "priority": "required",
+             "description": "Implement restoration hook", "dependsOn": []},
+            {"id": "t2", "kind": "verification", "priority": "recommended",
+             "description": "Run targeted tests", "dependsOn": ["t1"]},
+        ],
+    })
+    assert "DERIVED TASK LIST" in msg_with_tasks
+    assert "Implement restoration hook" in msg_with_tasks
+    assert "depends on: t1" in msg_with_tasks
+    # An empty/malformed taskList must degrade the same as its absence —
+    # never an empty "(none)" section nobody asked for.
+    assert "DERIVED TASK LIST" not in _build_review_task_message({"taskList": []})
+    assert "DERIVED TASK LIST" not in _build_review_task_message({"taskList": "not a list"})
 
     print("architect review self-check: PASS")
 
@@ -4347,7 +4371,7 @@ def _build_review_task_message(review_request):
         if isinstance(f, dict) and f.get("path")
     ) or "  (none)"
 
-    return (
+    message = (
         "ARCHITECTURE PLAN (produced before implementation began):\n"
         + json.dumps(plan, indent=2) + "\n\n"
         "CHANGED FILES:\n" + files_text + "\n\n"
@@ -4355,6 +4379,32 @@ def _build_review_task_message(review_request):
         "have no tracked diff to show — use your own read-only tools "
         "if you need their full content):\n" + diff_text
     )
+
+    # Task 4.3 ("Architect task-list review"): present only on the FIRST
+    # review of a session (see glimmer-v2.py's run_architect_review call
+    # site) — the derived task list (tasks.json), so this same review turn
+    # also answers V7's task-list-review questions (does it still
+    # implement the plan? anything missing/superfluous/misordered?) without
+    # spending a second model call. Absent on every later round -- no
+    # section is appended then, exactly the pre-Task-4.3 message.
+    task_list = review_request.get("taskList")
+    if isinstance(task_list, list) and task_list:
+        tasks_text = "\n".join(
+            f"  - [{t.get('id')}] ({t.get('kind')}, {t.get('priority', 'required')}) "
+            f"{t.get('description')}"
+            + (f" — depends on: {', '.join(t.get('dependsOn'))}" if t.get("dependsOn") else "")
+            for t in task_list
+            if isinstance(t, dict)
+        ) or "  (none)"
+        message += (
+            "\n\nDERIVED TASK LIST (produced from the architecture plan before "
+            "implementation began -- also review this as part of your decision: "
+            "does it still implement the plan, is anything important missing or "
+            "superfluous, are dependencies correct, is scope appropriate?):\n"
+            + tasks_text
+        )
+
+    return message
 
 
 def run_architect(task, workspace, max_turns, review_request_path=None):

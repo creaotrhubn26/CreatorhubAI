@@ -2649,7 +2649,7 @@ ARCHITECT_REVIEW_DECISIONS = {
 }
 
 
-def make_review_request(plan, files, change_types, diff_text, iteration, review_round):
+def make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=None):
     """C2: the review-request payload v2 (trusted layer) writes to disk
     for the architect-review subprocess to read directly (glimmer-
     engineer.py's _load_review_request) — V7 §5.6's shape, scoped down
@@ -2657,8 +2657,22 @@ def make_review_request(plan, files, change_types, diff_text, iteration, review_
     needs: the plan it's checking against, the real changed-files list,
     and the real diff (git_diff_text — same underlying git plumbing as
     diff_hash/file_change_types, not a new discovery pass).
+
+    Task 4.3 ("Architect task-list review"): task_list is C3's derived
+    tasks.json (glimmer-v2.py's own derive_tasks output), included ONLY on
+    the very first review of a session (iteration==0, review_round==1 --
+    see the call site in main()'s review loop). This is the simpler of
+    two ways to satisfy V7's "architect should review the task list at
+    important checkpoints" -- rather than spending a SECOND model call on
+    a standalone task-list review, the task list rides along in the one
+    review request that already exists, so the architect can flag a
+    missing/superfluous/misordered task in the SAME turn it reviews the
+    diff. Zero new model calls; None (the default) reproduces the exact
+    payload shape from before this task, so every later review round
+    (which has no fresh task list to add, and no reason to re-review one
+    already approved) is unaffected.
     """
-    return {
+    request = {
         "type": "architect_review_request",
         "iteration": iteration,
         "reviewRound": review_round,
@@ -2668,6 +2682,9 @@ def make_review_request(plan, files, change_types, diff_text, iteration, review_
         ],
         "diff": diff_text,
     }
+    if task_list is not None:
+        request["taskList"] = task_list
+    return request
 
 
 def load_architect_review(session_dir, iteration, review_round):
@@ -2891,7 +2908,7 @@ def architect_review_failure_text(review):
 
 
 def run_architect_review(engineer, ws, plan, files, change_types, baseline, session, events_path, sid,
-                          iteration, review_round):
+                          iteration, review_round, task_list=None):
     """C2 (glimmer-v7): pre-verification architect review (V7 §5.9),
     invoked from main()'s per-iteration loop only when a plan exists.
     Reuses invoke_engineer's SAME mode="architect" spawn path as C1's
@@ -2904,6 +2921,11 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     any failure (spawn error, missing/invalid output) degrades to None,
     identical in meaning to "review never happened" — see load_
     architect_review's uniform degradation contract.
+
+    task_list (Task 4.3): forwarded straight into make_review_request --
+    see that function's docstring for why this is the one review call
+    that carries it (iteration==0, review_round==1 only; every other
+    call site passes nothing, keeping their payload unchanged).
     """
     print("\n" + "=" * 72)
     print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
@@ -2922,7 +2944,7 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
         if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
             diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
 
-        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round)
+        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=task_list)
         request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
 
         rc = invoke_engineer(
@@ -3738,7 +3760,29 @@ def _superseded_by_repair(task: dict, tasks: list) -> bool:
     return False
 
 
-def required_tasks_resolved(tasks) -> bool:
+def load_task_overrides(session_dir) -> dict:
+    """Task 4.3: read task-overrides.json -- a GATEWAY/human-owned sidecar,
+    exactly like human-acceptance.json (§14): written ONLY by the Control
+    Center's POST /sessions/:id/tasks/:taskId/skip|approve routes
+    (control-center/server/src/lib/sessions.ts writeTaskOverride).
+    glimmer-v2.py NEVER writes this file, only reads it here, so a human's
+    skip/approve decision and the orchestrator's own evidence-derived task
+    state stay two genuinely separate facts -- the same trust model as
+    the accepted/verified split. Shape: {taskId: {action, at}}.
+
+    Returns {} on every degraded case (file missing, unreadable, not
+    valid JSON, not an object) -- same uniform-degrade-to-empty contract
+    as load_architecture_plan's uniform None, just {} here since every
+    caller only ever does overrides.get(task_id) against it."""
+    path = Path(session_dir) / "task-overrides.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def required_tasks_resolved(tasks, overrides: dict | None = None) -> bool:
     """Task 4.2 (V7 session completion rule): deterministic gate --
     True iff every priority=="required" task has reached a resolved
     terminal state, defined precisely as:
@@ -3746,10 +3790,16 @@ def required_tasks_resolved(tasks) -> bool:
       - status == "failed" AND _superseded_by_repair(task, tasks) is True
         (an exact-matched repair task already proved the underlying check
         now passes -- see that function's docstring for why this is
-        honest, not a loophole).
-    Any other status ("pending", "in_progress", or a genuine unsuperseded
-    "failed") makes this False -- fail-closed, matching every other gate
-    in this file.
+        honest, not a loophole), OR
+      - Task 4.3: a human recorded a skip or approve override for this
+        task in task-overrides.json (see load_task_overrides) -- a human
+        decision counts as resolved regardless of the task's own status.
+        This is deliberately NOT orchestrator-derived evidence; it's the
+        same "a human can accept/skip what the machine can't verify"
+        trust model as §14's human-acceptance.json.
+    Any other status ("pending", "in_progress", or a genuine unsuperseded,
+    un-overridden "failed") makes this False -- fail-closed, matching
+    every other gate in this file.
 
     tasks is None or [] (no architect plan ever ran -- C3's task graph is
     inactive, or a plan produced zero implementation/verification steps)
@@ -3759,6 +3809,7 @@ def required_tasks_resolved(tasks) -> bool:
     when the mechanism producing them never ran."""
     if not tasks:
         return True
+    overrides = overrides or {}
     for t in tasks:
         if t.get("priority") != "required":
             continue
@@ -3766,6 +3817,9 @@ def required_tasks_resolved(tasks) -> bool:
         if status == "complete":
             continue
         if status == "failed" and _superseded_by_repair(t, tasks):
+            continue
+        override = overrides.get(t.get("id"))
+        if isinstance(override, dict) and override.get("action") in ("skip", "approve"):
             continue
         return False
     return True
@@ -4262,7 +4316,13 @@ def main():
                         # below, the same True/False/None contract every
                         # other gate here follows.
                         gates["implementationComplete"] = None
-                        gates["tasksResolved"] = required_tasks_resolved(tasks) if tasks is not None else None
+                        # Task 4.3: a human skip/approve override (task-
+                        # overrides.json, gateway-owned) can resolve a
+                        # required task the orchestrator itself never saw
+                        # complete -- see required_tasks_resolved.
+                        gates["tasksResolved"] = (
+                            required_tasks_resolved(tasks, load_task_overrides(session)) if tasks is not None else None
+                        )
                         manifest["gates"] = gates
 
                         if gates["tasksResolved"] is False:
@@ -4350,6 +4410,11 @@ def main():
                     review = run_architect_review(
                         engineer, ws, architecture_plan, files, change_types, baseline,
                         session, events_path, sid, iteration, review_round,
+                        # Task 4.3 (Architect task-list review): only the
+                        # very first review of the whole session carries
+                        # the derived task list -- one budgeted pass, not
+                        # a re-review on every repair round.
+                        task_list=(tasks if iteration == 0 and review_round == 1 else None),
                     )
                     attempt.setdefault("architectReviews", []).append(
                         {"round": review_round, "review": review}
@@ -4687,8 +4752,12 @@ def main():
                 # Task 4.2 (V7 session completion rule): None when C3's task
                 # graph never ran for this session (no --architect-first
                 # plan) -- same "mechanism didn't run" pass-through every
-                # other optional gate above already follows.
-                gates["tasksResolved"] = required_tasks_resolved(tasks) if tasks is not None else None
+                # other optional gate above already follows. Task 4.3: a
+                # human skip/approve override can also resolve a required
+                # task -- see required_tasks_resolved.
+                gates["tasksResolved"] = (
+                    required_tasks_resolved(tasks, load_task_overrides(session)) if tasks is not None else None
+                )
                 manifest["gates"] = gates
 
                 if gates_block_verified(gates):
@@ -5475,6 +5544,17 @@ def _architect_review_selfcheck() -> None:
         {"path": "b.ts", "changeType": "added"},
     ]
     assert request["diff"] == "diff text here"
+    assert "taskList" not in request, "task_list omitted -> key absent, exact pre-Task-4.3 payload shape"
+
+    # Task 4.3 (Architect task-list review): task_list, when given, rides
+    # along as request["taskList"] -- the whole point being zero new model
+    # calls (it's carried by the SAME review request, not a second one).
+    tasks_for_review = [{"id": "t1", "kind": "implementation", "status": "pending", "dependsOn": []}]
+    request_with_tasks = make_review_request(
+        plan, ["a.ts"], {"a.ts": "modified"}, "diff", iteration=0, review_round=1,
+        task_list=tasks_for_review,
+    )
+    assert request_with_tasks["taskList"] == tasks_for_review
 
     revise_text = architect_review_failure_text({
         "requiredChanges": ["reuse existing store"],
@@ -6270,6 +6350,42 @@ def _tasks_selfcheck() -> None:
     assert required_tasks_resolved(wrong_check_superseded) is False
 
     # ------------------------------------------------------------
+    # 10b. Task 4.3: human skip/approve overrides (task-overrides.json,
+    #      gateway-owned -- see load_task_overrides).
+    # ------------------------------------------------------------
+    still_pending_task = [{"id": "t1", "priority": "required", "status": "pending", "description": "a"}]
+    assert required_tasks_resolved(still_pending_task) is False, "sanity: no override -> still blocks"
+    assert required_tasks_resolved(still_pending_task, {"t1": {"action": "skip", "at": "x"}}) is True, (
+        "a human skip override must resolve a required task the orchestrator never saw complete"
+    )
+    assert required_tasks_resolved(still_pending_task, {"t1": {"action": "approve", "at": "x"}}) is True, (
+        "a human approve override must also resolve it -- chiefly for completion.type==manual tasks"
+    )
+    assert required_tasks_resolved(still_pending_task, {"t2": {"action": "skip", "at": "x"}}) is False, (
+        "an override for a DIFFERENT task id must not resolve this one"
+    )
+    assert required_tasks_resolved(still_pending_task, {"t1": {"action": "bogus", "at": "x"}}) is False, (
+        "an unrecognized override action must fail closed, not resolve the task"
+    )
+    assert required_tasks_resolved(still_pending_task, None) is False, "overrides=None must behave like {} (no override)"
+
+    # load_task_overrides: uniform {} on every degraded case; real overrides
+    # pass through on a genuinely valid file.
+    with tempfile.TemporaryDirectory() as td:
+        overrides_dir = Path(td)
+        assert load_task_overrides(overrides_dir) == {}, "missing file -> {}"
+
+        (overrides_dir / "task-overrides.json").write_text("not json{{{", encoding="utf-8")
+        assert load_task_overrides(overrides_dir) == {}, "malformed JSON -> {}"
+
+        (overrides_dir / "task-overrides.json").write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        assert load_task_overrides(overrides_dir) == {}, "valid JSON but not an object -> {}"
+
+        real_overrides = {"t1": {"action": "skip", "at": "2026-08-22T00:00:00Z"}}
+        (overrides_dir / "task-overrides.json").write_text(json.dumps(real_overrides), encoding="utf-8")
+        assert load_task_overrides(overrides_dir) == real_overrides
+
+    # ------------------------------------------------------------
     # 11. Task 4.2: make_prompt's FOCUS block -- additive, byte-identical
     #     when tasks is None/absent; present (first pending required task,
     #     in list order) otherwise; absent again once nothing is pending.
@@ -6827,8 +6943,7 @@ def _gates_selfcheck() -> None:
     no_change_ok_idx = main_source.index("if ok:", no_change_if_idx)
     impl_null_idx = main_source.index('gates["implementationComplete"] = None', no_change_ok_idx)
     tasks_resolved_idx = main_source.index(
-        'gates["tasksResolved"] = required_tasks_resolved(tasks) if tasks is not None else None',
-        no_change_ok_idx,
+        'gates["tasksResolved"] = (', no_change_ok_idx,
     )
     tasks_resolved_check_idx = main_source.index('if gates["tasksResolved"] is False:', no_change_ok_idx)
     no_change_verified_label_idx = main_source.index('"no-change-verified"', tasks_resolved_check_idx)
