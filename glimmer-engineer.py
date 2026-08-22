@@ -2847,6 +2847,14 @@ def _architect_mode_selfcheck() -> None:
             assert normalized["risk"] == "medium"
             assert normalized["implementationPlan"] == ["inspect hydration path", "implement hook"]
             assert "planningFailed" not in normalized
+            # Task 2.2 (V7 §5.12): "version" tolerates absence -- the model
+            # never sends one (versioning is v2.py's job, stamped after this
+            # validation step), so it must default to 1 for backward compat.
+            assert normalized["version"] == 1
+            ok_v2, normalized_v2 = validate_architecture_plan({**parsed, "version": 2})
+            assert ok_v2 and normalized_v2["version"] == 2
+            ok_bad_v, normalized_bad_v = validate_architecture_plan({**parsed, "version": "not-an-int"})
+            assert ok_bad_v and normalized_bad_v["version"] == 1  # malformed -> default, never rejects the plan
 
             written_path = _write_architecture_plan_file(normalized)
             assert written_path is not None
@@ -3901,6 +3909,18 @@ def validate_architecture_plan(data):
     expected_scope = data.get("expectedScope")
     if isinstance(expected_scope, dict):
         normalized["expectedScope"] = expected_scope
+
+    # Task 2.2 (V7 §5.12): plan versioning is owned by glimmer-v2.py (the
+    # trusted layer) -- it stamps the real version number onto the plan
+    # dict AFTER this validation step (run_architect_first/run_architect_
+    # replan), not the model. This is tolerant-but-honest passthrough only:
+    # absent or malformed "version" defaults to 1 (backward compat with
+    # every plan produced before this field existed) rather than rejecting
+    # the whole plan over one cosmetic field.
+    version = data.get("version", 1)
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        version = 1
+    normalized["version"] = version
 
     return True, normalized
 

@@ -1733,11 +1733,16 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
                 "verificationPlan",
             )
         }
+        # Task 2.2 (V7 §5.12): "Engineer should always know which
+        # ArchitecturePlan version it is implementing." plan.get("version")
+        # defaults to 1 -- every plan reaching here was already stamped by
+        # run_architect_first/run_architect_replan, but this stays honest
+        # if a caller ever passes a hand-built plan dict without one.
         plan_block = (
-            "\n\nARCHITECTURE PLAN (from --architect-first Architect mode; "
-            "a hint from prior read-only exploration, not a substitute for "
-            "your own verification — if evidence contradicts it, deviate "
-            "and say why):\n"
+            f"\n\nARCHITECTURE PLAN v{plan.get('version', 1)} (from Architect "
+            "mode; a hint from prior read-only exploration, not a "
+            "substitute for your own verification — if evidence "
+            "contradicts it, deviate and say why):\n"
             + json.dumps(plan_fields, indent=2)
         )
         # C1 handoff enforcement (Fix 1, V7 spec Section 5.4; follow-up:
@@ -2023,6 +2028,11 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     plan = load_architecture_plan(session)
 
     if plan is not None:
+        # Task 2.2 (V7 §5.12): the architect-first plan is always version 1
+        # -- versioning is v2.py's (the trusted layer's) responsibility,
+        # never the model's. Replans (run_architect_replan, below) stamp
+        # version N+1 the same way.
+        plan["version"] = 1
         print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
         # NIT (fix round 1): packages is model-controlled (architect's own
         # JSON output) -- cap entry count and per-entry length so a
@@ -2036,6 +2046,123 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
     return plan
+
+
+# ============================================================
+# Task 2.2 (glimmer-v7): re-planning loop + plan versions — V7 §5.12
+# ============================================================
+# Triggered only from inside the C2 review loop below, on a REPLAN_REQUIRED
+# decision. Reuses run_architect_first's exact spawn/load machinery (same
+# mode="architect" invocation, same never-raises contract, same load_
+# architecture_plan uniform-None-on-any-failure reader) with an extended
+# prompt instead of the plain v1 prompt. Versioning itself is v2.py's
+# (the trusted layer's) responsibility, never the model's -- the plan
+# dict is stamped with plan["version"] AFTER validation/load, same spirit
+# as C1's read_candidate_evidence treating model output as untrusted.
+
+
+def make_architect_replan_prompt(contract, summary, review, from_version):
+    """V7 §5.12: the re-planning prompt. Reuses make_architect_prompt's
+    exact planning-mode text (objective + contract + repo map, byte-
+    identical prefix) and APPENDS the prior review's findings/
+    requiredChanges as evidence of why plan v{from_version} was
+    rejected, so the architect revises instead of re-deriving from
+    scratch with no memory of what failed. `review` is whatever load_
+    architect_review returned (already normalized: findings/
+    requiredChanges default to [] when absent) -- never raises on an
+    empty/None review, same tolerant-but-honest bar as architect_review_
+    failure_text.
+    """
+    review = review or {}
+    findings = review.get("findings") or []
+    required_changes = review.get("requiredChanges") or []
+
+    lines = [
+        f"ArchitecturePlan v{from_version} was rejected by pre-verification "
+        f"review (decision: {review.get('decision', 'REPLAN_REQUIRED')}). "
+        f"Produce a REVISED ArchitecturePlan (same JSON shape as before) "
+        f"that addresses this evidence of why v{from_version} failed:"
+    ]
+    if findings:
+        lines.append("Findings:")
+        lines.extend(f"  - {f}" for f in findings)
+    if required_changes:
+        lines.append("Required changes:")
+        lines.extend(f"  - {c}" for c in required_changes)
+    if not findings and not required_changes:
+        lines.append("  (review produced no specific findings/requiredChanges)")
+
+    return make_architect_prompt(contract, summary) + "\n\n" + "\n".join(lines)
+
+
+def run_architect_replan(engineer, ws, contract, summary, session, events_path, sid,
+                          review, from_version, to_version):
+    """V7 §5.12: re-invoke the architect after a REPLAN_REQUIRED decision.
+    Must never raise (same contract as run_architect_first): any failure
+    degrades to returning None, which the caller (main()'s review loop)
+    treats as a fail-CLOSED replan -- never silently continuing on the
+    just-rejected v{from_version} plan.
+    """
+    print("\n" + "=" * 72)
+    print(f" [V2] Architecture re-plan v{from_version} -> v{to_version} (REPLAN_REQUIRED)")
+    print("=" * 72)
+
+    try:
+        replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version)
+        (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
+
+        rc = invoke_engineer(
+            engineer, ws, replan_prompt,
+            True,  # auto_approve forced regardless, same as run_architect_first
+            None,  # architect mode's own smaller default turn budget applies
+            session / f"architect-replan-{to_version}.log",
+            events_path, sid, mode="architect",
+        )
+        print(f"[V2] Architect replan subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - replan failure must never block the run
+        print(f"[V2] WARN: architect replan subprocess failed to run: {exc}")
+
+    # Deliberately OUTSIDE the try above, same reasoning as run_architect_
+    # first's identical comment: load_architecture_plan already degrades
+    # to None internally on any read/parse/planningFailed case.
+    plan = load_architecture_plan(session)
+
+    if plan is not None:
+        plan["version"] = to_version
+        print(f"[V2] Architect replan v{to_version} loaded: risk={plan.get('risk')!r}")
+        packages = plan.get("packages")
+        if isinstance(packages, list):
+            packages = [str(p)[:200] for p in packages[:20]]
+        emit_event(events_path, "architect_plan_created", sid,
+                   risk=plan.get("risk"), packages=packages)
+    else:
+        print(f"[V2] Architect replan v{to_version} produced no usable plan "
+              "(missing/invalid/failed); failing closed (never continuing on the rejected plan).")
+
+    return plan
+
+
+def record_architecture_plan_version(session, manifest, plan):
+    """V7 §5.12: persist one ArchitecturePlan version. Writes
+    architecture-plan-vN.json (an additional, never-overwritten
+    snapshot -- plan history) AND re-writes architecture-plan.json (the
+    pre-existing "current plan" convention every gateway reader already
+    uses) so both stay in sync with plan["version"]. Appends one
+    {version, path, createdAt} entry to manifest["architectPlans"]
+    (oldest first). `plan` must already carry a stamped "version" key --
+    run_architect_first/run_architect_replan's job, not this function's;
+    defaults to 1 defensively if somehow missing.
+    """
+    version = plan.get("version", 1)
+    text = json.dumps(plan, indent=2)
+    versioned_name = f"architecture-plan-v{version}.json"
+    (Path(session) / versioned_name).write_text(text, encoding="utf-8")
+    (Path(session) / "architecture-plan.json").write_text(text, encoding="utf-8")
+    manifest.setdefault("architectPlans", []).append({
+        "version": version,
+        "path": versioned_name,
+        "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    })
 
 
 # ============================================================
@@ -2124,12 +2251,22 @@ def load_architect_review(session_dir, iteration, review_round):
 def classify_architect_review_decision(decision):
     """Maps one ArchitectReview decision (V7 §5.7) to what main()'s
     review sub-loop does next. Pure/deterministic — exercised directly
-    by --architect-review-selfcheck without a live model or session."""
+    by --architect-review-selfcheck without a live model or session.
+
+    Task 2.2 (V7 §5.12): REPLAN_REQUIRED is no longer terminal-rejected --
+    it routes to "replan" (re-invoke the architect for a new plan
+    version, then continue with a delta prompt, same as "revise" but
+    with a swapped-in plan) instead of stopping the run. Only
+    HUMAN_REVIEW_REQUIRED (and any unrecognized decision) still maps to
+    the terminal "rejected" outcome.
+    """
     if decision in ("APPROVED", "APPROVED_WITH_CONDITIONS"):
         return "approved"
     if decision == "REVISE_IMPLEMENTATION":
         return "revise"
-    if decision in ("REPLAN_REQUIRED", "HUMAN_REVIEW_REQUIRED"):
+    if decision == "REPLAN_REQUIRED":
+        return "replan"
+    if decision == "HUMAN_REVIEW_REQUIRED":
         return "rejected"
     return "rejected"  # unrecognized decision must never silently proceed to verify()
 
@@ -2931,6 +3068,12 @@ def main():
             if architecture_plan is not None:
                 manifest["gates"] = {"architectureApproved": None}
                 manifest["architectReviews"] = {"max": ARCHITECT_REVIEW_BUDGET, "used": 0}
+                # Task 2.2 (V7 §5.12): persist v1 into the plan-history
+                # array + write architecture-plan-v1.json alongside the
+                # existing architecture-plan.json (gateway readers keep
+                # working unchanged -- that file always holds the latest
+                # version).
+                record_architecture_plan_version(session, manifest, architecture_plan)
                 # C3: same gate as the two lines above -- tasks derive from
                 # the plan's implementationPlan/verificationPlan only when
                 # a usable plan exists. manifest["tasksFile"] mirrors the
@@ -3098,16 +3241,53 @@ def main():
                         architect_outcome = decision_outcome
                         break
 
-                    # decision_outcome == "revise": this IS the disagreement
-                    # V7 §5.13 budgets. Check budget before spending it -- a
-                    # revise round that would exceed it never runs.
+                    # decision_outcome in ("revise", "replan"): both ARE the
+                    # disagreement V7 §5.13 budgets -- Task 2.2 shares the
+                    # SAME budget/counter across revise and replan rounds
+                    # (no separate replan budget). Check budget before
+                    # spending it -- a round that would exceed it never runs.
                     if manifest["architectReviews"]["used"] >= ARCHITECT_REVIEW_BUDGET:
                         architect_outcome = "budget_exhausted"
                         break
                     manifest["architectReviews"]["used"] += 1
                     save()
-                    print(f"[V2] Architect review requested REVISE_IMPLEMENTATION "
-                          f"(iteration={iteration}, round={review_round}); running one bounded revise pass.")
+
+                    # Task 2.2 (V7 §5.12): REPLAN_REQUIRED re-invokes the
+                    # architect for a NEW plan version (findings from this
+                    # review appended as evidence of why the current
+                    # version failed) BEFORE the delta-prompt re-invoke
+                    # below -- which then reuses the exact same revise-
+                    # style continuation, just with `architecture_plan`
+                    # already swapped to the new version.
+                    if decision_outcome == "replan":
+                        from_version = architecture_plan.get("version", 1)
+                        to_version = from_version + 1
+                        emit_event(events_path, "architect_replan_started", sid,
+                                   fromVersion=from_version, toVersion=to_version,
+                                   reviewRound=review_round)
+                        new_plan = run_architect_replan(
+                            engineer, ws, contract, summary, session, events_path, sid,
+                            review, from_version, to_version,
+                        )
+                        if new_plan is None:
+                            # Fail-closed honesty: an invalid/failed replan
+                            # must never silently continue implementing
+                            # against the just-rejected v{from_version}
+                            # plan. Budget is already consumed above --
+                            # this is exactly the existing "rejected"
+                            # terminal path (needs-architect-review-rejected),
+                            # not a new manifest status.
+                            print(f"[V2] Replan v{from_version} -> v{to_version} produced no usable "
+                                  "plan; failing closed to architecture-review rejection.")
+                            architect_outcome = "rejected"
+                            break
+                        architecture_plan = new_plan
+                        record_architecture_plan_version(session, manifest, architecture_plan)
+                        save()
+
+                    print(f"[V2] Architect review requested {review['decision']} "
+                          f"(iteration={iteration}, round={review_round}); running one bounded "
+                          f"{'replan+' if decision_outcome == 'replan' else ''}revise pass.")
                     # Fix round 1 (Minor 5): the real outer `iteration` and
                     # the real `checkpoint_sha` (whatever the repair loop
                     # last set, possibly still None on iteration 0) --
@@ -3897,7 +4077,10 @@ def _architect_review_selfcheck() -> None:
     assert classify_architect_review_decision("APPROVED") == "approved"
     assert classify_architect_review_decision("APPROVED_WITH_CONDITIONS") == "approved"
     assert classify_architect_review_decision("REVISE_IMPLEMENTATION") == "revise"
-    assert classify_architect_review_decision("REPLAN_REQUIRED") == "rejected"
+    # Task 2.2 (V7 §5.12): REPLAN_REQUIRED is no longer terminal-rejected --
+    # see --architect-replan-selfcheck for the full re-planning-loop
+    # coverage (version bump, budget sharing, invalid-replan fail-closed).
+    assert classify_architect_review_decision("REPLAN_REQUIRED") == "replan"
     assert classify_architect_review_decision("HUMAN_REVIEW_REQUIRED") == "rejected"
     assert classify_architect_review_decision("NOT_A_REAL_DECISION") == "rejected"  # never silently proceed
 
@@ -4064,17 +4247,18 @@ def _architect_review_selfcheck() -> None:
 
     # ------------------------------------------------------------
     # 10. Fix round 1 (Important 1+2): budget increments ONLY on a
-    #     REVISE_IMPLEMENTATION disagreement round -- a plain APPROVED/
-    #     APPROVED_WITH_CONDITIONS review, and a fail-open (no usable
-    #     review output) round, must both be free. Otherwise repeated
-    #     approvals across repair iterations pre-block later iterations
-    #     (Important 1), and persistent review-machinery failure burns
-    #     budget until fail-open degrades into fail-closed (Important 2).
-    #     Structural proof via source ordering: the ONE increment site
-    #     is only reachable after the review call AND after both the
-    #     fail-open break and the approved/rejected break have already
-    #     had their chance to fire -- i.e. only on the remaining case,
-    #     "revise".
+    #     disagreement round (REVISE_IMPLEMENTATION OR, since Task 2.2,
+    #     REPLAN_REQUIRED -- same shared counter, see --architect-replan-
+    #     selfcheck) -- a plain APPROVED/APPROVED_WITH_CONDITIONS review,
+    #     and a fail-open (no usable review output) round, must both be
+    #     free. Otherwise repeated approvals across repair iterations
+    #     pre-block later iterations (Important 1), and persistent
+    #     review-machinery failure burns budget until fail-open degrades
+    #     into fail-closed (Important 2). Structural proof via source
+    #     ordering: the ONE increment site is only reachable after the
+    #     review call AND after both the fail-open break and the
+    #     approved/rejected break have already had their chance to fire --
+    #     i.e. only on the remaining cases, "revise"/"replan".
     # ------------------------------------------------------------
     assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1, (
         "budget must increment in exactly one place"
@@ -4109,6 +4293,191 @@ def _architect_review_selfcheck() -> None:
     )
 
     print("architect review self-check: PASS")
+
+
+def _architect_replan_selfcheck() -> None:
+    """Task 2.2 (glimmer-v7, V7 §5.12): re-planning loop + plan versions.
+    Covers decision routing (REPLAN_REQUIRED no longer terminal-rejected),
+    the replan prompt builder, version-increment + plan-history
+    persistence, run_architect_replan's invalid-plan fail-closed
+    contract, and source-ordering proofs that replan shares the review
+    loop's existing budget and that the architect_replan_started emit
+    site actually lives inside that loop. No live model needed -- same
+    fixture/monkeypatch style as --architect-review-selfcheck.
+    Run with: python3 glimmer-v2.py --architect-replan-selfcheck
+    """
+    import inspect
+
+    # ------------------------------------------------------------
+    # 1. Decision routing: REPLAN_REQUIRED routes to a NEW "replan"
+    #    outcome, not "rejected" -- it is no longer terminal.
+    # ------------------------------------------------------------
+    assert classify_architect_review_decision("REPLAN_REQUIRED") == "replan"
+    assert classify_architect_review_decision("HUMAN_REVIEW_REQUIRED") == "rejected"
+    assert classify_architect_review_decision("REVISE_IMPLEMENTATION") == "revise"
+
+    # ------------------------------------------------------------
+    # 2. make_architect_replan_prompt: reuses make_architect_prompt
+    #    verbatim as a prefix, appends findings/requiredChanges as
+    #    evidence of why v{from_version} failed; never raises on an
+    #    empty/missing review.
+    # ------------------------------------------------------------
+    contract = {
+        "objective": "restore a session after reload",
+        "scope": {"package": "repository"},
+        "mode": "implement",
+        "constraints": {},
+        "verification": [],
+        "repairBudget": 0,
+    }
+    summary = "repo summary text"
+    base_prompt = make_architect_prompt(contract, summary)
+
+    review = {
+        "decision": "REPLAN_REQUIRED",
+        "findings": ["duplicate state introduced"],
+        "requiredChanges": ["reuse existing store"],
+    }
+    replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version=1)
+    assert replan_prompt.startswith(base_prompt)
+    assert "v1" in replan_prompt
+    assert "duplicate state introduced" in replan_prompt
+    assert "reuse existing store" in replan_prompt
+
+    # Never raises / never empty on a missing or findings-less review.
+    empty_prompt = make_architect_replan_prompt(contract, summary, {}, from_version=2)
+    assert empty_prompt.startswith(base_prompt) and empty_prompt != base_prompt
+    assert make_architect_replan_prompt(contract, summary, None, from_version=2) == empty_prompt
+
+    # ------------------------------------------------------------
+    # 3. record_architecture_plan_version: writes architecture-plan-vN.json
+    #    (never overwritten by a later version -- real history) AND keeps
+    #    architecture-plan.json pointed at the LATEST version (existing
+    #    gateway-reader convention, unchanged file name/location).
+    #    Appends exactly one manifest["architectPlans"] entry per call.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session_dir = Path(td)
+        manifest = {}
+
+        plan_v1 = {"objective": "x", "packages": [], "risk": "low", "version": 1}
+        record_architecture_plan_version(session_dir, manifest, plan_v1)
+        assert json.loads((session_dir / "architecture-plan-v1.json").read_text())["version"] == 1
+        assert json.loads((session_dir / "architecture-plan.json").read_text())["version"] == 1
+        assert manifest["architectPlans"] == [
+            {"version": 1, "path": "architecture-plan-v1.json",
+             "createdAt": manifest["architectPlans"][0]["createdAt"]}
+        ]
+        assert manifest["architectPlans"][0]["createdAt"]  # non-empty ISO timestamp
+
+        plan_v2 = {"objective": "x", "packages": [], "risk": "low", "version": 2}
+        record_architecture_plan_version(session_dir, manifest, plan_v2)
+        assert json.loads((session_dir / "architecture-plan-v2.json").read_text())["version"] == 2
+        # "latest" file now reflects v2 -- overwritten, not appended.
+        assert json.loads((session_dir / "architecture-plan.json").read_text())["version"] == 2
+        # v1's own versioned snapshot is untouched -- history, not overwritten.
+        assert json.loads((session_dir / "architecture-plan-v1.json").read_text())["version"] == 1
+        assert [e["version"] for e in manifest["architectPlans"]] == [1, 2]
+
+    # ------------------------------------------------------------
+    # 4. run_architect_replan: uniform-None-on-failure contract (same
+    #    shape as run_architect_first/load_architecture_plan). Monkeypatch
+    #    invoke_engineer (module-global swapped back in `finally`, same
+    #    pattern as --repomap-cache-selfcheck's _build_repo_map_uncached
+    #    swap) so no live model/subprocess is needed.
+    # ------------------------------------------------------------
+    real_invoke_engineer = globals()["invoke_engineer"]
+    try:
+        # 4a. Engineer subprocess "succeeds" but writes nothing usable
+        #     (e.g. crashed mid-write, or never got session dir) ->
+        #     load_architecture_plan degrades to None -> replan returns
+        #     None. This IS the fail-closed contract: caller must never
+        #     fall back to silently continuing on the rejected plan.
+        globals()["invoke_engineer"] = lambda *a, **k: 0
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            events_path = session_dir / "events.jsonl"
+            result = run_architect_replan(
+                Path("fake-engineer"), session_dir, contract, summary, session_dir,
+                events_path, "sid-replan-fail", review, from_version=1, to_version=2,
+            )
+            assert result is None
+
+        # 4b. Engineer subprocess writes a genuinely valid plan -> replan
+        #     returns it, stamped with the NEW version (never the model's
+        #     own claim, if any -- v2.py's stamp always wins).
+        def _fake_invoke_writes_plan(engineer, ws, prompt, auto_approve, max_turns,
+                                      log_path, events_path, sid, mode=None,
+                                      plan_candidate_count=0, review_request=None):
+            Path(ws).joinpath("architecture-plan.json").write_text(
+                json.dumps({
+                    "objective": "restore a session after reload",
+                    "packages": ["frontend"],
+                    "risk": "medium",
+                    "version": 999,  # deliberately wrong -- must be overwritten
+                }),
+                encoding="utf-8",
+            )
+            return 0
+
+        globals()["invoke_engineer"] = _fake_invoke_writes_plan
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            events_path = session_dir / "events.jsonl"
+            new_plan = run_architect_replan(
+                Path("fake-engineer"), session_dir, contract, summary, session_dir,
+                events_path, "sid-replan-ok", review, from_version=1, to_version=2,
+            )
+            assert new_plan is not None
+            assert new_plan["version"] == 2, "v2.py's stamp must win over any model-claimed version"
+            assert new_plan["risk"] == "medium"
+    finally:
+        globals()["invoke_engineer"] = real_invoke_engineer
+
+    # ------------------------------------------------------------
+    # 5. Source-ordering proofs on main()'s review loop.
+    # ------------------------------------------------------------
+    main_source = inspect.getsource(main)
+
+    # 5a. The architect_replan_started emit site must sit INSIDE the
+    #     review loop (between its `while True:` opening and the
+    #     post-loop gates assignment) -- not, say, buried unreachably
+    #     inside run_architect_replan itself (a different function, so
+    #     it would never appear in main_source at all if misplaced).
+    loop_start_idx = main_source.index("while True:", main_source.index("review_round = 0"))
+    # NOT the plan-creation-time `{"architectureApproved": None}` (an
+    # earlier, unrelated occurrence of the same prefix) -- the specific
+    # post-loop assignment that closes out the review sub-loop.
+    gates_idx = main_source.index('manifest["gates"] = {"architectureApproved": architect_gates_value(architect_outcome)}')
+    replan_emit_idx = main_source.index('emit_event(events_path, "architect_replan_started"')
+    assert loop_start_idx < replan_emit_idx < gates_idx, (
+        "architect_replan_started must be emitted from inside the review loop"
+    )
+
+    # 5b. Replan is gated behind the SAME shared budget increment as
+    #     revise -- no second/separate increment site (still exactly one
+    #     in the whole file), and the replan branch is only reachable
+    #     AFTER that one increment has already run.
+    assert main_source.count('manifest["architectReviews"]["used"] += 1') == 1
+    increment_idx = main_source.index('manifest["architectReviews"]["used"] += 1')
+    replan_branch_idx = main_source.index('if decision_outcome == "replan":')
+    assert increment_idx < replan_branch_idx, (
+        "replan must be gated behind the SAME shared budget increment as revise, "
+        "not a separate/unbudgeted path"
+    )
+
+    # 5c. Invalid-replan fail-closed: the "new_plan is None" branch sets
+    #     architect_outcome = "rejected" (the EXISTING terminal path,
+    #     never a new/silent-continue status), and that assignment is
+    #     only reachable after the shared budget increment -- i.e. the
+    #     budget is already spent by the time a replan can fail closed.
+    fail_closed_idx = main_source.index("if new_plan is None:")
+    rejected_after_replan_idx = main_source.index('architect_outcome = "rejected"', fail_closed_idx)
+    assert increment_idx < fail_closed_idx < rejected_after_replan_idx, (
+        "invalid-replan fail-closed must be reachable only after budget consumption"
+    )
+
+    print("architect replan self-check: PASS")
 
 
 def _tasks_selfcheck() -> None:
@@ -4791,6 +5160,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--architect-review-selfcheck"]:
         _architect_review_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--architect-replan-selfcheck"]:
+        _architect_replan_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--tasks-selfcheck"]:
         _tasks_selfcheck()
