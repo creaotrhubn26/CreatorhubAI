@@ -32,6 +32,16 @@ GLIMMER_PLAN_CANDIDATES = os.environ.get("GLIMMER_PLAN_CANDIDATES")
 # new parameter threaded through every one of them just for this one tool.
 _loaded_architecture_plan = None
 
+# Review round 1 (MED): whether run_engineer was actually invoked with
+# --architect-consult-enabled. execute_tool must gate on this too (not
+# just on a plan existing) -- offering the tool at all is conditioned on
+# BOTH per _augment_tools_with_consult_architect, and a model can still
+# emit a tool_call naming an unoffered tool (same "structurally
+# incapable, not merely un-offered" reasoning as the architect-mode
+# WRITE_TOOLS guard above). Set once at run_engineer startup, alongside
+# _loaded_architecture_plan.
+_architect_consult_enabled = False
+
 
 def _emit(event_type: str, **fields) -> None:
     # No-op when the events file isn't configured (e.g. direct standalone
@@ -2020,6 +2030,33 @@ def execute_tool(
     # caching identical questions would silently under-count it).
     if tool_name == "consult_architect":
         global _consult_architect_used
+
+        # Review round 1 (MED): the SAME structural gate
+        # _augment_tools_with_consult_architect used to decide whether to
+        # offer this tool at all -- re-checked here so a model that calls
+        # it anyway (unoffered, or offered under a stale plan/flag state)
+        # is still structurally denied, not merely un-offered. No budget
+        # burn and no network call for this path -- it isn't a real
+        # consultation attempt, just an invalid call.
+        if not _architect_consult_enabled or _loaded_architecture_plan is None:
+            message = (
+                "CONSULT_NOT_OFFERED: consult_architect is not available "
+                "in this session (no architecture plan, or "
+                "--architect-consult-enabled was not passed)."
+            )
+
+            print()
+            print(f"✗ BLOCKED: consult_architect ({message})")
+
+            envelope = _build_tool_envelope(
+                ok=False,
+                tool=tool_name,
+                duration_ms=_duration_ms(),
+                error={"code": "CONSULT_NOT_OFFERED", "message": message},
+            )
+            _persist_tool_envelope(envelope)
+
+            return _render_tool_envelope_message(envelope), False
 
         if _consult_architect_used >= CONSULT_ARCHITECT_BUDGET:
             message = (
@@ -5112,6 +5149,17 @@ def _format_advisory_nudge(detail):
     return f"ADVISORY: {detail}. Consider consulting the architect before continuing."
 
 
+def _normalize_advisory_path(raw):
+    """Review round 1 (LOW): 3-line duplicate of glimmer-v2.py's
+    _normalize_plan_path (same reasoning there: cheap, not a security
+    boundary, just enough that "./src/x.ts", "src/x.ts/", and
+    "src//x.ts" all compare equal) -- kept local rather than imported
+    since glimmer-engineer.py and glimmer-v2.py are separate subprocess
+    entry points that don't import each other."""
+    p = str(raw).strip().replace("\\", "/").strip("/")
+    return os.path.normpath(p) if p else p
+
+
 def _evaluate_advisory_triggers(architecture_plan, new_file_count, changed_paths, turn, max_turns, fired):
     """Deterministic, cheap, per-turn checks -- no model call, no I/O.
     Each of the three trigger keys can fire AT MOST ONCE per session:
@@ -5166,13 +5214,16 @@ def _evaluate_advisory_triggers(architecture_plan, new_file_count, changed_paths
                 candidate_files = []
 
             candidate_paths = {
-                c.get("path")
+                _normalize_advisory_path(c.get("path"))
                 for c in candidate_files
                 if isinstance(c, dict) and isinstance(c.get("path"), str) and c.get("path")
             }
 
             if candidate_paths:
-                outside = sorted(p for p in changed_paths if p not in candidate_paths)
+                outside = sorted(
+                    p for p in changed_paths
+                    if _normalize_advisory_path(p) not in candidate_paths
+                )
                 if outside:
                     detail = (
                         f"changed file {outside[0]!r} is outside the "
@@ -5276,6 +5327,27 @@ def _consult_selfcheck() -> None:
     result_d = _evaluate_advisory_triggers(empty_plan, 5, set(), 0, 10, fired_d)
     assert result_d == [], "trigger (a) must not fire with a zero/absent estimate"
 
+    # Review round 1 (LOW): path normalization -- a candidateFiles entry
+    # written as "./src/x.ts" must match a changed path recorded as
+    # "src/x.ts" (no false nudge from a cosmetic path-form difference).
+    fired_e = set()
+    dotted_plan = {
+        "expectedScope": {},
+        "candidateFiles": [{"path": "./src/x.ts", "reason": "x", "confidence": 0.9}],
+    }
+    result_e = _evaluate_advisory_triggers(dotted_plan, 0, {"src/x.ts"}, 0, 10, fired_e)
+    assert result_e == [], (
+        "'./src/x.ts' candidate must match 'src/x.ts' changed path after normalization"
+    )
+    # A genuinely different path still fires.
+    result_e2 = _evaluate_advisory_triggers(dotted_plan, 0, {"other.ts"}, 0, 10, fired_e)
+    assert result_e2 == [
+        (
+            "edit_outside_candidate_files",
+            "changed file 'other.ts' is outside the architecture plan's candidateFiles",
+        )
+    ], result_e2
+
     # ------------------------------------------------------------
     # 2. Nudge message shape + real wiring into run_engineer (source
     #    inspection, same style as _plan_aware_budget_selfcheck /
@@ -5320,12 +5392,18 @@ def _consult_selfcheck() -> None:
     # ------------------------------------------------------------
     # 4. Budget exhaustion: execute_tool returns an ok:false envelope
     #    with error code CONSULT_BUDGET_EXHAUSTED once the budget is
-    #    used up -- and never reaches the model to get there.
+    #    used up -- and never reaches the model to get there. Requires
+    #    the tool to actually be "offered" (enabled + plan loaded) so
+    #    this exercises the budget path, not the structural gate below.
     # ------------------------------------------------------------
-    global _consult_architect_used
+    global _consult_architect_used, _architect_consult_enabled, _loaded_architecture_plan
     real_used = _consult_architect_used
+    real_enabled = _architect_consult_enabled
+    real_plan = _loaded_architecture_plan
     try:
         _consult_architect_used = CONSULT_ARCHITECT_BUDGET
+        _architect_consult_enabled = True
+        _loaded_architecture_plan = {"objective": "x", "packages": [], "risk": "low"}
 
         result_text_out, changed = execute_tool(
             "consult_architect",
@@ -5340,8 +5418,39 @@ def _consult_selfcheck() -> None:
         assert _consult_architect_used == CONSULT_ARCHITECT_BUDGET, (
             "an already-exhausted budget must not keep incrementing"
         )
+
+        # ------------------------------------------------------------
+        # 5. Review round 1 (MED): unoffered-call denial. Even with
+        #    budget remaining, a call must be denied -- with NO budget
+        #    burn and no model call -- whenever the tool wasn't actually
+        #    offered (flag off, or no plan loaded).
+        # ------------------------------------------------------------
+        for enabled, plan_loaded in ((False, True), (True, False), (False, False)):
+            _consult_architect_used = 0
+            _architect_consult_enabled = enabled
+            _loaded_architecture_plan = (
+                {"objective": "x", "packages": [], "risk": "low"} if plan_loaded else None
+            )
+
+            denied_text, denied_changed = execute_tool(
+                "consult_architect",
+                {"question": "is this the right abstraction?"},
+                Path("."),
+                {"approve_all": True},
+                {},
+                [],
+            )
+            assert denied_changed is False
+            assert "CONSULT_NOT_OFFERED" in denied_text, (
+                f"enabled={enabled} plan_loaded={plan_loaded}: {denied_text}"
+            )
+            assert _consult_architect_used == 0, (
+                "a denied (unoffered) call must not burn budget"
+            )
     finally:
         _consult_architect_used = real_used
+        _architect_consult_enabled = real_enabled
+        _loaded_architecture_plan = real_plan
 
     print("consult self-check: PASS")
 
@@ -5974,9 +6083,10 @@ def run_engineer(
     # doesn't change mid-session. Drives both the deterministic advisory
     # triggers (regardless of architect_consult_enabled) and, gated by
     # that flag too, whether consult_architect is offered at all.
-    global _loaded_architecture_plan
+    global _loaded_architecture_plan, _architect_consult_enabled
     _loaded_architecture_plan = _load_architecture_plan_for_engineer()
     architecture_plan = _loaded_architecture_plan
+    _architect_consult_enabled = architect_consult_enabled
 
     _augment_tools_with_consult_architect(
         metadata, tools, architecture_plan, architect_consult_enabled,
@@ -6774,9 +6884,15 @@ def run_engineer(
         for _trigger_key, _trigger_detail in newly_fired:
             nudge = _format_advisory_nudge(_trigger_detail)
 
+            # Review round 1 (LOW): "user", not "system" -- a second
+            # mid-stream system message is untested against this
+            # codebase's chat template (the only system message
+            # elsewhere is the very first one), and advisory-never-
+            # blocks means a template/role error on the NEXT turn must
+            # never be able to crash run_engineer.
             messages.append(
                 {
-                    "role": "system",
+                    "role": "user",
                     "content": nudge,
                 }
             )
