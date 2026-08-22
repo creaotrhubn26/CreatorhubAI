@@ -314,10 +314,14 @@ sessionsRouter.get("/sessions/:id/tasks", async (req, res) => {
 async function handleTaskOverride(req: Request, res: Response, action: "skip" | "approve") {
   try {
     const tasks = await readSessionTasks(req.params.id);
-    if (!tasks || !tasks.some((t) => t.id === req.params.taskId)) {
-      return res.status(404).json({ error: "not found" });
-    }
-    const record = await writeTaskOverride(req.params.id, req.params.taskId, action);
+    const task = tasks?.find((t) => t.id === req.params.taskId);
+    if (!task) return res.status(404).json({ error: "not found" });
+    // Review round 1 (Important 3): stamp the task's CURRENT kind/
+    // description onto the override record -- see writeTaskOverride/
+    // applyTaskOverrides for why (task ids aren't stable across a replan).
+    const record = await writeTaskOverride(req.params.id, req.params.taskId, action, {
+      kind: task.kind, description: task.description,
+    });
     res.json({ taskId: req.params.taskId, ...record });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

@@ -125,7 +125,7 @@ describe("TasksPanel", () => {
       { id: "t1", description: "Optional cleanup", kind: "implementation", dependsOn: [], status: "pending", priority: "optional" },
     ]);
     const skipSpy = vi.spyOn(client.glimmerApi, "skipTask").mockResolvedValue({ taskId: "t1", action: "skip", at: "2026-01-01T00:00:00Z" });
-    render(withQuery(<TasksPanel sessionId="s1" />));
+    render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
     await waitFor(() => expect(screen.getByText("Optional cleanup")).toBeInTheDocument());
     openPanel();
 
@@ -140,7 +140,7 @@ describe("TasksPanel", () => {
         priority: "optional", override: { action: "skip", at: "2026-01-01T00:00:00Z" },
       },
     ]);
-    render(withQuery(<TasksPanel sessionId="s1" />));
+    render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
     await waitFor(() => expect(screen.getByText("Already skipped")).toBeInTheDocument());
     openPanel();
 
@@ -158,5 +158,94 @@ describe("TasksPanel", () => {
     openPanel();
 
     expect(screen.queryByRole("button", { name: "Skip" })).not.toBeInTheDocument();
+  });
+
+  // Review round 1 (Minor 8d): canAct waits for the session to actually
+  // load -- session===undefined ("not loaded yet") must not flash Skip/
+  // Approve visible only to hide them once the real status arrives.
+  it("hides Skip/Approve buttons while the session hasn't loaded yet (no button flash)", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
+      { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
+    ]);
+    render(withQuery(<TasksPanel sessionId="s1" />)); // no session prop at all -- "still loading"
+    await waitFor(() => expect(screen.getByText("Add hook")).toBeInTheDocument());
+    openPanel();
+
+    expect(screen.queryByRole("button", { name: "Skip" })).not.toBeInTheDocument();
+  });
+
+  // Review round 1 (Important 2): a session that's already terminal (gates
+  // were already computed and written once at process exit) can still take
+  // a skip/approve on needs_review, but the fact that it can't retroactively
+  // change THIS run's gates must be visible, not implied.
+  it("shows 'takes effect on the next run' once an override is recorded on an already-terminal session", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
+      {
+        id: "t1", description: "Needs a human call", kind: "verification", dependsOn: [], status: "skipped",
+        priority: "optional", override: { action: "skip", at: "2026-01-01T00:00:00Z" },
+      },
+    ]);
+    render(withQuery(<TasksPanel sessionId="s1" session={{ status: "needs_review" } as any} />));
+    await waitFor(() => expect(screen.getByText("Needs a human call")).toBeInTheDocument());
+    openPanel();
+
+    expect(screen.getByText(/takes effect on the next run/)).toBeInTheDocument();
+  });
+
+  it("does NOT show the 'takes effect on the next run' note while the session is still live", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
+      {
+        id: "t1", description: "Mid-run call", kind: "verification", dependsOn: [], status: "skipped",
+        priority: "optional", override: { action: "skip", at: "2026-01-01T00:00:00Z" },
+      },
+    ]);
+    render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
+    await waitFor(() => expect(screen.getByText("Mid-run call")).toBeInTheDocument());
+    openPanel();
+
+    expect(screen.queryByText(/takes effect on the next run/)).not.toBeInTheDocument();
+  });
+
+  // Review round 1 (Moderate 7): a human "approve" launders a task into
+  // status="complete" -- the summary must not blend that into a plain
+  // N/M complete count without saying so.
+  it("shows '(K human)' in the summary when any task was human-approved", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
+      { id: "t1", description: "a", kind: "implementation", dependsOn: [], status: "complete" },
+      {
+        id: "t2", description: "b", kind: "implementation", dependsOn: [], status: "complete",
+        override: { action: "approve", at: "2026-01-01T00:00:00Z" },
+      },
+    ]);
+    render(withQuery(<TasksPanel sessionId="s1" />));
+    await waitFor(() => expect(screen.getByText(/2\/2 complete \(1 human\)/)).toBeInTheDocument());
+  });
+
+  it("shows a plain N/M complete summary when no task was human-approved", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
+      { id: "t1", description: "a", kind: "implementation", dependsOn: [], status: "complete" },
+      { id: "t2", description: "b", kind: "implementation", dependsOn: [], status: "pending" },
+    ]);
+    render(withQuery(<TasksPanel sessionId="s1" />));
+    await waitFor(() => expect(screen.getByText("1/2 complete")).toBeInTheDocument());
+  });
+
+  // Review round 1 (Important 3): a stale override (id recycled by a
+  // replan) must be visibly ignored, never silently misapplied.
+  it("shows an honest note and leaves the task unchanged when its override no longer matches (stale/id-recycled)", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
+      {
+        id: "t1", description: "Add telemetry for the new flow", kind: "implementation", dependsOn: [], status: "pending",
+        staleOverride: { action: "skip", at: "2026-01-01T00:00:00Z", kind: "verification", description: "Run the old tests" },
+      },
+    ]);
+    render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
+    await waitFor(() => expect(screen.getByText("Add telemetry for the new flow")).toBeInTheDocument());
+    openPanel();
+
+    expect(screen.getByText("pending")).toBeInTheDocument();
+    expect(screen.getByText(/no longer matches this task/)).toBeInTheDocument();
+    // The task itself was never overridden -- Skip/Approve stay available.
+    expect(screen.getByRole("button", { name: "Skip" })).toBeInTheDocument();
   });
 });

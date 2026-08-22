@@ -32,10 +32,22 @@ function TaskStatusBadge({ status }: { status: GlimmerTask["status"] }) {
 
 // Session statuses where a human skip/approve action is still meaningful --
 // "session non-terminal or needs_review" per the brief (needs_review IS
-// terminal for RepairCycleStepper's purposes, but a human is exactly who's
-// expected to act on required tasks in that state).
+// terminal for gate-computation purposes, see TERMINAL_SESSION_STATUSES
+// below, but a human is exactly who's expected to act on required tasks in
+// that state).
 const READONLY_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set([
   "verified", "failed", "blocked", "cancelled",
+]);
+
+// Review round 1 (Important 2): every status where glimmer-v2.py's process
+// has already exited and gates were already computed -- unlike
+// READONLY_SESSION_STATUSES above, this INCLUDES needs_review, because an
+// override recorded on a needs_review session still can't retroactively
+// change gates this run already wrote to manifest.json. Used only to decide
+// whether to show the "takes effect on the next run" note, never to hide
+// the buttons themselves (needs_review must stay actionable).
+const TERMINAL_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set([
+  "verified", "failed", "blocked", "cancelled", "needs_review",
 ]);
 
 function PriorityBadge({ priority }: { priority?: GlimmerTask["priority"] }) {
@@ -53,9 +65,10 @@ function PriorityBadge({ priority }: { priority?: GlimmerTask["priority"] }) {
   return <span style={{ color: "var(--text-muted)" }}>optional</span>;
 }
 
-function TaskCard({ task, canAct, onSkip, onApprove, pending }: {
+function TaskCard({ task, canAct, sessionTerminal, onSkip, onApprove, pending }: {
   task: GlimmerTask;
   canAct: boolean;
+  sessionTerminal: boolean;
   onSkip: (taskId: string) => void;
   onApprove: (taskId: string) => void;
   pending: boolean;
@@ -82,6 +95,26 @@ function TaskCard({ task, canAct, onSkip, onApprove, pending }: {
       {task.override && (
         <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
           human: {task.override.action} at {new Date(task.override.at).toLocaleString()}
+        </div>
+      )}
+      {/* Review round 1 (Important 2): a session's gates are computed once,
+          at process-exit time -- an override recorded afterward (this
+          session already reached a terminal status, needs_review included)
+          is real and stored, but cannot change THIS run's already-written
+          gates. Deterministic, not a guess: shown purely off session
+          status. */}
+      {task.override && sessionTerminal && (
+        <div style={{ fontSize: 12, color: "var(--amber)" }}>Recorded — takes effect on the next run</div>
+      )}
+      {/* Review round 1 (Important 3): task-overrides.json keys by task id,
+          but ids can be recycled across a replan (merge_replanned_tasks
+          renumbers). An override whose recorded kind/description no longer
+          match THIS task with that id was written for a task that no
+          longer exists -- ignored, not silently misapplied. */}
+      {task.staleOverride && (
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          A recorded {task.staleOverride.action} override no longer matches this task (its id was reused by a
+          replan) — ignored.
         </div>
       )}
       {showButtons && (
@@ -147,8 +180,20 @@ export function TasksPanel({ sessionId, session }: { sessionId: string; session?
   if (!tasks?.length) return null;
 
   const done = tasks.filter((t) => t.status === "complete").length;
-  const summary = `${done}/${tasks.length} complete`;
-  const canAct = !session || !READONLY_SESSION_STATUSES.has(session.status);
+  // Review round 1 (Moderate 7): a human "approve" override launders a
+  // task into the same status="complete" the "done" count above reads --
+  // without this, N/M complete would silently blend orchestrator evidence
+  // and a human's manual sign-off into one indistinguishable number.
+  const humanApproved = tasks.filter((t) => t.override?.action === "approve").length;
+  const summary = humanApproved > 0
+    ? `${done}/${tasks.length} complete (${humanApproved} human)`
+    : `${done}/${tasks.length} complete`;
+  // Review round 1 (Minor 8d): wait for the session to actually load before
+  // deciding whether actions are allowed -- session===undefined means "not
+  // loaded yet", not "no restriction", so buttons don't flash visible then
+  // disappear once the real status arrives.
+  const canAct = session != null && !READONLY_SESSION_STATUSES.has(session.status);
+  const sessionTerminal = session != null && TERMINAL_SESSION_STATUSES.has(session.status);
   const anyPending = skipMutation.isPending || approveMutation.isPending;
 
   return (
@@ -168,7 +213,7 @@ export function TasksPanel({ sessionId, session }: { sessionId: string; session?
             <ul>
               {tasks.filter((t) => t.kind === kind).map((t) => (
                 <TaskCard
-                  key={t.id} task={t} canAct={canAct} pending={anyPending}
+                  key={t.id} task={t} canAct={canAct} sessionTerminal={sessionTerminal} pending={anyPending}
                   onSkip={(id) => skipMutation.mutate(id)} onApprove={(id) => approveMutation.mutate(id)}
                 />
               ))}
@@ -182,7 +227,7 @@ export function TasksPanel({ sessionId, session }: { sessionId: string; session?
               <ul>
                 {col.map((t) => (
                   <TaskCard
-                    key={t.id} task={t} canAct={canAct} pending={anyPending}
+                    key={t.id} task={t} canAct={canAct} sessionTerminal={sessionTerminal} pending={anyPending}
                     onSkip={(id) => skipMutation.mutate(id)} onApprove={(id) => approveMutation.mutate(id)}
                   />
                 ))}

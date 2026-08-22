@@ -191,6 +191,14 @@ export interface GlimmerSession {
     // as architectureApproved/scopeApproved), null when no tasks.json exists
     // for this session (C3's task graph never ran -- not applicable).
     tasksResolved?: boolean | null;
+    // Review round 1 (Important 1): set to "human" ONLY when at least one
+    // required task's resolution came from a task-overrides.json skip/
+    // approve rather than orchestrator-derived evidence (see glimmer-
+    // v2.py's any_task_resolved_by_human_override). Absent when
+    // tasksResolved is false/null, or when every required task resolved
+    // on real evidence alone -- a human decision must stay visibly
+    // distinct from evidence, never blended into a plain "✓".
+    tasksResolvedBy?: "human";
   };
   architectPlan?: { used: boolean; risk: string | null };
   // Task 2.1 (V7 §5.5): how architect mode was decided for this run —
@@ -447,9 +455,20 @@ export interface VisualVerification {
 // means the human decided a required task doesn't need to happen; "approve"
 // means the human manually signed off a task's completion (chiefly for
 // completion.type=="manual" tasks, which have no automatic evaluator).
+// Review round 1 (Important 3): kind/description are captured at write
+// time (the task as it existed when the human clicked) so a later reader
+// can tell whether "this id" still means the same task -- task ids are
+// NOT stable across a replan (merge_replanned_tasks/derive_tasks can
+// renumber), so trusting the id alone risks silently applying a stale
+// human decision to an unrelated task that happens to reuse the id.
+// Absent on an override written before this round (legacy record) --
+// treated as "can't check, trust the id" by both applyTaskOverrides and
+// glimmer-v2.py's required_tasks_resolved.
 export interface TaskOverride {
   action: "skip" | "approve";
   at: string;
+  kind?: GlimmerTask["kind"];
+  description?: string;
 }
 
 export interface GlimmerTask {
@@ -490,6 +509,12 @@ export interface GlimmerTask {
   // never written to tasks.json itself. See applyTaskOverrides (server/src/
   // lib/sessions.ts).
   override?: TaskOverride;
+  // Review round 1 (Important 3): present instead of `override` when a
+  // recorded override's id matched but its kind/description didn't -- the
+  // id was reused by a replan for a different task, so the override is
+  // honestly ignored rather than silently misapplied. See
+  // applyTaskOverrides.
+  staleOverride?: TaskOverride;
 }
 
 interface GlimmerEventBase {
@@ -647,6 +672,16 @@ export interface TaskListCompletedEvent extends GlimmerEventBase {
   type: "task_list_completed";
   taskCount: number;
 }
+// Review round 1 (Important 1): emitted by glimmer-v2.py at gate-
+// computation time (both gates["tasksResolved"] call sites in main())
+// whenever a required task's resolution actually came from a human's
+// task-overrides.json skip/approve, not orchestrator-derived evidence --
+// see any_task_resolved_by_human_override. One event per such task.
+export interface TaskOverrideAppliedEvent extends GlimmerEventBase {
+  type: "task_override_applied";
+  taskId: string;
+  action: "skip" | "approve";
+}
 export interface VisualVerificationStartedEvent extends GlimmerEventBase {
   type: "visual_verification_started";
   command: string;
@@ -716,6 +751,7 @@ export type GlimmerEvent =
   | TaskCreatedEvent
   | TaskStatusChangedEvent
   | TaskListCompletedEvent
+  | TaskOverrideAppliedEvent
   | VisualVerificationStartedEvent
   | VisualFindingDetectedEvent
   | VisualVerificationCompletedEvent
@@ -733,7 +769,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "architect_planning_started", "architect_plan_created",
   "architect_review_requested", "architect_review_completed",
   "architect_replan_started", "architect_autotriggered",
-  "task_created", "task_status_changed", "task_list_completed",
+  "task_created", "task_status_changed", "task_list_completed", "task_override_applied",
   "visual_verification_started", "visual_finding_detected",
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",

@@ -622,7 +622,9 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     expect(typeof res.body.at).toBe("string");
 
     const onDisk = JSON.parse(await fs.readFile(path.join(dir, "task-overrides.json"), "utf-8"));
-    expect(onDisk).toEqual({ t1: { action: "skip", at: res.body.at } });
+    expect(onDisk).toEqual({
+      t1: { action: "skip", at: res.body.at, kind: "implementation", description: "Add hook" },
+    });
   });
 
   it("writes task-overrides.json on approve, independent of other tasks' overrides", async () => {
@@ -676,6 +678,34 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     expect(t1.override).toMatchObject({ action: "skip" });
     expect(t2).toMatchObject({ status: "complete", priority: "required" });
     expect(t2.override).toMatchObject({ action: "approve" });
+  });
+
+  // Review round 1 (Important 3): replay a replan renumbering ids -- an
+  // override recorded for the OLD "t2" (a "Run tests" verification task)
+  // must not silently apply to a NEW, unrelated task that happens to be
+  // renumbered to the same id "t2" afterward (merge_replanned_tasks can do
+  // this; ids are not stable across a replan).
+  it("does not apply an override whose id was recycled by a replan for a different task", async () => {
+    const id = "20260822-000022-glimmer-task-id-recycled";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const skipRes = await request(app).post(`/api/sessions/${id}/tasks/t2/skip`);
+    expect(skipRes.body).toMatchObject({ taskId: "t2", action: "skip" });
+
+    // Simulate a replan: t2 now names a completely different task.
+    const replannedTasks = [
+      tasks[0],
+      { id: "t2", description: "Add telemetry for the new flow", kind: "implementation", dependsOn: ["t1"], status: "pending", priority: "required" },
+    ];
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(replannedTasks));
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    const newT2 = res.body.find((t: any) => t.id === "t2");
+    expect(newT2.status).toBe("pending"); // NOT "skipped" -- the stale override must not apply
+    expect(newT2.override).toBeUndefined();
+    expect(newT2.staleOverride).toMatchObject({ action: "skip" });
   });
 });
 

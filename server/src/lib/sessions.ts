@@ -300,13 +300,50 @@ export function readTaskOverrides(id: string): Promise<Record<string, TaskOverri
 // sessions rarely have more than a handful of tasks) — a second call for the
 // same taskId simply replaces its prior override; deliberately no undo/
 // toggle, per the brief's "keep simple, one-shot buttons" instruction.
-export async function writeTaskOverride(id: string, taskId: string, action: TaskOverride["action"]): Promise<TaskOverride> {
+//
+// Review round 1 (Important 3): taskFacts (kind/description, captured from
+// the task as it exists RIGHT NOW, at the route that already read
+// tasks.json to validate taskId) are stamped onto the record so a later
+// reader can tell whether "this id" still means the same task -- ids are
+// NOT stable across a replan. See TaskOverride's own comment and
+// applyTaskOverrides below.
+//
+// Review round 1 (Moderate 6): write-to-temp-then-rename instead of a
+// direct writeFile -- a crash/kill mid-write must never leave a torn/
+// truncated task-overrides.json for readTaskOverrides to trip over (it
+// would silently read back as {} via its JSON.parse-catch, quietly
+// dropping every override recorded so far). rename() is atomic on the
+// same filesystem, and the temp file lives in the same directory so it
+// always is.
+export async function writeTaskOverride(
+  id: string, taskId: string, action: TaskOverride["action"], taskFacts: { kind: GlimmerTask["kind"]; description: string },
+): Promise<TaskOverride> {
   const real = resolveSessionId(id);
+  // Review round 1 (Minor 8b): this function is reachable directly (not
+  // only through the route, which already validates the id via
+  // readSessionTasks), and it WRITES to a path derived from `real` --
+  // same guard every other id-derived filesystem write in this module
+  // gets, not inherited implicitly from a caller.
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
   const existing = (await readTaskOverrides(real)) ?? {};
-  const record: TaskOverride = { action, at: new Date().toISOString() };
+  const record: TaskOverride = { action, at: new Date().toISOString(), ...taskFacts };
   const next = { ...existing, [taskId]: record };
-  await fs.writeFile(path.join(sessionsDir(), real, "task-overrides.json"), JSON.stringify(next), "utf-8");
+  const finalPath = path.join(sessionsDir(), real, "task-overrides.json");
+  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
+  await fs.writeFile(tmpPath, JSON.stringify(next), "utf-8");
+  await fs.rename(tmpPath, finalPath);
   return record;
+}
+
+// Review round 1 (Important 3): true when an override's captured
+// kind/description (if any -- absent on a legacy pre-round-1 record)
+// still match the task currently holding this id. A mismatch means the
+// id was recycled (e.g. merge_replanned_tasks renumbering after a
+// replan) for an unrelated task -- the override belongs to a task that
+// no longer exists under this id.
+function overrideMatchesTask(override: TaskOverride, task: GlimmerTask): boolean {
+  if (override.kind === undefined && override.description === undefined) return true; // legacy record -- trust the id alone
+  return override.kind === task.kind && override.description === task.description;
 }
 
 // Pure display transform consumed by GET /sessions/:id/tasks — never mutates
@@ -322,8 +359,14 @@ export function applyTaskOverrides(tasks: GlimmerTask[], overrides: Record<strin
   return tasks.map((t) => {
     const override = overrides[t.id];
     if (!override) return t;
+    // Review round 1 (Important 3): id reused by a replan -- ignore the
+    // override (never misapply a stale human decision to the wrong
+    // task), but keep the raw fact visible via staleOverride so a human
+    // can tell why a Skip/Approve they remember seems to have vanished.
+    if (!overrideMatchesTask(override, t)) return { ...t, staleOverride: override };
     if (override.action === "skip") return { ...t, status: "skipped", priority: "optional", override };
-    return { ...t, status: "complete", override }; // "approve"
+    if (override.action === "approve") return { ...t, status: "complete", override };
+    return t; // Review round 1 (Moderate 5): unrecognized action -- fail OPEN to unchanged, never guess a display.
   });
 }
 
