@@ -46,6 +46,41 @@ GLIMMER_VISUAL = Path(__file__).resolve().parent / "glimmer-visual.py"
 VISUAL_VERIFY_TOKEN = "visual"
 VISUAL_DEFAULT_VIEWPORTS = ("1440x900", "390x844")
 
+# V7 §22.18 deterministic visual requiredness: area words / extensions that
+# mark a contract scope or changed-files set as UI-area work, same
+# token/extension-match convention as select_skills (below) and O2's
+# detect_documentation_impact -- plain deterministic keyword matching, no
+# model judgment. Deliberately small and web-generic (not framework-
+# specific); extend if a real UI area keeps missing this.
+VISUAL_AREA_WORDS = {
+    "frontend", "ui", "web", "client", "app", "mobile", "component",
+    "components", "view", "views", "page", "pages", "screen", "screens",
+}
+VISUAL_AREA_EXTENSIONS = {
+    ".tsx", ".jsx", ".css", ".scss", ".less", ".html", ".vue", ".svelte",
+}
+# V7 §22.10: cap on ArchitecturePlan.visualRequirements -- untrusted model
+# output (same discipline run_architect_first already applies to
+# plan.packages before it ever reaches an event/log/prompt).
+MAX_VISUAL_REQUIREMENTS = 20
+MAX_VISUAL_REQUIREMENT_CHARS = 300
+# Mirrors glimmer-visual.py's own DEFAULT_CHECKS verbatim -- not imported,
+# per that script's "stays standalone" module docstring (same mirrored-
+# not-imported convention as _extract_json_object elsewhere in this
+# codebase). glimmer-visual.py's own --check is a full override of its
+# defaults when given at all (its DEFAULT_CHECKS comment: "used only when
+# the caller doesn't pass --check at all") -- v2.py needs the literal
+# check text here so an ArchitecturePlan's visualRequirements can join the
+# basics as EXTRA checks (V7 §22.10: "part of the verification contract",
+# not a replacement for it) without changing that override semantics.
+VISUAL_DEFAULT_CHECKS = (
+    "no clipped or cut-off elements",
+    "no unexpected overlapping elements",
+    "all visible text is readable",
+    "no elements rendered outside the viewport",
+    "no horizontal overflow",
+)
+
 IGNORE_DIRS = {
     ".git", "node_modules", ".next", ".turbo", ".cache", "coverage",
     "dist", "build", "out", ".output", ".venv", "venv", "__pycache__",
@@ -690,6 +725,92 @@ def verifier_commands(m, files, level):
     return result
 
 
+# V7 §18: "standard" is required's own level; the tier immediately above it
+# is what standard's *recommended* set borrows from. "full" has nothing
+# above it, so its recommended set is always empty.
+NEXT_VERIFICATION_LEVEL = {"minimal": "standard", "standard": "full", "full": None}
+
+
+def visual_requiredness(level, visual_url, contract, files, plan):
+    """V7 §22.18 deterministic rule table for where the visual check lands.
+    Pure decision function (no side effects, no command-building) so the
+    rule table is independently testable from verification_plan's
+    command-assembly plumbing below.
+
+    | --visual-url | level      | frontend-area match OR plan.visualRequirements | outcome     |
+    |--------------|------------|--------------------------------------------------|--------------|
+    | absent       | any        | any                                                | "absent"     |
+    | present      | minimal    | any                                                | "recommended"|
+    | present      | standard+  | no                                                 | "recommended"|
+    | present      | standard+  | yes                                                | "required"   |
+
+    "absent" preserves the existing honest convention verbatim: no
+    --visual-url means no auto-added visual check at all (an explicit
+    "visual" --verify/contract.verification entry still fails loud via
+    validate_visual_url, unrelated to this function). "required" only at
+    standard+ -- minimal level never auto-requires a visual check,
+    regardless of scope/plan, though it can still be recommended.
+    """
+    if not visual_url:
+        return "absent"
+    visual_requirements = sanitize_visual_requirements(plan)
+    frontend_match = visual_scope_matches_frontend(contract, files)
+    if level in ("standard", "full") and (frontend_match or visual_requirements):
+        return "required"
+    return "recommended"
+
+
+def verification_plan(m, files, level, verify_entries, session, visual_url,
+                       model_readiness_url=READINESS_URL_DEFAULT, contract=None, plan=None):
+    """V7 §18: split the verification plan into required (gates VERIFIED --
+    exactly what verifier_commands+expand_verify_entries has always built
+    for `level`, plus any explicit --verify/contract.verification entries)
+    and recommended (deterministically the NEXT level's extra commands,
+    e.g. minimal's recommended is standard's lint; standard's recommended is
+    full's test+build). Recommended commands are run (see verify()'s `tier`
+    param) but never gate VERIFIED -- see the main() call site's `if ok:`
+    guard and gates_block_verified, neither of which ever reads them.
+
+    V7 §22.18 (Task 3.3): on top of that existing split, deterministically
+    place an AUTO visual check (i.e. one the caller didn't already spell
+    out via --verify/contract.verification's literal "visual" token) into
+    required or recommended per visual_requiredness's rule table above.
+    `contract`/`plan` are optional (default None) so every pre-3.3 caller
+    -- including --verification-plan-selfcheck's existing calls, which
+    never pass them -- is unaffected: visual_scope_matches_frontend(None,
+    files) and sanitize_visual_requirements(None) both degrade to no
+    match/[], so with no contract/plan this reduces to "recommended
+    whenever --visual-url is set, absent otherwise" -- and when
+    --visual-url is also None (every existing self-check call), nothing
+    changes at all.
+    """
+    required = verifier_commands(m, files, level)
+    required = expand_verify_entries(required, verify_entries, session, visual_url, model_readiness_url,
+                                      visual_requirements=sanitize_visual_requirements(plan))
+    next_level = NEXT_VERIFICATION_LEVEL.get(level)
+    recommended = []
+    if next_level:
+        required_keys = {tuple(c) for c in required}
+        recommended = [c for c in verifier_commands(m, files, next_level) if tuple(c) not in required_keys]
+
+    # An explicit "visual" --verify/contract.verification entry already
+    # expanded into `required` above (expand_verify_entries) -- never
+    # auto-add a second one on top of it.
+    already_visual = any(is_visual_check_command(c) for c in required)
+    outcome = visual_requiredness(level, visual_url, contract, files, plan)
+    if outcome != "absent" and not already_visual:
+        visual_cmd = build_visual_verify_command(
+            session, visual_url, model_readiness_url,
+            visual_requirements=sanitize_visual_requirements(plan),
+        )
+        if outcome == "required":
+            required.append(visual_cmd)
+        else:
+            recommended.append(visual_cmd)
+
+    return {"required": required, "recommended": recommended}
+
+
 def _model_base_url(readiness_url):
     """Derive the bare http://host:port glimmer-visual.py's --model-url
     wants from v2's EXISTING model-readiness URL (same llama-server, just
@@ -700,7 +821,51 @@ def _model_base_url(readiness_url):
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_DEFAULT):
+def sanitize_visual_requirements(plan):
+    """V7 §22.10: ArchitecturePlan.visualRequirements is optional, untrusted
+    model output -- v2 (the trusted layer) treats it exactly like
+    run_architect_first already treats plan.packages before it reaches an
+    event/prompt: tolerant of absence (no field, wrong type, `plan` itself
+    None -- all -> []), and capped so a runaway/malicious value can't
+    bloat the vision model's own contract text (MAX_VISUAL_REQUIREMENTS
+    entries, MAX_VISUAL_REQUIREMENT_CHARS each). Non-string / blank
+    entries are dropped rather than coerced -- same "don't fabricate
+    substance" principle glimmer-visual.py's own _coerce_finding applies
+    to the vision model's findings."""
+    if not plan:
+        return []
+    raw = plan.get("visualRequirements")
+    if not isinstance(raw, list):
+        return []
+    return [
+        v.strip()[:MAX_VISUAL_REQUIREMENT_CHARS]
+        for v in raw[:MAX_VISUAL_REQUIREMENTS]
+        if isinstance(v, str) and v.strip()
+    ]
+
+
+def visual_scope_matches_frontend(contract, files):
+    """V7 §22.18 deterministic requiredness: is this a UI-area session?
+    Reuses select_skills' own two signals (scope area/paths token match,
+    changed-file extension match) rather than inventing a third matching
+    convention -- a contract scope of e.g. "frontend"/"ui"/"web client"
+    tokenizes and hits VISUAL_AREA_WORDS the same way select_skills'
+    area_hit does, and a changed .tsx/.css/... file hits VISUAL_AREA_
+    EXTENSIONS the same way its filetype_hit does. Never raises: a
+    missing/malformed contract or files list degrades to False (no
+    match), never an exception."""
+    try:
+        scope_tokens = set(_segment_tokens(_skills_scope_text(contract)))
+        if scope_tokens & VISUAL_AREA_WORDS:
+            return True
+        exts = {os.path.splitext(str(f))[1].lower() for f in (files or [])}
+        return bool(exts & VISUAL_AREA_EXTENSIONS)
+    except Exception:  # noqa: BLE001 -- a requiredness check must never crash the verification plan
+        return False
+
+
+def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_DEFAULT,
+                                 visual_requirements=None):
     """C4 (glimmer-v7): real subprocess argv for the visual capture check,
     targeting sessions/<id>/visual/ (V7 §22.14 evidence store layout).
     Creates the output directory up front so glimmer-visual.py -- which is
@@ -723,6 +888,11 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
     here could improve on. No opt-out flag -- "visual" in the plan is
     already the opt-in; capture-only mode stays available by running
     glimmer-visual.py directly without --vision.
+
+    V7 §22.10: `visual_requirements` (already sanitize_visual_requirements-
+    capped by the caller) become extra --check entries alongside
+    glimmer-visual.py's own DEFAULT_CHECKS -- the Architect's UX
+    constraints join the vision contract instead of replacing it.
     """
     out_dir = session / "visual"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -730,6 +900,15 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
     for vp in VISUAL_DEFAULT_VIEWPORTS:
         cmd += ["--viewport", vp]
     cmd += ["--vision", "--model-url", _model_base_url(model_readiness_url)]
+    if visual_requirements:
+        # glimmer-visual.py's --check replaces its own defaults when given
+        # at all -- send the basics explicitly alongside the extras so
+        # visualRequirements genuinely ADD to the contract instead of
+        # silently dropping the V7 §22.2 basics.
+        for check in VISUAL_DEFAULT_CHECKS:
+            cmd += ["--check", check]
+        for req in visual_requirements:
+            cmd += ["--check", req]
     return cmd
 
 
@@ -753,7 +932,7 @@ def validate_visual_url(raw_verify_entries, visual_url):
 
 
 def expand_verify_entries(commands, raw_entries, session, visual_url,
-                           model_readiness_url=READINESS_URL_DEFAULT):
+                           model_readiness_url=READINESS_URL_DEFAULT, visual_requirements=None):
     """Expand contract.verification / --verify entries into real subprocess
     argv lists, appended onto `commands`. Mirrors the pre-C4
     shlex.split-and-append behavior exactly for every entry EXCEPT the
@@ -764,15 +943,46 @@ def expand_verify_entries(commands, raw_entries, session, visual_url,
     verification plan that never contains "visual" takes the identical
     path through this function as the old inline loop did -- zero behavior
     change for every existing invocation shape.
+
+    Fix round 3: `visual_requirements` (already sanitize_visual_requirements-
+    capped by the caller) threads straight through to
+    build_visual_verify_command, same as the auto-added visual check
+    verification_plan builds a few lines below its own call to this
+    function. Without this, an EXPLICIT "visual" --verify/contract.
+    verification entry -- the most deliberate way a caller opts into
+    vision review -- silently dropped the Architect's own
+    visualRequirements, while the auto-added path kept them. Default
+    None degrades to build_visual_verify_command's own no-requirements
+    behavior, so every pre-existing caller is unaffected.
     """
     for raw in raw_entries:
         if raw.strip().lower() == VISUAL_VERIFY_TOKEN:
-            cmd = build_visual_verify_command(session, visual_url, model_readiness_url)
+            cmd = build_visual_verify_command(session, visual_url, model_readiness_url,
+                                               visual_requirements=visual_requirements)
         else:
             cmd = shlex.split(raw)
         if cmd and cmd not in commands:
             commands.append(cmd)
     return commands
+
+
+def visual_state_count(session):
+    """V7 §22.7/Task 3.3: best-effort, read-only peek at visual-manifest.
+    json's "states" list for the visual_verification_started/completed
+    events' `stateCount` field. Deterministic and side-effect-free: reads
+    the same file classify_visual_check_result reads right after this,
+    so both events derive stateCount from one snapshot. Never raises --
+    missing/unreadable/malformed manifest (a genuine capture failure, or
+    simply nothing written yet) returns None so the caller can omit the
+    field rather than fabricate a count; every manifest glimmer-visual.py
+    itself ever writes (pre- or post-3.3) always has a "states" list
+    (default ["initial"]), so this is 1 for every single-state run."""
+    try:
+        manifest_doc = json.loads((Path(session) / "visual" / "visual-manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    states = manifest_doc.get("states")
+    return len(states) if isinstance(states, list) else None
 
 
 def classify_visual_check_result(result, session):
@@ -1082,7 +1292,7 @@ def remove_baseline_worktree(ws, target):
 
 
 def verify(ws, commands, timeout, session, iteration, repo_map, source_root, baseline, toolchain_mode="path",
-           events_path=None, session_id=None):
+           events_path=None, session_id=None, tier="required", fail_fast=True):
     current_bridges = []
     if toolchain_mode == "linked":
         _, current_bridges = prepare_toolchain_bridges(ws, repo_map)
@@ -1106,8 +1316,15 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             # running app under test isn't rebuilt per git worktree).
             is_visual = is_visual_check_command(cmd)
             if is_visual:
+                # V7 §22.7 (Task 3.3): one deterministic read of visual-
+                # manifest.json's states, shared by both events below --
+                # run_verifier_command (just above) already ran
+                # glimmer-visual.py to completion, so the manifest it
+                # wrote is on disk by now for either event to read.
+                state_count = visual_state_count(session)
                 if events_path is not None:
-                    emit_event(events_path, "visual_verification_started", session_id, command=label)
+                    emit_event(events_path, "visual_verification_started", session_id,
+                               command=label, stateCount=state_count)
                 result = classify_visual_check_result(result, session)
                 if events_path is not None:
                     for finding in result.get("visualBlockingFindings", []):
@@ -1123,7 +1340,7 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
                                    category=category,
                                    description=str(finding.get("description", ""))[:300])
                     emit_event(events_path, "visual_verification_completed", session_id,
-                               status=result["status"])
+                               status=result["status"], stateCount=state_count)
 
             if result["status"] == "CODE_FAIL" and not is_visual:
                 if baseline_ws is None:
@@ -1150,13 +1367,19 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
                 else:
                     result["newErrorSignatures"] = sorted(cur_sigs - base_sigs) if cur_sigs else []
 
+            # V7 §18: tier is a plain tag on the result, not a second
+            # verify() code path -- "required"/"recommended" only changes
+            # how the CALLER treats the aggregate (gating vs. reported-only)
+            # and whether fail_fast stops at the first failure.
+            result["tier"] = tier
             results.append(result)
             (session / f"verify-{iteration:02d}-{i:02d}.json").write_text(
                 json.dumps(result, indent=2), encoding="utf-8"
             )
             if events_path is not None:
                 emit_event(events_path, "verification_completed", session_id, check=label,
-                           status=result["status"], baselineAware=bool(result.get("baseline")))
+                           status=result["status"], baselineAware=bool(result.get("baseline")),
+                           tier=tier)
             if result["status"] == "PASS":
                 print("PASS")
             elif result["status"] == "PASS_BASELINE":
@@ -1167,8 +1390,14 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             if not result.get("ok"):
                 if result.get("outputTail"):
                     print(result["outputTail"][-5000:])
-                return False, results
-        return True, results
+                if fail_fast:
+                    return False, results
+        # fail_fast=True (default) only ever reaches here with every result
+        # ok -- identical to the pre-§18 `return True, results`. fail_fast=
+        # False (recommended tier) can reach here with a failure recorded
+        # above without having stopped the loop, so the aggregate must be
+        # computed for real rather than assumed true.
+        return all(r.get("ok") for r in results), results
     finally:
         cleanup_toolchain_bridges(current_bridges)
         cleanup_toolchain_bridges(baseline_bridges)
@@ -1187,6 +1416,102 @@ def failure_text(results):
                 f"Output:\n{r.get('outputTail', '')[-12000:]}{extra}"
             )
     return "Unknown verification failure"
+
+
+# V7 §21: heuristic used ONLY to decide whether a failing check's own output
+# is worth mining for test-file paths -- SCRIPT_GROUPS["test"] names
+# ("test", "test:ci", "vitest") are all substrings of the resulting
+# `npm [--prefix <dir>] run <name>` / raw command text.
+# ponytail: substring match, not a real "which SCRIPT_GROUPS bucket did this
+# come from" lookup -- upgrade to threading the group name through
+# verifier_commands if a script literally named e.g. "testlint" ever
+# misfires this.
+def is_test_check_command(command_label):
+    low = (command_label or "").lower()
+    return "test" in low or "vitest" in low
+
+
+# Conservative: only matches paths that look like test files (a
+# ".test."/".spec." JS/TS file), and build_repair_contract below additionally
+# requires the path to exist in the workspace before trusting it.
+TEST_FILE_PATH_RE = re.compile(r"[\w./-]+\.(?:test|spec)\.[jt]sx?")
+
+
+def extract_existing_test_files(output_text, ws):
+    found = []
+    ws_resolved = Path(ws).resolve()
+    for m in TEST_FILE_PATH_RE.finditer(output_text or ""):
+        rel = m.group(0)
+        # Containment guard: failure output is model/tool-adjacent text — a
+        # match like "../secret.test.ts" must never leak path-existence
+        # outside the workspace into allowedFiles/repair-NN.json.
+        if ".." in rel.split("/"):
+            continue
+        candidate = (ws_resolved / rel)
+        try:
+            if not candidate.resolve().is_relative_to(ws_resolved):
+                continue
+        except OSError:
+            continue
+        if rel not in found and candidate.is_file():
+            found.append(rel)
+    return found
+
+
+def build_repair_contract(attempt_number, results, files, ws):
+    """V7 §21 structured repair contract, built once verify() returns
+    ok=False for the REQUIRED tier (`results` is that tier's result list).
+
+    failedCheck names the first failing result (fail_fast=True for the
+    required tier means there is at most one). newFailures is that check's
+    own newErrorSignatures, capped -- the same signal failure_text already
+    surfaces in prose, just kept machine-shaped here.
+
+    allowedFiles is deterministic GUIDANCE, not an enforced boundary: the
+    changed-files set so far, plus -- only when the failing check is itself
+    a test runner -- any test file path named in its output that actually
+    exists in the workspace (conservative extraction: regex match AND an
+    existing-file check, never a bare string guess)."""
+    failing = next((r for r in results if not r.get("ok")), None)
+    # C4 fix round 3: a failing visual check (V7 §22.5 CODE_FAIL) never has
+    # newErrorSignatures -- verify() excludes the visual check from the
+    # baseline-worktree comparison that populates that field (see verify()'s
+    # `and not is_visual` guard) -- so without this, a required visual
+    # failure handed the engineer an empty newFailures list: a blind repair
+    # round. visualBlockingFindings (classify_visual_check_result) carries
+    # the actual defect list instead.
+    if failing and failing.get("visualBlockingFindings"):
+        new_failures = [
+            f"{f.get('severity')}: {f.get('category')} — {f.get('description')}"
+            for f in failing["visualBlockingFindings"]
+        ][:50]
+    else:
+        new_failures = (failing.get("newErrorSignatures") or [])[:50] if failing else []
+    allowed = list(dict.fromkeys(files))  # de-dup, preserve order
+    if failing and is_test_check_command(failing.get("command", "")):
+        for f in extract_existing_test_files(failing.get("outputTail", ""), ws):
+            if f not in allowed:
+                allowed.append(f)
+    return {
+        "attempt": attempt_number,
+        "failedCheck": failing.get("command") if failing else None,
+        "newFailures": new_failures,
+        "allowedFiles": allowed,
+    }
+
+
+def compute_repair_writes_outside_allowed(files, repair_contract):
+    """V7 §21, advisory only: allowedFiles is a heuristic guidance signal
+    (see build_repair_contract), not a hard scope like compute_scope_guard's
+    contract-derived boundary -- a real fix legitimately touches a file this
+    heuristic never named (e.g. the implementation file a stack trace never
+    mentions). Never blocks; the caller only prints a WARN and records this
+    list on the attempt, same advisory treatment as scope guard's own
+    "unbounded" case."""
+    if not repair_contract:
+        return []
+    allowed = set(repair_contract.get("allowedFiles") or [])
+    return [f for f in files if f not in allowed]
 
 
 def checkpoint(ws, n):
@@ -1671,7 +1996,8 @@ def build_skills_block(contract, plan, skills=None, skills_dir=None) -> str:
     )
 
 
-def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None, evidence=None):
+def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None, evidence=None,
+                 repair_contract=None):
     # R2: the contract dict (same shape as manifest["contract"]) is the sole
     # source of truth for scope/mode/constraints — derive the human-readable
     # OPERATING CONTRACT lines below FROM it rather than maintaining separate
@@ -1720,6 +2046,24 @@ PREVIOUS LOCAL-ONLY CHECKPOINT:
 {checkpoint_sha}
 
 Repair only failures introduced by this task. Preserve correct prior work and pre-existing baseline failures.
+"""
+        # V7 §21: rendered on top of the freeform failure block above --
+        # same underlying facts, machine-shaped, so the engineer doesn't
+        # have to re-derive failedCheck/newFailures from prose. Only ever
+        # added when the caller actually built a contract (every pre-§21
+        # call site passes nothing here, so this stays byte-identical to
+        # the old prompt for them). allowedFiles is explicitly labeled
+        # GUIDANCE, not an enforced boundary -- see
+        # compute_repair_writes_outside_allowed's advisory-only check.
+        if repair_contract is not None:
+            repair += f"""
+STRUCTURED REPAIR CONTRACT (V7 §21):
+{json.dumps(repair_contract, indent=2)}
+
+allowedFiles above is GUIDANCE ONLY, derived from the changed-files set so
+far plus (for a failing test check) existing test file paths named in its
+own output -- not an enforced boundary. Prefer touching only those files;
+a genuine fix may still require another file if the evidence supports it.
 """
 
     # C1 (glimmer-v7): appended AFTER the existing template's .strip() below
@@ -3264,6 +3608,11 @@ def main():
     save()
 
     success, failure, checkpoint_sha = False, None, None
+    # V7 §21: the structured repair contract built from the PREVIOUS failed
+    # attempt, consumed by make_prompt on the NEXT (repair) iteration and by
+    # the outside-allowed advisory check right after that iteration's
+    # engineer run. None on iteration 0 and on every non-repair path.
+    repair_contract = None
     final_label = "NOT VERIFIED"
     # O2: initialized here (before the try), not just at its usual C3 spot
     # inside the try below -- the finally block now reads `tasks` on EVERY
@@ -3360,7 +3709,8 @@ def main():
             if iteration > 0:
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
             prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
-                                 plan=architecture_plan, evidence=candidate_evidence)
+                                 plan=architecture_plan, evidence=candidate_evidence,
+                                 repair_contract=repair_contract)
             (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
             # C3: spawn -- deterministic evidence point 1/3. The engineer
             # subprocess is about to execute the whole implementationPlan
@@ -3409,6 +3759,21 @@ def main():
                       f"{manifest['contract']['scope'].get('package')!r} claims a bounded scope but no "
                       "area/paths were given; cannot verify (unbounded)")
 
+            # V7 §21, advisory only: did THIS repair round's writes land
+            # outside the allowedFiles guidance the previous failure built?
+            # iteration 0 is never a repair round (repair_contract is None
+            # there), and this is deliberately separate from the scope guard
+            # above -- allowedFiles is a heuristic derived from one failing
+            # check's output, not the task contract's declared scope, so it
+            # gets its own (still advisory) signal rather than being folded
+            # into scopeGuard.
+            if iteration > 0 and repair_contract is not None:
+                outside_allowed = compute_repair_writes_outside_allowed(files, repair_contract)
+                attempt["repairWritesOutsideAllowed"] = outside_allowed
+                if outside_allowed:
+                    print(f"[V2] WARN: repair contract — {len(outside_allowed)} changed file(s) outside "
+                          f"allowedFiles guidance {repair_contract.get('allowedFiles')}: {outside_allowed}")
+
             # Task 1.4 (V7 §6): budgets.maxChangedFiles -- distinct from the
             # scope guard above (which now blocks too, but only after
             # verify() ok, via gates.scopeApproved): this DOES block
@@ -3428,7 +3793,8 @@ def main():
 
             if not files:
                 commands = [["git", "diff", "--check"]]
-                commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
+                commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url,
+                                                  visual_requirements=sanitize_visual_requirements(architecture_plan))
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
                                          repo, source_root, baseline, args.toolchain_mode,
@@ -3459,6 +3825,12 @@ def main():
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
                         manifest["status"] = "no-change-verified"
+                        # V7 §20: verification freeze -- verifiedAt lets the
+                        # gateway detect (read-time, not enforced by any
+                        # daemon here) whether the workspace was written to
+                        # again after this VERIFIED promotion. See the
+                        # "verified" promotion below for the other site.
+                        manifest["verifiedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                         manifest["state"] = canonical_session_state(manifest["status"])
                         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                         success = True
@@ -3730,16 +4102,45 @@ def main():
                 save()
                 break
 
-            commands = verifier_commands(repo, files, args.verification_level)
-            commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url)
-            attempt["verificationCommands"] = [shlex.join(c) for c in commands]
+            # V7 §18: verification_plan splits required (gates VERIFIED,
+            # identical commands verifier_commands+expand_verify_entries has
+            # always built for this level) from recommended (the next tier
+            # up's extra commands -- run but never gating). V7 §22.18/§22.10
+            # (Task 3.3): contract + architecture_plan feed the deterministic
+            # visual-requiredness rule table and visualRequirements passthrough
+            # -- architecture_plan is None whenever --architect-first wasn't
+            # used, which visual_requiredness/sanitize_visual_requirements
+            # both already treat identically to "no plan at all".
+            plan = verification_plan(repo, files, args.verification_level, args.verify,
+                                      session, args.visual_url, args.model_readiness_url,
+                                      contract=manifest.get("contract"), plan=architecture_plan)
+            commands = plan["required"]
+            attempt["verificationPlan"] = {
+                "required": [shlex.join(c) for c in plan["required"]],
+                "recommended": [shlex.join(c) for c in plan["recommended"]],
+            }
+            manifest["verificationPlan"] = attempt["verificationPlan"]
+            attempt["verificationCommands"] = attempt["verificationPlan"]["required"]
 
             before = diff_hash(ws, baseline)
             ok, results = verify(ws, commands, args.timeout, session, iteration,
                                  repo, source_root, baseline, args.toolchain_mode,
                                  events_path, sid)
+            # V7 §18: recommended checks only run once required already
+            # passed -- no point spending time on non-gating extras when a
+            # repair round is coming regardless. fail_fast=False so one
+            # recommended failure doesn't hide the rest; the aggregate
+            # result is deliberately discarded (`_`) -- recommended NEVER
+            # feeds `ok`/gating, only its own per-check results, reported
+            # below and via each check's own "recommended"-tagged event.
+            recommended_results = []
+            if ok and plan["recommended"]:
+                _, recommended_results = verify(ws, plan["recommended"], args.timeout, session, iteration,
+                                                 repo, source_root, baseline, args.toolchain_mode,
+                                                 events_path, sid, tier="recommended", fail_fast=False)
             after = diff_hash(ws, baseline)
             attempt["verificationResults"] = results
+            attempt["recommendedResults"] = recommended_results
             attempt["diffHashAfterVerify"] = after
             # C3: post-verify -- deterministic evidence point 3/3.
             if tasks is not None:
@@ -3850,6 +4251,15 @@ def main():
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
+                # V7 §20: verification freeze -- the orchestrator process
+                # exits shortly after this, so there is no daemon left to
+                # notice a later write. verifiedAt is the fact the gateway
+                # needs to detect staleness itself, read-time, on its next
+                # GET (see control-center/server/src/lib/sessions.ts
+                # readSession's computeStale option): if the workspace picks
+                # up uncommitted changes after this timestamp, the session
+                # reads back as "stale" until a fresh run re-verifies it.
+                manifest["verifiedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 manifest["state"] = canonical_session_state(manifest["status"])
                 emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                 save()
@@ -3881,6 +4291,18 @@ def main():
             print("\n[V2] New code failure detected. Creating LOCAL-ONLY checkpoint...")
             checkpoint_sha = checkpoint(ws, iteration + 1)
             manifest["attempts"][-1]["checkpoint"] = checkpoint_sha
+            # V7 §21: structured repair contract for the repair round about
+            # to start -- attempt number matches the "REPAIR N" label
+            # make_prompt will use next iteration (iteration + 1). Built
+            # only here (not on the INFRA_BLOCKED/TIMEOUT/budget-exhausted
+            # break paths above), the same "only when a repair round
+            # actually follows" discipline checkpoint_sha itself already
+            # follows just above.
+            repair_contract = build_repair_contract(iteration + 1, results, files, ws)
+            manifest["attempts"][-1]["repairContract"] = repair_contract
+            (session / f"repair-{iteration + 1:02d}.json").write_text(
+                json.dumps({"repair": repair_contract}, indent=2), encoding="utf-8"
+            )
             save()
             print(f"[V2] checkpoint={checkpoint_sha}")
             print("[V2] No push. Starting controlled repair round.")
@@ -5626,6 +6048,28 @@ def _visual_selfcheck() -> None:
         default_cmd = build_visual_verify_command(session, "http://x/route")
         assert _model_base_url(READINESS_URL_DEFAULT) in default_cmd
 
+    # Fix round 3: visual_requirements threaded through expand_verify_entries
+    # for an EXPLICIT "visual" --verify/contract.verification entry -- the
+    # most deliberate opt-in path -- must reach the built command's --check
+    # list exactly like the auto-added visual check already does.
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        commands = expand_verify_entries(
+            [["git", "diff", "--check"]], ["visual"], session, "http://x/route",
+            visual_requirements=["primary action remains visible at laptop height"],
+        )
+        visual_cmd = commands[1]
+        assert "primary action remains visible at laptop height" in visual_cmd
+        for check in VISUAL_DEFAULT_CHECKS:
+            assert check in visual_cmd, "requirements must ADD to the basics, not replace them"
+
+        # No visual_requirements (default None) -> identical to the plain
+        # "visual" expansion above, byte-for-byte.
+        plain_commands = expand_verify_entries(
+            [["git", "diff", "--check"]], ["visual"], session, "http://x/route",
+        )
+        assert plain_commands[1] == build_visual_verify_command(session, "http://x/route")
+
     # --- severity classification: synthetic/injected findings.json. ---
     def _write_capture(session, manifest_status, findings):
         vdir = session / "visual"
@@ -5752,6 +6196,94 @@ def _visual_selfcheck() -> None:
     # unaffected).
     validate_visual_url(["npm run typecheck"], None)
     validate_visual_url([], None)
+
+    # --- V7 §22.10: sanitize_visual_requirements -- tolerant absence,
+    # cap count/length, drop non-string/blank entries. ---
+    assert sanitize_visual_requirements(None) == []
+    assert sanitize_visual_requirements({}) == []
+    assert sanitize_visual_requirements({"visualRequirements": "not-a-list"}) == []
+    assert sanitize_visual_requirements({"visualRequirements": [
+        "reuse existing modal shell", 123, "", "   ", None,
+    ]}) == ["reuse existing modal shell"]
+    long_req = "x" * 500
+    assert sanitize_visual_requirements({"visualRequirements": [long_req]}) == [
+        long_req[:MAX_VISUAL_REQUIREMENT_CHARS]
+    ]
+    too_many_reqs = [f"req {i}" for i in range(30)]
+    capped = sanitize_visual_requirements({"visualRequirements": too_many_reqs})
+    assert capped == too_many_reqs[:MAX_VISUAL_REQUIREMENTS]
+
+    # build_visual_verify_command: no visualRequirements -> byte-identical
+    # to the pre-3.3 command (no --check at all, glimmer-visual.py's own
+    # DEFAULT_CHECKS apply).
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        plain_cmd = build_visual_verify_command(session, "http://x/route")
+        assert "--check" not in plain_cmd
+
+        # visualRequirements present -> the basics are sent explicitly
+        # ALONGSIDE the extras (glimmer-visual.py's own --check would
+        # otherwise silently replace its defaults).
+        with_reqs = build_visual_verify_command(
+            session, "http://x/route", visual_requirements=["primary action remains visible at laptop height"],
+        )
+        assert with_reqs.count("--check") == len(VISUAL_DEFAULT_CHECKS) + 1
+        for check in VISUAL_DEFAULT_CHECKS:
+            assert check in with_reqs
+        assert "primary action remains visible at laptop height" in with_reqs
+
+    # --- V7 §22.18: visual_requiredness rule table. ---
+    frontend_contract = {"scope": {"package": "frontend"}}
+    backend_contract = {"scope": {"package": "backend"}}
+    plan_with_reqs = {"visualRequirements": ["reuse existing modal shell"]}
+
+    # Absent URL -> "absent" no matter what, existing honest convention.
+    assert visual_requiredness("standard", None, frontend_contract, ["a.tsx"], None) == "absent"
+    assert visual_requiredness("full", None, frontend_contract, ["a.tsx"], plan_with_reqs) == "absent"
+
+    # minimal level never auto-requires, even with a frontend match/plan.
+    assert visual_requiredness("minimal", "http://x", frontend_contract, ["a.tsx"], plan_with_reqs) == "recommended"
+
+    # standard+, no frontend match, no plan -> recommended (URL given, but
+    # nothing marks this a UI-area session).
+    assert visual_requiredness("standard", "http://x", backend_contract, ["a.py"], None) == "recommended"
+    assert visual_requiredness("full", "http://x", backend_contract, ["a.py"], None) == "recommended"
+
+    # standard+, frontend scope area match (no plan) -> required.
+    assert visual_requiredness("standard", "http://x", frontend_contract, ["a.py"], None) == "required"
+
+    # standard+, no area match but a .tsx changed file -> required (filetype match).
+    assert visual_requiredness("standard", "http://x", backend_contract, ["src/App.tsx"], None) == "required"
+
+    # standard+, no scope/filetype match but plan.visualRequirements present -> required.
+    assert visual_requiredness("standard", "http://x", backend_contract, ["a.py"], plan_with_reqs) == "required"
+
+    # Never raises on a malformed contract/files.
+    assert visual_requiredness("standard", "http://x", "not-a-dict", None, None) == "recommended"
+
+    # --- V7 §22.7: visual_state_count -- the value both visual_verification_
+    # started/completed events carry as stateCount. ---
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert visual_state_count(session) is None, "no manifest written yet -> None, not fabricated"
+
+        vdir = session / "visual"
+        vdir.mkdir(parents=True)
+        (vdir / "visual-manifest.json").write_text(json.dumps({
+            "route": "/x", "viewports": ["1440x900"], "states": ["initial"],
+            "status": "pass", "captures": [], "findings": [],
+        }), encoding="utf-8")
+        assert visual_state_count(session) == 1
+
+        (vdir / "visual-manifest.json").write_text(json.dumps({
+            "route": "/x", "viewports": ["1440x900"],
+            "states": ["initial", "dialog opened", "loading"],
+            "status": "pass", "captures": [], "findings": [],
+        }), encoding="utf-8")
+        assert visual_state_count(session) == 3
+
+        (vdir / "visual-manifest.json").write_text("not valid json", encoding="utf-8")
+        assert visual_state_count(session) is None, "malformed manifest -> None, never raises"
 
     print("visual (C4) self-check: PASS")
 
@@ -5931,6 +6463,299 @@ def _skills_selfcheck() -> None:
     print("skills (O1) self-check: PASS")
 
 
+def _repair_contract_selfcheck() -> None:
+    """V7 §21. Run with: python3 glimmer-v2.py --repair-contract-selfcheck"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+
+        # 1. Basic shape: failedCheck names the first failing result;
+        #    newFailures is its capped newErrorSignatures; allowedFiles
+        #    starts from the changed-files set.
+        results = [
+            {"command": "git diff --check", "ok": True, "status": "PASS"},
+            {"command": "npm --prefix frontend run typecheck", "ok": False, "status": "CODE_FAIL",
+             "newErrorSignatures": ["a.ts:<LOC> error TS2322: x"]},
+        ]
+        rc = build_repair_contract(1, results, ["frontend/a.ts"], ws)
+        assert rc == {
+            "attempt": 1,
+            "failedCheck": "npm --prefix frontend run typecheck",
+            "newFailures": ["a.ts:<LOC> error TS2322: x"],
+            "allowedFiles": ["frontend/a.ts"],
+        }
+
+        # 2. newFailures capped at 50.
+        many = [f"err {i}" for i in range(80)]
+        rc2 = build_repair_contract(2, [{"command": "x", "ok": False, "newErrorSignatures": many}], [], ws)
+        assert len(rc2["newFailures"]) == 50
+
+        # 3. All-ok results never raises -- failedCheck/newFailures degrade
+        #    to None/[] rather than crashing (shouldn't normally happen:
+        #    build_repair_contract is only ever called after verify() ok=False).
+        rc3 = build_repair_contract(1, [{"command": "x", "ok": True}], [], ws)
+        assert rc3["failedCheck"] is None and rc3["newFailures"] == []
+
+        # 4. allowedFiles test-file extraction: a failing TEST check names an
+        #    existing test file in its own output -- extracted and appended.
+        (ws / "src").mkdir()
+        (ws / "src" / "Dialog.test.ts").write_text("x")
+        test_results = [{
+            "command": "npm run test", "ok": False, "status": "CODE_FAIL",
+            "outputTail": "FAIL src/Dialog.test.ts\n  1 test failed",
+        }]
+        rc4 = build_repair_contract(1, test_results, ["src/Dialog.ts"], ws)
+        assert rc4["allowedFiles"] == ["src/Dialog.ts", "src/Dialog.test.ts"]
+
+        # 5. A path named in output that does NOT exist on disk is never
+        #    added (existing-file check) -- conservative extraction.
+        test_results_missing = [{
+            "command": "npm run test", "ok": False, "status": "CODE_FAIL",
+            "outputTail": "FAIL src/Missing.test.ts",
+        }]
+        rc5 = build_repair_contract(1, test_results_missing, ["src/Dialog.ts"], ws)
+        assert rc5["allowedFiles"] == ["src/Dialog.ts"]
+
+        # 6. A non-test check (e.g. typecheck) never triggers test-file
+        #    extraction, even when its output happens to mention a
+        #    *.test.ts path.
+        (ws / "src" / "Other.test.ts").write_text("x")
+        typecheck_mentioning_test = [{
+            "command": "npm run typecheck", "ok": False, "status": "CODE_FAIL",
+            "outputTail": "src/Other.test.ts:1:1 - error TS1234",
+        }]
+        rc6 = build_repair_contract(1, typecheck_mentioning_test, ["src/Dialog.ts"], ws)
+        assert rc6["allowedFiles"] == ["src/Dialog.ts"]
+
+        # 6b. Fix round 1 (MED): path-traversal containment — a failure
+        #     output naming "../escape.test.ts" (which EXISTS one level
+        #     above the workspace) must never land in allowedFiles.
+        (ws.parent / "escape.test.ts").write_text("x")
+        traversal_results = [{
+            "command": "npm run test", "ok": False, "status": "CODE_FAIL",
+            "outputTail": "FAIL ../escape.test.ts",
+        }]
+        rc6b = build_repair_contract(1, traversal_results, ["src/Dialog.ts"], ws)
+        assert rc6b["allowedFiles"] == ["src/Dialog.ts"], rc6b["allowedFiles"]
+
+        # 6c. C4 fix round 3: a failing visual check carries no
+        #     newErrorSignatures (excluded from baseline compare) -- its
+        #     visualBlockingFindings must populate newFailures instead of
+        #     leaving the engineer a blind repair round.
+        visual_results = [{
+            "command": "glimmer-visual.py --check dialog", "ok": False, "status": "CODE_FAIL",
+            "visualBlockingFindings": [
+                {"severity": "critical", "category": "layout", "description": "dialog off-screen"},
+                {"severity": "high", "category": "contrast", "description": "text unreadable"},
+            ],
+        }]
+        rc6c = build_repair_contract(1, visual_results, [], ws)
+        assert rc6c["newFailures"] == [
+            "critical: layout — dialog off-screen",
+            "high: contrast — text unreadable",
+        ]
+
+        # 6d. visualBlockingFindings capped at 50, same as newErrorSignatures.
+        many_findings = [
+            {"severity": "high", "category": "c", "description": str(i)} for i in range(80)
+        ]
+        rc6d = build_repair_contract(
+            1, [{"command": "x", "ok": False, "visualBlockingFindings": many_findings}], [], ws
+        )
+        assert len(rc6d["newFailures"]) == 50
+
+        # 7. compute_repair_writes_outside_allowed: advisory-only detection.
+        contract = {"allowedFiles": ["src/Dialog.ts", "src/Dialog.test.ts"]}
+        assert compute_repair_writes_outside_allowed(
+            ["src/Dialog.ts", "src/Unexpected.ts"], contract
+        ) == ["src/Unexpected.ts"]
+        assert compute_repair_writes_outside_allowed(["src/Dialog.ts"], contract) == []
+        assert compute_repair_writes_outside_allowed(["a.ts"], None) == []
+        # An empty/falsy contract dict is treated the same as no contract
+        # (nothing to compare against) -- never claims a file is "outside"
+        # guidance that was never actually built.
+        assert compute_repair_writes_outside_allowed(["a.ts"], {}) == []
+        assert compute_repair_writes_outside_allowed(["a.ts"], {"allowedFiles": []}) == ["a.ts"]
+
+    # 8. is_test_check_command heuristic.
+    assert is_test_check_command("npm run test") is True
+    assert is_test_check_command("npm --prefix frontend run vitest") is True
+    assert is_test_check_command("npm run typecheck") is False
+    assert is_test_check_command("") is False
+
+    # 9. make_prompt renders the structured contract additively -- absent
+    #    repair_contract, output is byte-identical to the pre-§21 prompt.
+    contract_dict = {
+        "objective": "fix x", "scope": {"package": "repository"}, "mode": "implement",
+        "constraints": {"minimalChange": True, "noCommit": True, "noPush": True,
+                          "noDeploy": True, "noDependencyInstall": True},
+    }
+    base = make_prompt(contract_dict, "repo summary", 1, failure="boom", checkpoint_sha="deadbeef")
+    same = make_prompt(contract_dict, "repo summary", 1, failure="boom", checkpoint_sha="deadbeef",
+                        repair_contract=None)
+    assert base == same
+    assert "STRUCTURED REPAIR CONTRACT" not in base
+    with_rc = make_prompt(
+        contract_dict, "repo summary", 1, failure="boom", checkpoint_sha="deadbeef",
+        repair_contract={"attempt": 1, "failedCheck": "typecheck", "newFailures": [], "allowedFiles": ["a.ts"]},
+    )
+    assert with_rc != base
+    assert "STRUCTURED REPAIR CONTRACT" in with_rc
+    assert "GUIDANCE ONLY" in with_rc
+    assert json.dumps(
+        {"attempt": 1, "failedCheck": "typecheck", "newFailures": [], "allowedFiles": ["a.ts"]}, indent=2
+    ) in with_rc
+
+    print("repair contract (V7 §21) self-check: PASS")
+
+
+def _verification_plan_selfcheck() -> None:
+    """V7 §18. Run with: python3 glimmer-v2.py --verification-plan-selfcheck"""
+    m = {"packages": [{"dir": ".", "path": "package.json",
+                        "scripts": {"typecheck": "tsc", "lint": "eslint --fix",
+                                    "test": "vitest run", "build": "vite build"}}]}
+    files = ["a.ts"]
+    fake_session = Path("/nonexistent-glimmer-selfcheck-session")
+
+    def joined(plan_side):
+        return [shlex.join(c) for c in plan_side]
+
+    # minimal: required = git diff --check + typecheck only; recommended =
+    # standard's one extra command (lint) minimal doesn't already require.
+    p = verification_plan(m, files, "minimal", [], fake_session, None)
+    assert joined(p["required"]) == ["git diff --check", "npm run typecheck"]
+    assert joined(p["recommended"]) == ["npm run lint"]
+
+    # standard: required adds lint; recommended is full's extra (test+build).
+    p = verification_plan(m, files, "standard", [], fake_session, None)
+    assert joined(p["required"]) == ["git diff --check", "npm run typecheck", "npm run lint"]
+    assert joined(p["recommended"]) == ["npm run test", "npm run build"]
+
+    # full: required has everything; nothing above it, so recommended is empty.
+    p = verification_plan(m, files, "full", [], fake_session, None)
+    assert joined(p["required"]) == [
+        "git diff --check", "npm run typecheck", "npm run lint", "npm run test", "npm run build",
+    ]
+    assert p["recommended"] == []
+
+    # Explicit --verify entries always land in required (the user asked for
+    # them directly), regardless of level, and are never duplicated into
+    # recommended.
+    p = verification_plan(m, files, "minimal", ["./scripts/custom-check.sh"], fake_session, None)
+    assert joined(p["required"]) == ["git diff --check", "npm run typecheck", "./scripts/custom-check.sh"]
+    assert joined(p["recommended"]) == ["npm run lint"]
+
+    # verify()'s tier threading + fail_fast: every result carries the tier
+    # it was run under; fail_fast=True (the default, used for required)
+    # stops at the first failure, fail_fast=False (recommended) runs every
+    # command through to completion and the returned aggregate reflects
+    # every result, not just the ones fail_fast would have reached.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        run(["git", "init", "-q"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "--allow-empty", "-q", "-m", "init"], ws)
+        baseline_sha = head(ws)
+        session_dir = ws / "session"
+        session_dir.mkdir()
+        repo_map = {"packages": []}
+        passing_cmd = [sys.executable, "-c", "pass"]
+        # A genuinely missing binary classifies INFRA_BLOCKED (run()'s own
+        # check=False path, see classify_raw_result) -- a real failure with
+        # none of the baseline-worktree machinery a CODE_FAIL would trigger,
+        # kept deliberately cheap for a self-check.
+        missing_cmd = ["definitely-not-a-real-binary-glimmer-selfcheck"]
+
+        ok, results = verify(ws, [passing_cmd], 30, session_dir, 0, repo_map, ws, baseline_sha, "none")
+        assert ok is True and results[0]["tier"] == "required"
+
+        ok, results = verify(ws, [passing_cmd], 30, session_dir, 0, repo_map, ws, baseline_sha, "none",
+                              None, "sid", tier="recommended")
+        assert ok is True and results[0]["tier"] == "recommended"
+
+        ok, results = verify(ws, [missing_cmd, passing_cmd], 30, session_dir, 0, repo_map, ws, baseline_sha, "none")
+        assert ok is False
+        assert len(results) == 1  # fail_fast=True (default): stops after the first failure
+        assert results[0]["tier"] == "required"
+
+        ok, results = verify(ws, [missing_cmd, passing_cmd], 30, session_dir, 0, repo_map, ws, baseline_sha, "none",
+                              None, "sid", tier="recommended", fail_fast=False)
+        assert ok is False  # aggregate still reflects the failure
+        assert len(results) == 2  # fail_fast=False: ran to completion despite the failure
+        assert [r["tier"] for r in results] == ["recommended", "recommended"]
+
+    # Recommended-never-gates, logic level: the promotion path's gating
+    # functions never read recommendedResults, and the recommended verify()
+    # call in main() only ever runs already inside an `if ok` guard --
+    # required's own `ok` is what gates VERIFIED, never anything recommended
+    # adds. Mirrors the existing "source-ordering proof" style
+    # (--gates-selfcheck / --architect-review-selfcheck) rather than
+    # spinning up a whole session run.
+    import inspect
+    assert "recommendedResults" not in inspect.getsource(gates_block_verified)
+    assert "recommendedResults" not in inspect.getsource(blocked_gate_names)
+    main_source = inspect.getsource(main)
+    assert 'if ok and plan["recommended"]:' in main_source
+
+    # --- V7 §22.18 (Task 3.3): visual requiredness composes with the
+    # required[]/recommended[] split above. contract/plan default to None
+    # (existing calls above never pass them) -- with visual_url also None
+    # there, nothing changed; these new cases exercise contract/plan. A
+    # real tempdir is needed here (unlike every call above): whenever
+    # visual_url is actually set, build_visual_verify_command creates
+    # session/"visual" for real -- fake_session is deliberately a
+    # nonexistent path, fine for the visual_url=None calls above but not
+    # once a visual command actually gets built.
+    frontend_contract = {"scope": {"package": "frontend"}}
+    backend_contract = {"scope": {"package": "backend"}}
+    plan_with_reqs = {"visualRequirements": ["reuse existing modal shell"]}
+
+    with tempfile.TemporaryDirectory() as td:
+        real_session = Path(td)
+
+        # No --visual-url at all -> unaffected, even at standard+ with a
+        # frontend contract (the existing honest NOT_RUN convention).
+        p = verification_plan(m, files, "standard", [], real_session, None, contract=frontend_contract)
+        assert not any(is_visual_check_command(c) for c in p["required"] + p["recommended"])
+
+        # --visual-url given, standard level, frontend-area contract ->
+        # visual joins required[], appended after the language-level
+        # checks already there (typecheck/lint), not replacing any of them.
+        p = verification_plan(m, files, "standard", [], real_session, "http://x/route",
+                               contract=frontend_contract)
+        assert joined(p["required"])[:3] == ["git diff --check", "npm run typecheck", "npm run lint"]
+        assert is_visual_check_command(p["required"][-1])
+        assert not any(is_visual_check_command(c) for c in p["recommended"])
+
+        # --visual-url given, standard level, NO frontend match, no plan ->
+        # visual stays recommended, never required.
+        p = verification_plan(m, files, "standard", [], real_session, "http://x/route",
+                               contract=backend_contract)
+        assert not any(is_visual_check_command(c) for c in p["required"])
+        assert any(is_visual_check_command(c) for c in p["recommended"])
+
+        # minimal level never auto-requires, even with a frontend contract
+        # -- only ever recommended.
+        p = verification_plan(m, files, "minimal", [], real_session, "http://x/route",
+                               contract=frontend_contract)
+        assert not any(is_visual_check_command(c) for c in p["required"])
+        assert any(is_visual_check_command(c) for c in p["recommended"])
+
+        # plan.visualRequirements alone (no frontend contract match) is
+        # enough to promote to required[] at standard+, AND flows into the
+        # built command as extra --check entries.
+        p = verification_plan(m, files, "standard", [], real_session, "http://x/route",
+                               contract=backend_contract, plan=plan_with_reqs)
+        visual_cmd = next(c for c in p["required"] if is_visual_check_command(c))
+        assert "reuse existing modal shell" in visual_cmd
+
+        # Explicit "visual" in --verify already expands into required[] --
+        # never auto-add a second visual command on top of it.
+        p = verification_plan(m, files, "standard", ["visual"], real_session, "http://x/route",
+                               contract=frontend_contract)
+        assert sum(1 for c in p["required"] + p["recommended"] if is_visual_check_command(c)) == 1
+
+    print("verification plan (V7 §18) self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
@@ -5967,6 +6792,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--skills-selfcheck"]:
         _skills_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--repair-contract-selfcheck"]:
+        _repair_contract_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--verification-plan-selfcheck"]:
+        _verification_plan_selfcheck()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
