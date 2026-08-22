@@ -4,7 +4,7 @@ import type { DocEdge, DocNode } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
 import { EmptyState } from "../common/EmptyState";
-import { edgesForNode, filterDocNodes, groupDocNodesByType } from "../../state/docGraph";
+import { edgesForNode, filterDocNodes, groupDocNodesByType, str } from "../../state/docGraph";
 
 // Task 7.5 (V7 "System Explorer") -- click-to-expand row, same shape as
 // EvidencePanel: no separate detail fetch, the whole graph is already one
@@ -23,8 +23,8 @@ function NodeRow({
         style={{ display: "flex", gap: 8, alignItems: "baseline", width: "100%", textAlign: "left" }}
       >
         <StatusBadge status={node.status} />
-        <span>{node.title}</span>
-        <code style={{ fontSize: 12, color: "var(--text-muted)" }}>{node.path}</code>
+        <span>{str(node.title)}</span>
+        <code style={{ fontSize: 12, color: "var(--text-muted)" }}>{str(node.path)}</code>
       </button>
       {selected && (
         <div style={{ marginTop: 4, marginLeft: 12 }}>
@@ -35,11 +35,13 @@ function NodeRow({
             <dd className="mono">{node.confidence}</dd>
             <dt>SHA</dt>
             {/* Provenance is displayed verbatim — a missing sha is a real
-                fact (glimmer-v2.py never resolved one), never guessed. */}
-            <dd className="mono">{node.provenance.sha ?? "Unavailable"}</dd>
+                fact (glimmer-v2.py never resolved one), never guessed.
+                `provenance` itself may be absent (M5 fix: v2 tolerates a
+                node with no provenance), so that's guarded too. */}
+            <dd className="mono">{node.provenance?.sha ?? "Unavailable"}</dd>
           </dl>
           <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Evidence</p>
-          {node.provenance.evidence.length === 0 ? (
+          {!node.provenance?.evidence?.length ? (
             <p style={{ fontSize: 12, color: "var(--text-muted)" }}>None recorded</p>
           ) : (
             <ul>
@@ -90,6 +92,14 @@ export function SystemExplorerScreen() {
       )}
       {!isError && data && (
         <>
+          {/* M6 fix (round-7 review): findDocGraph returns the first
+              docs/graph.json it finds across every session's workspace --
+              with sessions against more than one repo, that graph could
+              belong to a different repository than the one in view. Never
+              render it as an unlabeled "this repository". */}
+          <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            Source: {data.source.workspace} (session {data.source.sessionId})
+          </p>
           <input placeholder="Filter nodes…" value={query} onChange={(e) => setQuery(e.target.value)} />
           {groups.length === 0 && <p style={{ color: "var(--text-muted)" }}>No nodes match "{query}"</p>}
           {groups.map((g) => (

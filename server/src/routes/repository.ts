@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
 import { listSessionIds, isValidSessionId } from "../lib/sessions.js";
-import type { DocGraph, RepoMap } from "@glimmer/shared";
+import type { DocGraph, DocGraphSource, RepoMap } from "@glimmer/shared";
 
 export const repositoryRouter = Router();
 
@@ -46,7 +46,14 @@ function isDocGraphShape(v: unknown): v is DocGraph {
 // tolerance: a torn graph.json in one session's workspace must not block
 // finding a good one elsewhere, and finding none at all is the ordinary
 // "repo never ran --docs-bootstrap" case, not an error.
-export async function findDocGraph(): Promise<DocGraph | null> {
+//
+// M6 fix (round-7 review): with sessions against two different repos, "first
+// found" can return the wrong repo's graph. This doesn't stop being a
+// first-match walk (that's still the only "current repo" signal the gateway
+// has), but it must never be SILENTLY ambiguous -- so the workspace + session
+// id the graph actually came from is returned alongside it for the caller to
+// label.
+export async function findDocGraph(): Promise<{ graph: DocGraph; source: DocGraphSource } | null> {
   const ids = await listSessionIds();
   for (const id of ids) {
     if (!isValidSessionId(id)) continue;
@@ -72,16 +79,16 @@ export async function findDocGraph(): Promise<DocGraph | null> {
     } catch {
       continue; // malformed graph.json -- skip, don't fail the whole request
     }
-    if (isDocGraphShape(parsed)) return parsed;
+    if (isDocGraphShape(parsed)) return { graph: parsed, source: { workspace, sessionId: id } };
   }
   return null;
 }
 
 repositoryRouter.get("/repository/doc-graph", async (_req, res) => {
   try {
-    const graph = await findDocGraph();
-    if (!graph) return res.status(404).json({ error: "no docs/graph.json found in any session workspace" });
-    res.json(graph);
+    const found = await findDocGraph();
+    if (!found) return res.status(404).json({ error: "no docs/graph.json found in any session workspace" });
+    res.json({ ...found.graph, source: found.source });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

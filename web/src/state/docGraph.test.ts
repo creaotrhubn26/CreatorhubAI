@@ -36,6 +36,19 @@ describe("docGraph", () => {
     expect(filterDocNodes([node({})], "nonexistent")).toEqual([]);
   });
 
+  // M5 regression (round-7 review): glimmer-v2.py's verify_doc_nodes only
+  // requires a node to have an `id` -- title/path are tolerated absent. The
+  // TypeScript DocNode type claims they're always strings, but that's a
+  // compile-time fiction over unvalidated JSON; a real graph.json missing
+  // one must not throw (was: TypeError on `.toLowerCase()` of undefined).
+  it("does not throw on a v2-valid node missing title/path", () => {
+    const sparse = { id: "a", type: "doc", status: "CURRENT", confidence: "unknown" } as unknown as DocNode;
+    expect(() => filterDocNodes([sparse], "x")).not.toThrow();
+    expect(filterDocNodes([sparse], "x")).toEqual([]);
+    // Still matches on the field it does have (id).
+    expect(filterDocNodes([sparse], "a")).toEqual([sparse]);
+  });
+
   it("splits edges into in/out relative to a node id", () => {
     const edges: DocEdge[] = [
       { from: "a", to: "b", kind: "calls" },

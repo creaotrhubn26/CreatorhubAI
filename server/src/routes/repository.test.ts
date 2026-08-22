@@ -79,14 +79,43 @@ describe("GET /api/repository/doc-graph", () => {
     );
   }
 
-  it("returns the parsed docs/graph.json from a session's workspace when present", async () => {
-    await makeSession("doc-graph-found", async (ws) => {
-      await fs.mkdir(path.join(ws, "docs"), { recursive: true });
-      await fs.writeFile(path.join(ws, "docs", "graph.json"), JSON.stringify(graph));
+  it("returns the parsed docs/graph.json from a session's workspace when present, labeled with its source", async () => {
+    let ws!: string;
+    await makeSession("doc-graph-found", async (w) => {
+      ws = w;
+      await fs.mkdir(path.join(w, "docs"), { recursive: true });
+      await fs.writeFile(path.join(w, "docs", "graph.json"), JSON.stringify(graph));
     });
     const res = await request(app).get("/api/repository/doc-graph");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(graph);
+    expect(res.body).toEqual({ ...graph, source: { workspace: ws, sessionId: "doc-graph-found" } });
+  });
+
+  // M6 regression (round-7 review): findDocGraph walks every session
+  // newest-first and returns the FIRST docs/graph.json it finds -- with two
+  // sessions pointed at two different repos, that must never come back
+  // unlabeled as "the" graph. Assert the response identifies which session
+  // and workspace it actually came from, not just that some graph came back.
+  it("labels the returned graph's source when multiple sessions have different workspaces", async () => {
+    const otherGraph = { schemaVersion: 1, nodes: [{ ...graph.nodes[0], id: "svc:other" }], edges: [] };
+    let wsA!: string;
+    let wsB!: string;
+    await makeSession("doc-graph-repo-a", async (ws) => {
+      wsA = ws;
+      await fs.mkdir(path.join(ws, "docs"), { recursive: true });
+      await fs.writeFile(path.join(ws, "docs", "graph.json"), JSON.stringify(graph));
+    });
+    await makeSession("doc-graph-repo-b", async (ws) => {
+      wsB = ws;
+      await fs.mkdir(path.join(ws, "docs"), { recursive: true });
+      await fs.writeFile(path.join(ws, "docs", "graph.json"), JSON.stringify(otherGraph));
+    });
+    const res = await request(app).get("/api/repository/doc-graph");
+    expect(res.status).toBe(200);
+    // Whichever one wins the "first found" walk, the response's `source`
+    // must name that exact session/workspace -- never silently ambiguous.
+    const winner = res.body.source.sessionId === "doc-graph-repo-a" ? { graph, ws: wsA } : { graph: otherGraph, ws: wsB };
+    expect(res.body).toEqual({ ...winner.graph, source: { workspace: winner.ws, sessionId: res.body.source.sessionId } });
   });
 
   it("returns 404 when no session's workspace has a docs/graph.json (opt-in artifact)", async () => {

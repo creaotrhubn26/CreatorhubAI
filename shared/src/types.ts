@@ -923,6 +923,15 @@ export interface DocGraph {
   edges: DocEdge[];
 }
 
+// M6 fix (round-7 review): findDocGraph walks every session's workspace and
+// returns the first docs/graph.json it finds -- with two sessions pointed at
+// different repos, "first found" must never be silently ambiguous. The API
+// response always carries where the graph came from so the UI can label it.
+export interface DocGraphSource {
+  workspace: string;
+  sessionId: string;
+}
+
 export interface ModelStatus {
   status: "ONLINE" | "REACHABLE_AUTH" | "OFFLINE" | "UNKNOWN";
   endpoint: string;

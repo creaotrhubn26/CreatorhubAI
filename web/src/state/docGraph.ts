@@ -14,13 +14,22 @@ export interface DocNodeGroup {
   nodes: DocNode[];
 }
 
+// M5 fix (round-7 review): glimmer-v2.py's verify_doc_nodes tolerates a node
+// with no title/path (only `id` is required) -- the DocNode type says these
+// are always strings, but a hand-authored or partially-curated graph.json is
+// unvalidated JSON wearing that type, not a guarantee of it. Coerce instead
+// of trusting the field is there, everywhere a node's own text is read.
+export function str(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+
 // Plain case-insensitive substring match against id/title/path -- no query
 // language, matching the task's "simple text filter" requirement.
 export function filterDocNodes(nodes: DocNode[], query: string): DocNode[] {
   const q = query.trim().toLowerCase();
   if (!q) return nodes;
   return nodes.filter(
-    (n) => n.id.toLowerCase().includes(q) || n.title.toLowerCase().includes(q) || n.path.toLowerCase().includes(q)
+    (n) => str(n.id).toLowerCase().includes(q) || str(n.title).toLowerCase().includes(q) || str(n.path).toLowerCase().includes(q)
   );
 }
 
