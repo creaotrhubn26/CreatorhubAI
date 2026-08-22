@@ -254,9 +254,8 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
     # and USER_DENIED, both handled elsewhere), and envelope error codes are
     # not yet plumbed from evidence-NN.jsonl into events.jsonl/manifest
     # status for this function to observe live. This branch is forward-
-    # compatible groundwork only (same "no emit site yet" precedent as
-    # glimmer_events.EVENT_TYPES's "architect_replan_started"), exercised in
-    # _r6_selfcheck with a synthetic status.
+    # compatible groundwork only (no current call site produces this raw
+    # status), exercised in _r6_selfcheck with a synthetic status.
     if raw == "failed-tool-execution":
         return {"class": "TOOL_EXECUTION_FAILURE", "detail": "a tool call returned a non-policy execution error", "evidenceIds": []}
 
@@ -2041,7 +2040,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         if isinstance(packages, list):
             packages = [str(p)[:200] for p in packages[:20]]
         emit_event(events_path, "architect_plan_created", sid,
-                   risk=plan.get("risk"), packages=packages)
+                   risk=plan.get("risk"), packages=packages, version=1)
     else:
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
@@ -2111,6 +2110,19 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path, 
         replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version)
         (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
 
+        # Fix round 1 (HIGH): architecture-plan.json already holds
+        # v{from_version} (record_architecture_plan_version wrote it there
+        # as "latest" when that version was created) -- without removing
+        # it first, a dead/failed replan subprocess that writes NOTHING
+        # leaves the OLD plan sitting there, and load_architecture_plan
+        # below would happily re-load it and get stamped as v{to_version}.
+        # That is fail-OPEN (silently promoting the rejected plan under a
+        # new version number), the exact opposite of this function's
+        # documented fail-closed contract. Unlink so a failed subprocess
+        # produces a genuinely missing file -> load_architecture_plan
+        # returns None, same as run_architect_first's very first run.
+        (Path(session) / "architecture-plan.json").unlink(missing_ok=True)
+
         rc = invoke_engineer(
             engineer, ws, replan_prompt,
             True,  # auto_approve forced regardless, same as run_architect_first
@@ -2134,7 +2146,7 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path, 
         if isinstance(packages, list):
             packages = [str(p)[:200] for p in packages[:20]]
         emit_event(events_path, "architect_plan_created", sid,
-                   risk=plan.get("risk"), packages=packages)
+                   risk=plan.get("risk"), packages=packages, version=to_version)
     else:
         print(f"[V2] Architect replan v{to_version} produced no usable plan "
               "(missing/invalid/failed); failing closed (never continuing on the rejected plan).")
@@ -2410,6 +2422,33 @@ def derive_tasks(plan: dict) -> list:
             "status": "pending",
         })
     return tasks
+
+
+def merge_replanned_tasks(old_tasks, new_tasks):
+    """Task 2.2 fix round 1 (MED): re-deriving tasks from a NEW plan
+    version (derive_tasks always assigns fresh t1..tN ids, with no
+    stable identity across calls) must not silently discard status
+    progress already recorded against work that DIDN'T actually change.
+    Rule: a new task carries over an old task's status only when both
+    `kind` and `description` match EXACTLY (kind-scoped so an
+    implementation step and a verification step that happen to share
+    wording never cross-match). Any new task with no identical match is
+    genuinely new work introduced by the replan and starts "pending" --
+    derive_tasks' own default, untouched here. Never raises: old_tasks
+    may be None/empty (first-ever plan, nothing to carry over), in which
+    case new_tasks is returned as-is.
+    """
+    if not old_tasks:
+        return new_tasks
+    carried_status = {}
+    for t in old_tasks:
+        key = (t.get("kind"), t.get("description"))
+        carried_status.setdefault(key, t.get("status"))
+    for t in new_tasks:
+        status = carried_status.get((t.get("kind"), t.get("description")))
+        if status:
+            t["status"] = status
+    return new_tasks
 
 
 def save_tasks(session_dir, tasks) -> None:
@@ -3283,6 +3322,41 @@ def main():
                             break
                         architecture_plan = new_plan
                         record_architecture_plan_version(session, manifest, architecture_plan)
+                        # Fix round 1 (MED): the delta prompt below embeds
+                        # `candidate_evidence` alongside `plan=architecture_
+                        # plan` -- without refreshing it here, it would
+                        # still be v{from_version}'s pre-read candidateFiles
+                        # evidence, now mislabeled as belonging to the new
+                        # plan. read_candidate_evidence is deterministic/
+                        # cheap (v2.py re-reading files off disk, no model
+                        # call), same as the v1 call site above.
+                        candidate_evidence = read_candidate_evidence(architecture_plan, ws)
+                        # Fix round 1 (MED): risk snapshot must reflect the
+                        # NEW plan, not the stale v{from_version} one.
+                        manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)
+                        # Fix round 1 (MED): re-derive tasks from the new
+                        # plan's implementationPlan/verificationPlan (ids
+                        # are NOT stable across derive_tasks calls) --
+                        # merge_replanned_tasks carries over an old task's
+                        # status onto a new task with an IDENTICAL
+                        # (kind, description) pair; anything genuinely new
+                        # starts pending. The set_implementation_tasks_
+                        # status(in_progress)/reset_verification_tasks_
+                        # status(pending) calls a few lines below still run
+                        # unchanged right after this -- they reset state
+                        # for the upcoming re-invoke exactly as a plain
+                        # REVISE_IMPLEMENTATION round already does; this
+                        # merge only makes the tasks.json/task_created
+                        # events written IN BETWEEN honestly reflect carried-
+                        # over progress instead of every task looking
+                        # brand new.
+                        if tasks is not None:
+                            tasks = merge_replanned_tasks(tasks, derive_tasks(architecture_plan))
+                            save_tasks(session, tasks)
+                            for t in tasks:
+                                emit_event(events_path, "task_created", sid,
+                                           taskId=t["id"], kind=t["kind"],
+                                           description=t["description"][:200])
                         save()
 
                     print(f"[V2] Architect review requested {review['decision']} "
@@ -4393,15 +4467,39 @@ def _architect_replan_selfcheck() -> None:
         #     load_architecture_plan degrades to None -> replan returns
         #     None. This IS the fail-closed contract: caller must never
         #     fall back to silently continuing on the rejected plan.
+        #
+        #     Fix round 1 (HIGH): PRE-SEED architecture-plan.json with the
+        #     REJECTED v{from_version} plan first, exactly like the real
+        #     session dir has it (record_architecture_plan_version already
+        #     wrote it there as "latest" when v1 was created) -- without
+        #     this seed, an empty temp dir would return None regardless of
+        #     whether run_architect_replan unlinks it, giving this
+        #     assertion no teeth. With the seed present, a dead subprocess
+        #     that writes nothing must still yield None -- proving the
+        #     unlink-before-invoke fix, not just an empty-dir coincidence.
         globals()["invoke_engineer"] = lambda *a, **k: 0
         with tempfile.TemporaryDirectory() as td:
             session_dir = Path(td)
             events_path = session_dir / "events.jsonl"
+            (session_dir / "architecture-plan.json").write_text(
+                json.dumps({
+                    "objective": "restore a session after reload",
+                    "packages": ["frontend"], "risk": "medium", "version": 1,
+                }),
+                encoding="utf-8",
+            )
             result = run_architect_replan(
                 Path("fake-engineer"), session_dir, contract, summary, session_dir,
                 events_path, "sid-replan-fail", review, from_version=1, to_version=2,
             )
-            assert result is None
+            assert result is None, (
+                "a dead replan subprocess must never re-load and re-stamp "
+                "the OLD (rejected) plan as the new version -- fail-closed, "
+                "not fail-open"
+            )
+            assert not (session_dir / "architecture-plan.json").exists(), (
+                "the stale v{from_version} file must be gone, not silently reused"
+            )
 
         # 4b. Engineer subprocess writes a genuinely valid plan -> replan
         #     returns it, stamped with the NEW version (never the model's
@@ -4475,6 +4573,56 @@ def _architect_replan_selfcheck() -> None:
     rejected_after_replan_idx = main_source.index('architect_outcome = "rejected"', fail_closed_idx)
     assert increment_idx < fail_closed_idx < rejected_after_replan_idx, (
         "invalid-replan fail-closed must be reachable only after budget consumption"
+    )
+
+    # 5d. Fix round 1 (MED x2): after the plan swap, candidate_evidence,
+    #     manifest["architectPlan"], and tasks must all be refreshed
+    #     against the NEW plan -- not left stale from v{from_version}.
+    #     Structural proof: all three refresh sites appear AFTER
+    #     `architecture_plan = new_plan` (the swap itself).
+    swap_idx = main_source.index("architecture_plan = new_plan")
+    evidence_refresh_idx = main_source.index(
+        "candidate_evidence = read_candidate_evidence(architecture_plan, ws)", swap_idx
+    )
+    architect_plan_manifest_refresh_idx = main_source.index(
+        'manifest["architectPlan"] = architect_plan_manifest_record(architecture_plan)', swap_idx
+    )
+    tasks_merge_idx = main_source.index(
+        "tasks = merge_replanned_tasks(tasks, derive_tasks(architecture_plan))", swap_idx
+    )
+    assert swap_idx < evidence_refresh_idx, "candidate_evidence must be re-read against the NEW plan"
+    assert swap_idx < architect_plan_manifest_refresh_idx, "architectPlan risk snapshot must reflect the NEW plan"
+    assert swap_idx < tasks_merge_idx, "tasks must be re-derived from the NEW plan"
+
+    # ------------------------------------------------------------
+    # 6. merge_replanned_tasks: carries over status for an IDENTICAL
+    #    (kind, description) pair; genuinely new tasks start pending;
+    #    never raises on old_tasks=None/[] (first-ever plan).
+    # ------------------------------------------------------------
+    old_tasks = [
+        {"id": "t1", "kind": "implementation", "description": "inspect hydration path", "status": "complete"},
+        {"id": "t2", "kind": "implementation", "description": "add restoration hook", "status": "failed"},
+        {"id": "t3", "kind": "verification", "description": "frontend_typecheck", "status": "complete"},
+    ]
+    new_tasks = [
+        {"id": "t1", "kind": "implementation", "description": "inspect hydration path", "status": "pending"},
+        {"id": "t2", "kind": "implementation", "description": "add a NEW retry layer", "status": "pending"},
+        {"id": "t3", "kind": "verification", "description": "frontend_typecheck", "status": "pending"},
+    ]
+    merged = merge_replanned_tasks(old_tasks, new_tasks)
+    assert merged[0]["status"] == "complete", "identical description -> status carried over"
+    assert merged[1]["status"] == "pending", "genuinely new work -> starts pending, nothing to carry"
+    assert merged[2]["status"] == "complete", "verification task carried over the same way"
+    assert merge_replanned_tasks(None, new_tasks) == new_tasks, "no old tasks -> new_tasks returned as-is"
+    assert merge_replanned_tasks([], new_tasks) == new_tasks
+
+    # kind-scoped: an implementation and a verification task sharing the
+    # exact same description text must NEVER cross-match.
+    cross_kind_old = [{"id": "t1", "kind": "implementation", "description": "run lint", "status": "complete"}]
+    cross_kind_new = [{"id": "t1", "kind": "verification", "description": "run lint", "status": "pending"}]
+    assert merge_replanned_tasks(cross_kind_old, cross_kind_new)[0]["status"] == "pending", (
+        "kind must be part of the match key -- an implementation task's status "
+        "must never leak onto a same-worded verification task"
     )
 
     print("architect replan self-check: PASS")

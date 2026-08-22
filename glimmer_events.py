@@ -24,9 +24,9 @@ EVENT_TYPES = {
     "candidate_selected", "scope_expanded", "repair_started",
     "parser_recovery", "session_completed",
     # V7 event vocabulary expansion (Task 1.2 — §5.14, §22.15, task events,
-    # §23.13). "architect_replan_started" has no emit site yet: no replan
-    # path exists in glimmer-v2.py today (see run_architect_review), so the
-    # type is defined here for Round 5 to wire up, not emitted anywhere.
+    # §23.13). "architect_replan_started" is emitted by glimmer-v2.py's
+    # review loop (Task 2.2, V7 §5.12) right before re-invoking the
+    # architect on a REPLAN_REQUIRED decision -- see run_architect_replan.
     "session_created", "skill_loaded", "model_retry", "context_selected",
     "architect_planning_started", "architect_plan_created",
     "architect_review_requested", "architect_review_completed",
@@ -119,6 +119,7 @@ def _selfcheck() -> None:
             ("architect_plan_created", {"risk": "low"}),
             ("architect_review_requested", {"iteration": 0, "reviewRound": 1}),
             ("architect_review_completed", {"iteration": 0, "reviewRound": 1, "decision": "APPROVED"}),
+            ("architect_replan_started", {"fromVersion": 1, "toVersion": 2, "reviewRound": 1}),
             ("task_created", {"taskId": "t1", "kind": "implementation"}),
             ("task_status_changed", {"taskId": "t1", "status": "complete", "previousStatus": "in_progress"}),
             ("task_list_completed", {"taskCount": 2}),
@@ -137,11 +138,6 @@ def _selfcheck() -> None:
             assert rec["type"] == t, f"expected {t!r}, got {rec['type']!r}"
             for k, v in fields.items():
                 assert rec[k] == v, f"{t}: field {k!r} mismatch"
-        # architect_replan_started has no emit site yet (no replan path
-        # exists) but must still be a valid, emittable type.
-        emit(path, "architect_replan_started", "s2")
-        with open(path) as f:
-            assert json.loads(f.readlines()[-1])["type"] == "architect_replan_started"
 
         print("glimmer_events self-check: PASS (4/4)")
 
