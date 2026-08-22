@@ -44,6 +44,16 @@ _loaded_architecture_plan = None
 # _loaded_architecture_plan.
 _architect_consult_enabled = False
 
+# Task 7.4 (V7 "Documentation tools"): the parsed docs/graph.json dict,
+# loaded once at run_engineer/run_architect startup by
+# _augment_tools_with_doc_tools -- None whenever the workspace has no
+# graph yet (most repos, today). Same module-level pattern as
+# _loaded_architecture_plan just above, for the same reason: execute_tool
+# is called from ~8 existing call sites with an unchanged signature, so a
+# tool that needs session-lifetime state reads it from a module global
+# instead of a new threaded-through parameter.
+_loaded_doc_graph = None
+
 
 def _emit(event_type: str, **fields) -> None:
     # No-op when the events file isn't configured (e.g. direct standalone
@@ -331,6 +341,19 @@ SEMANTIC_TOOL_NAMES = {
     "get_evidence",
 }
 
+# Task 7.4 (V7 "Documentation tools"): docs_search/docs_get_node/
+# docs_impact -- same client-side in-process interception path as
+# SEMANTIC_TOOL_NAMES above, but a SEPARATE set because their availability
+# is conditional (offered only when <workspace>/docs/graph.json exists --
+# see _augment_tools_with_doc_tools below), unlike SEMANTIC_TOOL_NAMES
+# which is always offered. Definitions/dispatch implementation live
+# further down this file, right where the graph reader is defined.
+DOC_TOOL_NAMES = {
+    "docs_search",
+    "docs_get_node",
+    "docs_impact",
+}
+
 PATH_TOOLS = {
     "read_file",
     "file_glob_search",
@@ -365,7 +388,14 @@ REQUIRED_ENGINEERING_TOOLS = {
 # READ_TOOLS, so Architect mode (which is itself entirely read-only) gets
 # them too — deliberate, not an oversight (see reconciliation doc O4 /
 # §3.11's "available in architect mode" requirement).
-ARCHITECT_TOOL_NAMES = READ_TOOLS | {"exec_shell_command"} | SEMANTIC_TOOL_NAMES
+#
+# Task 7.4 (V7 "Documentation tools"): "Architect gets read-oriented
+# documentation tools" — same reasoning, DOC_TOOL_NAMES included here too.
+# Whether they're actually IN `tools` at all still depends on
+# _augment_tools_with_doc_tools having found a real docs/graph.json first
+# (run_architect calls it, same as run_engineer) — this set only decides
+# what's ALLOWED, never what's offered.
+ARCHITECT_TOOL_NAMES = READ_TOOLS | {"exec_shell_command"} | SEMANTIC_TOOL_NAMES | DOC_TOOL_NAMES
 
 # C1 fix round 1 (Minor finding): engineer mode's existing default,
 # preserved exactly (was a bare literal `default=32` in main()'s argparse
@@ -2571,6 +2601,377 @@ SEMANTIC_TOOL_DEFINITIONS = [
 
 
 # ============================================================
+# Task 7.4 (V7 "Documentation tools" / "Bootstrapping an existing
+# repository"): docs_search / docs_get_node / docs_impact -- read-only,
+# served in-process exactly like the O4 semantic tools above, but offered
+# ONLY when <workspace>/docs/graph.json exists (deterministic
+# availability, same "structural gate" spirit as
+# _augment_tools_with_consult_architect below, just with no budget: these
+# are pure reads with no side effect or cost to ration).
+#
+# glimmer-v2.py owns the AUTHORITATIVE graph reader/writer and impact
+# mapper (load_doc_graph / map_changed_files_to_doc_nodes /
+# _categories_for_path / _CATEGORY_TO_NODE_TYPE) -- but v2.py and this
+# file are separate subprocess entry points that never import each other
+# (same reasoning as _normalize_advisory_path's comment further below).
+# docs_impact's mapping logic is therefore REPLICATED verbatim rather than
+# shared, so keep the two in sync by hand if either changes -- same
+# discipline this codebase already applies to the architect-risk-table
+# mirror between the two files.
+# ============================================================
+
+DOC_GRAPH_RELATIVE_PATH = "docs/graph.json"
+ADR_DECISIONS_RELATIVE_DIR = "docs/decisions"
+
+DOC_TOOLS_SEARCH_CAP = 20
+DOC_TOOLS_NODE_EDGES_CAP = 50
+DOC_TOOLS_ADR_SCAN_CAP = 100
+
+
+def _load_doc_graph_for_engineer(workspace):
+    """Read-only mirror of glimmer-v2.py's load_doc_graph: absent file ->
+    None (most repos have no graph yet -- not an error); malformed JSON,
+    or valid JSON that isn't the {"nodes": [...]} shape -> None + a
+    warning, never raises. `workspace` is always the resolved, already-
+    validated (git-root) workspace Path run_engineer/run_architect pass
+    in -- DOC_GRAPH_RELATIVE_PATH is a fixed literal, never model/
+    argument-controlled, so there is no path-containment concern here
+    (contrast PATH_TOOLS, which sanitize a model-supplied path)."""
+    path = Path(workspace) / DOC_GRAPH_RELATIVE_PATH
+    if not path.is_file():
+        return None
+    try:
+        graph = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"[glimmer-engineer] WARN: malformed {DOC_GRAPH_RELATIVE_PATH}: {exc}")
+        return None
+    if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+        return None
+    graph.setdefault("edges", [])
+    return graph
+
+
+def _load_adr_titles_for_engineer(workspace):
+    """Minimal ADR reader for docs_search only: id/title/path, not the
+    full frontmatter glimmer-v2.py's load_adrs parses (areas/status/body
+    aren't needed for a title search). Same tolerant, capped, never-
+    raises discipline as that reader -- deliberately smaller since a
+    title search is the ONLY thing this file needs from an ADR."""
+    decisions_dir = Path(workspace) / ADR_DECISIONS_RELATIVE_DIR
+    if not decisions_dir.is_dir():
+        return []
+    out = []
+    for path in sorted(decisions_dir.glob("ADR-*.md"))[:DOC_TOOLS_ADR_SCAN_CAP]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        adr_id, title = None, None
+        for line in text.splitlines()[:20]:
+            line = line.strip()
+            if line.lower().startswith("id:"):
+                adr_id = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+            if adr_id and title:
+                break
+        if adr_id:
+            out.append({
+                "id": adr_id,
+                "title": title or adr_id,
+                "path": str(path.relative_to(Path(workspace))),
+            })
+    return out
+
+
+def _docs_search(query, graph, workspace):
+    """docs_search(query): exact-token search (split on non-alnum, case-
+    insensitive -- same boundary rule as this codebase's other
+    deterministic matchers) over graph node id/type/path/title AND ADR
+    id/title. Capped to DOC_TOOLS_SEARCH_CAP results."""
+    tokens = {t for t in re.split(r"[^a-z0-9]+", str(query or "").lower()) if t}
+    if not tokens:
+        return "docs_search: empty query."
+
+    results = []
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        haystack = " ".join(str(node.get(k, "")) for k in ("id", "type", "path", "title"))
+        node_tokens = {t for t in re.split(r"[^a-z0-9]+", haystack.lower()) if t}
+        if tokens & node_tokens:
+            results.append(
+                f"node {node.get('id')} ({node.get('type')}, {node.get('status')}): "
+                f"{node.get('path')} -- {node.get('title')}"
+            )
+
+    for adr in _load_adr_titles_for_engineer(workspace):
+        haystack = f"{adr['id']} {adr['title']}"
+        adr_tokens = {t for t in re.split(r"[^a-z0-9]+", haystack.lower()) if t}
+        if tokens & adr_tokens:
+            results.append(f"adr {adr['id']}: {adr['title']} ({adr['path']})")
+
+    if not results:
+        return f"docs_search: no matches for {query!r}."
+    return "\n".join(results[:DOC_TOOLS_SEARCH_CAP])
+
+
+def _docs_get_node(node_id, graph):
+    """docs_get_node(id): one node plus its edges (either endpoint),
+    capped to DOC_TOOLS_NODE_EDGES_CAP. Read-only, one hop only -- no
+    graph traversal beyond the node's own direct edges."""
+    node = next(
+        (n for n in (graph.get("nodes") or []) if isinstance(n, dict) and n.get("id") == node_id),
+        None,
+    )
+    if node is None:
+        return f"docs_get_node: no node with id {node_id!r}."
+    edges = [
+        e for e in (graph.get("edges") or [])
+        if isinstance(e, dict) and (e.get("from") == node_id or e.get("to") == node_id)
+    ][:DOC_TOOLS_NODE_EDGES_CAP]
+    return json.dumps({"node": node, "edges": edges}, indent=2, ensure_ascii=False)
+
+
+# Task 7.2 keyword table, REPLICATED verbatim from glimmer-v2.py's
+# _DOC_IMPACT_WORDS / _CAMEL_AWARE_CATEGORIES / _word_hits /
+# _categories_for_path / _CATEGORY_TO_NODE_TYPE (see the module comment
+# at the top of this section for why this is a replica, not an import) --
+# keep these five in sync by hand with glimmer-v2.py if either changes.
+_DOC_IMPACT_WORDS = {
+    "routes": ("routes", "router"),
+    "schema": ("schema", "schemas", "migration", "migrations", "prisma"),
+    "api": ("api", "openapi", "swagger"),
+    "config": ("config",),
+    "auth": ("auth", "authentication", "session", "sessions", "permission",
+              "permissions", "token", "tokens"),
+}
+_CAMEL_AWARE_CATEGORIES = {"auth"}
+
+
+def _doc_impact_word_hits(word, path, camel_aware):
+    """Replica of glimmer-v2.py's _word_hits -- see that function's
+    docstring for the full boundary-rule rationale."""
+    for m in re.finditer(re.escape(word), path, re.IGNORECASE):
+        start, end = m.start(), m.end()
+        before_ok = start == 0 or not path[start - 1].isalnum()
+        after_ok = end == len(path) or not path[end].isalnum()
+        if camel_aware:
+            if not before_ok and path[start - 1].islower() and path[start].isupper():
+                before_ok = True
+            if not after_ok and path[end].isupper():
+                after_ok = True
+        if before_ok and after_ok:
+            return True
+    return False
+
+
+def _doc_impact_categories_for_path(raw):
+    """Replica of glimmer-v2.py's _categories_for_path."""
+    path = str(raw).replace("\\", "/")
+    lower = path.lower()
+    segments = [s for s in lower.split("/") if s]
+    basename = segments[-1] if segments else lower
+
+    categories = set()
+    for category, words in _DOC_IMPACT_WORDS.items():
+        camel_aware = category in _CAMEL_AWARE_CATEGORIES
+        for word in words:
+            if _doc_impact_word_hits(word, path, camel_aware):
+                categories.add(category)
+                break
+
+    if basename.endswith(".sql"):
+        categories.add("schema")
+    if basename == "dockerfile" or basename.startswith("docker-compose"):
+        categories.add("config")
+    if basename == ".env.example":
+        categories.add("config")
+    if ".github" in segments and "workflows" in segments:
+        categories.add("config")
+    return categories
+
+
+_CATEGORY_TO_NODE_TYPE = {
+    "routes": "route",
+    "schema": "schema",
+    "config": "config",
+    "api": "service",
+    "auth": "service",
+}
+
+
+def _map_changed_files_to_doc_nodes(graph, changed_files):
+    """Replica of glimmer-v2.py's map_changed_files_to_doc_nodes -- see
+    that function's docstring for the full two-signal (path-prefix +
+    keyword-category) rationale. Pure, no I/O."""
+    nodes_by_id = {
+        n["id"]: n for n in (graph.get("nodes") or [])
+        if isinstance(n, dict) and n.get("id")
+    }
+    touched = set()
+    for raw in (changed_files or []):
+        path = str(raw).replace("\\", "/")
+        for node in nodes_by_id.values():
+            node_path = str(node.get("path") or "").replace("\\", "/")
+            if node_path and (path == node_path or path.startswith(node_path.rstrip("/") + "/")):
+                touched.add(node["id"])
+        for category in _doc_impact_categories_for_path(path):
+            wanted_type = _CATEGORY_TO_NODE_TYPE.get(category)
+            if wanted_type is None:
+                continue
+            for node in nodes_by_id.values():
+                if node.get("type") == wanted_type:
+                    touched.add(node["id"])
+
+    impacted = {nid for nid in touched if nodes_by_id[nid].get("type") == "doc"}
+    for edge in graph.get("edges") or []:
+        if not isinstance(edge, dict) or edge.get("kind") != "documents":
+            continue
+        if edge.get("to") not in touched:
+            continue
+        doc_node = nodes_by_id.get(edge.get("from"))
+        if doc_node is not None and doc_node.get("type") == "doc":
+            impacted.add(edge["from"])
+    return sorted(impacted)
+
+
+def _docs_impact(files, graph):
+    impacted = _map_changed_files_to_doc_nodes(graph, files)
+    if not impacted:
+        return "docs_impact: no impacted documentation nodes."
+    return "\n".join(impacted)
+
+
+def _execute_doc_tool(tool_name, arguments, workspace):
+    """Single dispatch point for DOC_TOOL_NAMES, same shape convention as
+    _execute_semantic_tool. `_loaded_doc_graph` is re-checked here (not
+    just at offer-time in _augment_tools_with_doc_tools) so a model that
+    calls one of these anyway when no graph exists gets an honest "not
+    available" text answer -- harmless (these tools have no side effects
+    or budget to abuse), rather than a crash."""
+    if _loaded_doc_graph is None:
+        return {"plain_text_response": (
+            f"{tool_name}: no {DOC_GRAPH_RELATIVE_PATH} in this workspace -- "
+            "documentation tools are unavailable for this session."
+        )}
+    if tool_name == "docs_search":
+        text = _docs_search(arguments.get("query", ""), _loaded_doc_graph, workspace)
+    elif tool_name == "docs_get_node":
+        text = _docs_get_node(str(arguments.get("id", "")), _loaded_doc_graph)
+    elif tool_name == "docs_impact":
+        files = arguments.get("files")
+        if not isinstance(files, list):
+            files = [files] if files else []
+        text = _docs_impact(files, _loaded_doc_graph)
+    else:
+        raise ValueError(f"unknown doc tool: {tool_name}")
+    return {"plain_text_response": text}
+
+
+DOC_TOOL_DEFINITIONS = [
+    {
+        "display_name": "Search documentation",
+        "tool": "docs_search",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "docs_search",
+                "description": (
+                    "Exact-token search over the workspace's documentation "
+                    "graph (docs/graph.json node ids/types/paths/titles) "
+                    "and ADR titles (docs/decisions/). Only offered when "
+                    "docs/graph.json exists. Capped to "
+                    f"{DOC_TOOLS_SEARCH_CAP} results."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search terms."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+    },
+    {
+        "display_name": "Get documentation node",
+        "tool": "docs_get_node",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "docs_get_node",
+                "description": (
+                    "Fetch one documentation graph node by exact id, plus "
+                    "its edges (one hop). Only offered when docs/graph.json "
+                    "exists."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Exact node id."},
+                    },
+                    "required": ["id"],
+                },
+            },
+        },
+    },
+    {
+        "display_name": "Documentation impact",
+        "tool": "docs_impact",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "docs_impact",
+                "description": (
+                    "Given a list of changed file paths, return which "
+                    "documentation graph node ids are impacted (path-prefix "
+                    "and keyword-category matching against docs/graph.json). "
+                    "Only offered when docs/graph.json exists."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Changed file paths (workspace-relative).",
+                        },
+                    },
+                    "required": ["files"],
+                },
+            },
+        },
+    },
+]
+
+
+def _augment_tools_with_doc_tools(metadata, tools, workspace):
+    """Mutates metadata/tools IN PLACE to add the three docs_* tools --
+    ONLY when <workspace>/docs/graph.json exists (deterministic
+    availability, per Task 7.4: "Tools offered ONLY when docs/graph.json
+    exists in the workspace"). Also sets the module-level _loaded_doc_
+    graph global _execute_doc_tool reads from -- same single-load-point
+    pattern as _loaded_architecture_plan."""
+    global _loaded_doc_graph
+    _loaded_doc_graph = _load_doc_graph_for_engineer(workspace)
+    if _loaded_doc_graph is None:
+        return
+    for item in DOC_TOOL_DEFINITIONS:
+        metadata[item["tool"]] = item
+        tools.append(item["definition"])
+
+
+# ============================================================
 # TOOL EXECUTION
 # ============================================================
 
@@ -2830,11 +3231,13 @@ def execute_tool(
     # read_file/file_glob_search/grep_search, so they share the same
     # (tool, args)-keyed cache — including its existing invalidation
     # (cache.clear() on every successful write in run_engineer's loop).
+    # Task 7.4: the docs_* tools are equally idempotent within a session
+    # (the graph is loaded once, never changes mid-session) — same cache.
     if tool_name in {
         "read_file",
         "file_glob_search",
         "grep_search",
-    } | SEMANTIC_TOOL_NAMES:
+    } | SEMANTIC_TOOL_NAMES | DOC_TOOL_NAMES:
         cache_key = json.dumps(
             [
                 tool_name,
@@ -3055,6 +3458,14 @@ def execute_tool(
     # here on.
     if tool_name in SEMANTIC_TOOL_NAMES:
         result = _execute_semantic_tool(
+            tool_name,
+            arguments,
+            workspace,
+        )
+    elif tool_name in DOC_TOOL_NAMES:
+        # Task 7.4: same in-process interception as the semantic tools
+        # just above, never reaches http_json either.
+        result = _execute_doc_tool(
             tool_name,
             arguments,
             workspace,
@@ -3476,7 +3887,8 @@ def _architect_mode_selfcheck() -> None:
     #    every turn/phase by construction.
     # ------------------------------------------------------------
     all_tool_names = (
-        READ_TOOLS | WRITE_TOOLS | {"exec_shell_command", "get_datetime"} | SEMANTIC_TOOL_NAMES
+        READ_TOOLS | WRITE_TOOLS | {"exec_shell_command", "get_datetime"}
+        | SEMANTIC_TOOL_NAMES | DOC_TOOL_NAMES
     )
     synthetic_tools = [
         {"type": "function", "function": {"name": name}}
@@ -5896,6 +6308,12 @@ def run_architect(task, workspace, max_turns, review_request_path=None):
 
     metadata, tools = get_tools()
 
+    # Task 7.4 (V7 "Documentation tools"): "Architect gets read-oriented
+    # documentation tools" -- same offer-only-when-graph-exists gate as
+    # run_engineer. Must run BEFORE the ARCHITECT_TOOL_NAMES filter below
+    # so a newly-appended docs_* definition actually survives it.
+    _augment_tools_with_doc_tools(metadata, tools, workspace)
+
     architect_tools = [
         tool
         for tool in tools
@@ -7636,6 +8054,10 @@ def run_engineer(
         metadata, tools, architecture_plan, architect_consult_enabled,
     )
 
+    # Task 7.4 (V7 "Documentation tools"): docs_search/docs_get_node/
+    # docs_impact -- offered only when a real docs/graph.json exists.
+    _augment_tools_with_doc_tools(metadata, tools, workspace)
+
     # R5 (glimmer-v7): load once per session, not per shell_policy call —
     # repo-map.json doesn't change mid-session.
     validation_allowlist = (
@@ -8602,6 +9024,158 @@ def run_engineer(
     )
 
 
+def _doc_tools_selfcheck() -> None:
+    """Task 7.4 (V7 "Documentation tools"). Covers: availability gating
+    (_augment_tools_with_doc_tools offers the three docs_* tools only when
+    docs/graph.json exists), docs_search/docs_get_node/docs_impact results
+    against a real fixture graph + ADRs on disk, the DOC_TOOLS_SEARCH_CAP
+    cap, the structural "not offered" fallback (_execute_doc_tool never
+    crashes when called with no graph loaded), and that a node id is never
+    used as a filesystem path (no containment surface to exploit -- it's
+    a plain dict-key lookup into the already-parsed, workspace-relative
+    graph).
+    Run with: python3 glimmer-engineer.py --doc-tools-selfcheck
+    """
+    import tempfile
+
+    global _loaded_doc_graph
+    saved_graph = _loaded_doc_graph
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+
+            # ------------------------------------------------------------
+            # 1. Availability gating: absent docs/graph.json -> tools never
+            #    offered, _loaded_doc_graph stays None.
+            # ------------------------------------------------------------
+            metadata, tools = {}, []
+            _augment_tools_with_doc_tools(metadata, tools, ws)
+            assert _loaded_doc_graph is None
+            assert not DOC_TOOL_NAMES & set(metadata), "no graph -> no doc tools offered"
+            assert tools == []
+
+            # Malformed graph.json (not valid JSON) must degrade to
+            # None + a warning, never raise -- same tolerance as
+            # glimmer-v2.py's load_doc_graph.
+            (ws / "docs").mkdir()
+            (ws / "docs" / "graph.json").write_text("not json{{{", encoding="utf-8")
+            metadata2, tools2 = {}, []
+            _augment_tools_with_doc_tools(metadata2, tools2, ws)
+            assert _loaded_doc_graph is None
+            assert tools2 == []
+
+            # ------------------------------------------------------------
+            # 2. A real graph -> all three tools offered, with the fixed
+            #    definition shape get_tools() expects.
+            # ------------------------------------------------------------
+            graph = {
+                "schemaVersion": 1,
+                "nodes": [
+                    {"id": "svc:auth", "type": "service", "path": "backend/auth",
+                     "title": "Auth service", "status": "CURRENT"},
+                    {"id": "doc:auth-flow", "type": "doc", "path": "docs/auth-flow.md",
+                     "title": "Auth flow", "status": "CURRENT"},
+                ],
+                "edges": [
+                    {"from": "doc:auth-flow", "to": "svc:auth", "kind": "documents"},
+                ],
+            }
+            (ws / "docs" / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+            decisions = ws / "docs" / "decisions"
+            decisions.mkdir()
+            (decisions / "ADR-0001.md").write_text(
+                "---\nid: ADR-0001\nstatus: accepted\nareas: [auth]\n"
+                "title: Backend owns auth session state\n---\nBody.\n",
+                encoding="utf-8",
+            )
+
+            metadata3, tools3 = {}, []
+            _augment_tools_with_doc_tools(metadata3, tools3, ws)
+            assert DOC_TOOL_NAMES <= set(metadata3), "a real graph must offer all three doc tools"
+            assert len(tools3) == 3
+            assert _loaded_doc_graph is not None
+
+            # ------------------------------------------------------------
+            # 3. docs_search: exact-token match over node fields AND ADR
+            #    id/title; capped; empty query handled; no match handled.
+            # ------------------------------------------------------------
+            search_result = _docs_search("auth", _loaded_doc_graph, ws)
+            assert "svc:auth" in search_result
+            assert "ADR-0001" in search_result, "docs_search must also match ADR titles"
+
+            assert _docs_search("", _loaded_doc_graph, ws) == "docs_search: empty query."
+            assert "no matches" in _docs_search("zzznope", _loaded_doc_graph, ws)
+
+            # Cap: DOC_TOOLS_SEARCH_CAP results max even when more match.
+            big_graph = {
+                "nodes": [
+                    {"id": f"svc:widget{i}", "type": "service", "path": f"p{i}",
+                     "title": "widget"}
+                    for i in range(DOC_TOOLS_SEARCH_CAP + 10)
+                ],
+                "edges": [],
+            }
+            capped = _docs_search("widget", big_graph, ws)
+            assert len(capped.splitlines()) == DOC_TOOLS_SEARCH_CAP
+
+            # ------------------------------------------------------------
+            # 4. docs_get_node: node + edges (one hop); missing id handled;
+            #    id is a plain dict-key lookup -- never touches the
+            #    filesystem, so a path-traversal-shaped id is inert.
+            # ------------------------------------------------------------
+            node_result = json.loads(_docs_get_node("svc:auth", _loaded_doc_graph))
+            assert node_result["node"]["id"] == "svc:auth"
+            assert len(node_result["edges"]) == 1
+            assert node_result["edges"][0]["from"] == "doc:auth-flow"
+
+            assert "no node with id" in _docs_get_node("does-not-exist", _loaded_doc_graph)
+            assert "no node with id" in _docs_get_node("../../etc/passwd", _loaded_doc_graph), (
+                "a path-traversal-shaped id must be treated as an ordinary "
+                "(nonexistent) lookup key, never a filesystem path"
+            )
+
+            # ------------------------------------------------------------
+            # 5. docs_impact: changed backend/auth/* file -> svc:auth
+            #    touched -> doc:auth-flow impacted via the "documents" edge.
+            # ------------------------------------------------------------
+            impact_result = _docs_impact(["backend/auth/session.ts"], _loaded_doc_graph)
+            assert "doc:auth-flow" in impact_result
+
+            assert _docs_impact([], _loaded_doc_graph) == "docs_impact: no impacted documentation nodes."
+            assert _docs_impact(["totally/unrelated.ts"], _loaded_doc_graph) == (
+                "docs_impact: no impacted documentation nodes."
+            )
+
+            # ------------------------------------------------------------
+            # 6. _execute_doc_tool: structural "not offered" fallback --
+            #    calling a doc tool with no graph loaded must degrade to an
+            #    honest text answer, never raise.
+            # ------------------------------------------------------------
+            _loaded_doc_graph = None
+            envelope = _execute_doc_tool("docs_search", {"query": "auth"}, ws)
+            assert "unavailable" in envelope["plain_text_response"]
+
+            # ------------------------------------------------------------
+            # 7. Containment: DOC_GRAPH_RELATIVE_PATH is a fixed, workspace-
+            #    relative literal -- no argument ever controls which file
+            #    gets read.
+            # ------------------------------------------------------------
+            assert DOC_GRAPH_RELATIVE_PATH == "docs/graph.json"
+            assert not DOC_GRAPH_RELATIVE_PATH.startswith("/")
+
+            # ------------------------------------------------------------
+            # 8. ARCHITECT_TOOL_NAMES includes the doc tools too (Architect
+            #    gets read-oriented documentation tools, same as engineer).
+            # ------------------------------------------------------------
+            assert DOC_TOOL_NAMES <= ARCHITECT_TOOL_NAMES
+    finally:
+        _loaded_doc_graph = saved_graph
+
+    print("documentation tools (V7 §7.4) self-check: PASS")
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -8789,6 +9363,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--recovery-ladder-selfcheck"]:
         _recovery_ladder_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--doc-tools-selfcheck"]:
+        _doc_tools_selfcheck()
         sys.exit(0)
 
     try:

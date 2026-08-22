@@ -1565,7 +1565,7 @@ def _contract_scope_text(contract):
     return ", ".join(scope_bits)
 
 
-def make_architect_prompt(contract, summary):
+def make_architect_prompt(contract, summary, ws=None):
     """C1 (glimmer-v7): the "task" text handed to `glimmer-engineer.py
     --mode architect` — NOT make_prompt's full engineering OPERATING
     CONTRACT (that prose is write-loop-specific: freeze rules, diff/
@@ -1574,6 +1574,12 @@ def make_architect_prompt(contract, summary):
     ARCHITECT_SYSTEM_PROMPT) already carries the permissions/output-shape
     instructions; this is just the objective + contract + repo map it
     needs to plan against.
+
+    Task 7.3 (V7 "ADR consultation"): `ws` (optional, defaults to None so
+    every pre-existing 2-arg call site is byte-for-byte unaffected) is
+    passed straight to build_adr_prompt_section, which appends "" whenever
+    there's nothing to add -- so this stays the exact same prompt for any
+    repo with no docs/decisions/ or no matching ADR.
     """
     return textwrap.dedent(f"""
     TASK CONTRACT (authoritative — sole source of scope/mode/constraints for this task):
@@ -1587,7 +1593,7 @@ def make_architect_prompt(contract, summary):
 
     TRUSTED REPOSITORY MAP:
     {summary}
-    """).strip()
+    """).strip() + build_adr_prompt_section(contract, ws)
 
 
 
@@ -2628,7 +2634,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     emit_event(events_path, "architect_planning_started", sid)
 
     try:
-        architect_prompt = make_architect_prompt(contract, summary)
+        architect_prompt = make_architect_prompt(contract, summary, ws)
         (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
 
         rc = invoke_engineer(
@@ -2685,17 +2691,19 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 # as C1's read_candidate_evidence treating model output as untrusted.
 
 
-def make_architect_replan_prompt(contract, summary, review, from_version):
+def make_architect_replan_prompt(contract, summary, review, from_version, ws=None):
     """V7 §5.12: the re-planning prompt. Reuses make_architect_prompt's
-    exact planning-mode text (objective + contract + repo map, byte-
-    identical prefix) and APPENDS the prior review's findings/
-    requiredChanges as evidence of why plan v{from_version} was
-    rejected, so the architect revises instead of re-deriving from
-    scratch with no memory of what failed. `review` is whatever load_
-    architect_review returned (already normalized: findings/
-    requiredChanges default to [] when absent) -- never raises on an
-    empty/None review, same tolerant-but-honest bar as architect_review_
-    failure_text.
+    exact planning-mode text (objective + contract + repo map [+ any
+    matching ADRs, Task 7.3], byte-identical prefix) and APPENDS the
+    prior review's findings/requiredChanges as evidence of why plan
+    v{from_version} was rejected, so the architect revises instead of
+    re-deriving from scratch with no memory of what failed. `review` is
+    whatever load_architect_review returned (already normalized:
+    findings/requiredChanges default to [] when absent) -- never raises
+    on an empty/None review, same tolerant-but-honest bar as
+    architect_review_failure_text. `ws` (optional) is forwarded straight
+    to make_architect_prompt; omitting it reproduces the exact pre-Task-
+    7.3 prompt.
     """
     review = review or {}
     findings = review.get("findings") or []
@@ -2716,7 +2724,7 @@ def make_architect_replan_prompt(contract, summary, review, from_version):
     if not findings and not required_changes:
         lines.append("  (review produced no specific findings/requiredChanges)")
 
-    return make_architect_prompt(contract, summary) + "\n\n" + "\n".join(lines)
+    return make_architect_prompt(contract, summary, ws) + "\n\n" + "\n".join(lines)
 
 
 def run_architect_replan(engineer, ws, contract, summary, session, events_path, sid,
@@ -2732,7 +2740,7 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path, 
     print("=" * 72)
 
     try:
-        replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version)
+        replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version, ws)
         (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
 
         # Fix round 1 (HIGH): architecture-plan.json already holds
@@ -2848,7 +2856,8 @@ ARCHITECT_REVIEW_DECISIONS = {
 }
 
 
-def make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=None):
+def make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=None,
+                         matched_adr_ids=None):
     """C2: the review-request payload v2 (trusted layer) writes to disk
     for the architect-review subprocess to read directly (glimmer-
     engineer.py's _load_review_request) — V7 §5.6's shape, scoped down
@@ -2870,6 +2879,14 @@ def make_review_request(plan, files, change_types, diff_text, iteration, review_
     payload shape from before this task, so every later review round
     (which has no fresh task list to add, and no reason to re-review one
     already approved) is unaffected.
+
+    Task 7.3 (V7 "ADR consultation"): matched_adr_ids is select_matching_
+    adr_ids(contract, ws)'s output -- additive, same "key present only
+    when there's something to say" discipline as taskList: omitted
+    (falsy/None) means either no docs/decisions/ dir or nothing matched,
+    reproducing the exact pre-Task-7.3 payload shape. When present, it
+    lets the architect note a deviation against a specific ADR without
+    re-deriving the area match itself.
     """
     request = {
         "type": "architect_review_request",
@@ -2883,6 +2900,8 @@ def make_review_request(plan, files, change_types, diff_text, iteration, review_
     }
     if task_list is not None:
         request["taskList"] = task_list
+    if matched_adr_ids:
+        request["matchedAdrIds"] = matched_adr_ids
     return request
 
 
@@ -3112,7 +3131,7 @@ def architect_review_failure_text(review):
 
 
 def run_architect_review(engineer, ws, plan, files, change_types, baseline, session, events_path, sid,
-                          iteration, review_round, task_list=None):
+                          iteration, review_round, task_list=None, matched_adr_ids=None):
     """C2 (glimmer-v7): pre-verification architect review (V7 §5.9),
     invoked from main()'s per-iteration loop only when a plan exists.
     Reuses invoke_engineer's SAME mode="architect" spawn path as C1's
@@ -3130,6 +3149,10 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     see that function's docstring for why this is the one review call
     that carries it (iteration==0, review_round==1 only; every other
     call site passes nothing, keeping their payload unchanged).
+
+    matched_adr_ids (Task 7.3): also forwarded straight into make_review_
+    request's additive matchedAdrIds field -- callers compute it once via
+    select_matching_adr_ids(contract, ws).
     """
     print("\n" + "=" * 72)
     print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
@@ -3148,7 +3171,8 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
         if len(diff_text) > ARCHITECT_REVIEW_DIFF_MAX_CHARS:
             diff_text = diff_text[:ARCHITECT_REVIEW_DIFF_MAX_CHARS] + "\n\n[diff truncated by v2 review-request builder]"
 
-        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round, task_list=task_list)
+        request = make_review_request(plan, files, change_types, diff_text, iteration, review_round,
+                                       task_list=task_list, matched_adr_ids=matched_adr_ids)
         request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
 
         rc = invoke_engineer(
@@ -4180,6 +4204,316 @@ def check_doc_drift(graph: dict, ws) -> list:
 
 
 # ============================================================
+# Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation"): the
+# ADR store lives at <workspace>/docs/decisions/ADR-NNNN.md, one file per
+# decision, a simple frontmatter block (not a real YAML parser -- stdlib
+# only, and the shape is deliberately this simple):
+#
+#   ---
+#   id: ADR-0001
+#   status: accepted
+#   areas: [auth, backend]
+#   title: Some decision title
+#   ---
+#   Context / Decision / Consequences prose...
+#
+# ADRs are HUMAN-authored. Nothing in this file (or anywhere in Glimmer)
+# ever writes one -- load_adrs below is a READER ONLY. This is the
+# hallucination guard V7's "ADR consultation" section calls for:
+# Glimmer must never invent architectural history, only surface real,
+# human-recorded decisions to the architect.
+# ============================================================
+
+ADR_DECISIONS_RELATIVE_DIR = "docs/decisions"
+ADR_MAX_COUNT = 100
+ADR_PROMPT_MAX_MATCHED = 5
+ADR_PROMPT_BODY_CHARS = 500
+
+_ADR_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
+
+
+def _parse_adr_frontmatter(text: str):
+    """Tolerant parser for the `--- key: value ... ---` frontmatter block
+    above -- plain `key: value` lines, `areas` additionally accepting an
+    inline bracket list (`areas: [a, b]`). Returns (fields dict, body str),
+    or None when the text has no recognizable frontmatter block at all
+    (the caller treats None as "malformed, skip + warn" -- never raises)."""
+    m = _ADR_FRONTMATTER_RE.match(text)
+    if not m:
+        return None
+    fm_text, body = m.group(1), m.group(2)
+    fields = {}
+    for line in fm_text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "areas" and value.startswith("[") and value.endswith("]"):
+            value = [v.strip().strip("'\"") for v in value[1:-1].split(",") if v.strip()]
+        fields[key] = value
+    return fields, body.strip()
+
+
+def load_adrs(ws) -> list:
+    """Task 7.3: tolerant reader for <ws>/docs/decisions/ADR-*.md. Absent
+    directory -> [] (most repos have no ADRs yet -- an honest "not
+    applicable", not an error). A single malformed file (no frontmatter,
+    or no id) is skipped with a warning -- it never aborts the whole read,
+    same discipline as load_doc_graph. Capped to the first ADR_MAX_COUNT
+    files in sorted (filename) order, so ADR-0001..ADR-0100 always win
+    over anything past that -- deterministic, and a runaway ADR count
+    can't blow up prompt-building."""
+    decisions_dir = Path(ws) / ADR_DECISIONS_RELATIVE_DIR
+    if not decisions_dir.is_dir():
+        return []
+
+    adrs = []
+    for path in sorted(decisions_dir.glob("ADR-*.md"))[:ADR_MAX_COUNT]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"[V2] WARN: unreadable ADR {path}: {exc}")
+            continue
+        parsed = _parse_adr_frontmatter(text)
+        if parsed is None:
+            print(f"[V2] WARN: malformed ADR (no frontmatter): {path}")
+            continue
+        fields, body = parsed
+        adr_id = fields.get("id")
+        if not adr_id:
+            print(f"[V2] WARN: malformed ADR (no id): {path}")
+            continue
+        areas = fields.get("areas")
+        if not isinstance(areas, list):
+            areas = [a for a in re.split(r"[,\s]+", str(areas or "")) if a]
+        adrs.append({
+            "id": str(adr_id),
+            "status": fields.get("status") or "proposed",
+            "areas": [str(a).lower() for a in areas],
+            "title": fields.get("title") or str(adr_id),
+            "body": body,
+            "path": str(path.relative_to(Path(ws))),
+        })
+    return adrs
+
+
+def _adr_contract_tokens(contract) -> set:
+    """The exact-token universe an ADR's areas[] are matched against:
+    the contract's scope tokens (same _skills_scope_text/_segment_tokens
+    pair select_skills uses for skill-area matching) UNIONED with the
+    contract's objective tokens -- Task 7.3 explicitly calls for matching
+    "the contract's area/objective tokens", and ADR areas are plain words
+    like skill areas, so the identical tokenizer/boundary rules apply."""
+    contract = contract or {}
+    tokens = set(_segment_tokens(_skills_scope_text(contract)))
+    tokens |= set(_segment_tokens(str(contract.get("objective") or "")))
+    return tokens
+
+
+def select_matching_adrs(contract, adrs) -> list:
+    """Task 7.3 ("ADR consultation"): which ADRs match this contract --
+    deterministic EXACT-token match against adr["areas"], same discipline
+    as select_skills (a raw substring test would let a short area like
+    "ui" match unrelated tokens that merely contain those letters) --
+    NEVER a model judgment. Ordered by id ascending (stable, reproducible
+    prompt) and capped to ADR_PROMPT_MAX_MATCHED."""
+    tokens = _adr_contract_tokens(contract)
+    if not tokens:
+        return []
+    matched = [
+        adr for adr in (adrs or [])
+        if any(area and area in tokens for area in adr.get("areas") or [])
+    ]
+    matched.sort(key=lambda a: a["id"])
+    return matched[:ADR_PROMPT_MAX_MATCHED]
+
+
+def select_matching_adr_ids(contract, ws) -> list:
+    """Task 7.3: just the ids from select_matching_adrs(contract,
+    load_adrs(ws)) -- the one call site both build_adr_prompt_section and
+    make_review_request's additive matchedAdrIds field need. `ws` is None
+    whenever there's no real workspace to read from (mirrors
+    build_adr_prompt_section's own None-safety); never raises."""
+    if not ws:
+        return []
+    try:
+        return [a["id"] for a in select_matching_adrs(contract, load_adrs(ws))]
+    except Exception:
+        return []
+
+
+def build_adr_prompt_section(contract, ws) -> str:
+    """Task 7.3: the "ARCHITECTURE DECISION RECORDS" block make_architect_
+    prompt appends -- "" (byte-for-byte no change) whenever ws is None,
+    docs/decisions/ doesn't exist, or nothing matches this contract.
+    Same never-raises-into-"" discipline as build_skills_block. Reminds
+    the architect in-band that ADRs are human-authored and consumption-
+    only -- the hallucination guard from V7's "ADR consultation" section
+    lives here in the prompt text, not just in load_adrs never writing."""
+    if not ws:
+        return ""
+    try:
+        matched = select_matching_adrs(contract, load_adrs(ws))
+    except Exception:
+        return ""
+    if not matched:
+        return ""
+
+    parts = []
+    for adr in matched:
+        body = adr["body"]
+        if len(body) > ADR_PROMPT_BODY_CHARS:
+            body = body[:ADR_PROMPT_BODY_CHARS] + "...[truncated]"
+        parts.append(f"--- {adr['id']} ({adr['status']}): {adr['title']} ---\n{body}")
+    block = "\n\n".join(parts)
+    return (
+        "\n\nARCHITECTURE DECISION RECORDS -- HUMAN-authored, matched "
+        "deterministically by exact area/objective token (never a model "
+        f"judgment), at most {ADR_PROMPT_MAX_MATCHED}. These record WHY "
+        "past decisions were made. If your plan conflicts with one, flag "
+        "an ARCHITECTURAL DEVIATION instead of silently overriding it -- "
+        "an ADR may be superseded, but that must be an explicit decision. "
+        "Glimmer never generates ADRs itself -- only a human authors "
+        "them:\n" + block
+    )
+
+
+# ============================================================
+# Task 7.4 (V7 "Bootstrapping an existing repository"): --docs-bootstrap
+# builds the initial docs/graph.json skeleton (+ docs/decisions/ +
+# docs/README.md) for a repo that has neither yet. One node per
+# package/config/workflow from the existing repo map, all stamped
+# status=GENERATED -- which is already a FROZEN status (_DOC_STATUS_
+# FROZEN, Task 7.1): verify_doc_nodes/apply_doc_impact/check_doc_drift
+# all leave GENERATED nodes untouched, so a bootstrapped skeleton stays
+# honestly "unverified, machine-generated" until a human actually curates
+# it -- exactly the "ratchet" the architecture doc's bootstrap section
+# describes, with zero new status-machine code needed.
+# ============================================================
+
+DOCS_README_RELATIVE_PATH = "docs/README.md"
+
+_DOCS_README_STUB = """# Documentation graph
+
+This directory holds Glimmer's machine-readable documentation intelligence
+for this repository:
+
+- `graph.json` -- nodes (systems/services/routes/schemas/configs/docs) and
+  the edges between them, each carrying a `status` (CURRENT/STALE/
+  UNVERIFIED/MISSING/DEPRECATED/GENERATED) and a `provenance` record of
+  the evidence/commit it was last verified against.
+- `decisions/ADR-NNNN.md` -- human-authored Architecture Decision Records.
+  Glimmer only ever *reads* these; it never writes or generates one.
+
+## Honesty about GENERATED nodes
+
+Every node created by `--docs-bootstrap` is stamped `status: GENERATED` --
+a real, factual inventory entry (a package, a config file, a CI workflow
+that exists on disk), NOT a verified description of what that thing does
+or why. GENERATED nodes are left alone by verification/drift/impact
+checks until a human curates them (fills in an honest title, sets a real
+status, links them to actual documentation) -- at that point they become
+ordinary CURRENT/STALE/UNVERIFIED nodes like any hand-authored one.
+
+Every area Glimmer touches should end up at least as well documented as
+before it started -- preferably better.
+"""
+
+
+def build_docs_bootstrap_graph(repo_map: dict) -> dict:
+    """Task 7.4: pure function, repo_map (build_repo_map's shape) -> an
+    initial graph.json skeleton. One node per package/config/workflow
+    entry, type-mapped onto the graph's system|service|route|schema|
+    config vocabulary (workflow -> config: there is no dedicated
+    "workflow" node type, same coarse-heuristic spirit as Task 7.2's
+    _CATEGORY_TO_NODE_TYPE mapping "api"/"auth" onto "service"). Every
+    node: status=GENERATED, confidence="unknown", provenance={"evidence":
+    [], "sha": None} -- an honest "this is a real, factual inventory
+    entry, nothing more" per Bootstrap Phase 3 ("low-risk factual graph
+    nodes"). No edges -- inferring a "documents" edge would be a claim
+    this phase doesn't support."""
+    nodes = []
+    seen_ids = set()
+
+    def _add(node_id, node_type, path, title):
+        if node_id in seen_ids:
+            return
+        seen_ids.add(node_id)
+        nodes.append({
+            "id": node_id,
+            "type": node_type,
+            "path": path,
+            "title": title,
+            "status": DOC_STATUS_GENERATED,
+            "confidence": "unknown",
+            "provenance": {"evidence": [], "sha": None},
+        })
+
+    for pkg in repo_map.get("packages") or []:
+        if not isinstance(pkg, dict):
+            continue
+        dir_ = pkg.get("dir") or "."
+        node_id = "service:root" if dir_ == "." else f"service:{dir_}"
+        _add(node_id, "service", dir_, pkg.get("name") or dir_)
+
+    for cfg in repo_map.get("configs") or []:
+        _add(f"config:{cfg}", "config", str(cfg), str(cfg))
+
+    for wf in repo_map.get("workflows") or []:
+        _add(f"config:{wf}", "config", str(wf), str(wf))
+
+    return {"schemaVersion": 1, "nodes": nodes, "edges": []}
+
+
+def _docs_bootstrap(workspace) -> int:
+    """Task 7.4 CLI entry point (`--docs-bootstrap <workspace>`): builds
+    docs/graph.json + docs/decisions/ + docs/README.md. NEVER overwrites
+    an existing graph.json -- fails loud (a human, or a prior bootstrap,
+    already owns that file; silently clobbering real curation would be
+    the opposite of honest). Prints a summary. No model call anywhere in
+    this path -- deterministic, same as the rest of Task 7.1/7.2/7.4."""
+    ws = Path(workspace).expanduser().resolve()
+    if not ws.is_dir():
+        print(f"[V2] --docs-bootstrap: workspace not found: {ws}", file=sys.stderr)
+        return 1
+
+    graph_path = ws / DOC_GRAPH_RELATIVE_PATH
+    if graph_path.exists():
+        print(
+            f"[V2] --docs-bootstrap: refusing to overwrite existing "
+            f"{DOC_GRAPH_RELATIVE_PATH} -- delete it first if you really "
+            "want to regenerate the skeleton.",
+            file=sys.stderr,
+        )
+        return 1
+
+    repo_map = build_repo_map(ws)
+    graph = build_docs_bootstrap_graph(repo_map)
+
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+
+    (ws / ADR_DECISIONS_RELATIVE_DIR).mkdir(parents=True, exist_ok=True)
+
+    readme_path = ws / DOCS_README_RELATIVE_PATH
+    if not readme_path.exists():
+        readme_path.write_text(_DOCS_README_STUB, encoding="utf-8")
+
+    by_type = {}
+    for n in graph["nodes"]:
+        by_type[n["type"]] = by_type.get(n["type"], 0) + 1
+    counts = ", ".join(f"{k}={v}" for k, v in sorted(by_type.items())) or "none"
+    print(f"[V2] --docs-bootstrap: wrote {DOC_GRAPH_RELATIVE_PATH} "
+          f"({len(graph['nodes'])} nodes: {counts})")
+    print(f"[V2] --docs-bootstrap: {ADR_DECISIONS_RELATIVE_DIR}/ ready for human-authored ADRs")
+    print(f"[V2] --docs-bootstrap: {DOCS_README_RELATIVE_PATH} written")
+    print("[V2] --docs-bootstrap: every node is status=GENERATED (unverified until a human curates it)")
+    return 0
+
+
+# ============================================================
 # Task 4.1 (V7 §21 x task list): repair tasks -- auto-created each time a
 # required-tier verify() failure triggers an actual repair round (see
 # main()'s build_repair_contract call site). Makes the repair loop visible
@@ -5021,6 +5355,11 @@ def main():
                         # the derived task list -- one budgeted pass, not
                         # a re-review on every repair round.
                         task_list=(tasks if iteration == 0 and review_round == 1 else None),
+                        # Task 7.3 (ADR consultation): computed fresh per
+                        # round (cheap -- capped file read) rather than
+                        # threaded from outside the loop, so a human
+                        # editing docs/decisions/ mid-session is picked up.
+                        matched_adr_ids=select_matching_adr_ids(contract, ws),
                     )
                     attempt.setdefault("architectReviews", []).append(
                         {"round": review_round, "review": review}
@@ -5338,6 +5677,7 @@ def main():
                         post_review = run_architect_review(
                             engineer, ws, architecture_plan, files, change_types, baseline,
                             session, events_path, sid, iteration, review_round + 1,
+                            matched_adr_ids=select_matching_adr_ids(contract, ws),
                         )
                         attempt.setdefault("architectReviews", []).append(
                             {"round": review_round + 1, "review": post_review,
@@ -8723,6 +9063,296 @@ def _candidate_ranking_selfcheck() -> None:
     print("candidate ranking (V7 §27) self-check: PASS")
 
 
+def _adr_selfcheck() -> None:
+    """Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation").
+    Covers: frontmatter parsing (tolerant -- malformed/missing-id files
+    skipped, never raise), load_adrs' absent-dir/cap behavior, exact-token
+    area matching (no substring false-positive, mirroring select_skills),
+    the ADR_PROMPT_MAX_MATCHED cap + id-ascending ordering, the prompt-
+    section's shape/truncation/empty-when-nothing-matches, make_
+    architect_prompt's byte-identical-with-no-ws contract, and make_
+    review_request's additive matchedAdrIds field.
+    Run with: python3 glimmer-v2.py --adr-selfcheck
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+
+        # ------------------------------------------------------------
+        # 1. load_adrs: absent docs/decisions/ -> [], never an error.
+        # ------------------------------------------------------------
+        assert load_adrs(ws) == [], "no docs/decisions/ dir -> [] (not an error)"
+
+        decisions = ws / "docs" / "decisions"
+        decisions.mkdir(parents=True)
+
+        # A well-formed ADR.
+        (decisions / "ADR-0001.md").write_text(
+            "---\n"
+            "id: ADR-0001\n"
+            "status: accepted\n"
+            "areas: [auth, backend]\n"
+            "title: Session ownership belongs to the backend\n"
+            "---\n"
+            "Context\nUsers need cross-device recovery.\n\n"
+            "Decision\nBackend owns persistent session ownership.\n",
+            encoding="utf-8",
+        )
+        # A second, non-matching ADR (different area).
+        (decisions / "ADR-0002.md").write_text(
+            "---\n"
+            "id: ADR-0002\n"
+            "status: proposed\n"
+            "areas: [billing]\n"
+            "title: Billing retries\n"
+            "---\n"
+            "Body text.\n",
+            encoding="utf-8",
+        )
+        # Malformed: no frontmatter delimiters at all -- skipped, not raised.
+        (decisions / "ADR-0003.md").write_text("just some prose, no frontmatter\n", encoding="utf-8")
+        # Malformed: frontmatter present but no id -- skipped, not raised.
+        (decisions / "ADR-0004.md").write_text(
+            "---\nstatus: accepted\nareas: [auth]\ntitle: Missing id\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        # Not an ADR file at all (glob shouldn't pick it up).
+        (decisions / "notes.md").write_text("---\nid: ADR-9999\n---\nignored\n", encoding="utf-8")
+
+        adrs = load_adrs(ws)
+        ids = sorted(a["id"] for a in adrs)
+        assert ids == ["ADR-0001", "ADR-0002"], (
+            f"malformed ADR-0003/0004 and non-matching-glob notes.md must be skipped, got {ids!r}"
+        )
+        by_id = {a["id"]: a for a in adrs}
+        assert by_id["ADR-0001"]["areas"] == ["auth", "backend"]
+        assert by_id["ADR-0001"]["status"] == "accepted"
+        assert by_id["ADR-0001"]["title"] == "Session ownership belongs to the backend"
+        assert "Backend owns persistent session ownership" in by_id["ADR-0001"]["body"]
+
+        # ------------------------------------------------------------
+        # 2. select_matching_adrs: EXACT-token match, not substring -- a
+        #    contract scoped to "authorization" (contains "auth" as a
+        #    substring but is a different whole token) must NOT match
+        #    ADR-0001's "auth" area.
+        # ------------------------------------------------------------
+        contract_auth = {
+            "objective": "fix the auth session bug",
+            "scope": {"package": "backend"},
+        }
+        matched = select_matching_adrs(contract_auth, adrs)
+        assert [a["id"] for a in matched] == ["ADR-0001"], matched
+
+        contract_no_substring = {
+            "objective": "improve authorization middleware",
+            "scope": {"package": "frontend"},
+        }
+        # "authorization" tokenizes to one whole token "authorization",
+        # which is NOT "auth" -- must not match via substring.
+        assert select_matching_adrs(contract_no_substring, adrs) == [], (
+            "exact-token match must not let 'authorization' match ADR area 'auth' as a substring"
+        )
+
+        # scope.package deliberately "frontend" here (not "backend") --
+        # ADR-0001 also carries area "backend", so a "backend"-scoped
+        # contract would legitimately match it too; this isolates the
+        # objective-keyword ("billing") signal on its own.
+        contract_billing = {"objective": "retry billing", "scope": {"package": "frontend"}}
+        assert [a["id"] for a in select_matching_adrs(contract_billing, adrs)] == ["ADR-0002"]
+
+        contract_none = {"objective": "unrelated task", "scope": {"package": "frontend"}}
+        assert select_matching_adrs(contract_none, adrs) == []
+
+        # select_matching_adr_ids mirrors select_matching_adrs, just ids;
+        # None/empty ws never raises.
+        assert select_matching_adr_ids(contract_auth, ws) == ["ADR-0001"]
+        assert select_matching_adr_ids(contract_auth, None) == []
+        assert select_matching_adr_ids(contract_auth, "") == []
+
+        # Cap: ADR_PROMPT_MAX_MATCHED matches, ordered by id ascending.
+        for n in range(3, 3 + ADR_PROMPT_MAX_MATCHED + 2):
+            (decisions / f"ADR-{n:04d}.md").write_text(
+                f"---\nid: ADR-{n:04d}\nstatus: accepted\nareas: [auth]\ntitle: extra {n}\n---\nBody.\n",
+                encoding="utf-8",
+            )
+        many_adrs = load_adrs(ws)
+        many_matched = select_matching_adrs(contract_auth, many_adrs)
+        assert len(many_matched) == ADR_PROMPT_MAX_MATCHED, (
+            f"expected capped to {ADR_PROMPT_MAX_MATCHED}, got {len(many_matched)}"
+        )
+        assert [a["id"] for a in many_matched] == sorted(a["id"] for a in many_matched), (
+            "matched ADRs must be ordered by id ascending"
+        )
+
+        # ------------------------------------------------------------
+        # 3. build_adr_prompt_section: "" when ws is None or nothing
+        #    matches; a real section (with truncation) when something does.
+        # ------------------------------------------------------------
+        assert build_adr_prompt_section(contract_auth, None) == ""
+        assert build_adr_prompt_section(contract_none, ws) == ""
+
+        section = build_adr_prompt_section(contract_auth, ws)
+        assert "ARCHITECTURE DECISION RECORDS" in section
+        assert "ADR-0001" in section
+        assert "HUMAN-authored" in section
+
+        long_body_adr = decisions / "ADR-0002.md"
+        long_body_adr.write_text(
+            "---\nid: ADR-0002\nstatus: accepted\nareas: [auth]\ntitle: Long\n---\n"
+            + ("x" * (ADR_PROMPT_BODY_CHARS + 200)) + "\n",
+            encoding="utf-8",
+        )
+        long_section = build_adr_prompt_section(contract_auth, ws)
+        assert "[truncated]" in long_section, "a body over ADR_PROMPT_BODY_CHARS must be truncated"
+
+        # ------------------------------------------------------------
+        # 4. make_architect_prompt: ws=None (the default) reproduces the
+        #    exact pre-Task-7.3 prompt; passing ws appends the ADR section
+        #    only when something actually matches.
+        # ------------------------------------------------------------
+        contract_full = {
+            "objective": "fix the auth session bug",
+            "scope": {"package": "backend"},
+            "mode": "implement",
+            "constraints": {},
+            "verification": [],
+            "repairBudget": 0,
+        }
+        no_ws_prompt = make_architect_prompt(contract_full, "repo summary")
+        assert no_ws_prompt == make_architect_prompt(contract_full, "repo summary", ws=None), (
+            "ws defaulting to None must be identical to omitting it"
+        )
+        assert "ARCHITECTURE DECISION RECORDS" not in no_ws_prompt
+
+        with_ws_prompt = make_architect_prompt(contract_full, "repo summary", ws)
+        assert with_ws_prompt.startswith(no_ws_prompt), (
+            "the ADR section must be a pure suffix -- the base prompt text must not change"
+        )
+        assert "ARCHITECTURE DECISION RECORDS" in with_ws_prompt
+
+        empty_ws = Path(td) / "no-adrs-here"
+        empty_ws.mkdir()
+        assert make_architect_prompt(contract_full, "repo summary", empty_ws) == no_ws_prompt, (
+            "a workspace with no docs/decisions/ must reproduce the exact no-ws prompt"
+        )
+
+    # ------------------------------------------------------------
+    # 5. make_review_request: matchedAdrIds is additive -- absent when
+    #    falsy/None (exact pre-Task-7.3 shape), present when given.
+    # ------------------------------------------------------------
+    plan = {"objective": "x", "packages": [], "risk": "low"}
+    base_request = make_review_request(plan, ["a.ts"], {"a.ts": "modified"}, "diff", 0, 1)
+    assert "matchedAdrIds" not in base_request
+
+    request_with_ids = make_review_request(
+        plan, ["a.ts"], {"a.ts": "modified"}, "diff", 0, 1, matched_adr_ids=["ADR-0001"],
+    )
+    assert request_with_ids["matchedAdrIds"] == ["ADR-0001"]
+
+    request_with_empty = make_review_request(
+        plan, ["a.ts"], {"a.ts": "modified"}, "diff", 0, 1, matched_adr_ids=[],
+    )
+    assert "matchedAdrIds" not in request_with_empty, "an empty match list must not add a noise key"
+
+    print("ADR store + consultation (V7 §7.3) self-check: PASS")
+
+
+def _docs_bootstrap_selfcheck() -> None:
+    """Task 7.4 (V7 "Bootstrapping an existing repository"): the
+    --docs-bootstrap skeleton builder. Covers build_docs_bootstrap_graph's
+    type-mapping (package->service, config/workflow->config) against a
+    fake repo map, every node's honest GENERATED/unknown/no-sha shape, and
+    _docs_bootstrap's real-filesystem behavior: writes graph.json +
+    docs/decisions/ + docs/README.md on a clean workspace, and REFUSES
+    (never overwrites) when graph.json already exists.
+    Run with: python3 glimmer-v2.py --docs-bootstrap-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. build_docs_bootstrap_graph: pure, from a fake repo map.
+    # ------------------------------------------------------------
+    fake_repo_map = {
+        "packages": [
+            {"path": "package.json", "dir": ".", "name": "root-pkg"},
+            {"path": "frontend/package.json", "dir": "frontend", "name": "@app/frontend"},
+        ],
+        "configs": ["tsconfig.json", "frontend/tsconfig.json"],
+        "workflows": [".github/workflows/ci.yml"],
+    }
+    graph = build_docs_bootstrap_graph(fake_repo_map)
+    assert graph["schemaVersion"] == 1
+    assert graph["edges"] == [], "Phase 3 (bootstrap) must never invent edges"
+
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    assert by_id["service:root"]["type"] == "service"
+    assert by_id["service:root"]["path"] == "."
+    assert by_id["service:root"]["title"] == "root-pkg"
+    assert by_id["service:frontend"]["type"] == "service"
+    assert by_id["service:frontend"]["path"] == "frontend"
+    assert by_id["config:tsconfig.json"]["type"] == "config"
+    assert by_id["config:frontend/tsconfig.json"]["type"] == "config"
+    assert by_id["config:.github/workflows/ci.yml"]["type"] == "config", (
+        "workflow has no dedicated node type -- must fall back to config"
+    )
+
+    for node in graph["nodes"]:
+        assert node["status"] == DOC_STATUS_GENERATED
+        assert node["confidence"] == "unknown"
+        assert node["provenance"] == {"evidence": [], "sha": None}
+
+    # verify_doc_nodes must leave every bootstrapped node untouched --
+    # GENERATED is a frozen status (Task 7.1's _DOC_STATUS_FROZEN), the
+    # exact mechanism that makes bootstrap output honest ("unverified
+    # until a human curates it") without any new status-machine code.
+    assert DOC_STATUS_GENERATED in _DOC_STATUS_FROZEN
+
+    # Duplicate dir across packages/configs must not double-add a node.
+    dup_map = {"packages": [{"path": "a/package.json", "dir": "a", "name": "a"}],
+               "configs": [], "workflows": []}
+    dup_graph = build_docs_bootstrap_graph(dup_map)
+    assert len(dup_graph["nodes"]) == 1
+
+    # ------------------------------------------------------------
+    # 2. _docs_bootstrap: real filesystem behavior.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        (ws / "package.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+        # build_repo_map (reused, unmodified, by _docs_bootstrap) shells
+        # out to git -- a real (if empty) repo is needed for this fixture.
+        subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=ws, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=ws, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=ws, check=True)
+
+        rc = _docs_bootstrap(str(ws))
+        assert rc == 0, "bootstrap on a clean workspace must succeed"
+
+        graph_path = ws / DOC_GRAPH_RELATIVE_PATH
+        assert graph_path.is_file()
+        written = json.loads(graph_path.read_text(encoding="utf-8"))
+        assert any(n["id"] == "service:root" for n in written["nodes"])
+
+        assert (ws / ADR_DECISIONS_RELATIVE_DIR).is_dir()
+        assert (ws / DOCS_README_RELATIVE_PATH).is_file()
+        assert "GENERATED" in (ws / DOCS_README_RELATIVE_PATH).read_text(encoding="utf-8")
+
+        # NEVER overwrites an existing graph -- fails loud (non-zero rc),
+        # and the on-disk file must be byte-identical to what a human (or
+        # a prior bootstrap) already wrote there.
+        graph_path.write_text('{"nodes": [], "edges": [], "curated": true}', encoding="utf-8")
+        before = graph_path.read_text(encoding="utf-8")
+        rc2 = _docs_bootstrap(str(ws))
+        assert rc2 != 0, "bootstrap must refuse to overwrite an existing graph.json"
+        assert graph_path.read_text(encoding="utf-8") == before, (
+            "an existing graph.json must be left byte-for-byte untouched on refusal"
+        )
+
+        # A nonexistent workspace must also fail loud, not crash.
+        assert _docs_bootstrap(str(ws / "does-not-exist")) != 0
+
+    print("docs bootstrap (V7 §7.4) self-check: PASS")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--r6-selfcheck"]:
         _r6_selfcheck()
@@ -8772,6 +9402,22 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--candidate-ranking-selfcheck"]:
         _candidate_ranking_selfcheck()
         raise SystemExit(0)
+    if sys.argv[1:] == ["--adr-selfcheck"]:
+        _adr_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--docs-bootstrap-selfcheck"]:
+        _docs_bootstrap_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:2] == ["--docs-bootstrap"]:
+        # Task 7.4: a standalone CLI mode, not a task run -- takes a bare
+        # workspace path instead of the usual `task ... --workspace ...`
+        # shape, so it's dispatched here (same special-case-before-
+        # argparse pattern as every --*-selfcheck above) rather than
+        # forced through main()'s required-positional-task argparse.
+        if len(sys.argv) != 3:
+            print("Usage: glimmer-v2.py --docs-bootstrap <workspace>", file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(_docs_bootstrap(sys.argv[2]))
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         raise SystemExit(main())
