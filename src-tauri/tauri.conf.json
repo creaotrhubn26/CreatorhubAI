@@ -10,6 +10,7 @@
     "frontendDist": "../web/dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Glimmer Control Center",
@@ -30,6 +31,7 @@
     "active": true,
     "targets": "all",
     "category": "DeveloperTool",
+    "externalBin": ["binaries/node"],
     "shortDescription": "Local desktop shell for the Glimmer autonomous engineering gateway",
     "icon": [
       "icons/32x32.png",

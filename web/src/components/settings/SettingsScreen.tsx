@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { getTheme, setTheme, type ThemePreference } from "../../state/themePreference";
+import { tauriGlobal } from "../../state/desktopNotify";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -59,13 +60,21 @@ export function SettingsScreen() {
       <h2 style={{ fontSize: "var(--fs-h1)", fontWeight: 600, textTransform: "none", letterSpacing: "-0.01em", color: "inherit" }}>
         Notifications
       </h2>
-      <p>
-        Completion notifications: {permission}
-        {!supported && " (unsupported in this environment)"}
-      </p>
-      <button onClick={enableNotifications} disabled={!supported || permission === "granted"}>
-        Enable completion notifications
-      </button>
+      {tauriGlobal() ? (
+        // Desktop app: notifications go through the OS via the Tauri shell;
+        // macOS shows its own per-app permission prompt on first delivery.
+        <p>Completion notifications: handled by the desktop app (macOS asks on first notification)</p>
+      ) : (
+        <>
+          <p>
+            Completion notifications: {permission}
+            {!supported && " (unsupported in this environment)"}
+          </p>
+          <button onClick={enableNotifications} disabled={!supported || permission === "granted"}>
+            Enable completion notifications
+          </button>
+        </>
+      )}
     </div>
   );
 }
