@@ -222,6 +222,12 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "BUDGET_EXHAUSTED", "detail": "architect review budget exhausted (V7 §5.13)", "evidenceIds": []}
     if raw == "needs-architect-review":
         return {"class": "POLICY_BLOCK", "detail": "architect review rejected the implementation or the review budget was exhausted (V7 §5.10/§5.13)", "evidenceIds": []}
+    # Task 2.3 (V7 §5.10): TECHNICALLY_VERIFIED + ARCHITECTURE_REVIEW_FAILED
+    # = NEEDS_REWORK -- tests passed, but the post-verification consistency
+    # check flagged files outside plan.candidateFiles/expectedScope.maxFiles
+    # and the follow-up architect review round rejected the diff.
+    if raw == "needs-architect-review-consistency-rejected":
+        return {"class": "POLICY_BLOCK", "detail": "post-verification architecture consistency review rejected the implementation (V7 §5.10)", "evidenceIds": []}
     # Task 1.3: readiness_probe (main()'s preflight) now records this exact
     # status when the model server never becomes reachable, instead of
     # falling through to the generic "initialized" -> "failed-aborted"
@@ -2295,6 +2301,52 @@ def architect_gates_value(outcome):
     return None  # outcome is None (never ran) or "fail_open"
 
 
+def scope_guard_gate_value(scope_result):
+    """Task 2.3 (V7 §5.11): maps compute_scope_guard's result to the
+    True/False/None gate contract every other gates.* key already uses --
+    inScope True -> True, a real expansion (expandedFiles non-empty) ->
+    False, "unbounded" (scope claimed a concrete path but gave none, so
+    compute_scope_guard could not tell) -> None (indeterminate, not a
+    pass). None input (no scope_result computed yet) -> None."""
+    if not scope_result:
+        return None
+    if scope_result.get("unbounded"):
+        return None
+    return True if scope_result.get("inScope") else False
+
+
+def combine_gate_values(*values):
+    """Task 2.3 (V7 §5.11): tri-state AND across gate values -- False
+    dominates (any real failure blocks), else None dominates (any
+    indeterminate input makes the combination indeterminate too -- "null
+    wins over true"), else True only when every input is True. Used to
+    fold gates.scopeApproved from two independent signals (the existing
+    contract-scope guard + the new plan-candidateFiles consistency
+    check) into one honest value."""
+    if any(v is False for v in values):
+        return False
+    if any(v is None for v in values):
+        return None
+    return True
+
+
+def gates_block_verified(gates: dict) -> bool:
+    """V7 §5.11: the final-acceptance rule. VERIFIED requires
+    implementationComplete and verificationPassed to be exactly True
+    (both are always computable by the time this runs -- there is no
+    honest "not applicable" for either), and architectureApproved/
+    scopeApproved/documentationCurrent to each be anything OTHER than
+    False (None = not-applicable/never-ran, still allowed; only an
+    explicit False blocks). Pure/deterministic -- exercised directly by
+    --gates-selfcheck without a live model or session."""
+    if gates.get("implementationComplete") is not True:
+        return True
+    if gates.get("verificationPassed") is not True:
+        return True
+    return any(gates.get(key) is False for key in
+                ("architectureApproved", "scopeApproved", "documentationCurrent"))
+
+
 def architect_review_failure_text(review):
     """C2: format an ArchitectReview's requiredChanges + findings into
     the SAME "failure text" shape make_prompt's repair branch already
@@ -2367,6 +2419,67 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
                    iteration=iteration, reviewRound=review_round,
                    decision=review["decision"])
     return review
+
+
+def _normalize_plan_path(raw) -> str:
+    """Cheap path normalization shared by check_post_verification_
+    consistency's membership comparison -- not a security boundary (unlike
+    _resolve_candidate_path's containment check above), just enough
+    normalization that "./src/x.ts" and "src/x.ts" compare equal. Never
+    raises on malformed input."""
+    p = str(raw).strip().replace("\\", "/")
+    return p[2:] if p.startswith("./") else p
+
+
+def check_post_verification_consistency(files: list, plan) -> dict:
+    """V7 §5.10: post-verification architecture consistency check --
+    cheap, deterministic, no model call by itself (main() decides whether
+    to spend an architect review round on a flagged result). Compares the
+    session's FINAL changed-files set against plan.candidateFiles (the
+    set of files the architect expected to touch) and, when present,
+    plan.expectedScope.maxFiles (the count the architect expected).
+
+    candidateFiles[].path and expectedScope are MODEL OUTPUT (the
+    architect wrote the plan) -- treated as advisory estimates, not a
+    contract: a flag here never blocks VERIFIED by itself (see main()'s
+    call site and gates_block_verified). Returns
+    {"flagged": bool, "outsideFiles": [...], "reason": str | None}.
+
+    No plan -> always {"flagged": False, "outsideFiles": [], "reason": None}
+    -- a deliberate no-op (nothing to compare against), not an
+    indeterminate result. Never raises: candidateFiles/expectedScope may be
+    missing, malformed, or adversarial; every malformed entry is simply
+    skipped rather than erroring.
+    """
+    if not plan:
+        return {"flagged": False, "outsideFiles": [], "reason": None}
+
+    candidate_paths = set()
+    candidates = plan.get("candidateFiles")
+    if isinstance(candidates, list):
+        for c in candidates:
+            if isinstance(c, dict) and isinstance(c.get("path"), str) and c["path"].strip():
+                candidate_paths.add(_normalize_plan_path(c["path"]))
+
+    outside = [f for f in files if _normalize_plan_path(f) not in candidate_paths]
+
+    max_files = None
+    expected_scope = plan.get("expectedScope")
+    if isinstance(expected_scope, dict):
+        raw_max = expected_scope.get("maxFiles")
+        if isinstance(raw_max, (int, float)) and not isinstance(raw_max, bool) and raw_max >= 0:
+            max_files = raw_max
+    over_budget = max_files is not None and len(files) > max_files
+
+    if not outside and not over_budget:
+        return {"flagged": False, "outsideFiles": [], "reason": None}
+
+    reasons = []
+    if outside:
+        reasons.append(f"{len(outside)} changed file(s) outside plan.candidateFiles")
+    if over_budget:
+        reasons.append(f"{len(files)} changed files exceeds expectedScope.maxFiles={max_files}")
+    return {"flagged": True, "outsideFiles": outside, "reason": "; ".join(reasons)}
 
 
 # ============================================================
@@ -3143,6 +3256,11 @@ def main():
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
                                  plan_candidate_count=len(candidate_evidence))
+            # Task 2.3 (V7 §5.11): gates.implementationComplete tracks the
+            # MOST RECENT engineer invocation this iteration -- a revise
+            # round below reassigns this to revise_rc, exactly mirroring
+            # which rc evaluate_implementation_tasks was last called with.
+            last_engineer_rc = rc
             files = changed_files(ws, baseline)
             change_types = file_change_types(ws, baseline)
             for f in files:
@@ -3157,8 +3275,11 @@ def main():
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
-            # R4 Scope Guard: classify (does not block yet — staged rollout,
-            # see compute_scope_guard's docstring and task-6a-report.md).
+            # R4 Scope Guard: classify. Task 2.3 (V7 §5.11) graduates this
+            # from advisory-only to a real VERIFIED-blocking signal — see
+            # scope_guard_gate_value/gates_block_verified below, consulted
+            # only after verify() ok (a real expansion here now surfaces as
+            # gates.scopeApproved = false, not just a printed WARN).
             scope_result = compute_scope_guard(files, manifest.get("contract", {}))
             attempt["scopeGuard"] = scope_result
             if scope_result["expandedFiles"]:
@@ -3171,10 +3292,11 @@ def main():
                       f"{manifest['contract']['scope'].get('package')!r} claims a bounded scope but no "
                       "area/paths were given; cannot verify (unbounded)")
 
-            # Task 1.4 (V7 §6): budgets.maxChangedFiles -- unlike the scope
-            # guard above (classify-only, staged rollout), this DOES block:
-            # exceeding it fails the session outright, before verify() ever
-            # runs for this iteration.
+            # Task 1.4 (V7 §6): budgets.maxChangedFiles -- distinct from the
+            # scope guard above (which now blocks too, but only after
+            # verify() ok, via gates.scopeApproved): this DOES block
+            # immediately, exceeding it fails the session outright, before
+            # verify() ever runs for this iteration.
             if changed_files_budget_exceeded(files, args.max_changed_files):
                 print(f"[V2] BUDGET EXCEEDED: {len(files)} changed files > "
                       f"--max-changed-files {args.max_changed_files}")
@@ -3397,6 +3519,7 @@ def main():
                         session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
                         events_path, sid, plan_candidate_count=len(candidate_evidence),
                     )
+                    last_engineer_rc = revise_rc
                     files = changed_files(ws, baseline)
                     change_types = file_change_types(ws, baseline)
                     for f in files:
@@ -3489,6 +3612,69 @@ def main():
                 raise V2Error("Verifier changed repository content; refusing to continue")
 
             if ok:
+                # Task 2.3 (V7 §5.10): post-verification consistency check --
+                # cheap, deterministic, no model call by itself. Sits strictly
+                # AFTER verify() returned ok=True and BEFORE the VERIFIED
+                # promotion just below. plan.candidateFiles/expectedScope are
+                # model ESTIMATES, not a contract (see check_post_verification_
+                # consistency's docstring) -- a flag alone never blocks;
+                # only a real architect rejection of the flagged diff does.
+                consistency = check_post_verification_consistency(files, architecture_plan)
+                attempt["consistencyCheck"] = consistency
+                manifest["consistency"] = consistency
+                consistency_gate = True
+                architect_reviews = manifest.get("architectReviews")
+                if consistency["flagged"] and architecture_plan is not None and architect_reviews is not None:
+                    if architect_reviews["used"] < ARCHITECT_REVIEW_BUDGET:
+                        architect_reviews["used"] += 1
+                        save()
+                        post_review = run_architect_review(
+                            engineer, ws, architecture_plan, files, change_types, baseline,
+                            session, events_path, sid, iteration, review_round + 1,
+                        )
+                        attempt.setdefault("architectReviews", []).append(
+                            {"round": review_round + 1, "review": post_review,
+                             "trigger": "post_verification_consistency"}
+                        )
+                        if post_review is None:
+                            consistency_gate = None  # fail-open: never ran, can't tell
+                        else:
+                            consistency_gate = (
+                                classify_architect_review_decision(post_review["decision"]) == "approved"
+                            )
+                    else:
+                        # No budget left to spend on a review round -- honesty,
+                        # not a block (V7 §5.10's plan is an estimate, not a
+                        # contract): record the flag, leave scopeApproved
+                        # indeterminate (null), let VERIFIED proceed.
+                        consistency_gate = None
+
+                gates = dict(manifest.get("gates") or {})
+                gates["implementationComplete"] = bool(files) and last_engineer_rc == 0
+                gates["verificationPassed"] = True
+                gates["scopeApproved"] = combine_gate_values(
+                    scope_guard_gate_value(scope_result), consistency_gate
+                )
+                manifest["gates"] = gates
+
+                if gates_block_verified(gates):
+                    # V7 §5.10: TECHNICALLY_VERIFIED + ARCHITECTURE_REVIEW_FAILED
+                    # = NEEDS_REWORK -- tests passed but the post-verification
+                    # consistency review rejected the diff; must never be
+                    # promoted to VERIFIED. Terminal, same as the pre-verify
+                    # architect-review rejection path above (budget for this
+                    # round is already spent).
+                    attempt["status"] = "needs-architect-review-consistency-rejected"
+                    manifest["attempts"].append(attempt)
+                    manifest["status"] = "needs-architect-review-consistency-rejected"
+                    manifest["state"] = canonical_session_state(manifest["status"])
+                    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                    save()
+                    final_label = "ARCHITECTURE CONSISTENCY REVIEW FAILED — NOT VERIFIED"
+                    print("\n[V2] post-verification consistency review rejected the implementation; "
+                          "blocking promotion to verified.")
+                    break
+
                 attempt["status"] = "verified"
                 manifest["attempts"].append(attempt)
                 manifest["status"] = "verified"
@@ -4922,6 +5108,135 @@ def _doc_impact_selfcheck() -> None:
     print("doc-impact (O2 phase 1) self-check: PASS")
 
 
+def _gates_selfcheck() -> None:
+    """Task 2.3 (glimmer-v7, V7 §5.10/§5.11): post-verification consistency
+    check + the completed 5-key gates object. Covers
+    check_post_verification_consistency's four required cases (clean,
+    outside-files flagged, maxFiles exceeded, no plan -> no-op), the
+    scope_guard_gate_value/combine_gate_values/gates_block_verified
+    composition matrix (each False blocks VERIFIED, None does not), and a
+    source-ordering proof that the consistency check runs strictly between
+    the changed-files verify() call and the VERIFIED promotion. Run with:
+    python3 glimmer-v2.py --gates-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. check_post_verification_consistency
+    # ------------------------------------------------------------
+    # No plan -> deterministic no-op, never an indeterminate result.
+    assert check_post_verification_consistency(["a.ts"], None) == {
+        "flagged": False, "outsideFiles": [], "reason": None,
+    }
+    assert check_post_verification_consistency([], {}) == {
+        "flagged": False, "outsideFiles": [], "reason": None,
+    }
+
+    # Clean: every changed file is a candidate; normalization tolerates a
+    # "./" prefix on either side.
+    clean_plan = {"candidateFiles": [{"path": "./src/a.ts"}, {"path": "src/b.ts"}]}
+    clean = check_post_verification_consistency(["src/a.ts", "src/b.ts"], clean_plan)
+    assert clean == {"flagged": False, "outsideFiles": [], "reason": None}
+
+    # Outside files: a changed file with no matching candidateFiles entry.
+    outside_plan = {"candidateFiles": [{"path": "src/a.ts"}]}
+    outside = check_post_verification_consistency(["src/a.ts", "src/unexpected.ts"], outside_plan)
+    assert outside["flagged"] is True
+    assert outside["outsideFiles"] == ["src/unexpected.ts"]
+    assert "outside plan.candidateFiles" in outside["reason"]
+
+    # maxFiles exceeded: every file IS a listed candidate, but the count
+    # alone exceeds expectedScope.maxFiles -- outsideFiles stays empty,
+    # flagged is still True, for a distinct reason.
+    budget_plan = {
+        "candidateFiles": [{"path": "a.ts"}, {"path": "b.ts"}, {"path": "c.ts"}],
+        "expectedScope": {"maxFiles": 2},
+    }
+    over_budget = check_post_verification_consistency(["a.ts", "b.ts", "c.ts"], budget_plan)
+    assert over_budget["flagged"] is True
+    assert over_budget["outsideFiles"] == []
+    assert "maxFiles=2" in over_budget["reason"]
+
+    # Malformed candidateFiles/expectedScope (model output, hostile input)
+    # never raises -- degrades to "zero usable candidates", which honestly
+    # flags every changed file as outside (a plan present but unreadable
+    # can't vouch for anything being in scope, unlike "no plan" above,
+    # which has nothing to compare against at all).
+    malformed = check_post_verification_consistency(
+        ["a.ts"], {"candidateFiles": "not-a-list", "expectedScope": "not-a-dict"}
+    )
+    assert malformed["flagged"] is True and malformed["outsideFiles"] == ["a.ts"]
+    assert check_post_verification_consistency(
+        ["a.ts"], {"candidateFiles": [{"path": 123}, "not-a-dict", {"path": "  "}]}
+    )["flagged"] is True  # none of those entries resolve to a usable candidate path
+
+    # ------------------------------------------------------------
+    # 2. scope_guard_gate_value
+    # ------------------------------------------------------------
+    assert scope_guard_gate_value(None) is None
+    assert scope_guard_gate_value({"inScope": True, "expandedFiles": []}) is True
+    assert scope_guard_gate_value({"inScope": False, "expandedFiles": ["x.ts"]}) is False
+    assert scope_guard_gate_value({"inScope": False, "expandedFiles": [], "unbounded": True}) is None
+
+    # ------------------------------------------------------------
+    # 3. combine_gate_values -- False dominates, then None, else True.
+    # ------------------------------------------------------------
+    assert combine_gate_values(True, True) is True
+    assert combine_gate_values(True, False) is False
+    assert combine_gate_values(False, None) is False
+    assert combine_gate_values(True, None) is None
+    assert combine_gate_values(None, None) is None
+    assert combine_gate_values() is True  # vacuous AND
+
+    # ------------------------------------------------------------
+    # 4. gates_block_verified: implementationComplete/verificationPassed
+    #    must be exactly True; architectureApproved/scopeApproved/
+    #    documentationCurrent may be True OR None, only False blocks.
+    # ------------------------------------------------------------
+    all_true = {
+        "implementationComplete": True, "architectureApproved": True,
+        "verificationPassed": True, "scopeApproved": True, "documentationCurrent": True,
+    }
+    assert gates_block_verified(all_true) is False, "V7 §5.11's own worked example must pass"
+
+    # Absent optional gate keys (no plan, no doc impact) default to None via
+    # dict.get -- never-ran/not-applicable, must not block.
+    assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
+
+    for optional_key in ("architectureApproved", "scopeApproved", "documentationCurrent"):
+        blocked = dict(all_true, **{optional_key: False})
+        assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
+        nulled = dict(all_true, **{optional_key: None})
+        assert gates_block_verified(nulled) is False, f"{optional_key}=None must NOT block VERIFIED"
+
+    assert gates_block_verified(dict(all_true, implementationComplete=False)) is True
+    assert gates_block_verified(dict(all_true, implementationComplete=None)) is True, (
+        "implementationComplete has no honest null -- it is always computable once verify() ran"
+    )
+    assert gates_block_verified(dict(all_true, verificationPassed=False)) is True
+    assert gates_block_verified(dict(all_true, verificationPassed=None)) is True
+
+    # ------------------------------------------------------------
+    # 5. Source-ordering proof: the consistency check must run strictly
+    #    between the changed-files verify() call and the VERIFIED
+    #    promotion, so a flagged/rejected diff can never slip past it.
+    # ------------------------------------------------------------
+    import inspect
+    main_source = inspect.getsource(main)
+    verify_call_idx = main_source.rindex(
+        "ok, results = verify(ws, commands, args.timeout, session, iteration,"
+    )
+    consistency_call_idx = main_source.index("consistency = check_post_verification_consistency(files, architecture_plan)")
+    gates_block_idx = main_source.index("if gates_block_verified(gates):")
+    verified_label_idx = main_source.rindex('final_label = "VERIFIED"')
+    assert verify_call_idx < consistency_call_idx, (
+        "the consistency check must run AFTER verify() -- it inspects the FINAL changed-files set"
+    )
+    assert consistency_call_idx < gates_block_idx < verified_label_idx, (
+        "gates_block_verified's decision must be made, and consulted, BEFORE the VERIFIED promotion"
+    )
+
+    print("gates (Task 2.3, V7 §5.10/§5.11) self-check: PASS")
+
+
 def _visual_selfcheck() -> None:
     """C4 (glimmer-v7): proves the vision-verification plumbing without a
     live browser or a live model call.
@@ -5320,6 +5635,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--doc-impact-selfcheck"]:
         _doc_impact_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--gates-selfcheck"]:
+        _gates_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--skills-selfcheck"]:
         _skills_selfcheck()
