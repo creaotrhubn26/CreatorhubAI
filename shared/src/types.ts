@@ -611,6 +611,14 @@ export interface ParserRecoveryEvent extends GlimmerEventBase {
   type: "parser_recovery";
   attempt: number;
   payloadPath: string;
+  // Round 6 (V7 §17 recovery ladder): which recovery tier this attempt's
+  // failure was running under -- "thinking_disabled" (attempts 2+) or
+  // "reduced_context" (the tier-3 attempt); omitted for the plain first
+  // attempt. requestId correlates this event with the ModelProvider
+  // request-id logged for the same call. Both additive/optional so older
+  // emitters/consumers with neither field keep working.
+  strategy?: string;
+  requestId?: string;
 }
 export interface SessionCompletedEvent extends GlimmerEventBase {
   type: "session_completed";
@@ -633,6 +641,9 @@ export interface ModelRetryEvent extends GlimmerEventBase {
   type: "model_retry";
   attempt: number;
   strategy: string;
+  // Round 6 (V7 §16 Model Runtime): the ModelProvider request id for the
+  // call this retry announces -- optional/additive, see ParserRecoveryEvent.
+  requestId?: string;
 }
 // context_selected (Task 5.1, V7 §7 context tiers): tier0Chars (system +
 // task -- permanent, never compacted), tier1Chars (active tool-result
