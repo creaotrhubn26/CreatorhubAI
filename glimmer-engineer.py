@@ -3495,6 +3495,16 @@ def chat_with_retry(
             )
 
             if attempt < attempts:
+                strategy = (
+                    "tool_safe_reasoning_off"
+                    if "tools" in base_payload
+                    else "same_turn"
+                )
+                _emit(
+                    "model_retry",
+                    attempt=attempt + 1,
+                    strategy=strategy,
+                )
                 if "tools" in base_payload:
                     print(
                         "Retrying same turn with "
@@ -4788,6 +4798,7 @@ def run_delivery_review(task, ledger, prose_report):
     failure path. The caller's return value/session outcome never
     depends on this function.
     """
+    _emit("delivery_review_started")
     try:
         known_ids = _known_delivery_review_evidence_ids()
         payload = _build_delivery_review_payload(task, ledger, prose_report)
@@ -4812,6 +4823,11 @@ def run_delivery_review(task, ledger, prose_report):
     print(f"Confidence:         {result['confidence']['level']}")
 
     _write_delivery_review_file(result)
+    _emit(
+        "delivery_review_completed",
+        customerReadiness=result["customerReadiness"],
+        confidence=result["confidence"]["level"],
+    )
 
 
 # ============================================================
@@ -5591,6 +5607,20 @@ def run_engineer(
     # (no addendum, no injected text at all) for every repo that has
     # never tripped shell_policy/the architect write-gate.
     system += failure_memory_addendum(workspace)
+
+    # Task 1.2 (context_selected): glimmer-v2.py's make_prompt already
+    # merges TASK CONTRACT/plan/skills/evidence into one `task` string
+    # before this subprocess ever sees it (invoke_engineer passes it as a
+    # single CLI arg) -- there is no separate skills/evidence value here
+    # to size independently without v2.py passing structured byte counts
+    # across that boundary. Emitting the two byte counts that ARE cheaply
+    # available (system, and the whole merged task string) now; splitting
+    # task into its skills/evidence sub-sections is Round 5 work.
+    _emit(
+        "context_selected",
+        systemBytes=len(system.encode("utf-8")),
+        taskBytes=len(task.encode("utf-8")),
+    )
 
     messages = [
         {

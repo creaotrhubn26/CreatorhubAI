@@ -1020,7 +1020,17 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             # running app under test isn't rebuilt per git worktree).
             is_visual = is_visual_check_command(cmd)
             if is_visual:
+                if events_path is not None:
+                    emit_event(events_path, "visual_verification_started", session_id, command=label)
                 result = classify_visual_check_result(result, session)
+                if events_path is not None:
+                    for finding in result.get("visualBlockingFindings", []):
+                        emit_event(events_path, "visual_finding_detected", session_id,
+                                   severity=finding.get("severity"),
+                                   category=finding.get("category"),
+                                   description=str(finding.get("description", ""))[:300])
+                    emit_event(events_path, "visual_verification_completed", session_id,
+                               status=result["status"])
 
             if result["status"] == "CODE_FAIL" and not is_visual:
                 if baseline_ws is None:
@@ -1420,12 +1430,20 @@ def _parse_skill_file(path: Path):
     }
 
 
-def load_skills(skills_dir=None) -> list:
+def load_skills(skills_dir=None, events_path=None, session_id=None) -> list:
     """Load every *.md skill file from skills_dir (default SKILLS_ROOT),
     sorted by filename for a stable base ordering (specificity sorting
     happens later, in select_skills). Never raises: a missing/unreadable
     dir, or any single unreadable/malformed file, is skipped -- worst
-    case this returns []."""
+    case this returns [].
+
+    Task 1.2: events_path/session_id are optional and default to None so
+    every existing call site (select_skills/build_skills_block/make_prompt,
+    and every test that calls this directly) is byte-for-byte unaffected.
+    Only main()'s one dedicated session-start call passes them, emitting
+    one skill_loaded event per skill actually found on disk -- distinct
+    from (and unrelated to) the per-iteration area/filetype *selection*
+    select_skills does later against the contract/plan."""
     d = Path(skills_dir) if skills_dir is not None else SKILLS_ROOT
     try:
         if not d.is_dir():
@@ -1442,6 +1460,9 @@ def load_skills(skills_dir=None) -> list:
             parsed = None
         if parsed:
             skills.append(parsed)
+            if events_path is not None and session_id is not None:
+                emit_event(events_path, "skill_loaded", session_id,
+                           name=parsed["name"], path=str(f))
     return skills
 
 
@@ -1804,6 +1825,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
     print("\n" + "=" * 72)
     print(" [V2] --architect-first: running Architect mode before iteration 0")
     print("=" * 72)
+    emit_event(events_path, "architect_planning_started", sid)
 
     try:
         architect_prompt = make_architect_prompt(contract, summary)
@@ -1831,6 +1853,8 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 
     if plan is not None:
         print(f"[V2] Architect plan loaded: risk={plan.get('risk')!r}, packages={plan.get('packages')!r}")
+        emit_event(events_path, "architect_plan_created", sid,
+                   risk=plan.get("risk"), packages=plan.get("packages"))
     else:
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
@@ -1982,6 +2006,8 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     print("\n" + "=" * 72)
     print(f" [V2] Architect review (iteration={iteration}, round={review_round})")
     print("=" * 72)
+    emit_event(events_path, "architect_review_requested", sid,
+               iteration=iteration, reviewRound=review_round)
 
     request_path = session / f"review-request-{iteration:02d}-{review_round:02d}.json"
 
@@ -2009,7 +2035,12 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
     except Exception as exc:  # noqa: BLE001 - review failure must never block the run
         print(f"[V2] WARN: architect review subprocess failed to run: {exc}")
 
-    return load_architect_review(session, iteration, review_round)
+    review = load_architect_review(session, iteration, review_round)
+    if review is not None:
+        emit_event(events_path, "architect_review_completed", sid,
+                   iteration=iteration, reviewRound=review_round,
+                   decision=review["decision"])
+    return review
 
 
 # ============================================================
@@ -2079,6 +2110,41 @@ def save_tasks(session_dir, tasks) -> None:
             json.dumps(tasks, indent=2), encoding="utf-8")
     except OSError as exc:
         print(f"[V2] WARN: failed to write tasks.json: {exc}")
+
+
+def snapshot_task_statuses(tasks) -> dict:
+    """Task 1.2: id -> status snapshot taken immediately before a call to
+    evaluate_implementation_tasks/evaluate_verification_tasks that may
+    mutate `tasks` in place -- feed the result to emit_task_transitions
+    right after that call to get an honest before/after diff. {} when
+    `tasks` is None (no plan, C3 inactive)."""
+    return {t["id"]: t["status"] for t in tasks} if tasks else {}
+
+
+def emit_task_transitions(events_path, sid, tasks, before: dict,
+                           list_completed_flag=None) -> None:
+    """Task 1.2 (§ task events): diff `before` (from snapshot_task_
+    statuses, taken just before an evaluate_*_tasks() call) against the
+    current statuses and emit task_status_changed for each id that
+    actually moved -- never for one that stayed pending/unmatched, same
+    honesty discipline as the evaluators themselves. Emits
+    task_list_completed once every task is non-pending; `list_completed_
+    flag` (a caller-owned single-element list, e.g. [False]) suppresses
+    repeat emissions across the several evaluate_*_tasks call sites in
+    one session once that has already fired. No-op when `tasks` is None.
+    """
+    if tasks is None:
+        return
+    for t in tasks:
+        prev = before.get(t["id"])
+        if prev is not None and prev != t["status"]:
+            emit_event(events_path, "task_status_changed", sid,
+                       taskId=t["id"], status=t["status"], previousStatus=prev)
+    already = list_completed_flag is not None and list_completed_flag[0]
+    if tasks and not already and all(t["status"] != "pending" for t in tasks):
+        emit_event(events_path, "task_list_completed", sid, taskCount=len(tasks))
+        if list_completed_flag is not None:
+            list_completed_flag[0] = True
 
 
 def set_implementation_tasks_status(tasks, status: str) -> None:
@@ -2441,10 +2507,19 @@ def main():
     session = STATE_ROOT / f"{sid}-{b.replace('/', '-')}"
     session.mkdir()
     events_path = session / "events.jsonl"
+    emit_event(events_path, "session_created", sid,
+               taskSummary=_truncate_bytes(task, 500, "..."), workspace=str(ws))
 
     repo = build_repo_map(ws)
     (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
     summary = repo_summary(repo)
+
+    # Task 1.2: skill_loaded events, once per session -- separate from (and
+    # ahead of) build_skills_block's own per-iteration load_skills() calls
+    # inside make_prompt, which pass no events_path/session_id and so never
+    # re-emit these. The returned list is intentionally unused here; this
+    # call exists purely to log what's on disk at session start.
+    load_skills(events_path=events_path, session_id=sid)
 
     # Task Contract (glimmer-v7 R2): one source of truth for scope/mode/constraints,
     # shared verbatim (field-for-field with @glimmer/shared TaskContract) between
@@ -2492,9 +2567,11 @@ def main():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     save()
-    # session_created isn't a real EVENT_TYPES variant; agent_state_changed is
-    # the closest real type. state= is now the canonical GlimmerSessionStatus
-    # value (R3) — manifest["state"] mirrors what "initialized" maps to.
+    # Task 1.2: session_created (emitted right after session.mkdir() above)
+    # is the real V7 event for this moment; agent_state_changed here still
+    # marks the "initialized" state transition (R3) — the two are distinct
+    # events, not a substitute for one another. state= is the canonical
+    # GlimmerSessionStatus value that manifest["state"] mirrors.
     emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
 
     print("=" * 72)
@@ -2534,6 +2611,10 @@ def main():
     # ever runs (e.g. readiness_probe failing below), which would otherwise
     # be a NameError in finally.
     tasks = None
+    # Task 1.2: shared across every evaluate_*_tasks call site below so
+    # task_list_completed fires at most once per session (see
+    # emit_task_transitions's docstring).
+    task_list_completed_flag = [False]
     try:
         if not args.skip_model_readiness:
             manifest["modelReadiness"] = readiness_probe(args.model_readiness_url, args.readiness_timeout)
@@ -2587,6 +2668,10 @@ def main():
                 tasks = derive_tasks(architecture_plan)
                 manifest["tasksFile"] = "tasks.json"
                 save_tasks(session, tasks)
+                for t in tasks:
+                    emit_event(events_path, "task_created", sid,
+                               taskId=t["id"], kind=t["kind"],
+                               description=t["description"][:200])
             save()
 
         for iteration in range(args.max_repairs + 1):
@@ -2612,8 +2697,10 @@ def main():
                            changeType=change_types.get(f, "modified"))
             # C3: engineer-return -- deterministic evidence point 2/3.
             if tasks is not None:
+                task_snapshot = snapshot_task_statuses(tasks)
                 evaluate_implementation_tasks(tasks, files, rc)
                 save_tasks(session, tasks)
+                emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
             attempt = {"iteration": iteration, "engineerReturnCode": rc,
                        "changedFiles": files, "diffHashBeforeVerify": diff_hash(ws, baseline)}
 
@@ -2644,8 +2731,10 @@ def main():
                     # applies here too so tasks.json stays honest even on
                     # the no-changed-files path.
                     if tasks is not None:
+                        task_snapshot = snapshot_task_statuses(tasks)
                         evaluate_verification_tasks(tasks, results)
                         save_tasks(session, tasks)
+                        emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
                     if ok:
                         attempt["status"] = "no-change-verified"
                         manifest["attempts"].append(attempt)
@@ -2761,8 +2850,10 @@ def main():
                         emit_event(events_path, "file_changed", sid, path=f,
                                    changeType=change_types.get(f, "modified"))
                     if tasks is not None:
+                        task_snapshot = snapshot_task_statuses(tasks)
                         evaluate_implementation_tasks(tasks, files, revise_rc)
                         save_tasks(session, tasks)
+                        emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
                     attempt["changedFiles"] = files
                     attempt["diffHashBeforeVerify"] = diff_hash(ws, baseline)
                     scope_result = compute_scope_guard(files, manifest.get("contract", {}))
@@ -2798,8 +2889,10 @@ def main():
             attempt["diffHashAfterVerify"] = after
             # C3: post-verify -- deterministic evidence point 3/3.
             if tasks is not None:
+                task_snapshot = snapshot_task_statuses(tasks)
                 evaluate_verification_tasks(tasks, results)
                 save_tasks(session, tasks)
+                emit_task_transitions(events_path, sid, tasks, task_snapshot, task_list_completed_flag)
             if before != after:
                 attempt["status"] = "verifier-mutated-repo"
                 manifest["attempts"].append(attempt)
