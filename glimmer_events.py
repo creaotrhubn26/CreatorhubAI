@@ -120,7 +120,11 @@ def _selfcheck() -> None:
             ("session_created", {"taskSummary": "add widget", "workspace": "/tmp/ws"}),
             ("skill_loaded", {"name": "frontend", "path": "/skills/frontend.md"}),
             ("model_retry", {"attempt": 2, "strategy": "same_turn"}),
-            ("context_selected", {"systemBytes": 100, "taskBytes": 200}),
+            # Fix round 1 (MED): sample updated to the real Task 5.1 shape
+            # glimmer-engineer.py actually emits (tier0Chars/tier1Chars/
+            # tier2Refs/tier3Note) -- the old systemBytes/taskBytes sample
+            # predated that task and was never emitted past it.
+            ("context_selected", {"tier0Chars": 1000, "tier1Chars": 200, "tier2Refs": 0, "tier3Note": "cold: n/a"}),
             ("architect_planning_started", {}),
             ("architect_plan_created", {"risk": "low"}),
             ("architect_review_requested", {"iteration": 0, "reviewRound": 1}),
