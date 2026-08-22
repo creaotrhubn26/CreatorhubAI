@@ -7,10 +7,11 @@
 //!
 //! Gateway location: resolved from the `GLIMMER_GATEWAY_DIR` env var, falling
 //! back to `<repo>/server` (baked in at compile time via `CARGO_MANIFEST_DIR`,
-//! since `src-tauri/` lives at the repo root). This requires the repo
-//! checkout + a built server (`npm --prefix server run build`) + `node` on
-//! PATH — see the report for why a bundled sidecar is future work, not this
-//! pass.
+//! since `src-tauri/` lives at the repo root) — so a bundled .app still
+//! needs the repo checkout with a built server (`npm --prefix server run
+//! build`). Node itself is bundled: `node_binary()` prefers the sidecar
+//! shipped via `bundle.externalBin` (see scripts/prepare-sidecar.sh),
+//! falling back to `node` on PATH in dev.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -64,15 +65,54 @@ fn spawn_gateway() -> Option<Child> {
         return None;
     }
 
-    match Command::new("node").arg("dist/index.js").current_dir(&dir).spawn() {
+    let node = node_binary();
+    match Command::new(&node).arg("dist/index.js").current_dir(&dir).spawn() {
         Ok(child) => {
-            println!("[glimmer] spawned gateway (pid {}) from {}", child.id(), dir.display());
+            println!(
+                "[glimmer] spawned gateway (pid {}) from {} via {}",
+                child.id(),
+                dir.display(),
+                node.display()
+            );
             Some(child)
         }
         Err(err) => {
-            eprintln!("[glimmer] failed to spawn gateway via `node`: {err}. Is node on PATH?");
+            eprintln!(
+                "[glimmer] failed to spawn gateway via {}: {err}. Is node on PATH?",
+                node.display()
+            );
             None
         }
+    }
+}
+
+/// Prefer the bundled node sidecar (Tauri places `externalBin` entries next
+/// to the app executable — `Contents/MacOS/glimmer-node` on macOS; named
+/// glimmer-node so a linux package never shadows /usr/bin/node), falling
+/// back to `node` on PATH so `tauri dev` and repo-checkout runs keep working
+/// without the ~50MB binary present (it's gitignored; produced by
+/// `scripts/prepare-sidecar.sh` before a bundling build).
+fn node_binary() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar = dir.join(if cfg!(windows) { "glimmer-node.exe" } else { "glimmer-node" });
+            if sidecar.exists() {
+                return sidecar;
+            }
+        }
+    }
+    PathBuf::from("node")
+}
+
+/// Desktop notification bridge: WKWebView has no `window.Notification`, so
+/// the web UI invokes this command (via `window.__TAURI__.core.invoke`)
+/// instead when running inside Tauri. Body text is the same deterministic
+/// "<session> finished: <status>" string the browser path uses.
+#[tauri::command]
+fn notify(app: tauri::AppHandle, title: String, body: String) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(err) = app.notification().builder().title(title).body(body).show() {
+        eprintln!("[glimmer] notification failed: {err}");
     }
 }
 
@@ -89,6 +129,8 @@ fn kill_gateway(state: &GatewayChild) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![notify])
         .setup(|app| {
             app.manage(GatewayChild(Mutex::new(spawn_gateway())));
             Ok(())

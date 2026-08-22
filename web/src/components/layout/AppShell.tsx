@@ -14,6 +14,7 @@ import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp,
 import { buildCommands, type PaletteMode } from "../../state/paletteCommands";
 import { CommandPalette } from "../common/CommandPalette";
 import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
+import { sendCompletionNotification } from "../../state/desktopNotify";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
@@ -343,10 +344,8 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     const unseen = completed.filter((id) => isUnseenCompletion(id, activeSessionId, document.hidden));
     if (unseen.length === 0) return;
 
-    if ("Notification" in window && Notification.permission === "granted") {
-      for (const id of unseen) {
-        new Notification("Glimmer", { body: `${shortSessionId(id)} finished: ${nextStatus[id]}` });
-      }
+    for (const id of unseen) {
+      sendCompletionNotification("Glimmer", `${shortSessionId(id)} finished: ${nextStatus[id]}`);
     }
 
     setUnseenIds((prev) => {

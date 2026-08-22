@@ -1,8 +1,8 @@
-import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
+import { loadTurns, saveTurns, type Turn } from "../../state/assistantHistory";
 
 const SUGGESTIONS = [
   "Why was this file chosen?",
@@ -11,41 +11,115 @@ const SUGGESTIONS = [
   "What risks remain?",
 ];
 
-interface Turn {
-  id: number;
-  question: string;
-  askedAt: string;
-  answer?: string;
-  error?: string;
-  answeredAt?: string;
-}
+const UNAVAILABLE_MESSAGE = "Unavailable — the assistant could not answer that.";
 
 function timeLabel(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+// A turn with neither an answer nor an error is either genuinely in flight
+// or an orphan: a reload mid-question, or a turn asked in a session that got
+// switched away from before it resolved. On (re)load there is no live
+// request behind it anymore, so it can never legitimately finish — resolve
+// it to the same Unavailable copy as any other failure rather than leaving
+// a permanent "Asking…" ghost.
+function resolveStaleTurns(turns: Turn[]): Turn[] {
+  return turns.map((t) => (t.answer === undefined && t.error === undefined ? { ...t, error: UNAVAILABLE_MESSAGE } : t));
+}
+
+interface AssistantState {
+  sid: string;
+  turns: Turn[];
+}
+
+function loadState(sessionId: string): AssistantState {
+  return { sid: sessionId, turns: resolveStaleTurns(loadTurns(sessionId)) };
+}
+
+// Applies a turns-updater only if `prev` still belongs to `forSession` — an
+// async callback (a delta, a completed answer, a fallback result) can land
+// after the user has switched to viewing a different session, and must not
+// write that stale content into the now-current session's state (which would
+// then get saved under the wrong sessionStorage key).
+function applyToSession(prev: AssistantState, forSession: string, fn: (turns: Turn[]) => Turn[]): AssistantState {
+  return prev.sid === forSession ? { sid: prev.sid, turns: fn(prev.turns) } : prev;
+}
+
 export function SessionAssistant({ sessionId, session }: { sessionId: string; session?: GlimmerSession }) {
   const [question, setQuestion] = useState("");
-  const [turns, setTurns] = useState<Turn[]>([]);
-  const askMutation = useMutation({
-    mutationFn: (q: string) => glimmerApi.askSession(sessionId, q),
-  });
+  const [chatState, setChatState] = useState<AssistantState>(() => loadState(sessionId));
+  const [pending, setPending] = useState(false);
 
-  function ask(q: string) {
-    if (!q || askMutation.isPending) return;
-    const id = Date.now();
-    setTurns((prev) => [...prev, { id, question: q, askedAt: new Date().toISOString() }]);
-    setQuestion("");
-    askMutation.mutate(q, {
-      onSuccess: (data) => {
-        setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() } : t)));
-      },
-      onError: () => {
-        setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, error: "Unavailable — the assistant could not answer that." } : t)));
-      },
-    });
+  // The panel can be reused across sessions without unmounting. Resetting
+  // during render (rather than in an effect) means the swap to the new
+  // session's history is visible in the very render that picks up the new
+  // sessionId — no stale-session frame is ever committed, and the save
+  // effect below (keyed on chatState.sid, not the sessionId prop) never races a
+  // save-on-change against this load.
+  if (chatState.sid !== sessionId) {
+    setChatState(loadState(sessionId));
+    // The old session's in-flight ask (if any) is discarded by the
+    // same-session guard — the new panel must not inherit its disabled
+    // "Asking…" state.
+    setPending(false);
   }
 
+  // Persist on every turn change, including pending/errored turns — never
+  // just the successful ones, so a reload mid-question doesn't silently drop
+  // or fabricate what actually happened. Saves under chatState.sid (the state's own
+  // session id), so it can only ever write a session's turns under that same
+  // session's key.
+  useEffect(() => {
+    saveTurns(chatState.sid, chatState.turns);
+  }, [chatState]);
+
+  async function ask(q: string) {
+    if (!q || pending) return;
+    const id = Date.now();
+    const forSession = sessionId;
+    setChatState((prev) => applyToSession(prev, forSession, (turns) => [...turns, { id, question: q, askedAt: new Date().toISOString() }]));
+    setQuestion("");
+    setPending(true);
+    let streamedAnyDelta = false;
+    try {
+      const answer = await glimmerApi.askSessionStream(forSession, q, (delta) => {
+        streamedAnyDelta = true;
+        setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+          turns.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t))
+        ));
+      });
+      setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+        turns.map((t) => (t.id === id ? { ...t, answer, answeredAt: new Date().toISOString() } : t))
+      ));
+    } catch (streamErr: any) {
+      // The server tags "upstream already reported dead" errors distinctly
+      // (a mid-stream or immediate error frame) — retrying via the
+      // non-streaming endpoint would just hit the same dead upstream, so
+      // only a connection-time failure to our OWN gateway (never reached the
+      // server at all) is worth a fallback attempt.
+      const upstreamReportedDead = streamErr?.name === "AssistantUpstreamError";
+      if (streamedAnyDelta || upstreamReportedDead) {
+        setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+          turns.map((t) => (t.id === id ? { ...t, answer: undefined, error: UNAVAILABLE_MESSAGE } : t))
+        ));
+      } else {
+        try {
+          const data = await glimmerApi.askSession(forSession, q);
+          setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+            turns.map((t) => (t.id === id ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() } : t))
+          ));
+        } catch {
+          setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+            turns.map((t) => (t.id === id ? { ...t, error: UNAVAILABLE_MESSAGE } : t))
+          ));
+        }
+      }
+    } finally {
+      setPending(false);
+    }
+  }
+
+  const turns = chatState.sid === sessionId ? chatState.turns : [];
   const hasChanges = !!session?.changedFiles.length;
   // Line-count stats are optional on ChangedFile and this backend never
   // populates them today — showing "+0 -0" when they're simply absent would
@@ -65,7 +139,7 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
       <div className="chat-suggestions">
         <div className="chat-suggestions__label">Try these</div>
         {SUGGESTIONS.map((s) => (
-          <button key={s} className="chat-suggestion" onClick={() => ask(s)} disabled={askMutation.isPending}>
+          <button key={s} className="chat-suggestion" onClick={() => ask(s)} disabled={pending}>
             {s}
           </button>
         ))}
@@ -116,8 +190,8 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
           onChange={(e) => setQuestion(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") ask(question); }}
         />
-        <button onClick={() => ask(question)} disabled={!question || askMutation.isPending} aria-label="Ask">
-          {askMutation.isPending ? "Asking…" : "Ask"}
+        <button onClick={() => ask(question)} disabled={!question || pending} aria-label="Ask">
+          {pending ? "Asking…" : "Ask"}
         </button>
       </div>
     </div>

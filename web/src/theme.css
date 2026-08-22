@@ -56,6 +56,45 @@
   --tok-type: #4ec9b0;
 }
 
+/* Light theme — same properties, redefined values only. Never edit the
+   dark values above; this block must byte-match everything :root already
+   sets, just lighter. Selected for AA contrast on a white surface. */
+:root[data-theme="light"] {
+  /* surface ladder */
+  --bg: #ffffff;
+  --surface-1: #f6f8fa;
+  --surface-2: #eaeef2;
+  --surface-raised: #eaeef2;
+  --border: #d0d7de;
+  --border-strong: #afb8c1;
+
+  /* text ladder */
+  --text: #1b1f24;
+  --text-primary: #1b1f24;
+  --text-secondary: #4b535d;
+  --text-muted: #6e7781;
+
+  /* accent — same teal family, darkened so it holds contrast on white */
+  --accent: #0a6f66;
+  --accent-strong: #075a52;
+  --on-accent: #ffffff;
+
+  /* semantic status — darkened for white-bg contrast */
+  --green: #1a7f37;
+  --amber: #9a6700;
+  --red: #cf222e;
+  --blue: #0969da;
+  --gray: #57606a;
+
+  /* diff syntax highlighting — darkened, still mutually distinguishable;
+     --tok-comment is left unset here on purpose, it's `var(--text-muted)`
+     above and inherits the light value already redefined here */
+  --tok-keyword: #8250df;
+  --tok-string: #953800;
+  --tok-number: #116329;
+  --tok-type: #24837b;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -584,6 +623,8 @@ pre {
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: var(--space-5) var(--space-3); text-align: center; color: var(--text-muted); }
 .empty-state__icon { font-size: 20px; line-height: 1; opacity: 0.55; }
 .empty-state__text { font-size: var(--fs-sm); }
+.empty-state__action { margin-top: var(--space-2); background: transparent; color: var(--text-secondary); border: 1px solid var(--border-strong); }
+.empty-state__action:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-strong); }
 
 /* ---- session list rows: second line + day grouping ---- */
 .ide-session-row { align-items: flex-start; }

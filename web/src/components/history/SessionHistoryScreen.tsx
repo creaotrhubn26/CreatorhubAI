@@ -1,11 +1,13 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
+import { EmptyState } from "../common/EmptyState";
 import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
 
 export function SessionHistoryScreen() {
-  const { data } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions });
+  const { data, isError, isPending } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions });
+  const navigate = useNavigate();
 
   // pending-* rows are transient adopted-workspace placeholders — a
   // duplicate of the real session once it appears, not a second session.
@@ -15,7 +17,19 @@ export function SessionHistoryScreen() {
   return (
     <div>
       <h1>Sessions</h1>
-      {sessions.length === 0 && <p>Unavailable</p>}
+      {/* "Unavailable" is reserved for a FAILED fetch (honesty rule) — an
+          in-flight first fetch renders nothing rather than asserting failure;
+          a successful fetch with zero sessions is a genuinely empty list and
+          the only state where offering "New Task" makes sense. */}
+      {sessions.length === 0 && !isPending && (data === undefined || isError ? (
+        <EmptyState icon="○" text="Unavailable" />
+      ) : (
+        <EmptyState
+          icon="○"
+          text="No sessions yet"
+          action={{ label: "New Task", onAction: () => navigate("/tasks/new") }}
+        />
+      ))}
       {groups.map((group) => (
         <div className="session-list-group" key={group.label}>
           <h2 className="session-list-group__label">{group.label}</h2>
