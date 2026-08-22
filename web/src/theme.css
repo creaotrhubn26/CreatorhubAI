@@ -626,6 +626,20 @@ pre {
 .empty-state__action { margin-top: var(--space-2); background: transparent; color: var(--text-secondary); border: 1px solid var(--border-strong); }
 .empty-state__action:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-strong); }
 
+/* ---- visual verification thumbnails (V7 §22.16) ---- */
+.visual-thumb {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; width: 96px;
+  font-size: var(--fs-xs); color: var(--text-muted); text-decoration: none;
+}
+.visual-thumb img {
+  width: 96px; height: 64px; object-fit: cover; border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border); background: var(--surface-2);
+}
+.visual-thumb--missing {
+  height: 64px; justify-content: center;
+  box-shadow: inset 0 0 0 1px var(--border); border-radius: var(--radius);
+}
+
 /* ---- session list rows: second line + day grouping ---- */
 .ide-session-row { align-items: flex-start; }
 .ide-session-row__main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }

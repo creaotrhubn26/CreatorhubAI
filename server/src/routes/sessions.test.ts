@@ -1,11 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import request from "supertest";
 import { promises as fs } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Express } from "express";
+
+const execGit = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,6 +20,13 @@ let app: Express;
 let workspace: string;
 let stateRoot: string;
 let readSessionEventsBatch: typeof import("./sessions.js").readSessionEventsBatch;
+// computeDiffHash comes from lib/git.js, which imports config.js -- like
+// app.js/sessions.js above, this MUST be a dynamic import done after
+// GLIMMER_STATE_ROOT is set below, never a static top-of-file import: a
+// static import runs at module-parse time, before this beforeAll, which
+// would warm config.js's module cache with the wrong (real ~/.muse-glimmer)
+// state root and 404 every route in this entire file.
+let computeDiffHash: typeof import("../lib/git.js").computeDiffHash;
 const sessionId = "diff-error-session";
 
 beforeAll(async () => {
@@ -28,6 +39,7 @@ beforeAll(async () => {
   const { createApp } = await import("../app.js");
   app = createApp();
   ({ readSessionEventsBatch } = await import("./sessions.js"));
+  ({ computeDiffHash } = await import("../lib/git.js"));
 
   // A workspace directory that exists but is not a git repo — `git diff`
   // inside it fails, which is what we want gitDiff to reject with.
@@ -578,6 +590,121 @@ describe("GET /api/sessions/:id/tasks", () => {
   });
 });
 
+describe("GET /api/sessions/:id/visual/manifest", () => {
+  const manifest = {
+    route: "http://localhost:5183/role-room",
+    viewports: ["1440x900"],
+    states: ["initial"],
+    status: "pass",
+    captures: [{ viewport: "1440x900", screenshot: "1440x900.png", status: "captured", error: null }],
+  };
+  const findings = { status: "PASS", viewport: "multi", viewports: ["1440x900"], findings: [] };
+
+  it("returns manifest + findings when both are present", async () => {
+    const id = "20260822-000060-glimmer-visual-found";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(manifest));
+    await fs.writeFile(path.join(dir, "findings.json"), JSON.stringify(findings));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ manifest, findings });
+  });
+
+  it("returns findings: null when only visual-manifest.json exists", async () => {
+    const id = "20260822-000061-glimmer-visual-no-findings";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(manifest));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ manifest, findings: null });
+  });
+
+  it("returns 404 when the session never ran glimmer-visual.py (opt-in artifact)", async () => {
+    const id = "20260822-000062-glimmer-visual-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404 for a path-traversal id", async () => {
+    const res = await request(app).get("/api/sessions/..%2F..%2Fevil/visual/manifest");
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260822-000063-glimmer-visual-fserror";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    // A directory named visual-manifest.json, not a file -> EISDIR, a real
+    // gateway fault distinct from "no artifact".
+    await fs.mkdir(path.join(dir, "visual-manifest.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
+  it("serves the PNG bytes with an image/png content type", async () => {
+    const id = "20260822-000064-glimmer-screenshot-found";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); // PNG magic bytes
+    await fs.writeFile(path.join(dir, "1440x900.png"), pngBytes);
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/image\/png/);
+    expect(Buffer.from(res.body)).toEqual(pngBytes);
+  });
+
+  it("returns 404 when the named screenshot does not exist", async () => {
+    const id = "20260822-000065-glimmer-screenshot-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id, "visual"), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404 for an unknown/path-traversal session id before ever touching the filename", async () => {
+    const res = await request(app).get("/api/sessions/..%2F..%2Fevil/visual/screenshot/1440x900.png");
+    expect(res.status).toBe(404);
+  });
+
+  it.each([
+    "..%2F..%2Fetc%2Fpasswd", // encoded traversal via slashes
+    "..png", // no chars before the required .png suffix
+    "foo%2Fbar.png", // encoded slash mid-name
+    "foo_bar.png", // outside the strict allowed charset
+    "1440x900.PNG", // wrong case extension
+    "1440x900", // missing .png suffix entirely
+    "%2e%2e%2f%2e%2e%2fetc%2fpasswd.png", // fully-encoded traversal attempt
+  ])("returns 400 for an invalid/traversal filename: %s", async (rawFile) => {
+    const id = "20260822-000066-glimmer-screenshot-traversal";
+    await fs.mkdir(path.join(stateRoot, "sessions", id, "visual"), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/${rawFile}`);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260822-000067-glimmer-screenshot-fserror";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    // A directory named like a valid screenshot filename -> EISDIR.
+    await fs.mkdir(path.join(dir, "1440x900.png"), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
 describe("opt-in artifact routes reject path-traversal ids", () => {
   it.each(["plan", "architect-reviews", "delivery-review", "tasks"])(
     "GET /api/sessions/:id/%s returns 404 for a traversal id",
@@ -789,5 +916,105 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
     } finally {
       server.close();
     }
+  });
+});
+
+// V7 §20 session-level verification freeze: GET /sessions/:id computes
+// staleness (git-derived), GET /sessions (the list) deliberately does not
+// (see the comment at that route and at readSession's computeStale option —
+// a per-session git spawn on every list poll would scale with session
+// count).
+// V7 §20 review round 1: fixtures below model production ordering, not
+// plain dirtiness -- glimmer-v2.py's collapse() leaves a real VERIFIED
+// session's workspace with an uncommitted diff on purpose, so finalDiffHash
+// (fingerprinted from that exact post-collapse state) is what staleness
+// actually compares against, not `git status --porcelain`.
+describe("stale verified-session detection (V7 §20)", () => {
+  let staleWorkspace: string;
+  let baselineSha: string;
+  let postCollapseHash: string;
+  const POST_COLLAPSE_CONTENT = "one\ntwo\n";
+
+  beforeAll(async () => {
+    staleWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-route-stale-ws-"));
+    await execGit("git", ["init", "-q"], { cwd: staleWorkspace });
+    await execGit("git", ["config", "user.email", "t@t.com"], { cwd: staleWorkspace });
+    await execGit("git", ["config", "user.name", "t"], { cwd: staleWorkspace });
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\n");
+    await execGit("git", ["add", "a.txt"], { cwd: staleWorkspace });
+    await execGit("git", ["commit", "-q", "-m", "init"], { cwd: staleWorkspace });
+    baselineSha = (await execGit("git", ["rev-parse", "HEAD"], { cwd: staleWorkspace })).stdout.trim();
+
+    // Model collapse()'s end state: HEAD stays at baselineSha, working tree
+    // holds the uncommitted diff -- finalDiffHash below is the real
+    // computeDiffHash() fingerprint of exactly this state, same as
+    // glimmer-v2.py's `finally` block computes it.
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT);
+    postCollapseHash = await computeDiffHash(staleWorkspace, baselineSha);
+  });
+
+  afterAll(async () => {
+    await fs.rm(staleWorkspace, { recursive: true, force: true });
+  });
+
+  it("GET /sessions/:id reports plain verified right after collapse, before anything else touches the workspace", async () => {
+    const id = "20260822-000009-glimmer-route-verified-unchanged";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
+        baseline: baselineSha, attempts: [],
+      })
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("verified");
+  });
+
+  it("GET /sessions/:id reports stale once the workspace is modified again after collapse", async () => {
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\ntwo\nTHREE\n");
+    const id = "20260822-000010-glimmer-route-stale";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
+        baseline: baselineSha, attempts: [],
+      })
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("stale");
+
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT); // restore
+  });
+
+  it("GET /sessions (list) does NOT compute staleness — the same modified verified session still reads as plain verified", async () => {
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\ntwo\nTHREE\n");
+    const id = "20260822-000011-glimmer-route-stale-list";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
+        baseline: baselineSha, attempts: [],
+      })
+    );
+
+    const res = await request(app).get("/api/sessions");
+    expect(res.status).toBe(200);
+    const row = res.body.find((s: { id: string }) => s.id === id);
+    expect(row?.status).toBe("verified");
+
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT); // restore
   });
 });

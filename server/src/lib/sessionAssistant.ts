@@ -10,6 +10,11 @@ function summarizeEvidence(session: GlimmerSession, events: GlimmerEvent[]): str
     const newErrors = c.newErrorSignatures.length ? ` (new errors: ${c.newErrorSignatures.join("; ")})` : "";
     lines.push(`  - ${c.command}: ${c.status}${newErrors}`);
   }
+  // V7 §18: recommended checks run but never gate — label them so the
+  // assistant's evidence stays complete without conflating tiers.
+  for (const c of session.verification.recommendedChecks ?? []) {
+    lines.push(`  - ${c.command}: ${c.status} (recommended, non-gating)`);
+  }
   for (const e of events) {
     if (e.type === "tool_blocked") lines.push(`Blocked: ${e.command} — ${e.reason}`);
     if (e.type === "candidate_selected") lines.push(`Selected ${e.file}: ${e.reasons.join(", ")}`);

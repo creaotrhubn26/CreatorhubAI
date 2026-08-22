@@ -9,6 +9,7 @@ function session(overrides: Partial<GlimmerSession>): GlimmerSession {
     workspace: "/ws", branch: "glimmer/x", baselineSha: "abc",
     changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
     repairsUsed: 0, repairBudget: 2,
+    finalStatus: { functional: "NOT_RUN", visual: "not_run", architecture: "not_run", documentation: "not_run" },
     ...overrides,
   };
 }

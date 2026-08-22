@@ -22,6 +22,7 @@ const SESSION: GlimmerSession = {
   baselineSha: "abc", changedFiles: [{ path: "DialogParser.ts", status: "modified" }],
   verification: { overall: "VERIFIED", checks: [{ command: "npm run typecheck", status: "PASS", ok: true, returncode: 0, elapsedSeconds: 1, outputTail: "", baselineAware: false, newErrorSignatures: [] }] },
   repairsUsed: 0, repairBudget: 2,
+  finalStatus: { functional: "VERIFIED", visual: "not_run", architecture: "not_run", documentation: "not_run" },
 };
 const EVENTS: GlimmerEvent[] = [
   { id: "e1", sessionId: "s1", timestamp: "t", type: "candidate_selected", file: "DialogParser.ts", reasons: ["owns parser state"] },

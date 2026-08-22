@@ -590,7 +590,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
               <div className="ide-bottompanel__body">
                 {!activeSessionId && <EmptyState icon="▤" text={`Open a session to see its ${bottomTab}.`} />}
                 {activeSessionId && bottomTab === "timeline" && <AgentTimeline events={events} />}
-                {activeSessionId && bottomTab === "verification" && <VerificationBody verification={activeSession?.verification} />}
+                {activeSessionId && bottomTab === "verification" && (
+                  <VerificationBody verification={activeSession?.verification} finalStatus={activeSession?.finalStatus} />
+                )}
                 {activeSessionId && bottomTab === "tasks" && <TasksPanel sessionId={activeSessionId} />}
                 {activeSessionId && bottomTab === "events" && <EventsRawList events={events} />}
               </div>

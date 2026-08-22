@@ -1,11 +1,17 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
+import { computeDiffHash } from "./git.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
   ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
+  FinalStatus, FinalGateStatus, VisualManifest, VisualFindings,
 } from "@glimmer/shared";
+
+// V7 §18: tier defaults to "required" for any manifest written before this
+// task existed -- the only tier that ever existed then, and the one
+// overallFromManifest/gating has always been computed from.
 
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
   "verified", "failed", "blocked", "needs_review", "cancelled",
@@ -56,6 +62,7 @@ function toVerificationCheck(raw: any): VerificationCheckResult {
     outputTail: raw.outputTail ?? "",
     baselineAware: raw.baseline !== undefined || raw.baselineAccepted !== undefined,
     newErrorSignatures: raw.newErrorSignatures ?? [],
+    tier: raw.tier === "recommended" ? "recommended" : "required",
   };
 }
 
@@ -70,12 +77,45 @@ function overallFromManifest(manifest: any): VerificationOverall {
   return "PARTIAL";
 }
 
+// V7 §22.17: gates.architectureApproved/documentationCurrent share this
+// exact true/false/null -> approved/rejected/not_run mapping.
+function gateToFinalStatus(value: boolean | null | undefined): FinalGateStatus {
+  if (value === true) return "approved";
+  if (value === false) return "rejected";
+  return "not_run";
+}
+
+// V7 §22.17 finalStatus gate object -- the functional/architecture/
+// documentation legs are all synchronously available from the manifest
+// (no filesystem read needed), so they're computed here, at parse time.
+// `visual` starts as "not_run" and is upgraded by readSession (below) after
+// an async read of the session's visual/findings.json, which is the only
+// leg that needs I/O.
+function composeFinalStatus(overall: VerificationOverall, gates: GlimmerSession["gates"]): FinalStatus {
+  return {
+    functional: overall,
+    visual: "not_run",
+    architecture: gateToFinalStatus(gates?.architectureApproved),
+    documentation: gateToFinalStatus(gates?.documentationCurrent),
+  };
+}
+
 export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   const m = raw as any;
   const attempts = m.attempts ?? [];
   const lastAttempt = attempts[attempts.length - 1];
   const checks: VerificationCheckResult[] = (lastAttempt?.verificationResults ?? []).map(toVerificationCheck);
-  const verification: VerificationSummary = { overall: overallFromManifest(m), checks };
+  // V7 §18: recommended-tier results, kept off `checks` entirely -- never
+  // consulted by overallFromManifest/gating, only reported. Omitted (not an
+  // empty array) when the attempt genuinely never ran a recommended check.
+  const recommendedRaw: any[] = lastAttempt?.recommendedResults ?? [];
+  const recommendedChecks: VerificationCheckResult[] | undefined =
+    recommendedRaw.length > 0 ? recommendedRaw.map(toVerificationCheck) : undefined;
+  const verification: VerificationSummary = {
+    overall: overallFromManifest(m),
+    checks,
+    ...(recommendedChecks ? { recommendedChecks } : {}),
+  };
   const status = mapManifestStatus(String(m.status ?? ""));
 
   const session: GlimmerSession = {
@@ -92,15 +132,66 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
     verification,
     repairsUsed: Math.max(0, attempts.length - 1),
     repairBudget: m.maxRepairs ?? 0,
+    // V7 §22.17: architecture/documentation legs need m.gates, which isn't
+    // assigned onto `session` until just below -- read the raw manifest
+    // field directly rather than reordering the gates assignment above this
+    // literal. `visual` is finalized by readSession's async override.
+    finalStatus: composeFinalStatus(verification.overall, m.gates),
   };
   // C2/C3 (glimmer-v7): pass these through only when the manifest actually
   // carries them — older sessions predating architect mode have none of these
   // keys, and GlimmerSession leaves them optional for exactly that reason.
   if (m.gates) session.gates = m.gates;
+  if (m.verificationPlan) session.verificationPlan = m.verificationPlan;
   if (m.architectPlan) session.architectPlan = m.architectPlan;
   if (m.architectTrigger) session.architectTrigger = m.architectTrigger;
   if (m.failure) session.failure = m.failure;
+  // V7 §20: only stamped once a session reaches VERIFIED (both promotion
+  // sites in glimmer-v2.py) -- absent everywhere else, same optional-pass-
+  // through discipline as gates/architectPlan/failure above.
+  if (m.verifiedAt) session.verifiedAt = m.verifiedAt;
+  // V7 §20: written unconditionally by glimmer-v2.py's `finally` block on
+  // every exit path, right after collapse() -- see the field's own comment
+  // on GlimmerSession for what it actually captures and why.
+  if (m.finalDiffHash) session.finalDiffHash = m.finalDiffHash;
   return session;
+}
+
+// V7 §20 session-level verification freeze: staleness is a fact the gateway
+// DETECTS, read-time, rather than something any daemon enforces -- nothing
+// runs after glimmer-v2.py exits.
+//
+// Review round 1 fix: the original rule ("workspace has uncommitted changes
+// now") was wrong -- collapse() (glimmer-v2.py, in the session's `finally`)
+// resets HEAD back to baselineSha and DELIBERATELY leaves the produced diff
+// sitting as uncommitted working-tree state (that's what View diff/accept
+// read). So every successful-with-a-diff session is "dirty" at verifiedAt
+// time by construction -- the old rule flagged the entire success path as
+// stale immediately.
+//
+// The real rule: a session is stale iff its CURRENT diff against baselineSha
+// no longer matches manifest.finalDiffHash (the fingerprint glimmer-v2.py
+// took of that exact diff when the session collapsed) -- i.e. something
+// wrote to the workspace after verification finished. Committing the
+// accepted diff elsewhere does NOT change this hash (git diff against a
+// fixed baseline sha compares content, not HEAD position), so an accepted-
+// and-committed session correctly reads back as still-verified, not stale.
+//
+// Bounded timeout (STALE_CHECK_TIMEOUT_MS): this runs on a route a session
+// screen polls every 4s -- a hung mount/filesystem must error out fast, not
+// hang the request.
+const STALE_CHECK_TIMEOUT_MS = 5_000;
+
+async function currentDiffHash(workspace: string, baselineSha: string): Promise<string | null> {
+  try {
+    return await computeDiffHash(workspace, baselineSha, { timeoutMs: STALE_CHECK_TIMEOUT_MS });
+  } catch {
+    // Missing workspace, not a git repo, timed out, permissions, ... -- no
+    // evidence either way. Never claim "stale" without proof (the human may
+    // have legitimately committed and cleaned up the workspace after
+    // accepting the result).
+    return null;
+  }
 }
 
 const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/;
@@ -175,6 +266,21 @@ export function readDeliveryReview(id: string): Promise<DeliveryReview | null> {
 export function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
   return readSessionJsonFile<GlimmerTask[]>(id, "tasks.json");
 }
+
+// V7 §22.14 visual evidence store -- glimmer-visual.py's --output-dir is
+// sessions/<id>/visual/, so these are nested one directory deeper than the
+// single-file artifacts above. Same opt-in-artifact absence convention:
+// no visual/ dir at all (the common case -- most sessions never run
+// glimmer-visual.py) reads back as null, not an error.
+export function readVisualManifest(id: string): Promise<VisualManifest | null> {
+  return readSessionJsonFile<VisualManifest>(id, path.join("visual", "visual-manifest.json"));
+}
+
+export function readVisualFindings(id: string): Promise<VisualFindings | null> {
+  return readSessionJsonFile<VisualFindings>(id, path.join("visual", "findings.json"));
+}
+
+const KNOWN_VISUAL_FINDINGS_STATUSES = new Set(["NOT_RUN", "PASS", "FAIL", "BLOCKED", "PASS_WITH_WARNINGS"]);
 
 const ARCHITECT_REVIEW_FILE_RE = /^architect-review-\d+-\d+\.json$/;
 
@@ -256,7 +362,18 @@ async function copyGatewayContract(fromId: string, toId: string): Promise<void> 
   }
 }
 
-export async function readSession(id: string): Promise<GlimmerSession | null> {
+// computeStale defaults to false: staleness detection spawns git (see
+// currentDiffHash above), and this function backs BOTH the session-list
+// endpoint (polled every few seconds by the sidebar) and the single-session
+// endpoint. Running a git spawn per session on every list poll would fork-
+// bomb the server (N sessions x one poll every 4s) for a fact only the one
+// open session screen actually needs -- so only GET /sessions/:id opts in.
+// GET /sessions (the list) deliberately leaves this false; sessions there
+// just read back as "verified" until someone opens them.
+export async function readSession(
+  id: string,
+  opts: { computeStale?: boolean } = {}
+): Promise<GlimmerSession | null> {
   const real = resolveSessionId(id);
   const raw = await readManifestRaw(real);
   if (!raw) return null;
@@ -265,6 +382,35 @@ export async function readSession(id: string): Promise<GlimmerSession | null> {
   if (taskContract) session = { ...session, taskContract };
   const humanAcceptance = await readHumanAcceptance(real);
   if (humanAcceptance) session = { ...session, humanAcceptance };
+  // V7 §22.17: the one finalStatus leg that needs I/O -- composeFinalStatus
+  // (above) already set every other leg synchronously. No visual/ dir at
+  // all (the common case) leaves it "not_run", set by composeFinalStatus.
+  const visualFindings = await readVisualFindings(real);
+  // NIT (fix round 3): findings.json is read straight off disk with no
+  // runtime schema check -- an unrecognized status value degrades to the
+  // same honest "not_run" fallback composeFinalStatus already uses, rather
+  // than passing an untrusted/malformed string straight into finalStatus.
+  if (visualFindings && KNOWN_VISUAL_FINDINGS_STATUSES.has(visualFindings.status)) {
+    session = { ...session, finalStatus: { ...session.finalStatus, visual: visualFindings.status } };
+  }
+  // Missing finalDiffHash (manifest predates this task) -> never stale, same
+  // honesty rule as currentDiffHash returning null: no fingerprint to
+  // compare against, no claim.
+  if (opts.computeStale && session.status === "verified" && session.finalDiffHash) {
+    const current = await currentDiffHash(session.workspace, session.baselineSha);
+    if (current !== null && current !== session.finalDiffHash) {
+      // V7 §22.17: keep the finalStatus gate object in agreement with §20
+      // staleness -- a stale session's workspace no longer matches what was
+      // verified, so the gate object's `functional` leg (composeFinalStatus
+      // set it to the manifest's VERIFIED overall) must not still claim
+      // VERIFIED alongside status: "stale".
+      session = {
+        ...session,
+        status: "stale",
+        finalStatus: { ...session.finalStatus, functional: "NEEDS_REVIEW" },
+      };
+    }
+  }
   return session;
 }
 

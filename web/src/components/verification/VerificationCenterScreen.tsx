@@ -1,9 +1,9 @@
 import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import type { VerificationCheckResult, VerificationSummary } from "@glimmer/shared";
+import type { FinalStatus, VerificationCheckResult, VerificationSummary } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { computeVerificationBadge } from "../../state/computeVerificationBadge";
-import { StatusBadge } from "../common/StatusBadge";
+import { StatusBadge, statusColor } from "../common/StatusBadge";
 import { EmptyState } from "../common/EmptyState";
 
 const TONE_COLOR: Record<ReturnType<typeof computeVerificationBadge>["tone"], string> = {
@@ -57,13 +57,68 @@ function BaselineSummary({ checks }: { checks: VerificationCheckResult[] }) {
   );
 }
 
+// V7 §18: recommended checks run but never gate VERIFIED -- kept visually
+// distinct (muted, its own labeled section) so nobody reads a recommended
+// failure as something that blocked promotion.
+function RecommendedSection({ checks }: { checks: VerificationCheckResult[] | undefined }) {
+  if (!checks || checks.length === 0) return null;
+  return (
+    <div style={{ marginTop: 24, opacity: 0.7 }}>
+      <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 8 }}>
+        Recommended (non-gating)
+      </p>
+      {checks.map((c) => (
+        <CheckCard key={c.command} check={c} />
+      ))}
+    </div>
+  );
+}
+
+const FINAL_STATUS_LABELS: Array<[keyof FinalStatus, string]> = [
+  ["functional", "Functional"],
+  ["visual", "Visual"],
+  ["architecture", "Architecture"],
+  ["documentation", "Documentation"],
+];
+
+// architecture/documentation use the approved/rejected/not_run gate
+// vocabulary (not a StatusBadge-known status string), so they get their own
+// small color mapping; functional/visual reuse statusColor's existing
+// VerificationOverall / visual-status entries directly, one color system.
+function finalStatusColor(field: keyof FinalStatus, value: string): string {
+  if (field === "architecture" || field === "documentation") {
+    if (value === "approved") return "var(--green)";
+    if (value === "rejected") return "var(--red)";
+    return "var(--gray)";
+  }
+  return statusColor(value);
+}
+
+// V7 §22.17: compact 4-cell gate summary, always present on a real session
+// (readSession composes it deterministically) -- same one-chip-per-field
+// pattern as GatesRow.
+function FinalStatusRow({ finalStatus }: { finalStatus: FinalStatus }) {
+  return (
+    <div className="gates-row" style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "0 0 16px" }}>
+      {FINAL_STATUS_LABELS.map(([key, label]) => (
+        <span key={key} className="meta-value" style={{ ["--badge-color" as any]: finalStatusColor(key, finalStatus[key]) }}>
+          {label}: {finalStatus[key]}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // Exported so the IDE shell's bottom-panel VERIFICATION tab can re-home this
 // exact body (session-scoped) without re-implementing the check rendering.
-export function VerificationBody({ verification }: { verification: VerificationSummary | null | undefined }) {
+export function VerificationBody({
+  verification, finalStatus,
+}: { verification: VerificationSummary | null | undefined; finalStatus?: FinalStatus }) {
   if (!verification) return <EmptyState icon="◌" text="Unavailable" />;
   const checks = verification.checks;
   return (
     <div>
+      {finalStatus && <FinalStatusRow finalStatus={finalStatus} />}
       <div style={{ marginBottom: 16 }}>
         <StatusBadge status={verification.overall} />
       </div>
@@ -72,6 +127,7 @@ export function VerificationBody({ verification }: { verification: VerificationS
       {checks.map((c) => (
         <CheckCard key={c.command} check={c} />
       ))}
+      <RecommendedSection checks={verification.recommendedChecks} />
     </div>
   );
 }
@@ -90,11 +146,15 @@ export function VerificationCenterScreen() {
   });
 
   const verification = id ? sessionQuery.data?.verification : statusQuery.data?.verification;
+  // finalStatus only exists on a real GlimmerSession (composed by
+  // readSession) -- DashboardStatus's own embedded verification summary (no
+  // :id) has no session to compose one from.
+  const finalStatus = id ? sessionQuery.data?.finalStatus : undefined;
 
   return (
     <div>
       <h1>Verification</h1>
-      <VerificationBody verification={verification} />
+      <VerificationBody verification={verification} finalStatus={finalStatus} />
     </div>
   );
 }

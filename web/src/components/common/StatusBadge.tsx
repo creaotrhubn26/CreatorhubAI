@@ -6,9 +6,19 @@ const COLOR: Record<string, string> = {
   implementing: "var(--blue)", verifying: "var(--blue)", discovery: "var(--blue)",
   preflight: "var(--blue)", understanding: "var(--blue)", candidate_selection: "var(--blue)",
   NOT_RUN: "var(--gray)", created: "var(--gray)", cancelled: "var(--gray)",
+  // V7 §20: non-success terminal (workspace changed after VERIFIED) -- same
+  // amber as needs_review/repairing, not red: no failure occurred, a re-run
+  // just needs to happen.
+  stale: "var(--amber)",
   // Stepper-only step states (RepairCycleStepper) — not session/verification
   // statuses, just the local DONE/RUNNING/PENDING vocabulary it derives.
   DONE: "var(--green)", RUNNING: "var(--blue)", PENDING: "var(--gray)",
+  // V7 §22.4/§22.14 visual verification statuses (build_findings /
+  // build_manifest, VisualVerificationPanel) — lowercase "pass"/"partial"
+  // are the capture-only manifest.status; the rest are findings.json's
+  // real reviewed/blocked/warned outcomes once --vision ran.
+  pass: "var(--green)", partial: "var(--amber)",
+  PASS_WITH_WARNINGS: "var(--amber)", BLOCKED: "var(--amber)", FAIL: "var(--red)",
 };
 
 // Shared with the IDE shell (session-list status dots, tab dots) so every

@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { promises as fs } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import {
   parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus,
 } from "./sessions.js";
+import { computeDiffHash } from "./git.js";
 import type { ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask } from "@glimmer/shared";
 import type { TaskContract } from "@glimmer/shared";
 
@@ -113,6 +116,48 @@ describe("parseManifest", () => {
       "sid-6"
     );
     expect(session.failure).toEqual({ class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] });
+  });
+});
+
+// V7 §22.17: finalStatus's functional/architecture/documentation legs are
+// all synchronously derivable from the manifest, so parseManifest computes
+// them directly -- readSession (below, in its own describe block) is only
+// responsible for upgrading the fourth leg (`visual`) after an async read.
+describe("finalStatus composition (V7 §22.17)", () => {
+  it("functional mirrors verification.overall exactly", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-final-1");
+    expect(session.finalStatus.functional).toBe(session.verification.overall);
+    expect(session.finalStatus.functional).toBe("VERIFIED");
+  });
+
+  it("defaults architecture/documentation/visual to not_run with no gates at all", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-final-2");
+    expect(session.finalStatus.architecture).toBe("not_run");
+    expect(session.finalStatus.documentation).toBe("not_run");
+    expect(session.finalStatus.visual).toBe("not_run");
+  });
+
+  it.each([
+    [true, "approved"],
+    [false, "rejected"],
+    [null, "not_run"],
+  ] as const)("gates.architectureApproved %s -> finalStatus.architecture %s", (raw, expected) => {
+    const session = parseManifest({ ...REAL_MANIFEST, gates: { architectureApproved: raw } }, "sid-final-3");
+    expect(session.finalStatus.architecture).toBe(expected);
+  });
+
+  it.each([
+    [true, "approved"],
+    [false, "rejected"],
+    [null, "not_run"],
+  ] as const)("gates.documentationCurrent %s -> finalStatus.documentation %s", (raw, expected) => {
+    const session = parseManifest({ ...REAL_MANIFEST, gates: { documentationCurrent: raw } }, "sid-final-4");
+    expect(session.finalStatus.documentation).toBe(expected);
+  });
+
+  it("a manifest with no attempts (NOT_RUN) reports functional NOT_RUN, not a crash", () => {
+    const session = parseManifest({ ...REAL_MANIFEST, attempts: [], status: "initialized" }, "sid-final-5");
+    expect(session.finalStatus.functional).toBe("NOT_RUN");
   });
 });
 
@@ -380,6 +425,75 @@ describe("opt-in orchestrator artifact reads", () => {
   });
 });
 
+const REAL_VISUAL_MANIFEST = {
+  route: "http://localhost:5183/role-room",
+  viewports: ["1440x900", "390x844"],
+  states: ["initial"],
+  status: "pass",
+  captures: [
+    { viewport: "1440x900", screenshot: "1440x900.png", status: "captured", error: null },
+    { viewport: "390x844", screenshot: "390x844.png", status: "captured", error: null },
+  ],
+};
+
+describe("visual verification reads + finalStatus.visual override (V7 §22.14/§22.17)", () => {
+  it("readVisualManifest returns the parsed manifest when present", async () => {
+    const id = "20260822-000050-glimmer-visual-manifest";
+    const dir = path.join(contractStateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    expect(await sessionsIsolated.readVisualManifest(id)).toEqual(REAL_VISUAL_MANIFEST);
+  });
+
+  it("readVisualManifest/readVisualFindings return null when no visual/ dir exists (normal, opt-in)", async () => {
+    const id = "20260822-000051-glimmer-no-visual";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readVisualManifest(id)).toBeNull();
+    expect(await sessionsIsolated.readVisualFindings(id)).toBeNull();
+  });
+
+  it("readSession upgrades finalStatus.visual from findings.json's real status", async () => {
+    const id = "20260822-000052-glimmer-visual-findings";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    const visualDir = path.join(dir, "visual");
+    await fs.mkdir(visualDir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(visualDir, "findings.json"),
+      JSON.stringify({ status: "PASS_WITH_WARNINGS", viewport: "multi", viewports: ["1440x900", "390x844"], findings: [] })
+    );
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.finalStatus.visual).toBe("PASS_WITH_WARNINGS");
+    // The other three legs are untouched by the visual override.
+    expect(session?.finalStatus.functional).toBe("VERIFIED");
+  });
+
+  it("readSession falls back to not_run for an unrecognized findings.json status", async () => {
+    const id = "20260822-000052b-glimmer-visual-bad-status";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    const visualDir = path.join(dir, "visual");
+    await fs.mkdir(visualDir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(visualDir, "findings.json"),
+      JSON.stringify({ status: "SOMETHING_UNKNOWN", viewport: "multi", viewports: ["1440x900"], findings: [] })
+    );
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.finalStatus.visual).toBe("not_run");
+  });
+
+  it("readSession leaves finalStatus.visual as not_run when no visual/ dir exists", async () => {
+    const id = "20260822-000053-glimmer-no-visual-session";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.finalStatus.visual).toBe("not_run");
+  });
+});
+
 describe("human acceptance (§14 Diff Review)", () => {
   it("readHumanAcceptance returns null when no one has accepted yet (normal)", async () => {
     const id = "20260817-000050-glimmer-not-accepted";
@@ -423,5 +537,169 @@ describe("human acceptance (§14 Diff Review)", () => {
     await sessionsIsolated.writeHumanAcceptance(id);
     const after = await sessionsIsolated.readSession(id);
     expect(after?.humanAcceptance?.accepted).toBe(true);
+  });
+});
+
+// V7 §20 session-level verification freeze: verifiedAt/finalDiffHash
+// pass-through + gateway-computed "stale" status.
+//
+// Review round 1 fix: staleness is NOT "workspace has uncommitted changes"
+// -- glimmer-v2.py's collapse() (its `finally` block) resets HEAD back to
+// baselineSha and DELIBERATELY leaves the produced diff sitting as
+// uncommitted working-tree state (that's what View diff/accept read), so
+// every successful-with-a-diff session is "dirty" at verifiedAt time BY
+// CONSTRUCTION. Every fixture below therefore models production ordering
+// explicitly: (1) commit baseline content, (2) leave an UNCOMMITTED diff in
+// the workspace exactly as collapse() would, (3) compute finalDiffHash from
+// THAT state via the real computeDiffHash() (same function git.test.ts's
+// cross-language contract test proves matches Python byte-for-byte) --
+// never a hand-picked/hardcoded hash. Staleness is then: does the CURRENT
+// diff-against-baseline still hash to that same value.
+describe("session-level verification freeze (V7 §20)", () => {
+  const exec = promisify(execFile);
+  let verifiedWorkspace: string;
+  let baselineSha: string;
+
+  // The exact uncommitted diff a real collapse() would have left: a.txt
+  // changed from its committed "one\n" to "one\ntwo\n".
+  const POST_VERIFY_CONTENT = "one\ntwo\n";
+
+  const verifiedManifest = (finalDiffHash: string) => ({
+    ...REAL_MANIFEST,
+    status: "verified",
+    verifiedAt: "2026-08-21T00:00:00.000Z",
+    baseline: baselineSha,
+    finalDiffHash,
+    workspace: verifiedWorkspace,
+  });
+
+  async function writeSession(id: string, manifest: unknown) {
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...(manifest as object), sessionId: id }));
+  }
+
+  beforeAll(async () => {
+    verifiedWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-verified-ws-"));
+    await exec("git", ["init", "-q"], { cwd: verifiedWorkspace });
+    await exec("git", ["config", "user.email", "t@t.com"], { cwd: verifiedWorkspace });
+    await exec("git", ["config", "user.name", "t"], { cwd: verifiedWorkspace });
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "one\n");
+    await exec("git", ["add", "a.txt"], { cwd: verifiedWorkspace });
+    await exec("git", ["commit", "-q", "-m", "init"], { cwd: verifiedWorkspace });
+    baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: verifiedWorkspace })).stdout.trim();
+  });
+
+  afterAll(async () => {
+    await fs.rm(verifiedWorkspace, { recursive: true, force: true });
+  });
+
+  it("parseManifest passes verifiedAt and finalDiffHash through when present, leaves both undefined otherwise", () => {
+    const withIt = parseManifest(verifiedManifest("deadbeef"), "sid-verified-at");
+    expect(withIt.verifiedAt).toBe("2026-08-21T00:00:00.000Z");
+    expect(withIt.finalDiffHash).toBe("deadbeef");
+    const withoutIt = parseManifest(REAL_MANIFEST, "sid-no-verified-at");
+    expect(withoutIt.verifiedAt).toBeUndefined();
+    expect(withoutIt.finalDiffHash).toBeUndefined();
+  });
+
+  describe("with a real post-collapse uncommitted diff (production ordering)", () => {
+    let finalDiffHash: string;
+
+    beforeAll(async () => {
+      // Model collapse()'s end state: HEAD stays at baselineSha, working
+      // tree holds the uncommitted diff. finalDiffHash is fingerprinted from
+      // exactly this state, same as glimmer-v2.py's `finally` block does.
+      await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), POST_VERIFY_CONTENT);
+      finalDiffHash = await computeDiffHash(verifiedWorkspace, baselineSha);
+    });
+
+    it("readSession without computeStale never touches git and reports plain verified", async () => {
+      const id = "20260821-000060-glimmer-stale-no-opt";
+      await writeSession(id, verifiedManifest(finalDiffHash));
+      const session = await sessionsIsolated.readSession(id);
+      expect(session?.status).toBe("verified");
+    });
+
+    it("readSession with computeStale reports plain verified when nothing changed since collapse", async () => {
+      const id = "20260821-000061-glimmer-stale-unchanged";
+      await writeSession(id, verifiedManifest(finalDiffHash));
+      const session = await sessionsIsolated.readSession(id, { computeStale: true });
+      expect(session?.status).toBe("verified");
+    });
+
+    it("readSession with computeStale reports stale once the workspace is modified again after collapse", async () => {
+      await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "one\ntwo\nTHREE\n");
+      const id = "20260821-000062-glimmer-stale-modified";
+      await writeSession(id, verifiedManifest(finalDiffHash));
+
+      const session = await sessionsIsolated.readSession(id, { computeStale: true });
+      expect(session?.status).toBe("stale");
+      // V7 §22.17: the gate object must agree with §20 staleness -- a stale
+      // session's finalStatus.functional must not still read VERIFIED.
+      expect(session?.finalStatus.functional).toBe("NEEDS_REVIEW");
+    });
+
+    it("readSession with computeStale is NOT stale again once content is restored EXACTLY (hash equality, not mtime)", async () => {
+      // Rewriting the identical bytes gives this file a fresh mtime/inode
+      // timestamp -- if staleness were mtime-based this would still read
+      // stale. It must not: content hash equality is what matters.
+      await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), POST_VERIFY_CONTENT);
+      const id = "20260821-000063-glimmer-stale-restored";
+      await writeSession(id, verifiedManifest(finalDiffHash));
+
+      const session = await sessionsIsolated.readSession(id, { computeStale: true });
+      expect(session?.status).toBe("verified");
+    });
+
+    it("readSession with computeStale detects a NEW untracked file as a hash change too", async () => {
+      await fs.writeFile(path.join(verifiedWorkspace, "untracked-after-verify.txt"), "surprise\n");
+      const id = "20260821-000064-glimmer-stale-untracked";
+      await writeSession(id, verifiedManifest(finalDiffHash));
+
+      const session = await sessionsIsolated.readSession(id, { computeStale: true });
+      expect(session?.status).toBe("stale");
+
+      await fs.rm(path.join(verifiedWorkspace, "untracked-after-verify.txt"));
+    });
+
+    afterAll(async () => {
+      // Restore to the fixture's baseline post-collapse state for any
+      // later test in this file that might reuse verifiedWorkspace.
+      await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), POST_VERIFY_CONTENT);
+    });
+  });
+
+  it("readSession with computeStale is NOT stale when finalDiffHash is absent (older manifest)", async () => {
+    const id = "20260821-000065-glimmer-stale-no-hash";
+    const { finalDiffHash: _omit, ...manifestWithoutHash } = verifiedManifest("irrelevant");
+    await writeSession(id, manifestWithoutHash);
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("verified");
+  });
+
+  it("readSession with computeStale is NOT stale when the workspace directory no longer exists", async () => {
+    const goneWorkspace = path.join(os.tmpdir(), "glimmer-workspace-that-never-existed-" + Date.now());
+    const id = "20260821-000066-glimmer-stale-workspace-gone";
+    await writeSession(id, { ...verifiedManifest("irrelevant"), workspace: goneWorkspace });
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("verified");
+  });
+
+  it("readSession with computeStale never flips a non-verified status to stale even with a hash mismatch", async () => {
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "totally different content\n");
+    const id = "20260821-000067-glimmer-stale-not-verified";
+    await writeSession(id, {
+      ...verifiedManifest("some-hash-that-will-never-match"),
+      status: "no-change-unverified",
+      verifiedAt: undefined,
+    });
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("needs_review");
+
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), POST_VERIFY_CONTENT);
   });
 });

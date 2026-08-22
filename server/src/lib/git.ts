@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import type { ChangedFile, CreateWorkspaceResult } from "@glimmer/shared";
 import { CONFIG } from "../config.js";
@@ -78,6 +79,59 @@ export async function gitDiff(workspace: string, paths: string[] = []): Promise<
   if (tracked.length > 0) parts.push(await git(workspace, ["diff", "--no-color", "--", ...tracked]));
   for (const p of untracked) parts.push(await gitDiffUntrackedFile(workspace, p));
   return parts.filter(Boolean).join("");
+}
+
+// V7 §20 session-level verification freeze — CROSS-LANGUAGE CONTRACT, must
+// match glimmer-v2.py's diff_hash(ws, baseline) (glimmer-v2.py, ~line 471)
+// byte-for-byte, or stale detection silently breaks. Both sides hash, in
+// order:
+//   1. the raw stdout of `git diff --binary <baseline> --` (run in workspace)
+//   2. for each path from `git ls-files --others --exclude-standard`, in
+//      THAT command's own output order: utf8(path) + 0x00 + the file's raw
+//      bytes (empty if it can't be read) + 0x00
+// Why this is safe despite glimmer-v2.py routing step 1 through a
+// text-mode subprocess (decode UTF-8, then re-`.encode()` before hashing):
+// that round-trip is lossless for valid UTF-8, which `git diff --binary`
+// always produces (binary hunks are base85-encoded, i.e. plain ASCII) —
+// capturing raw bytes here reproduces the identical input Python actually
+// hashes, without needing to replicate the round-trip.
+async function gitDiffHashInput(
+  workspace: string,
+  baseline: string,
+  opts: { timeoutMs?: number }
+): Promise<{ diff: Buffer; others: string[] }> {
+  const [{ stdout: diff }, othersRaw] = await Promise.all([
+    exec("git", ["diff", "--binary", baseline, "--"], {
+      cwd: workspace, maxBuffer: 20 * 1024 * 1024, timeout: opts.timeoutMs, encoding: "buffer",
+    }),
+    git(workspace, ["ls-files", "--others", "--exclude-standard"], opts),
+  ]);
+  // Mirrors glimmer-v2.py's lines(): split on any newline, drop blank lines.
+  const others = othersRaw.split(/\r\n|\r|\n/).filter((l) => l.trim());
+  return { diff: diff as unknown as Buffer, others };
+}
+
+export async function computeDiffHash(
+  workspace: string,
+  baseline: string,
+  opts: { timeoutMs?: number } = {}
+): Promise<string> {
+  const { diff, others } = await gitDiffHashInput(workspace, baseline, opts);
+  const hash = createHash("sha256");
+  hash.update(diff);
+  for (const rel of others) {
+    hash.update(Buffer.from(rel, "utf-8"));
+    hash.update(Buffer.from([0]));
+    try {
+      hash.update(await fs.readFile(path.join(workspace, rel)));
+    } catch {
+      // Matches diff_hash's `except OSError: pass` -- file vanished/
+      // unreadable between ls-files and the read; contributes no content,
+      // still gets the trailing NUL below.
+    }
+    hash.update(Buffer.from([0]));
+  }
+  return hash.digest("hex");
 }
 
 export async function gitRevertFile(

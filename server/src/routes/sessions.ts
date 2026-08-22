@@ -7,14 +7,17 @@ import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
   readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
-  writeHumanAcceptance,
+  writeHumanAcceptance, readVisualManifest, readVisualFindings,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
 import { askSessionAssistant, streamSessionAssistant } from "../lib/sessionAssistant.js";
-import { isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap } from "@glimmer/shared";
+import {
+  isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap,
+  type VisualVerification,
+} from "@glimmer/shared";
 
 export const sessionsRouter = Router();
 
@@ -61,12 +64,15 @@ export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]
 
 sessionsRouter.get("/sessions", async (_req, res) => {
   const ids = await listSessionIds();
-  const sessions = (await Promise.all(ids.map(readSession))).filter(Boolean);
+  // V7 §20: deliberately NOT { computeStale: true } here -- see readSession's
+  // own comment. This is a polled list endpoint; per-session git spawns here
+  // would scale with session count on every poll interval.
+  const sessions = (await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean);
   res.json(sessions);
 });
 
 sessionsRouter.get("/sessions/:id", async (req, res) => {
-  const session = await readSession(req.params.id);
+  const session = await readSession(req.params.id, { computeStale: true });
   if (!session) return res.status(404).json({ error: "not found" });
   res.json(session);
 });
@@ -292,6 +298,60 @@ sessionsRouter.get("/sessions/:id/tasks", async (req, res) => {
     if (!tasks) return res.status(404).json({ error: "not found" });
     res.json(tasks);
   } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// V7 §22.14/§22.16 visual evidence store -- static serving of a session's
+// visual/ artifacts. Same opt-in-artifact-absence convention as /plan,
+// /architect-reviews, etc.: no visual/ dir at all is normal (most sessions
+// never run glimmer-visual.py) and 404s honestly rather than erroring.
+sessionsRouter.get("/sessions/:id/visual/manifest", async (req, res) => {
+  try {
+    const manifest = await readVisualManifest(req.params.id);
+    if (!manifest) return res.status(404).json({ error: "not found" });
+    // findings.json is written unconditionally alongside visual-manifest.json
+    // by glimmer-visual.py's main(), so it should always be present once
+    // manifest is -- null here means a genuine read fault, not "vision
+    // wasn't run" (that's findings.status === "NOT_RUN", a different fact).
+    const findings = await readVisualFindings(req.params.id);
+    const body: VisualVerification = { manifest, findings };
+    res.json(body);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Screenshot filenames are exactly what glimmer-visual.py writes:
+// "{viewport}.png" or "{viewport}-{state}.png", e.g. "1440x900.png" /
+// "1440x900-dialogopen.png" -- letters, digits, and "-" only. This is a
+// file-serving endpoint (untrusted path segment straight into a filesystem
+// read), so validation is intentionally strict rather than permissive: no
+// ".", no "/", nothing a traversal payload could exploit, checked BEFORE
+// the file is ever touched. The resolved-path containment check below is
+// deliberate defense in depth on top of that charset restriction, not a
+// substitute for it (same two-layer discipline as isValidSessionId).
+const VISUAL_SCREENSHOT_FILENAME_RE = /^[A-Za-z0-9x-]+\.png$/;
+
+function resolveVisualScreenshotPath(visualDir: string, file: string): string | null {
+  if (!VISUAL_SCREENSHOT_FILENAME_RE.test(file)) return null;
+  const resolvedDir = path.resolve(visualDir);
+  const resolved = path.resolve(visualDir, file);
+  if (resolved !== path.join(resolvedDir, file) || !resolved.startsWith(resolvedDir + path.sep)) return null;
+  return resolved;
+}
+
+sessionsRouter.get("/sessions/:id/visual/screenshot/:file", async (req, res) => {
+  const real = resolveSessionId(req.params.id);
+  if (!isValidSessionId(real)) return res.status(404).json({ error: "not found" });
+  const visualDir = path.join(sessionsDir(), real, "visual");
+  const resolved = resolveVisualScreenshotPath(visualDir, req.params.file);
+  if (!resolved) return res.status(400).json({ error: "invalid filename" });
+  try {
+    const bytes = await fs.readFile(resolved);
+    res.type("png").send(bytes);
+  } catch (err: any) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "not found" });
     res.status(500).json({ error: err.message });
   }
 });

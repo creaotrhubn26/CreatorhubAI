@@ -24,7 +24,10 @@ statusRouter.get("/status", async (_req, res) => {
   // leaving recentSessions/latestSession/activeSession empty even with
   // plenty of real sessions on disk. Read+filter everything, then take the
   // newest 10 real sessions.
-  const sessions = ((await Promise.all(ids.map(readSession))).filter(Boolean) as NonNullable<
+  // V7 §20: plain readSession(id) (computeStale left false) -- this reads
+  // the whole session list on this polled status endpoint, same reasoning
+  // as GET /sessions.
+  const sessions = ((await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean) as NonNullable<
     Awaited<ReturnType<typeof readSession>>
   >[]).slice(0, 10);
   // Inclusion, not exclusion: an unmapped/terminal status must never be shown

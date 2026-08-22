@@ -1,6 +1,7 @@
 import type {
   DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance, CreateWorkspaceResult,
+  VisualVerification,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -25,6 +26,20 @@ export const glimmerApi = {
   getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),
   getSessionTasks: (id: string) => request<GlimmerTask[]>(`/api/sessions/${id}/tasks`),
+  // V7 §22.16 -- bypasses the generic request() helper (which throws on any
+  // non-2xx) because 404 here is the honest, common "never ran
+  // glimmer-visual.py" case a panel needs to render as "Not run", not an
+  // error to surface.
+  getVisualVerification: async (id: string): Promise<VisualVerification | null> => {
+    const res = await fetch(`${API_BASE}/api/sessions/${id}/visual/manifest`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`GET /api/sessions/${id}/visual/manifest failed: ${res.status}`);
+    return res.json() as Promise<VisualVerification>;
+  },
+  // Full-size screenshot URL — opened directly (new tab / <img src>), never
+  // fetched through request().
+  visualScreenshotUrl: (id: string, file: string) =>
+    `${API_BASE}/api/sessions/${id}/visual/screenshot/${encodeURIComponent(file)}`,
   askSession: (id: string, question: string) =>
     request<SessionAssistantAnswer>(`/api/sessions/${id}/ask`, { method: "POST", body: JSON.stringify({ question }) }),
   // Streaming variant: no EventSource (a POST body is required), so this
