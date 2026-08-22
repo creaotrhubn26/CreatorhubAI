@@ -2819,9 +2819,10 @@ def _paths_share_area(path, node_path):
 
 def _map_changed_files_to_doc_nodes(graph, changed_files):
     """Replica of glimmer-v2.py's map_changed_files_to_doc_nodes -- see
-    that function's docstring for the full two-signal (path-prefix +
-    keyword-category) rationale, including the M1 path-scoping fix on
-    the category signal (Review round 7). Pure, no I/O."""
+    that function's docstring for the full three-signal (path-prefix +
+    keyword-category + evidence-link) rationale, including the M1
+    path-scoping fix on the category signal and the Round 7 live
+    checkpoint L3 evidence-link signal. Pure, no I/O."""
     nodes_by_id = {
         n["id"]: n for n in (graph.get("nodes") or [])
         if isinstance(n, dict) and n.get("id")
@@ -2832,6 +2833,9 @@ def _map_changed_files_to_doc_nodes(graph, changed_files):
         for node in nodes_by_id.values():
             node_path = str(node.get("path") or "").replace("\\", "/")
             if node_path and (path == node_path or path.startswith(node_path.rstrip("/") + "/")):
+                touched.add(node["id"])
+            evidence = (node.get("provenance") or {}).get("evidence") or []
+            if any(path == str(ev).replace("\\", "/") for ev in evidence):
                 touched.add(node["id"])
         for category in _doc_impact_categories_for_path(path):
             wanted_type = _CATEGORY_TO_NODE_TYPE.get(category)
@@ -8084,10 +8088,21 @@ def run_engineer(
         load_validation_script_allowlist()
     )
 
+    # Round 7 live checkpoint (L2): docs/graph.json (only that exact
+    # path, see DOC_GRAPH_RELATIVE_PATH) is excluded from this repo's own
+    # clean-tree gate via a git pathspec -- it is orchestrator-owned
+    # bookkeeping glimmer-v2.py's doc pass may have legitimately left
+    # modified/uncommitted (Glimmer never commits on the model's behalf),
+    # so a fresh write session must not deadlock against a prior
+    # session's own doc-graph rewrite. Every other dirty path still
+    # blocks, exactly as before.
     baseline_status = git_local(
         workspace,
         "status",
         "--short",
+        "--",
+        ".",
+        f":(exclude){DOC_GRAPH_RELATIVE_PATH}",
     )
 
     dirty = [
@@ -9096,6 +9111,9 @@ def _doc_tools_selfcheck() -> None:
                      "title": "Auth service", "status": "CURRENT"},
                     {"id": "doc:auth-flow", "type": "doc", "path": "docs/auth-flow.md",
                      "title": "Auth flow", "status": "CURRENT"},
+                    {"id": "doc:evidence-linked", "type": "doc", "path": "docs/evidence-linked.md",
+                     "title": "Evidence-linked doc", "status": "CURRENT",
+                     "provenance": {"evidence": ["src/unrelated_evidence.ts"]}},
                 ],
                 "edges": [
                     {"from": "doc:auth-flow", "to": "svc:auth", "kind": "documents"},
@@ -9168,6 +9186,15 @@ def _doc_tools_selfcheck() -> None:
                 "docs_impact: no impacted documentation nodes."
             )
 
+            # Round 7 live checkpoint (L3), mirrored from glimmer-v2.py: a
+            # changed file matching a doc node's own provenance.evidence
+            # must be treated as impacted, even with no path-prefix or
+            # category relationship to that node at all.
+            evidence_impact = _docs_impact(["src/unrelated_evidence.ts"], _loaded_doc_graph)
+            assert "doc:evidence-linked" in evidence_impact, (
+                "changed file matching provenance.evidence must impact its doc node (L3)"
+            )
+
             # ------------------------------------------------------------
             # 6. _execute_doc_tool: structural "not offered" fallback --
             #    calling a doc tool with no graph loaded must degrade to an
@@ -9190,6 +9217,31 @@ def _doc_tools_selfcheck() -> None:
             #    gets read-oriented documentation tools, same as engineer).
             # ------------------------------------------------------------
             assert DOC_TOOL_NAMES <= ARCHITECT_TOOL_NAMES
+
+            # ------------------------------------------------------------
+            # 9. Round 7 live checkpoint (L2): run_engineer's own clean-
+            #    working-tree gate uses the exact same git pathspec-exclude
+            #    call as glimmer-v2.py's clean_start_dirty -- a solely-
+            #    dirty docs/graph.json must not trip it, a genuinely dirty
+            #    OTHER path still must. Exercised directly against the
+            #    real git command (not run_engineer() itself, which needs
+            #    a live model) so a regression here is still caught.
+            # ------------------------------------------------------------
+            git_local(ws, "init", "-q")
+            git_local(ws, "add", "-A")
+            git_local(ws, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "init")
+            (ws / "docs" / "graph.json").write_text('{"nodes": [], "edges": [], "changed": true}')
+            clean_tree_status = git_local(
+                ws, "status", "--short", "--", ".", f":(exclude){DOC_GRAPH_RELATIVE_PATH}",
+            )
+            assert clean_tree_status == "", (
+                "a solely-dirty docs/graph.json must not trip run_engineer's clean-tree gate"
+            )
+            (ws / "extra.ts").write_text("export const y = 2;")
+            dirty_status = git_local(
+                ws, "status", "--short", "--", ".", f":(exclude){DOC_GRAPH_RELATIVE_PATH}",
+            )
+            assert "extra.ts" in dirty_status, "a genuinely dirty OTHER path must still trip the gate"
     finally:
         _loaded_doc_graph = saved_graph
 

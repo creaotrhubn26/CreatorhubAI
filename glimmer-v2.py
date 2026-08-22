@@ -363,6 +363,29 @@ def status(ws):
     return lines(git(ws, "status", "--porcelain=v1", "--untracked-files=all"))
 
 
+def clean_start_dirty(ws) -> list:
+    """The clean-start check's own dirty list -- status(ws), except
+    docs/graph.json (only that exact path, see DOC_GRAPH_RELATIVE_PATH) is
+    tolerated (Round 7 live checkpoint, L2): it is orchestrator-owned
+    bookkeeping a prior session's doc pass may have legitimately left
+    modified/uncommitted (Glimmer never commits on the model's behalf --
+    noCommit is a hard constraint), so back-to-back sessions must not
+    deadlock against each other over it. Every other dirty path still
+    blocks, exactly as before.
+
+    Excluded via a git pathspec (`:(exclude)...`), NOT by slicing/string-
+    matching status(ws)'s porcelain lines -- git()'s blanket .strip() eats
+    the leading status-column space whenever the excluded path would
+    otherwise be the very first line of combined stdout, which silently
+    breaks a column-based (`line[3:]`) parse of that one line. main() and
+    --doc-graph-selfcheck both call this SAME function so the selfcheck
+    exercises the real logic, never a private reimplementation that could
+    silently drift from it (the exact class of gap Review round 7's C1
+    called out)."""
+    return lines(git(ws, "status", "--porcelain=v1", "--untracked-files=all",
+                      "--", ".", f":(exclude){DOC_GRAPH_RELATIVE_PATH}"))
+
+
 def branch(ws):
     return git(ws, "branch", "--show-current")
 
@@ -383,7 +406,19 @@ def commit_subject(ws, rev="HEAD"):
 def changed_files(ws, baseline):
     tracked = lines(git(ws, "diff", "--name-only", baseline, "--"))
     untracked = lines(git(ws, "ls-files", "--others", "--exclude-standard"))
-    return sorted(set(tracked + untracked))
+    all_files = sorted(set(tracked + untracked))
+    # Round 7 live checkpoint (L2): docs/graph.json is orchestrator-owned
+    # deterministic bookkeeping (see DOC_GRAPH_RELATIVE_PATH / _write_doc_graph)
+    # -- run_doc_pass, not the model, ever writes it. Excluding it here, at
+    # the one shared function every model-changed-files/scope-guard/
+    # maxChangedFiles-budget call site already routes through, means a
+    # legitimate graph-status rewrite is never attributed to the model's
+    # diff, never eats the changed-files budget, and never trips scope
+    # guard -- whether it was this session's own doc pass that wrote it,
+    # or a prior session's write still sitting uncommitted in the tree.
+    # Tracked separately, honestly, via manifest["orchestratorUpdatedFiles"]
+    # (see run_doc_pass).
+    return [f for f in all_files if f != DOC_GRAPH_RELATIVE_PATH]
 
 
 def changed_files_budget_exceeded(files: list, max_changed_files) -> bool:
@@ -3984,6 +4019,21 @@ def _looks_like_doc_path_ref(ref: str) -> bool:
     return ext in _DOC_PATH_REF_NO_SLASH_EXTS
 
 
+# Round 7 live checkpoint (L1): a run of 3+ identical letters (`NNNN`,
+# `XXXX`) or an angle-bracket segment (`<name>`) inside a doc path
+# reference is an obvious template placeholder from example prose
+# ("see `decisions/ADR-NNNN.md`"), never a real path this repo could
+# contain -- check_doc_drift skips these rather than flagging them as
+# broken links.
+_DOC_PATH_REF_PLACEHOLDER_RE = re.compile(r"([A-Za-z])\1{2,}")
+
+
+def _ref_has_placeholder(ref: str) -> bool:
+    if "<" in ref and ">" in ref:
+        return True
+    return bool(_DOC_PATH_REF_PLACEHOLDER_RE.search(ref))
+
+
 def load_doc_graph(ws) -> "dict | None":
     """Task 7.1: tolerant reader for <ws>/docs/graph.json. Absent file ->
     None (most repos have no graph yet -- not an error). Malformed JSON,
@@ -4148,7 +4198,7 @@ def _paths_share_area(path: str, node_path: str) -> bool:
 
 def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
     """Task 7.2 ("Impact analysis through the graph"): which doc-type
-    nodes does this diff's changed-file set touch? Two independent
+    nodes does this diff's changed-file set touch? Three independent
     signals, unioned into a "touched" node set:
 
       1. path-prefix match -- a changed file IS a node's recorded path, or
@@ -4160,6 +4210,14 @@ def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
          area with the changed file (_paths_share_area), not every node
          of that type in the graph. Without this, one route file change
          would mark every route doc in the repo impacted/STALE.
+      3. Round 7 live checkpoint (L3): exact match against the node's own
+         provenance.evidence entries -- a doc node that explicitly records
+         "I was verified against src/greet.js" must be treated as touched
+         the moment src/greet.js changes, even when the file lives nowhere
+         near the doc's own path and matches no category heuristic. Without
+         this, a changed evidence file only ever reached the gate by luck,
+         via check_doc_drift accidentally re-scanning the same doc's prose
+         for broken links -- the evidence link itself was silently ignored.
 
     A touched node that is itself type=="doc" is directly impacted. A
     touched node that is NOT a doc is impacted through any "documents"
@@ -4176,6 +4234,9 @@ def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
         for node in nodes_by_id.values():
             node_path = str(node.get("path") or "").replace("\\", "/")
             if node_path and (path == node_path or path.startswith(node_path.rstrip("/") + "/")):
+                touched.add(node["id"])
+            evidence = (node.get("provenance") or {}).get("evidence") or []
+            if any(path == str(ev).replace("\\", "/") for ev in evidence):
                 touched.add(node["id"])
         for category in _categories_for_path(path):
             wanted_type = _CATEGORY_TO_NODE_TYPE.get(category)
@@ -4274,8 +4335,16 @@ def check_doc_drift(graph: dict, ws) -> list:
     _DOC_PATH_REF_RE), narrowed to plausible paths by
     _looks_like_doc_path_ref (Review round 7, M2 -- the raw regex alone
     also matches prose like `Node.js`/`example.com`, which is never a
-    path reference). Any reference that doesn't resolve to a real path
-    under `ws` is a drift finding. Findings are capped at 10 per node,
+    path reference). A reference resolves (is not a finding) if it exists
+    either under the workspace root OR under the doc file's OWN directory
+    (Round 7 live checkpoint, L1) -- a doc at docs/README.md that says
+    `` `graph.json` `` means docs/graph.json, not a repo-root graph.json;
+    resolving only from repo root made every doc that refers to a
+    sibling file by its bare name a false-positive drift finding. A
+    reference containing an obvious placeholder segment (`NNNN`, `XXXX`,
+    `<...>` -- see _ref_has_placeholder) is skipped entirely, not
+    flagged: example prose like "see `decisions/ADR-NNNN.md`" was never a
+    real path. Findings are capped at 10 per node,
     recorded at node.provenance.driftFindings, and any node with at least
     one finding is flagged STALE. Writes the graph back atomically.
     Returns [{"nodeId", "reason"}] for every node with new findings --
@@ -4299,7 +4368,9 @@ def check_doc_drift(graph: dict, ws) -> list:
         for ref in _DOC_PATH_REF_RE.findall(text):
             if not _looks_like_doc_path_ref(ref):
                 continue
-            if (Path(ws) / ref).exists():
+            if _ref_has_placeholder(ref):
+                continue
+            if (Path(ws) / ref).exists() or (abs_path.parent / ref).exists():
                 continue
             findings.append(ref)
             if len(findings) >= 10:
@@ -4400,6 +4471,18 @@ def run_doc_pass(ws, events_path, sid, manifest: dict, tasks, session) -> None:
         for drifted in check_doc_drift(doc_graph, ws):
             emit_event(events_path, "documentation_stale_detected", sid,
                        nodeId=drifted["nodeId"], reason=drifted["reason"])
+
+        # Round 7 live checkpoint (L2): docs/graph.json is excluded from
+        # changed_files()'s output (it's orchestrator-owned, never model
+        # output -- see that function), so if the doc pass above (this
+        # session's, or a prior tolerated-dirty one -- see the clean-start
+        # check) left it differing from HEAD, that fact must still be
+        # recorded SOMEWHERE honestly, or the graph rewrite becomes
+        # invisible bookkeeping rather than a labeled, separate thing.
+        # Additive field -- omitted entirely when the graph isn't dirty.
+        if bool(git(ws, "status", "--porcelain=v1", "--untracked-files=all",
+                     "--", DOC_GRAPH_RELATIVE_PATH, check=False)):
+            manifest["orchestratorUpdatedFiles"] = [DOC_GRAPH_RELATIVE_PATH]
 
     # Same merge-not-clobber discipline as every other gates writer (e.g.
     # architectureApproved, set earlier in the same run) -- read whatever
@@ -5075,7 +5158,8 @@ def main():
             print(f"  - {f}")
         raise V2Error("Recovery completed safely. Review/reset the preserved diff, then rerun v2.1")
 
-    b, baseline, up, dirty = branch(ws), head(ws), upstream(ws), status(ws)
+    b, baseline, up = branch(ws), head(ws), upstream(ws)
+    dirty = clean_start_dirty(ws)
     if dirty:
         raise V2Error("V2.1 requires clean start:\n" + "\n".join(dirty[:100]))
     if not args.allow_non_glimmer_branch and not b.startswith("glimmer/"):
@@ -7901,6 +7985,20 @@ def _doc_graph_selfcheck() -> None:
         assert impacted == ["doc-api"], impacted
         assert map_changed_files_to_doc_nodes(graph, ["unrelated/z.txt"]) == []
 
+        # --- 3b. Round 7 live checkpoint (L3): a changed file matching a
+        # doc node's own provenance.evidence must be treated as touched,
+        # even with no path-prefix or category relationship at all --
+        # this is the signal that used to be silently ignored, and the
+        # live smoke-test scenario this fixes exactly. ---
+        graph["nodes"].append({
+            "id": "doc-evidence-linked", "type": "doc", "path": "docs/evidence-linked.md",
+            "status": "UNVERIFIED", "provenance": {"evidence": ["src/unrelated_evidence.ts"]},
+        })
+        assert map_changed_files_to_doc_nodes(graph, ["src/unrelated_evidence.ts"]) == [
+            "doc-evidence-linked"
+        ], "changed file matching provenance.evidence must impact its doc node (L3)"
+        assert map_changed_files_to_doc_nodes(graph, ["src/no_match_at_all.ts"]) == []
+
         # --- 4. apply_doc_impact: stale-flag, same-diff doc exemption, frozen skip ---
         for n in graph["nodes"]:
             if n["id"] == "doc-api":
@@ -7920,6 +8018,29 @@ def _doc_graph_selfcheck() -> None:
         drifty = [n for n in graph["nodes"] if n["id"] == "doc-drifty"][0]
         assert drifty["provenance"]["driftFindings"] == ["src/removed.ts"]
         assert drifty["status"] == DOC_STATUS_STALE
+
+        # --- 5b. Round 7 live checkpoint (L1): a bare-name ref resolves
+        # relative to the doc file's OWN directory, not just repo root;
+        # a ref with an obvious placeholder segment is skipped, not
+        # flagged. docs/graph.json already exists on disk at this point
+        # (verify_doc_nodes wrote it in step 2 above), so a doc living in
+        # docs/ that refers to it by bare name (`graph.json`) must resolve
+        # -- and `decisions/ADR-NNNN.md` (no such file, and never will be
+        # one) must be skipped as an example placeholder, not flagged. ---
+        (ws / "docs" / "relref.md").write_text(
+            "See `graph.json` and `decisions/ADR-NNNN.md` for details."
+        )
+        graph["nodes"].append({"id": "doc-relref", "type": "doc", "path": "docs/relref.md",
+                               "status": "UNVERIFIED", "provenance": {}})
+        drifted2 = check_doc_drift(graph, ws)
+        assert "doc-relref" not in [d["nodeId"] for d in drifted2], (
+            "doc-dir-relative ref and placeholder ref must not be flagged as drift (L1)"
+        )
+        relref = [n for n in graph["nodes"] if n["id"] == "doc-relref"][0]
+        assert relref["status"] == "UNVERIFIED", "must not be flipped to STALE by a false drift finding"
+        assert _ref_has_placeholder("decisions/ADR-NNNN.md") is True
+        assert _ref_has_placeholder("<id>/file.ts") is True
+        assert _ref_has_placeholder("src/api.ts") is False
 
         # --- 6. Gate tri-state composition: calls compute_doc_gate, the
         # SAME function main() calls via run_doc_pass (Review round 7,
@@ -7948,6 +8069,65 @@ def _doc_graph_selfcheck() -> None:
         # would permanently brick every non-graph repo the instant it
         # touched a routes/schema/api/config/auth-shaped file.
         assert compute_doc_gate(None, []) is None, "no graph -> never applicable, regardless of doc_impacts"
+
+        # --- 7. Round 7 live checkpoint (L2): docs/graph.json is
+        # orchestrator-owned bookkeeping, never model output -- must never
+        # be attributed to the model's changed files/scope guard/budget,
+        # must not deadlock the next session's clean-start check, and its
+        # dirtiness must be labeled separately (orchestratorUpdatedFiles).
+        # `ws` here is the same real git repo used above (already has
+        # commits from step 2). ---
+        # Earlier steps in this selfcheck already left assorted untracked
+        # docs/*.md fixtures lying around, so the tree isn't clean here --
+        # test the INVARIANT (rewriting docs/graph.json changes nothing
+        # observable) rather than assuming a pristine tree.
+        head_sha = head(ws)
+        before = changed_files(ws, head_sha)
+        assert DOC_GRAPH_RELATIVE_PATH not in before
+        (ws / "docs" / "graph.json").write_text('{"nodes": [], "edges": []}\n')
+        after = changed_files(ws, head_sha)
+        assert after == before, (
+            "rewriting docs/graph.json must never change the model-facing changed-files set"
+        )
+        # Clean-start's own dirty-filter (the SAME clean_start_dirty()
+        # main() calls -- not a private reimplementation, see its
+        # docstring): touching ONLY docs/graph.json must not add to the
+        # blocking dirty set; a genuinely dirty OTHER path still must.
+        # docs/graph.json is deliberately the ONLY dirty path at this
+        # point in the test, so this also covers the real regression this
+        # repro caught: a naive `line[3:]` column-slice of status(ws)
+        # breaks when the excluded path is the first (or only) line,
+        # because git()'s blanket .strip() eats that line's leading space.
+        for f in (ws / "docs" / "drifty.md", ws / "docs" / "relref.md"):
+            f.unlink(missing_ok=True)
+        run(["git", "add", "-A"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "settle"], ws)
+        assert clean_start_dirty(ws) == [], "a solely-dirty docs/graph.json must not block clean-start"
+        (ws / "docs" / "graph.json").write_text('{"nodes": [], "edges": [], "x": 1}\n')
+        assert clean_start_dirty(ws) == [], (
+            "touching only docs/graph.json must not change the blocking dirty set"
+        )
+        (ws / "src" / "extra.ts").write_text("export const y = 2;")
+        assert len(clean_start_dirty(ws)) == 1, "a genuinely dirty OTHER path must still block clean-start"
+        (ws / "src" / "extra.ts").unlink()
+
+        # orchestratorUpdatedFiles: run_doc_pass labels a dirty (untracked)
+        # graph separately rather than silently folding it into
+        # finalChangedFiles.
+        run_doc_pass_manifest = {"finalChangedFiles": []}
+        run_doc_pass(ws, ws / "events.jsonl", "selfcheck", run_doc_pass_manifest, None, None)
+        assert run_doc_pass_manifest.get("orchestratorUpdatedFiles") == [DOC_GRAPH_RELATIVE_PATH], (
+            "a dirty docs/graph.json must be labeled orchestratorUpdatedFiles, not hidden"
+        )
+        # Commit the graph so it matches HEAD (clean) -- the field must
+        # not be fabricated once there is nothing dirty to report.
+        run(["git", "add", "docs/graph.json"], ws)
+        run(["git", "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "graph"], ws)
+        run_doc_pass_manifest2 = {"finalChangedFiles": []}
+        run_doc_pass(ws, ws / "events.jsonl", "selfcheck", run_doc_pass_manifest2, None, None)
+        assert "orchestratorUpdatedFiles" not in run_doc_pass_manifest2, (
+            "a clean (committed) docs/graph.json must never fabricate orchestratorUpdatedFiles"
+        )
 
     print("doc-graph (Task 7.1/7.2) self-check: PASS")
 
