@@ -593,7 +593,7 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                 {activeSessionId && bottomTab === "verification" && (
                   <VerificationBody verification={activeSession?.verification} finalStatus={activeSession?.finalStatus} />
                 )}
-                {activeSessionId && bottomTab === "tasks" && <TasksPanel sessionId={activeSessionId} />}
+                {activeSessionId && bottomTab === "tasks" && <TasksPanel sessionId={activeSessionId} session={activeSession} />}
                 {activeSessionId && bottomTab === "events" && <EventsRawList events={events} />}
               </div>
             )}

@@ -601,6 +601,84 @@ describe("GET /api/sessions/:id/tasks", () => {
   });
 });
 
+// Task 4.3: human skip/approve, the task-level counterpart to §14's
+// /sessions/:id/accept. Gateway-owned (task-overrides.json) -- these routes
+// never touch tasks.json itself.
+describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
+  const tasks = [
+    { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
+    { id: "t2", description: "Run tests", kind: "verification", dependsOn: ["t1"], status: "pending", priority: "required" },
+  ];
+
+  it("writes task-overrides.json on skip and reflects it on a re-read", async () => {
+    const id = "20260822-000018-glimmer-task-skip";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const res = await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ taskId: "t1", action: "skip" });
+    expect(typeof res.body.at).toBe("string");
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "task-overrides.json"), "utf-8"));
+    expect(onDisk).toEqual({ t1: { action: "skip", at: res.body.at } });
+  });
+
+  it("writes task-overrides.json on approve, independent of other tasks' overrides", async () => {
+    const id = "20260822-000019-glimmer-task-approve";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    const res = await request(app).post(`/api/sessions/${id}/tasks/t2/approve`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ taskId: "t2", action: "approve" });
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "task-overrides.json"), "utf-8"));
+    expect(onDisk.t1).toMatchObject({ action: "skip" });
+    expect(onDisk.t2).toMatchObject({ action: "approve" });
+  });
+
+  it("404s for an unknown session id", async () => {
+    const res = await request(app).post("/api/sessions/does-not-exist/tasks/t1/skip");
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for a taskId that isn't in this session's tasks.json", async () => {
+    const id = "20260822-000020-glimmer-task-bad-id";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    const res = await request(app).post(`/api/sessions/${id}/tasks/does-not-exist/skip`);
+    expect(res.status).toBe(404);
+
+    // And the sidecar must not have been written for the rejected call.
+    await expect(fs.readFile(path.join(dir, "task-overrides.json"), "utf-8")).rejects.toThrow();
+  });
+
+  it("GET /sessions/:id/tasks merges overrides: skip -> status skipped + priority optional, approve -> status complete", async () => {
+    const id = "20260822-000021-glimmer-task-merge";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
+
+    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    await request(app).post(`/api/sessions/${id}/tasks/t2/approve`);
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(200);
+    const t1 = res.body.find((t: any) => t.id === "t1");
+    const t2 = res.body.find((t: any) => t.id === "t2");
+    expect(t1).toMatchObject({ status: "skipped", priority: "optional" });
+    expect(t1.override).toMatchObject({ action: "skip" });
+    expect(t2).toMatchObject({ status: "complete", priority: "required" });
+    expect(t2.override).toMatchObject({ action: "approve" });
+  });
+});
+
 describe("GET /api/sessions/:id/visual/manifest", () => {
   const manifest = {
     route: "http://localhost:5183/role-room",

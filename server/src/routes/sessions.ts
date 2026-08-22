@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -8,6 +8,7 @@ import {
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
   readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
   writeHumanAcceptance, readVisualManifest, readVisualFindings,
+  readTaskOverrides, writeTaskOverride, applyTaskOverrides,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
@@ -296,11 +297,35 @@ sessionsRouter.get("/sessions/:id/tasks", async (req, res) => {
   try {
     const tasks = await readSessionTasks(req.params.id);
     if (!tasks) return res.status(404).json({ error: "not found" });
-    res.json(tasks);
+    const overrides = await readTaskOverrides(req.params.id);
+    res.json(applyTaskOverrides(tasks, overrides));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Task 4.3: human skip/approve, the task-level counterpart to §14's
+// /sessions/:id/accept — gateway-owned (see writeTaskOverride), never
+// touches tasks.json (glimmer-v2.py's own artifact). 404s on an unknown
+// session OR an unknown taskId, same "reject bad input as not-found"
+// discipline as the rest of this file; never validates session status
+// here (the panel decides when to show the buttons, this route just
+// records the human's decision honestly whenever it's called).
+async function handleTaskOverride(req: Request, res: Response, action: "skip" | "approve") {
+  try {
+    const tasks = await readSessionTasks(req.params.id);
+    if (!tasks || !tasks.some((t) => t.id === req.params.taskId)) {
+      return res.status(404).json({ error: "not found" });
+    }
+    const record = await writeTaskOverride(req.params.id, req.params.taskId, action);
+    res.json({ taskId: req.params.taskId, ...record });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+sessionsRouter.post("/sessions/:id/tasks/:taskId/skip", (req, res) => handleTaskOverride(req, res, "skip"));
+sessionsRouter.post("/sessions/:id/tasks/:taskId/approve", (req, res) => handleTaskOverride(req, res, "approve"));
 
 // V7 §22.14/§22.16 visual evidence store -- static serving of a session's
 // visual/ artifacts. Same opt-in-artifact-absence convention as /plan,

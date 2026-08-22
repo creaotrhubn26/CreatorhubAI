@@ -441,12 +441,26 @@ export interface VisualVerification {
 // itself is now versioned {"schemaVersion": 2, "tasks": GlimmerTask[]} --
 // see readSessionTasks (server/src/lib/sessions.ts), which unwraps that
 // AND still tolerates a bare v1 array from an older session.
+// Task 4.3: a human skip/approve decision recorded in the gateway-owned
+// task-overrides.json sidecar (same trust model as human-acceptance.json --
+// glimmer-v2.py never writes it, only the CC gateway route does). "skip"
+// means the human decided a required task doesn't need to happen; "approve"
+// means the human manually signed off a task's completion (chiefly for
+// completion.type=="manual" tasks, which have no automatic evaluator).
+export interface TaskOverride {
+  action: "skip" | "approve";
+  at: string;
+}
+
 export interface GlimmerTask {
   id: string;
   description: string;
   kind: "implementation" | "verification" | "documentation" | "repair";
   dependsOn: string[];
-  status: "pending" | "in_progress" | "complete" | "failed";
+  // "skipped" (Task 4.3) is a DISPLAY-only status the gateway's GET
+  // /sessions/:id/tasks route produces when a human skip override exists --
+  // glimmer-v2.py itself never writes this value to tasks.json.
+  status: "pending" | "in_progress" | "complete" | "failed" | "skipped";
   // Task 4.1: who/what created this task.
   source?: "architect_plan" | "verification" | "repair" | "documentation" | "system";
   // Task 4.1: required tasks block gates.tasksResolved (and therefore
@@ -471,6 +485,11 @@ export interface GlimmerTask {
   // check's command; documentation: the impacted-areas list) -- see V7's
   // "Dynamic task creation" section.
   createdBecause?: string | null;
+  // Task 4.3: present only on the GET /sessions/:id/tasks route's merged
+  // response, when a human skip/approve override exists for this task --
+  // never written to tasks.json itself. See applyTaskOverrides (server/src/
+  // lib/sessions.ts).
+  override?: TaskOverride;
 }
 
 interface GlimmerEventBase {
