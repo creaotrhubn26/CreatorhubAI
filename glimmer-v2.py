@@ -1862,10 +1862,10 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
 # score >= ARCHITECT_RISK_THRESHOLD auto-triggers architect-first
 # (unless --no-architect was passed); see main()'s architect_trigger_mode.
 #
-# "mode == refactor": @glimmer/shared's TaskContract.mode union (and
-# --mode's own choices) has no "refactor" value today -- this signal is
-# honored anyway, forward-compatible with a future TaskContract value,
-# and simply never fires under the CLI's current --mode choices.
+# "mode == refactor": review round 1 fix -- "refactor" is now a real
+# --mode choice (and a real @glimmer/shared TaskContract.mode union
+# member, control-center branch v7-r2-architect), so this signal is
+# reachable end-to-end, not just forward-compatible dead code.
 ARCHITECT_RISK_CANDIDATE_THRESHOLD = 5
 ARCHITECT_RISK_THRESHOLD = 5
 
@@ -2629,7 +2629,10 @@ def main():
     ap.add_argument("--scope-area", default=None, help="Contract scope.area: sub-path within the package this task is scoped to")
     ap.add_argument("--scope-paths", action="append", default=None,
                     help="Contract scope.paths: explicit file path this task is scoped to (repeatable)")
-    ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review"),
+    # "refactor" added review round 1 (Task 2.1 fix): makes compute_architect_risk's
+    # mode_refactor signal reachable end-to-end -- previously no --mode value
+    # could ever produce it.
+    ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review", "refactor"),
                     default="implement", help="Contract mode: the kind of work this task performs")
     ap.add_argument("--auto-approve", action="store_true")
     ap.add_argument("--repo-map-only", action="store_true")
