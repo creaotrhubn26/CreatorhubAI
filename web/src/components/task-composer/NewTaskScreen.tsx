@@ -7,7 +7,7 @@ import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
   objective: "", scopePackage: "repository", scopeArea: "", mode: "implement",
-  verification: [], repairBudget: 2, maxTurns: undefined,
+  verification: [], repairBudget: 2, maxTurns: undefined, maxChangedFiles: undefined,
   timeoutSeconds: undefined, toolchainMode: "path", modelReadinessUrl: "", architectFirst: false,
 };
 
@@ -202,6 +202,15 @@ export function NewTaskScreen() {
                   type="number" min={1} max={64}
                   value={form.maxTurns ?? ""}
                   onChange={(e) => setForm({ ...form, maxTurns: e.target.value === "" ? undefined : Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                Max changed files
+                <input
+                  type="number" min={1} max={500}
+                  value={form.maxChangedFiles ?? ""}
+                  onChange={(e) => setForm({ ...form, maxChangedFiles: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  placeholder="unlimited"
                 />
               </label>
               <label>

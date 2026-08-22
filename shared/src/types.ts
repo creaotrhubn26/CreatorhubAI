@@ -73,6 +73,13 @@ export interface TaskContract {
   verification: string[];
   repairBudget: number;
   maxTurns?: number;
+  // Task 1.4 (V7 §6/§40): TaskContract budgets. Only maxChangedFiles today —
+  // maxTurns/maxRepairs already have their own top-level fields above.
+  // Omitted entirely (or maxChangedFiles omitted) means "unbounded", same
+  // contract every other optional field here already follows.
+  budgets?: {
+    maxChangedFiles?: number;
+  };
   // §7 New Task Composer "Advanced controls". Typed-only, closed enum for
   // toolchainMode — no freeform command strings. Omitted entirely (or any
   // individual field omitted) means "use the orchestrator's own default",

@@ -12,6 +12,10 @@ export interface TaskComposerFormState {
   verification: string[];
   repairBudget: number;
   maxTurns?: number;
+  // Task 1.4 (V7 §6) — shown in the same Advanced section as maxTurns
+  // above, but lives in the contract's top-level `budgets`, not `advanced`
+  // (see buildTaskContract). Undefined here means "unbounded".
+  maxChangedFiles?: number;
   // §7 Advanced controls — collapsed by default in the UI. Left
   // undefined/default here means "not in the contract" (see buildTaskContract).
   timeoutSeconds?: number;
@@ -38,6 +42,7 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
     repairBudget: Math.min(5, Math.max(0, form.repairBudget)),
     maxTurns: form.maxTurns,
     // Omitted entirely when nothing was touched — orchestrator defaults apply.
+    ...(form.maxChangedFiles !== undefined ? { budgets: { maxChangedFiles: form.maxChangedFiles } } : {}),
     ...(Object.keys(advanced).length > 0 ? { advanced } : {}),
   };
 }

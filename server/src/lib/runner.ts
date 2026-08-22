@@ -18,6 +18,8 @@ const VERIFICATION_COMMANDS: Record<string, string> = {
 const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
 const MAX_TURNS_RANGE = { min: 1, max: 64 };
 const TIMEOUT_RANGE = { min: 60, max: 3600 };
+// Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles closed range.
+const MAX_CHANGED_FILES_RANGE = { min: 1, max: 500 };
 
 function isValidModelReadinessUrl(value: string): boolean {
   // modelReadinessUrl becomes a single argv element after its flag — it is
@@ -42,6 +44,10 @@ function isInRange(n: unknown, range: { min: number; max: number }): n is number
 export function validateAdvanced(contract: TaskContract): string | null {
   if (contract.maxTurns !== undefined && !isInRange(contract.maxTurns, MAX_TURNS_RANGE)) {
     return `maxTurns must be an integer between ${MAX_TURNS_RANGE.min} and ${MAX_TURNS_RANGE.max}`;
+  }
+  const maxChangedFiles = contract.budgets?.maxChangedFiles;
+  if (maxChangedFiles !== undefined && !isInRange(maxChangedFiles, MAX_CHANGED_FILES_RANGE)) {
+    return `budgets.maxChangedFiles must be an integer between ${MAX_CHANGED_FILES_RANGE.min} and ${MAX_CHANGED_FILES_RANGE.max}`;
   }
   const advanced = contract.advanced;
   if (!advanced) return null;
@@ -73,6 +79,13 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
     }
   }
   if (contract.maxTurns) args.push("--max-turns", String(contract.maxTurns));
+  // Task 1.4 (V7 §6): budgets.maxChangedFiles -- same defense-in-depth
+  // posture as the advanced fields below (duplicates validateAdvanced's
+  // boundary; an out-of-range value is dropped, never forwarded).
+  const maxChangedFiles = contract.budgets?.maxChangedFiles;
+  if (maxChangedFiles !== undefined && isInRange(maxChangedFiles, MAX_CHANGED_FILES_RANGE)) {
+    args.push("--max-changed-files", String(maxChangedFiles));
+  }
 
   // §7 Advanced controls: typed-only, closed-enum mapping. Every check here
   // duplicates validateAdvanced's boundary (defense in depth) — an invalid
