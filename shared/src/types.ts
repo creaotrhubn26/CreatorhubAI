@@ -185,6 +185,12 @@ export interface GlimmerSession {
     implementationComplete?: boolean | null;
     verificationPassed?: boolean | null;
     scopeApproved?: boolean | null;
+    // Task 4.2 (V7 session completion rule): required_tasks_resolved(tasks)
+    // -- true when every priority=="required" task in tasks.json reached a
+    // resolved terminal state, false when one didn't (blocks VERIFIED, same
+    // as architectureApproved/scopeApproved), null when no tasks.json exists
+    // for this session (C3's task graph never ran -- not applicable).
+    tasksResolved?: boolean | null;
   };
   architectPlan?: { used: boolean; risk: string | null };
   // Task 2.1 (V7 §5.5): how architect mode was decided for this run —
@@ -424,13 +430,47 @@ export interface VisualVerification {
 // change-impact detector finds routes/schema/api/config/auth touched --
 // nothing in glimmer-v2.py's task writers ever flips it to complete/failed,
 // because phase 1 has no way to verify documentation currency. A human
-// closes it out of band.
+// closes it out of band. Task 4.1 (V7 R4) adds "repair": an auto-created
+// task per repair round (see create_repair_task in glimmer-v2.py).
+//
+// Task 4.1: the fields below source/priority/evidenceIds/affectedFiles/
+// blockingReason/createdAt/updatedAt/completion/createdBecause are ALL
+// optional, so an archived tasks.json written before this task (v1: no
+// wrapper, no completion contract) still satisfies this type unchanged --
+// same back-compat convention gates/architectPlan already use. tasks.json
+// itself is now versioned {"schemaVersion": 2, "tasks": GlimmerTask[]} --
+// see readSessionTasks (server/src/lib/sessions.ts), which unwraps that
+// AND still tolerates a bare v1 array from an older session.
 export interface GlimmerTask {
   id: string;
   description: string;
-  kind: "implementation" | "verification" | "documentation";
+  kind: "implementation" | "verification" | "documentation" | "repair";
   dependsOn: string[];
   status: "pending" | "in_progress" | "complete" | "failed";
+  // Task 4.1: who/what created this task.
+  source?: "architect_plan" | "verification" | "repair" | "documentation" | "system";
+  // Task 4.1: required tasks block gates.tasksResolved (and therefore
+  // VERIFIED) when unresolved; recommended/optional never do -- see
+  // required_tasks_resolved in glimmer-v2.py.
+  priority?: "required" | "recommended" | "optional";
+  evidenceIds?: string[];
+  affectedFiles?: string[];
+  blockingReason?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  // Task 4.1: the completion CONTRACT evaluators dispatch on, instead of a
+  // hardcoded per-kind rule. check is only meaningful for type=="check_passed":
+  // null means fuzzy-match the task's own description against a verify()
+  // result (every plan-derived verification task); a literal command string
+  // means exact-match that command (every repair task).
+  completion?: {
+    type: "files_changed" | "check_passed" | "manual" | "docs";
+    check?: string | null;
+  };
+  // Task 4.1: why a dynamically-created task exists (repair: the failing
+  // check's command; documentation: the impacted-areas list) -- see V7's
+  // "Dynamic task creation" section.
+  createdBecause?: string | null;
 }
 
 interface GlimmerEventBase {
@@ -573,6 +613,10 @@ export interface TaskCreatedEvent extends GlimmerEventBase {
   taskId: string;
   kind: GlimmerTask["kind"];
   description: string;
+  // Task 4.1: additive -- absent on an event emitted by a pre-Round-4
+  // orchestrator (archived session).
+  source?: GlimmerTask["source"];
+  priority?: GlimmerTask["priority"];
 }
 export interface TaskStatusChangedEvent extends GlimmerEventBase {
   type: "task_status_changed";

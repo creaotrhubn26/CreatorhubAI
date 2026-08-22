@@ -387,6 +387,17 @@ describe("opt-in orchestrator artifact reads", () => {
     expect(await sessionsIsolated.readSessionTasks(id)).toBeNull();
   });
 
+  it("readSessionTasks unwraps the Task 4.1 v2 {schemaVersion, tasks} wrapper", async () => {
+    const id = "20260822-000037-glimmer-tasks-v2";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "tasks.json"),
+      JSON.stringify({ schemaVersion: 2, tasks: REAL_TASKS })
+    );
+    expect(await sessionsIsolated.readSessionTasks(id)).toEqual(REAL_TASKS);
+  });
+
   it("readArchitectReviews globs and sorts architect-review-NN-MM.json", async () => {
     const id = "20260817-000037-glimmer-reviews";
     const dir = path.join(contractStateRoot, "sessions", id);

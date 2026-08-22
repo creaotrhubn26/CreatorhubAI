@@ -560,6 +560,17 @@ describe("GET /api/sessions/:id/tasks", () => {
     expect(res.body).toEqual(tasks);
   });
 
+  it("unwraps a Task 4.1 v2 {schemaVersion, tasks} tasks.json to the same flat array", async () => {
+    const id = "20260822-000017-glimmer-tasks-v2";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify({ schemaVersion: 2, tasks }));
+
+    const res = await request(app).get(`/api/sessions/${id}/tasks`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(tasks);
+  });
+
   it("returns 404 when no tasks.json was ever written (opt-in artifact)", async () => {
     const id = "20260818-000014-glimmer-tasks-missing";
     await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });

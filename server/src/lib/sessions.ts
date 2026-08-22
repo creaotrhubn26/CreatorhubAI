@@ -263,8 +263,25 @@ export function readDeliveryReview(id: string): Promise<DeliveryReview | null> {
   return readSessionJsonFile<DeliveryReview>(id, "delivery-review.json");
 }
 
-export function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
-  return readSessionJsonFile<GlimmerTask[]>(id, "tasks.json");
+// Task 4.1 (V7 R4): glimmer-v2.py's save_tasks now writes a versioned
+// wrapper -- {"schemaVersion": 2, "tasks": GlimmerTask[]} -- instead of a
+// bare array, so a reader can tell a full-model (Round-4) task list apart
+// from an older archived session's flat v1 array. Both shapes resolve to
+// the same flat GlimmerTask[] the /sessions/:id/tasks route has always
+// returned; a v1 array is returned as-is, a v2 wrapper is unwrapped, and
+// anything else (malformed JSON already became null upstream; a valid but
+// unrecognized shape) reads back as null, same "no readable artifact"
+// convention every other opt-in read here follows.
+export async function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
+  const raw = await readSessionJsonFile<GlimmerTask[] | { schemaVersion: number; tasks: GlimmerTask[] }>(
+    id, "tasks.json"
+  );
+  if (raw === null) return null;
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object" && Array.isArray((raw as { tasks: unknown }).tasks)) {
+    return (raw as { tasks: GlimmerTask[] }).tasks;
+  }
+  return null;
 }
 
 // V7 §22.14 visual evidence store -- glimmer-visual.py's --output-dir is
