@@ -6,6 +6,10 @@ const COLOR: Record<string, string> = {
   implementing: "var(--blue)", verifying: "var(--blue)", discovery: "var(--blue)",
   preflight: "var(--blue)", understanding: "var(--blue)", candidate_selection: "var(--blue)",
   NOT_RUN: "var(--gray)", created: "var(--gray)", cancelled: "var(--gray)",
+  // V7 §20: non-success terminal (workspace changed after VERIFIED) -- same
+  // amber as needs_review/repairing, not red: no failure occurred, a re-run
+  // just needs to happen.
+  stale: "var(--amber)",
   // Stepper-only step states (RepairCycleStepper) — not session/verification
   // statuses, just the local DONE/RUNNING/PENDING vocabulary it derives.
   DONE: "var(--green)", RUNNING: "var(--blue)", PENDING: "var(--gray)",

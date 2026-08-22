@@ -8,7 +8,9 @@ export const workspacesRouter = Router();
 workspacesRouter.get("/workspaces", async (_req, res) => {
   try {
     const ids = await listSessionIds();
-    const sessions = (await Promise.all(ids.map(readSession))).filter(Boolean) as NonNullable<
+    // V7 §20: plain readSession(id) (computeStale left false) -- this reads
+    // every session on the list, same reasoning as GET /sessions.
+    const sessions = (await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean) as NonNullable<
       Awaited<ReturnType<typeof readSession>>
     >[];
     const uniqueWorkspaces = [...new Set(sessions.map((s) => s.workspace))];

@@ -61,12 +61,15 @@ export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]
 
 sessionsRouter.get("/sessions", async (_req, res) => {
   const ids = await listSessionIds();
-  const sessions = (await Promise.all(ids.map(readSession))).filter(Boolean);
+  // V7 §20: deliberately NOT { computeStale: true } here -- see readSession's
+  // own comment. This is a polled list endpoint; per-session git spawns here
+  // would scale with session count on every poll interval.
+  const sessions = (await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean);
   res.json(sessions);
 });
 
 sessionsRouter.get("/sessions/:id", async (req, res) => {
-  const session = await readSession(req.params.id);
+  const session = await readSession(req.params.id, { computeStale: true });
   if (!session) return res.status(404).json({ error: "not found" });
   res.json(session);
 });

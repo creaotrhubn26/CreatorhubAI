@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { promises as fs } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -423,5 +425,121 @@ describe("human acceptance (§14 Diff Review)", () => {
     await sessionsIsolated.writeHumanAcceptance(id);
     const after = await sessionsIsolated.readSession(id);
     expect(after?.humanAcceptance?.accepted).toBe(true);
+  });
+});
+
+// V7 §20 session-level verification freeze: verifiedAt pass-through +
+// gateway-computed "stale" status. Uses a real temp git repo as the
+// session's workspace, same fixture pattern as git.test.ts's gitStatus
+// coverage, since staleness is decided by real `git status --porcelain`
+// output, not a mock.
+describe("session-level verification freeze (V7 §20)", () => {
+  const exec = promisify(execFile);
+  let verifiedWorkspace: string;
+
+  const verifiedManifest = () => ({
+    ...REAL_MANIFEST,
+    status: "verified",
+    verifiedAt: "2026-08-21T00:00:00.000Z",
+    workspace: verifiedWorkspace,
+  });
+
+  beforeAll(async () => {
+    verifiedWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-verified-ws-"));
+    await exec("git", ["init", "-q"], { cwd: verifiedWorkspace });
+    await exec("git", ["config", "user.email", "t@t.com"], { cwd: verifiedWorkspace });
+    await exec("git", ["config", "user.name", "t"], { cwd: verifiedWorkspace });
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "one\n");
+    await exec("git", ["add", "a.txt"], { cwd: verifiedWorkspace });
+    await exec("git", ["commit", "-q", "-m", "init"], { cwd: verifiedWorkspace });
+  });
+
+  afterAll(async () => {
+    await fs.rm(verifiedWorkspace, { recursive: true, force: true });
+  });
+
+  it("parseManifest passes verifiedAt through when present, leaves it undefined otherwise", () => {
+    const withIt = parseManifest(verifiedManifest(), "sid-verified-at");
+    expect(withIt.verifiedAt).toBe("2026-08-21T00:00:00.000Z");
+    const withoutIt = parseManifest(REAL_MANIFEST, "sid-no-verified-at");
+    expect(withoutIt.verifiedAt).toBeUndefined();
+  });
+
+  it("readSession without computeStale never touches git and reports plain verified, even with a dirty workspace", async () => {
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "two\n"); // dirty
+    const id = "20260821-000060-glimmer-stale-no-opt";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...verifiedManifest(), sessionId: id }));
+
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.status).toBe("verified");
+  });
+
+  it("readSession with computeStale reports plain verified when the workspace is clean", async () => {
+    await exec("git", ["checkout", "--", "a.txt"], { cwd: verifiedWorkspace }); // clean again
+    const id = "20260821-000061-glimmer-stale-clean";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...verifiedManifest(), sessionId: id }));
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("verified");
+  });
+
+  it("readSession with computeStale reports stale when the verified workspace has uncommitted changes", async () => {
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "changed after verify\n");
+    const id = "20260821-000062-glimmer-stale-dirty";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...verifiedManifest(), sessionId: id }));
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("stale");
+
+    await exec("git", ["checkout", "--", "a.txt"], { cwd: verifiedWorkspace }); // restore for later tests
+  });
+
+  it("readSession with computeStale detects an untracked (new) file as dirty too", async () => {
+    await fs.writeFile(path.join(verifiedWorkspace, "untracked-after-verify.txt"), "surprise\n");
+    const id = "20260821-000063-glimmer-stale-untracked";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...verifiedManifest(), sessionId: id }));
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("stale");
+
+    await fs.rm(path.join(verifiedWorkspace, "untracked-after-verify.txt"));
+  });
+
+  it("readSession with computeStale is NOT stale when the workspace directory no longer exists", async () => {
+    const goneWorkspace = path.join(os.tmpdir(), "glimmer-workspace-that-never-existed-" + Date.now());
+    const id = "20260821-000064-glimmer-stale-workspace-gone";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...verifiedManifest(), sessionId: id, workspace: goneWorkspace })
+    );
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("verified");
+  });
+
+  it("readSession with computeStale never flips a non-verified status to stale even with a dirty workspace", async () => {
+    await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "dirty but not verified\n");
+    const id = "20260821-000065-glimmer-stale-not-verified";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...verifiedManifest(), sessionId: id, status: "no-change-unverified", verifiedAt: undefined })
+    );
+
+    const session = await sessionsIsolated.readSession(id, { computeStale: true });
+    expect(session?.status).toBe("needs_review");
+
+    await exec("git", ["checkout", "--", "a.txt"], { cwd: verifiedWorkspace });
   });
 });

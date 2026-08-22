@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
+import { gitStatus } from "./git.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
@@ -100,7 +101,30 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   if (m.architectPlan) session.architectPlan = m.architectPlan;
   if (m.architectTrigger) session.architectTrigger = m.architectTrigger;
   if (m.failure) session.failure = m.failure;
+  // V7 §20: only stamped once a session reaches VERIFIED (both promotion
+  // sites in glimmer-v2.py) -- absent everywhere else, same optional-pass-
+  // through discipline as gates/architectPlan/failure above.
+  if (m.verifiedAt) session.verifiedAt = m.verifiedAt;
   return session;
+}
+
+// V7 §20 session-level verification freeze: staleness is a fact the gateway
+// DETECTS, read-time, rather than something any daemon enforces -- nothing
+// runs after glimmer-v2.py exits. Deterministic rule: a session is stale iff
+// it reached VERIFIED (has verifiedAt) AND its workspace directory still
+// exists AND that workspace currently has uncommitted changes (tracked or
+// untracked -- gitStatus's `dirty` already covers both via `git status
+// --porcelain`, see git.ts). A workspace that no longer exists is NOT
+// stale -- there is nothing to compare against, and the human may have
+// legitimately committed and cleaned up after accepting the result; guessing
+// "stale" with no evidence would be dishonest. Any other git failure (not a
+// repo, permissions, ...) is treated the same way: no evidence, no claim.
+async function isWorkspaceDirtyNow(workspace: string): Promise<boolean> {
+  try {
+    return (await gitStatus(workspace)).dirty;
+  } catch {
+    return false;
+  }
 }
 
 const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/;
@@ -256,7 +280,18 @@ async function copyGatewayContract(fromId: string, toId: string): Promise<void> 
   }
 }
 
-export async function readSession(id: string): Promise<GlimmerSession | null> {
+// computeStale defaults to false: staleness detection spawns git (see
+// isWorkspaceDirtyNow above), and this function backs BOTH the session-list
+// endpoint (polled every few seconds by the sidebar) and the single-session
+// endpoint. Running a git spawn per session on every list poll would fork-
+// bomb the server (N sessions x one poll every 4s) for a fact only the one
+// open session screen actually needs -- so only GET /sessions/:id opts in.
+// GET /sessions (the list) deliberately leaves this false; sessions there
+// just read back as "verified" until someone opens them.
+export async function readSession(
+  id: string,
+  opts: { computeStale?: boolean } = {}
+): Promise<GlimmerSession | null> {
   const real = resolveSessionId(id);
   const raw = await readManifestRaw(real);
   if (!raw) return null;
@@ -265,6 +300,11 @@ export async function readSession(id: string): Promise<GlimmerSession | null> {
   if (taskContract) session = { ...session, taskContract };
   const humanAcceptance = await readHumanAcceptance(real);
   if (humanAcceptance) session = { ...session, humanAcceptance };
+  if (opts.computeStale && session.status === "verified" && session.verifiedAt) {
+    if (await isWorkspaceDirtyNow(session.workspace)) {
+      session = { ...session, status: "stale" };
+    }
+  }
   return session;
 }
 

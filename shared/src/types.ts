@@ -21,7 +21,14 @@ export type GlimmerSessionStatus =
   | "failed"
   | "verified"
   | "needs_review"
-  | "cancelled";
+  | "cancelled"
+  // V7 §20 verification freeze: never written by the orchestrator. The
+  // gateway computes this read-time (readSession's computeStale option) when
+  // a "verified" session's workspace picks up uncommitted changes after
+  // manifest.verifiedAt -- the freeze itself is enforced per-run inside
+  // glimmer-engineer.py (engineer_state), not here; this is the session-level
+  // fact that verification no longer covers the workspace's current content.
+  | "stale";
 
 export interface ChangedFile {
   path: string;
@@ -142,6 +149,12 @@ export interface GlimmerSession {
   // technical verification and human acceptance must stay two separate
   // facts, or the model could self-approve its own delivered work.
   humanAcceptance?: HumanAcceptance;
+  // V7 §20: stamped by glimmer-v2.py at the moment a session reached
+  // VERIFIED (both the real-diff "verified" path and the empty-diff
+  // "no-change-verified" path). Optional -- absent on sessions predating
+  // this task and on any non-verified session. Used only by the gateway's
+  // own stale-detection read (see readSession); not otherwise displayed.
+  verifiedAt?: string;
 }
 
 export interface HumanAcceptance {

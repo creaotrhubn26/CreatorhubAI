@@ -145,6 +145,18 @@ export function ActiveSessionScreen() {
           ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
           : "Not yet accepted"}
       </p>
+      {/* V7 §20: session.status here comes straight from the gateway's own
+          read (readSession's computeStale), not the event-derived `state`
+          above -- glimmer-v2.py never emits a "stale" agent_state_changed
+          event (nothing runs after it exits to emit one), so the event
+          trail alone would never surface this. No failure record exists for
+          a stale session (nothing failed), which is why this is its own
+          line rather than routed through the failure banner. */}
+      {session.status === "stale" && (
+        <p style={{ fontSize: 12, color: "var(--amber)" }}>
+          Verified result is stale — the workspace changed after verification; re-run to re-verify.
+        </p>
+      )}
       {session.architectTrigger && session.architectTrigger.mode !== "off" && (
         // Deterministic fact from the orchestrator: how architect mode was
         // actually decided for THIS run (the composer preview is only an

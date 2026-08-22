@@ -1,11 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import request from "supertest";
 import { promises as fs } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Express } from "express";
+
+const execGit = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -789,5 +793,66 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
     } finally {
       server.close();
     }
+  });
+});
+
+// V7 §20 session-level verification freeze: GET /sessions/:id computes
+// staleness (git-derived), GET /sessions (the list) deliberately does not
+// (see the comment at that route and at readSession's computeStale option —
+// a per-session git spawn on every list poll would scale with session
+// count).
+describe("stale verified-session detection (V7 §20)", () => {
+  let staleWorkspace: string;
+
+  beforeAll(async () => {
+    staleWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-route-stale-ws-"));
+    await execGit("git", ["init", "-q"], { cwd: staleWorkspace });
+    await execGit("git", ["config", "user.email", "t@t.com"], { cwd: staleWorkspace });
+    await execGit("git", ["config", "user.name", "t"], { cwd: staleWorkspace });
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\n");
+    await execGit("git", ["add", "a.txt"], { cwd: staleWorkspace });
+    await execGit("git", ["commit", "-q", "-m", "init"], { cwd: staleWorkspace });
+  });
+
+  afterAll(async () => {
+    await fs.rm(staleWorkspace, { recursive: true, force: true });
+  });
+
+  it("GET /sessions/:id reports stale for a verified session whose workspace changed since verifiedAt", async () => {
+    await fs.writeFile(path.join(staleWorkspace, "a.txt"), "changed after verify\n");
+    const id = "20260822-000010-glimmer-route-stale";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
+        workspace: staleWorkspace, branch: "main", baseline: null, attempts: [],
+      })
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("stale");
+  });
+
+  it("GET /sessions (list) does NOT compute staleness — the same dirty verified session still reads as plain verified", async () => {
+    const id = "20260822-000011-glimmer-route-stale-list";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
+        workspace: staleWorkspace, branch: "main", baseline: null, attempts: [],
+      })
+    );
+
+    const res = await request(app).get("/api/sessions");
+    expect(res.status).toBe(200);
+    const row = res.body.find((s: { id: string }) => s.id === id);
+    expect(row?.status).toBe("verified");
+
+    await execGit("git", ["checkout", "--", "a.txt"], { cwd: staleWorkspace });
   });
 });
