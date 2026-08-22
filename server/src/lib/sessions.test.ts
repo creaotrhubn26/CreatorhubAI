@@ -119,6 +119,48 @@ describe("parseManifest", () => {
   });
 });
 
+// V7 §22.17: finalStatus's functional/architecture/documentation legs are
+// all synchronously derivable from the manifest, so parseManifest computes
+// them directly -- readSession (below, in its own describe block) is only
+// responsible for upgrading the fourth leg (`visual`) after an async read.
+describe("finalStatus composition (V7 §22.17)", () => {
+  it("functional mirrors verification.overall exactly", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-final-1");
+    expect(session.finalStatus.functional).toBe(session.verification.overall);
+    expect(session.finalStatus.functional).toBe("VERIFIED");
+  });
+
+  it("defaults architecture/documentation/visual to not_run with no gates at all", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-final-2");
+    expect(session.finalStatus.architecture).toBe("not_run");
+    expect(session.finalStatus.documentation).toBe("not_run");
+    expect(session.finalStatus.visual).toBe("not_run");
+  });
+
+  it.each([
+    [true, "approved"],
+    [false, "rejected"],
+    [null, "not_run"],
+  ] as const)("gates.architectureApproved %s -> finalStatus.architecture %s", (raw, expected) => {
+    const session = parseManifest({ ...REAL_MANIFEST, gates: { architectureApproved: raw } }, "sid-final-3");
+    expect(session.finalStatus.architecture).toBe(expected);
+  });
+
+  it.each([
+    [true, "approved"],
+    [false, "rejected"],
+    [null, "not_run"],
+  ] as const)("gates.documentationCurrent %s -> finalStatus.documentation %s", (raw, expected) => {
+    const session = parseManifest({ ...REAL_MANIFEST, gates: { documentationCurrent: raw } }, "sid-final-4");
+    expect(session.finalStatus.documentation).toBe(expected);
+  });
+
+  it("a manifest with no attempts (NOT_RUN) reports functional NOT_RUN, not a crash", () => {
+    const session = parseManifest({ ...REAL_MANIFEST, attempts: [], status: "initialized" }, "sid-final-5");
+    expect(session.finalStatus.functional).toBe("NOT_RUN");
+  });
+});
+
 describe("mapManifestStatus", () => {
   // Ground truth: glimmer-v2.py's manifest["status"] assignment sites.
   it.each([
@@ -380,6 +422,60 @@ describe("opt-in orchestrator artifact reads", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "architect-review-00-01.json"), "not json {{{");
     expect(await sessionsIsolated.readArchitectReviews(id)).toBeNull();
+  });
+});
+
+const REAL_VISUAL_MANIFEST = {
+  route: "http://localhost:5183/role-room",
+  viewports: ["1440x900", "390x844"],
+  states: ["initial"],
+  status: "pass",
+  captures: [
+    { viewport: "1440x900", screenshot: "1440x900.png", status: "captured", error: null },
+    { viewport: "390x844", screenshot: "390x844.png", status: "captured", error: null },
+  ],
+};
+
+describe("visual verification reads + finalStatus.visual override (V7 §22.14/§22.17)", () => {
+  it("readVisualManifest returns the parsed manifest when present", async () => {
+    const id = "20260822-000050-glimmer-visual-manifest";
+    const dir = path.join(contractStateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    expect(await sessionsIsolated.readVisualManifest(id)).toEqual(REAL_VISUAL_MANIFEST);
+  });
+
+  it("readVisualManifest/readVisualFindings return null when no visual/ dir exists (normal, opt-in)", async () => {
+    const id = "20260822-000051-glimmer-no-visual";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readVisualManifest(id)).toBeNull();
+    expect(await sessionsIsolated.readVisualFindings(id)).toBeNull();
+  });
+
+  it("readSession upgrades finalStatus.visual from findings.json's real status", async () => {
+    const id = "20260822-000052-glimmer-visual-findings";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    const visualDir = path.join(dir, "visual");
+    await fs.mkdir(visualDir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(visualDir, "findings.json"),
+      JSON.stringify({ status: "PASS_WITH_WARNINGS", viewport: "multi", viewports: ["1440x900", "390x844"], findings: [] })
+    );
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.finalStatus.visual).toBe("PASS_WITH_WARNINGS");
+    // The other three legs are untouched by the visual override.
+    expect(session?.finalStatus.functional).toBe("VERIFIED");
+  });
+
+  it("readSession leaves finalStatus.visual as not_run when no visual/ dir exists", async () => {
+    const id = "20260822-000053-glimmer-no-visual-session";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.finalStatus.visual).toBe("not_run");
   });
 });
 

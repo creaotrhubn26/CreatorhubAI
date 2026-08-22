@@ -6,6 +6,7 @@ import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
   ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
+  FinalStatus, FinalGateStatus, VisualManifest, VisualFindings,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -76,6 +77,29 @@ function overallFromManifest(manifest: any): VerificationOverall {
   return "PARTIAL";
 }
 
+// V7 §22.17: gates.architectureApproved/documentationCurrent share this
+// exact true/false/null -> approved/rejected/not_run mapping.
+function gateToFinalStatus(value: boolean | null | undefined): FinalGateStatus {
+  if (value === true) return "approved";
+  if (value === false) return "rejected";
+  return "not_run";
+}
+
+// V7 §22.17 finalStatus gate object -- the functional/architecture/
+// documentation legs are all synchronously available from the manifest
+// (no filesystem read needed), so they're computed here, at parse time.
+// `visual` starts as "not_run" and is upgraded by readSession (below) after
+// an async read of the session's visual/findings.json, which is the only
+// leg that needs I/O.
+function composeFinalStatus(overall: VerificationOverall, gates: GlimmerSession["gates"]): FinalStatus {
+  return {
+    functional: overall,
+    visual: "not_run",
+    architecture: gateToFinalStatus(gates?.architectureApproved),
+    documentation: gateToFinalStatus(gates?.documentationCurrent),
+  };
+}
+
 export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   const m = raw as any;
   const attempts = m.attempts ?? [];
@@ -108,6 +132,11 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
     verification,
     repairsUsed: Math.max(0, attempts.length - 1),
     repairBudget: m.maxRepairs ?? 0,
+    // V7 §22.17: architecture/documentation legs need m.gates, which isn't
+    // assigned onto `session` until just below -- read the raw manifest
+    // field directly rather than reordering the gates assignment above this
+    // literal. `visual` is finalized by readSession's async override.
+    finalStatus: composeFinalStatus(verification.overall, m.gates),
   };
   // C2/C3 (glimmer-v7): pass these through only when the manifest actually
   // carries them — older sessions predating architect mode have none of these
@@ -238,6 +267,19 @@ export function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
   return readSessionJsonFile<GlimmerTask[]>(id, "tasks.json");
 }
 
+// V7 §22.14 visual evidence store -- glimmer-visual.py's --output-dir is
+// sessions/<id>/visual/, so these are nested one directory deeper than the
+// single-file artifacts above. Same opt-in-artifact absence convention:
+// no visual/ dir at all (the common case -- most sessions never run
+// glimmer-visual.py) reads back as null, not an error.
+export function readVisualManifest(id: string): Promise<VisualManifest | null> {
+  return readSessionJsonFile<VisualManifest>(id, path.join("visual", "visual-manifest.json"));
+}
+
+export function readVisualFindings(id: string): Promise<VisualFindings | null> {
+  return readSessionJsonFile<VisualFindings>(id, path.join("visual", "findings.json"));
+}
+
 const ARCHITECT_REVIEW_FILE_RE = /^architect-review-\d+-\d+\.json$/;
 
 // architect-review-NN-MM.json is a collection (one file per review round), so
@@ -338,6 +380,13 @@ export async function readSession(
   if (taskContract) session = { ...session, taskContract };
   const humanAcceptance = await readHumanAcceptance(real);
   if (humanAcceptance) session = { ...session, humanAcceptance };
+  // V7 §22.17: the one finalStatus leg that needs I/O -- composeFinalStatus
+  // (above) already set every other leg synchronously. No visual/ dir at
+  // all (the common case) leaves it "not_run", set by composeFinalStatus.
+  const visualFindings = await readVisualFindings(real);
+  if (visualFindings) {
+    session = { ...session, finalStatus: { ...session.finalStatus, visual: visualFindings.status } };
+  }
   // Missing finalDiffHash (manifest predates this task) -> never stale, same
   // honesty rule as currentDiffHash returning null: no fingerprint to
   // compare against, no claim.

@@ -590,6 +590,121 @@ describe("GET /api/sessions/:id/tasks", () => {
   });
 });
 
+describe("GET /api/sessions/:id/visual/manifest", () => {
+  const manifest = {
+    route: "http://localhost:5183/role-room",
+    viewports: ["1440x900"],
+    states: ["initial"],
+    status: "pass",
+    captures: [{ viewport: "1440x900", screenshot: "1440x900.png", status: "captured", error: null }],
+  };
+  const findings = { status: "PASS", viewport: "multi", viewports: ["1440x900"], findings: [] };
+
+  it("returns manifest + findings when both are present", async () => {
+    const id = "20260822-000060-glimmer-visual-found";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(manifest));
+    await fs.writeFile(path.join(dir, "findings.json"), JSON.stringify(findings));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ manifest, findings });
+  });
+
+  it("returns findings: null when only visual-manifest.json exists", async () => {
+    const id = "20260822-000061-glimmer-visual-no-findings";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(manifest));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ manifest, findings: null });
+  });
+
+  it("returns 404 when the session never ran glimmer-visual.py (opt-in artifact)", async () => {
+    const id = "20260822-000062-glimmer-visual-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404 for a path-traversal id", async () => {
+    const res = await request(app).get("/api/sessions/..%2F..%2Fevil/visual/manifest");
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260822-000063-glimmer-visual-fserror";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    // A directory named visual-manifest.json, not a file -> EISDIR, a real
+    // gateway fault distinct from "no artifact".
+    await fs.mkdir(path.join(dir, "visual-manifest.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/manifest`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
+  it("serves the PNG bytes with an image/png content type", async () => {
+    const id = "20260822-000064-glimmer-screenshot-found";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); // PNG magic bytes
+    await fs.writeFile(path.join(dir, "1440x900.png"), pngBytes);
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/image\/png/);
+    expect(Buffer.from(res.body)).toEqual(pngBytes);
+  });
+
+  it("returns 404 when the named screenshot does not exist", async () => {
+    const id = "20260822-000065-glimmer-screenshot-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id, "visual"), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404 for an unknown/path-traversal session id before ever touching the filename", async () => {
+    const res = await request(app).get("/api/sessions/..%2F..%2Fevil/visual/screenshot/1440x900.png");
+    expect(res.status).toBe(404);
+  });
+
+  it.each([
+    "..%2F..%2Fetc%2Fpasswd", // encoded traversal via slashes
+    "..png", // no chars before the required .png suffix
+    "foo%2Fbar.png", // encoded slash mid-name
+    "foo_bar.png", // outside the strict allowed charset
+    "1440x900.PNG", // wrong case extension
+    "1440x900", // missing .png suffix entirely
+    "%2e%2e%2f%2e%2e%2fetc%2fpasswd.png", // fully-encoded traversal attempt
+  ])("returns 400 for an invalid/traversal filename: %s", async (rawFile) => {
+    const id = "20260822-000066-glimmer-screenshot-traversal";
+    await fs.mkdir(path.join(stateRoot, "sessions", id, "visual"), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/${rawFile}`);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260822-000067-glimmer-screenshot-fserror";
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    // A directory named like a valid screenshot filename -> EISDIR.
+    await fs.mkdir(path.join(dir, "1440x900.png"), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
 describe("opt-in artifact routes reject path-traversal ids", () => {
   it.each(["plan", "architect-reviews", "delivery-review", "tasks"])(
     "GET /api/sessions/:id/%s returns 404 for a traversal id",

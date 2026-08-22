@@ -77,6 +77,28 @@ export interface VerificationSummary {
   recommendedChecks?: VerificationCheckResult[];
 }
 
+// V7 §22.17 visual verification gate object, composed deterministically by
+// readSession (server/src/lib/sessions.ts) on every read -- never written by
+// the orchestrator itself, so this is always present (unlike gates/
+// architectPlan, which are absent on non-architect-mode sessions).
+export type FinalGateStatus = "approved" | "rejected" | "not_run";
+
+export interface FinalStatus {
+  // Straight passthrough of verification.overall -- no separate mapping.
+  functional: VerificationOverall;
+  // From the session's visual/findings.json status when the session ran
+  // glimmer-visual.py; "not_run" (not VisualFindingsStatus's own "NOT_RUN")
+  // when no visual/ dir exists at all -- the one case genuinely distinct
+  // from "captured/reviewed but nothing to report".
+  visual: VisualFindingsStatus | "not_run";
+  // gates.architectureApproved: true -> "approved", false -> "rejected",
+  // null/absent -> "not_run" (never ran / not applicable).
+  architecture: FinalGateStatus;
+  // gates.documentationCurrent, same true/false/null -> approved/rejected/
+  // not_run mapping as architecture above.
+  documentation: FinalGateStatus;
+}
+
 export interface TaskContract {
   objective: string;
   scope: {
@@ -195,6 +217,10 @@ export interface GlimmerSession {
   // Optional -- absent on sessions predating this task; readSession never
   // claims "stale" without it.
   finalDiffHash?: string;
+  // V7 §22.17: deterministic gate summary, always present (composed at read
+  // time from facts already on this object plus an opt-in visual/ dir read
+  // -- see FinalStatus's own field comments for the exact per-field mapping).
+  finalStatus: FinalStatus;
 }
 
 export interface HumanAcceptance {
@@ -237,6 +263,13 @@ export interface ArchitecturePlan {
   verificationPlan?: string[];
   expectedScope?: { minFiles?: number; maxFiles?: number };
   uncertainties?: string[];
+  // Task 3.4 (V7 §22.10/22.18): UI-affecting requirements the architect
+  // flags, which flow into the visual verification contract (Task 3.3).
+  // Same optional-tolerant convention as every array field above --
+  // validate_architecture_plan (glimmer-engineer.py) additionally caps this
+  // one at 20 entries / 300 chars each, since it feeds an automation
+  // contract file rather than just prompt text.
+  visualRequirements?: string[];
 }
 
 // V7 §5.7 ArchitectReview — pre-verification review decision, written to
@@ -311,6 +344,75 @@ export interface DeliveryReview {
   confidence: { level: "low" | "medium" | "high"; reason: string };
   reviewFailed?: true;
   reviewFailureReason?: string;
+}
+
+// V7 §22.14 visual evidence store — these mirror glimmer-visual.py's real
+// on-disk shapes (build_manifest / build_findings) field-for-field rather
+// than inventing a new combined shape, so the gateway route can pass the
+// parsed JSON straight through with no translation layer.
+
+// build_manifest's per-(viewport[, state]) entry. `state` is absent on a
+// pre-3.3 single-state run (capture_viewport's plain output carries no
+// "state" key at all); present ("initial" or a named state) whenever
+// --states-file drove the run -- V7 §22.7's "no state key -> initial"
+// convention.
+export interface VisualCapture {
+  viewport: string;
+  state?: string;
+  screenshot: string | null;
+  status: "captured" | "failed";
+  error: string | null;
+}
+
+// visual-manifest.json (build_manifest) -- "pass" only when every requested
+// viewport captured; "partial" when some did; "failed" when none did.
+export type VisualManifestStatus = "pass" | "partial" | "failed";
+
+export interface VisualManifest {
+  route: string;
+  viewports: string[];
+  states: string[];
+  status: VisualManifestStatus;
+  captures: VisualCapture[];
+}
+
+// findings.json (build_findings). "NOT_RUN" means capture succeeded but
+// --vision was never passed (capture succeeded != visually reviewed); the
+// other four values only appear once --vision actually ran a review.
+export type VisualFindingsStatus = "NOT_RUN" | "PASS" | "FAIL" | "BLOCKED" | "PASS_WITH_WARNINGS";
+
+export type VisualFindingSeverity = "low" | "medium" | "high" | "critical";
+
+// One entry from build_findings/`_coerce_finding`. `state` absent means
+// "initial" (V7 §22.7), same convention as VisualCapture.state.
+export interface VisualFinding {
+  id?: string;
+  severity: VisualFindingSeverity;
+  category?: string;
+  element?: string;
+  description: string;
+  viewport?: string;
+  state?: string;
+  region?: { x: number; y: number; width: number; height: number };
+}
+
+export interface VisualFindings {
+  status: VisualFindingsStatus;
+  viewport: string;
+  viewports: string[];
+  reviewed?: string[];
+  blocked?: string[];
+  findings: VisualFinding[];
+}
+
+// GET /api/sessions/:id/visual/manifest response body -- combines both
+// files glimmer-visual.py writes per run. `findings` is null only when
+// findings.json itself is unreadable/absent (shouldn't happen once
+// manifest exists, since main() always writes both together, but the route
+// tolerates it the same honest way every other opt-in artifact read does).
+export interface VisualVerification {
+  manifest: VisualManifest;
+  findings: VisualFindings | null;
 }
 
 // C3 (glimmer-v7): flat evidence-driven task list, written to tasks.json.
