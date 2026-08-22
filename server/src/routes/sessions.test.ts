@@ -544,6 +544,122 @@ describe("GET /api/sessions/:id/delivery-review", () => {
   });
 });
 
+describe("GET /api/sessions/:id/evidence", () => {
+  const indexEntries = [
+    { id: "sess-1-ev-1", kind: "file", path: "src/greet.js", toolCall: "read_file" },
+    {
+      id: "sess-1-ev-2", kind: "test-search", path: "src/greet.js", toolCall: "find_related_tests",
+      relatesTo: [{ path: "src/greet.test.js", kind: "test" }],
+    },
+  ];
+
+  it("returns the parsed evidence-index.json list when present", async () => {
+    const id = "20260822-000001-glimmer-evidence-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "evidence-index.json"), JSON.stringify(indexEntries));
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ entries: indexEntries });
+  });
+
+  it("returns 404 when no evidence-index.json was ever written (opt-in artifact)", async () => {
+    const id = "20260822-000002-glimmer-evidence-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence`);
+    expect(res.status).toBe(404);
+  });
+
+  it("?id= returns the single persisted evidence-NN.jsonl line, capped", async () => {
+    const id = "20260822-000003-glimmer-evidence-entry";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const bigContent = "z".repeat(5000);
+    await fs.writeFile(
+      path.join(dir, "evidence-00.jsonl"),
+      JSON.stringify({
+        id: "sess-1-ev-1", sessionId: "sess-1", timestamp: "t", tool: "read_file",
+        arguments: { path: "src/greet.js" }, content: bigContent,
+      }) + "\n"
+      // A tool_envelope-kind line has no top-level "id" -- must never be
+      // mistaken for the entry being looked up.
+      + JSON.stringify({ kind: "tool_envelope", ok: true, tool: "read_file", data: "x" }) + "\n"
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe("sess-1-ev-1");
+    expect(res.body.tool).toBe("read_file");
+    expect(res.body.arguments).toEqual({ path: "src/greet.js" });
+    expect(res.body.content.length).toBeLessThan(bigContent.length);
+    expect(res.body.content.endsWith("[truncated]")).toBe(true);
+  });
+
+  it("?id= redacts write_file/edit_file arguments to path+keys (never echoes full file content)", async () => {
+    const id = "20260822-000006-glimmer-evidence-write-redact";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const wholeFileContent = "line 1\n".repeat(2000);
+    await fs.writeFile(
+      path.join(dir, "evidence-00.jsonl"),
+      JSON.stringify({
+        id: "sess-1-ev-1", tool: "write_file",
+        arguments: { path: "src/big.ts", content: wholeFileContent },
+        content: "wrote src/big.ts",
+      }) + "\n"
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
+    expect(res.status).toBe(200);
+    expect(res.body.arguments).toEqual({ path: "src/big.ts", keys: ["path", "content"] });
+    expect(JSON.stringify(res.body.arguments)).not.toContain("line 1");
+  });
+
+  it("?id= caps non-write-tool arguments at 4000 characters", async () => {
+    const id = "20260822-000007-glimmer-evidence-args-cap";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const hugePattern = "x".repeat(5000);
+    await fs.writeFile(
+      path.join(dir, "evidence-00.jsonl"),
+      JSON.stringify({
+        id: "sess-1-ev-1", tool: "grep_search",
+        arguments: { pattern: hugePattern }, content: "no matches",
+      }) + "\n"
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
+    expect(res.status).toBe(200);
+    expect(typeof res.body.arguments).toBe("string");
+    expect(res.body.arguments.length).toBeLessThan(JSON.stringify({ pattern: hugePattern }).length);
+    expect(res.body.arguments.endsWith("...(truncated)")).toBe(true);
+  });
+
+  it("?id= returns 404 for an unknown evidence id", async () => {
+    const id = "20260822-000004-glimmer-evidence-entry-missing";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "evidence-00.jsonl"),
+      JSON.stringify({ id: "sess-1-ev-1", tool: "read_file", arguments: {}, content: "x" }) + "\n"
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-999`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const fileId = "20260822-000005-not-a-directory";
+    await fs.writeFile(path.join(stateRoot, "sessions", fileId), "not a session dir");
+
+    const res = await request(app).get(`/api/sessions/${fileId}/evidence`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
 describe("GET /api/sessions/:id/tasks", () => {
   const tasks = [
     { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },
@@ -825,7 +941,7 @@ describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
 });
 
 describe("opt-in artifact routes reject path-traversal ids", () => {
-  it.each(["plan", "architect-reviews", "delivery-review", "tasks"])(
+  it.each(["plan", "architect-reviews", "delivery-review", "tasks", "evidence"])(
     "GET /api/sessions/:id/%s returns 404 for a traversal id",
     async (routeName) => {
       const res = await request(app).get(`/api/sessions/..%2F..%2Fevil/${routeName}`);

@@ -1,7 +1,7 @@
 import type {
   DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance, CreateWorkspaceResult,
-  VisualVerification, TaskOverride,
+  VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -26,6 +26,12 @@ export const glimmerApi = {
   getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),
   getSessionTasks: (id: string) => request<GlimmerTask[]>(`/api/sessions/${id}/tasks`),
+  // Task 5.2 (V7 §26/§46) -- evidence-index.json list + one capped
+  // entry lookup by id, same one-route-two-shapes split as the server
+  // route (see server/src/routes/sessions.ts).
+  getEvidenceIndex: (id: string) => request<EvidenceIndexResponse>(`/api/sessions/${id}/evidence`),
+  getEvidenceEntry: (id: string, evidenceId: string) =>
+    request<EvidenceEntryResponse>(`/api/sessions/${id}/evidence?id=${encodeURIComponent(evidenceId)}`),
   // Task 4.3 — human skip/approve, gateway-owned (see server/src/lib/
   // sessions.ts writeTaskOverride). One-shot: a second click just replaces
   // the prior override, no undo.

@@ -9,6 +9,7 @@ import {
   readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
   writeHumanAcceptance, readVisualManifest, readVisualFindings,
   readTaskOverrides, writeTaskOverride, applyTaskOverrides,
+  readEvidenceIndex, readEvidenceEntry,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
@@ -288,6 +289,30 @@ sessionsRouter.get("/sessions/:id/delivery-review", async (req, res) => {
     const review = await readDeliveryReview(req.params.id);
     if (!review) return res.status(404).json({ error: "not found" });
     res.json(review);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Task 5.2 (V7 §26/§46): evidence-index.json + per-entry lookup behind
+// one endpoint, distinguished by the ?id= query param -- a single
+// GET route (rather than a second path segment) since both read from
+// the same underlying evidence store and the panel's two views (list,
+// then drill into one entry) are really one resource at different
+// granularity. Same opt-in-artifact-absence convention as /plan,
+// /delivery-review, etc.: no evidence-index.json (or no matching id) is
+// normal and 404s honestly.
+sessionsRouter.get("/sessions/:id/evidence", async (req, res) => {
+  try {
+    const evidenceId = req.query.id;
+    if (typeof evidenceId === "string" && evidenceId) {
+      const entry = await readEvidenceEntry(req.params.id, evidenceId);
+      if (!entry) return res.status(404).json({ error: "not found" });
+      return res.json(entry);
+    }
+    const entries = await readEvidenceIndex(req.params.id);
+    if (!entries) return res.status(404).json({ error: "not found" });
+    res.json({ entries });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -7,6 +7,7 @@ import type {
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
   ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
   FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
+  EvidenceIndexEntry, EvidenceEntryResponse,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -413,6 +414,112 @@ export async function readArchitectReviews(id: string): Promise<ArchitectReview[
     }
   }
   return reviews.length > 0 ? reviews : null;
+}
+
+// Task 5.2 (V7 §26/§46): evidence-index.json -- a single JSON array
+// glimmer-engineer.py appends to incrementally, one entry per persisted
+// evidence id (same read_candidate_evidence-lite treatment as
+// architecture-plan.json/delivery-review.json: absence is normal, a
+// malformed file resolves to null via readSessionJsonFile). Never
+// iteration-numbered (unlike evidence-NN.jsonl) since it's shared across
+// the whole session.
+export async function readEvidenceIndex(id: string): Promise<EvidenceIndexEntry[] | null> {
+  const raw = await readSessionJsonFile<unknown>(id, "evidence-index.json");
+  // Fix round 1 (NIT): readSessionJsonFile only proves valid JSON, not
+  // that it's the array shape this file is always written as -- a
+  // corrupt/partial write (e.g. truncated mid-`os.replace`) could parse
+  // to a non-array value that would otherwise reach a caller expecting
+  // .length/.map to exist.
+  return Array.isArray(raw) ? (raw as EvidenceIndexEntry[]) : null;
+}
+
+// Response body is capped well under evidence-NN.jsonl's own persist-time
+// cap (MAX_EVIDENCE_RESULT, 7000 chars in glimmer-engineer.py) -- this is
+// a second, independent cap on what the gateway ever sends a browser for
+// one entry, same "cap again at the boundary that actually serves it"
+// discipline as ARCHITECT_REVIEW_DIFF_MAX_CHARS elsewhere in this file.
+// Applied to both `content` and (Fix round 1, MED) `arguments`.
+const EVIDENCE_ENTRY_FIELD_MAX_CHARS = 4000;
+
+const EVIDENCE_FILE_RE = /^evidence-\d+\.jsonl$/;
+
+// Fix round 1 (MED): write_file/edit_file arguments carry the ENTIRE
+// written/edited file content (glimmer-engineer.py's own new_content/
+// old_string fields) -- serving that verbatim through this endpoint would
+// leak full file bodies where only "what tool ran, on what path" is
+// meant to be visible. Same redaction shape run_engineer's own
+// display_args/tool_started event already applies to WRITE_TOOLS.
+const EVIDENCE_WRITE_TOOL_NAMES = new Set(["write_file", "edit_file"]);
+
+function cappedEvidenceArguments(tool: string | undefined, args: unknown): unknown {
+  if (tool && EVIDENCE_WRITE_TOOL_NAMES.has(tool) && args && typeof args === "object" && !Array.isArray(args)) {
+    const obj = args as Record<string, unknown>;
+    return { path: obj.path, keys: Object.keys(obj) };
+  }
+  if (args === undefined) return args;
+  let json: string;
+  try {
+    json = JSON.stringify(args);
+  } catch {
+    return args; // not JSON-serializable (shouldn't happen for parsed JSON) -- pass through as-is
+  }
+  return json.length > EVIDENCE_ENTRY_FIELD_MAX_CHARS
+    ? json.slice(0, EVIDENCE_ENTRY_FIELD_MAX_CHARS) + "...(truncated)"
+    : args;
+}
+
+// One persisted evidence-NN.jsonl line by id (Task 5.1's get_evidence
+// tool reads this same family of files client-side; this is the
+// gateway's read-only equivalent for the Control Center panel). Scans
+// every evidence-*.jsonl file in the session dir, same collection
+// convention as readArchitectReviews above (a torn/malformed line is
+// skipped, not a request error) -- returns the FIRST match by id (ids
+// are unique within a session by construction, see
+// glimmer-engineer.py's _persist_evidence). null when the session dir
+// is missing, no evidence file matches, or no line carries this id.
+export async function readEvidenceEntry(id: string, evidenceId: string): Promise<EvidenceEntryResponse | null> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) return null;
+  let entries: string[];
+  try {
+    entries = await fs.readdir(path.join(sessionsDir(), real));
+  } catch (err: any) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+  const files = entries.filter((f) => EVIDENCE_FILE_RE.test(f)).sort();
+  for (const file of files) {
+    let raw: string;
+    try {
+      raw = await fs.readFile(path.join(sessionsDir(), real, file), "utf-8");
+    } catch {
+      continue;
+    }
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let record: any;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue; // torn/partial line -- same tolerant treatment as readSessionEventsBatch
+      }
+      // Only _persist_evidence's own entries carry a top-level "id" --
+      // tool_envelope entries (kind: "tool_envelope") do not, so this can
+      // never resolve to the wrong record shape.
+      if (record?.id !== evidenceId) continue;
+      const tool = typeof record.tool === "string" ? record.tool : undefined;
+      const content = typeof record.content === "string" ? record.content : undefined;
+      return {
+        id: evidenceId,
+        tool,
+        arguments: cappedEvidenceArguments(tool, record.arguments),
+        content: content !== undefined && content.length > EVIDENCE_ENTRY_FIELD_MAX_CHARS
+          ? content.slice(0, EVIDENCE_ENTRY_FIELD_MAX_CHARS) + "\n\n[truncated]"
+          : content,
+      };
+    }
+  }
+  return null;
 }
 
 export async function writeGatewayContract(dir: string, contract: TaskContract): Promise<void> {

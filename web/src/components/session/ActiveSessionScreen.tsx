@@ -14,6 +14,7 @@ import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
 import { GatesRow } from "./GatesRow";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 import { VisualVerificationPanel } from "./VisualVerificationPanel";
+import { EvidencePanel } from "./EvidencePanel";
 
 // Non-success terminal states where a `failure` cause (if present) is worth
 // surfacing as a banner. "verified" is terminal but not a failure to
@@ -175,6 +176,7 @@ export function ActiveSessionScreen() {
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
       {id && <DeliveryReviewPanel sessionId={id} />}
       {id && <VisualVerificationPanel sessionId={id} />}
+      {id && <EvidencePanel sessionId={id} />}
     </div>
   );
 }
