@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import atexit
 import functools
 import hashlib
 import json
@@ -10,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, error
@@ -418,6 +420,9 @@ def http_json(
     endpoint,
     payload=None,
     extra_headers=None,
+    # Task 6.1 (V7 §16): per-call timeout, default unchanged (3600) so
+    # every pre-existing caller that doesn't pass this is byte-compatible.
+    timeout_s=3600,
 ):
     headers = {
         "Authorization": f"Bearer {api_key()}",
@@ -442,7 +447,7 @@ def http_json(
     try:
         with request.urlopen(
             req,
-            timeout=3600,
+            timeout=timeout_s,
         ) as response:
 
             raw = response.read().decode(
@@ -461,6 +466,373 @@ def http_json(
         raise RuntimeError(
             f"HTTP {exc.code} {endpoint}\n{body}"
         ) from exc
+
+
+# ============================================================
+# MODEL PROVIDER (V7 §16 Model Runtime, §31 Model routing)
+# ============================================================
+#
+# Task 6.1. Wraps http_json (the internal transport -- unchanged, still
+# the one function every self-check monkeypatches) behind a stable
+# interface so the rest of the engineer doesn't depend on llama.cpp's
+# specific request/response shape. This is the ROUTING SEAM the spec
+# asks for, not live routing: every role in MODEL_ROLES below points at
+# the same API_BASE today, and .generate() still calls the shared
+# http_json (still always API_BASE + api_key()) rather than using its own
+# base_url/api_key_path for the actual transport -- those two attributes
+# are carried on the instance so a future real router has somewhere to
+# read them from, without this round rewriting http_json into a
+# multi-endpoint client for a distinction that doesn't exist yet.
+# glimmer-visual.py's vision model call is a SEPARATE provider in this
+# same sense (see its own module comment) -- it already takes its
+# endpoint as a CLI arg, which IS its routing; it stays standalone.
+
+MODEL_ROLES = {
+    "engineer": API_BASE,
+    "architect": API_BASE,
+    "consult": API_BASE,
+}
+
+# Round 6 usage-metrics totals, keyed by role: {"promptTokens",
+# "completionTokens", "calls"}. Written out once at process exit by
+# _write_model_usage_file (registered below) -- see that function's
+# docstring for why atexit rather than an explicit call at every
+# run_engineer/run_architect return point.
+_MODEL_USAGE_TOTALS = {}
+
+
+def _accumulate_usage(role, usage):
+    """Never raises -- usage metrics are observability, not correctness.
+    `usage` is the OpenAI-compatible {"prompt_tokens", "completion_tokens",
+    ...} dict from a chat-completions response when the server includes
+    one; absent/malformed usage still counts the call."""
+    try:
+        bucket = _MODEL_USAGE_TOTALS.setdefault(
+            role, {"promptTokens": 0, "completionTokens": 0, "calls": 0}
+        )
+        bucket["calls"] += 1
+        if isinstance(usage, dict):
+            bucket["promptTokens"] += int(usage.get("prompt_tokens") or 0)
+            bucket["completionTokens"] += int(usage.get("completion_tokens") or 0)
+    except Exception:  # noqa: BLE001 - metrics must never break a real call
+        pass
+
+
+def _write_model_usage_file():
+    """Registered with atexit so totals are written whether the process
+    ends normally or via an uncaught exception -- no-op (same convention
+    as _architecture_plan_file_path/every other session-dir writer here)
+    when there's no session dir (standalone invocation) or nothing was
+    ever accumulated."""
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return
+    if not _MODEL_USAGE_TOTALS:
+        return
+    try:
+        path = Path(GLIMMER_EVENTS_PATH).parent / "model-usage.json"
+        path.write_text(
+            json.dumps(_MODEL_USAGE_TOTALS, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+atexit.register(_write_model_usage_file)
+
+
+def _is_retryable_network_error(exc):
+    """True only for connection-refused/reset -- the request never
+    reached the server, so resending it can't double-execute anything.
+    Deliberately NOT true for a timeout (the server may already be mid-
+    flight processing the first request) and NOT true for an HTTPError/
+    RuntimeError (that's already a real response the server produced and
+    acted on) -- request idempotency at the model server is unknown, so
+    only the "never arrived" case is safe to retry blindly."""
+    if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+        return True
+    if isinstance(exc, error.URLError) and not isinstance(exc, error.HTTPError):
+        reason = getattr(exc, "reason", None)
+        return isinstance(reason, (ConnectionRefusedError, ConnectionResetError))
+    return False
+
+
+class ModelProvider:
+    """Task 6.1 (V7 §16). One instance per role (see MODEL_ROLES). All
+    network calls go through the module-level http_json so every existing
+    self-check's `global http_json; http_json = fake_http_json` pattern
+    keeps working unchanged against this class too."""
+
+    def __init__(self, base_url, api_key_path, role):
+        self.base_url = base_url
+        self.api_key_path = api_key_path
+        self.role = role
+        self.last_request_id = None
+        self._capabilities_cache = None  # None = not yet probed; {} on a failed probe
+
+    def generate(self, payload, timeout_s=None, request_id=None):
+        """POST /v1/chat/completions. Byte-compatible with the direct
+        http_json call sites it replaces (same headers/auth/error
+        behavior -- see http_json). Exactly ONE generic retry, and only
+        for a connection-refused/reset (see _is_retryable_network_error);
+        never for an HTTP 4xx/5xx body and never for a timeout. `request_id`
+        lets a caller pre-announce the id it's about to use (e.g. in a
+        model_retry event fired just before this call) so the same id
+        shows up in this call's own logs; a retried physical attempt
+        always gets its OWN fresh id, since it's a genuinely different
+        request against the server."""
+        kwargs = {"timeout_s": timeout_s} if timeout_s is not None else {}
+
+        for attempt_no in (1, 2):
+            this_id = (
+                request_id
+                if (attempt_no == 1 and request_id)
+                else uuid.uuid4().hex[:12]
+            )
+            self.last_request_id = this_id
+
+            try:
+                response = http_json(
+                    "POST", "/v1/chat/completions", payload, **kwargs
+                )
+            except RuntimeError as exc:
+                # HTTP 4xx/5xx: http_json already converted the response
+                # into this RuntimeError -- never retried (see
+                # _is_retryable_network_error's docstring).
+                print(f"[ModelProvider:{self.role}] request {this_id} failed: {exc}")
+                raise
+            except Exception as exc:
+                if attempt_no == 1 and _is_retryable_network_error(exc):
+                    print(
+                        f"[ModelProvider:{self.role}] request {this_id} "
+                        f"connection error, retrying once: {exc}"
+                    )
+                    continue
+                print(f"[ModelProvider:{self.role}] request {this_id} failed: {exc}")
+                raise
+            else:
+                usage = response.get("usage") if isinstance(response, dict) else None
+                _accumulate_usage(self.role, usage)
+                return response
+
+    def health(self):
+        """GET /health -- same endpoint glimmer-status.sh already curls.
+        Never raises: an unreachable/unhealthy server degrades to a
+        {"ok": False, "error": ...} dict instead of an exception."""
+        try:
+            return http_json("GET", "/health")
+        except Exception as exc:  # noqa: BLE001 - health probe must never blow up a caller
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def capabilities(self):
+        """GET /v1/models, probed at most once per instance and cached.
+        Never raises and never blocks operation on a failed probe: an
+        unreachable/unsupported endpoint degrades to {} (honest "nothing
+        known"), not an exception -- callers must already treat {} as
+        "no capability info", never as "the model has zero capabilities"."""
+        if self._capabilities_cache is not None:
+            return self._capabilities_cache
+        try:
+            result = http_json("GET", "/v1/models")
+            if not isinstance(result, dict):
+                result = {}
+        except Exception:  # noqa: BLE001 - fail-open, see docstring
+            result = {}
+        self._capabilities_cache = result
+        return result
+
+
+_MODEL_PROVIDERS = {
+    role: ModelProvider(base_url=url, api_key_path=API_KEY_FILE, role=role)
+    for role, url in MODEL_ROLES.items()
+}
+
+
+def _provider_for_role(role):
+    return _MODEL_PROVIDERS.get(role) or _MODEL_PROVIDERS["engineer"]
+
+
+def _model_provider_selfcheck() -> None:
+    """Task 6.1 (V7 §16/§31): ModelProvider, monkeypatching http_json (the
+    shared transport) so no live llama-server is needed. Run with:
+    python3 glimmer-engineer.py --model-provider-selfcheck
+    """
+    global http_json
+
+    real_http_json = http_json
+    real_totals = dict(_MODEL_USAGE_TOTALS)
+    _MODEL_USAGE_TOTALS.clear()
+
+    try:
+        # ------------------------------------------------------------
+        # 1. generate() byte-compat: same request shape (method/endpoint/
+        #    payload/timeout_s) a direct http_json call would have used,
+        #    same return value passed straight through.
+        # ------------------------------------------------------------
+        calls = []
+
+        def fake_ok(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            calls.append((method, endpoint, payload, timeout_s))
+            return {
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+
+        http_json = fake_ok
+        provider = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="test-role")
+        response = provider.generate({"model": "m", "messages": []})
+        assert calls == [("POST", "/v1/chat/completions", {"model": "m", "messages": []}, 3600)], calls
+        assert response["choices"][0]["message"]["content"] == "hi"
+        assert provider.last_request_id is not None and len(provider.last_request_id) == 12
+
+        calls.clear()
+        provider.generate({"model": "m", "messages": []}, timeout_s=30)
+        assert calls[-1][3] == 30, "a supplied timeout_s must be forwarded to http_json"
+
+        # ------------------------------------------------------------
+        # 2. Usage accumulation: promptTokens/completionTokens/calls per
+        #    role, across multiple generate() calls; a response with no
+        #    usage key still counts the call without fabricating tokens.
+        # ------------------------------------------------------------
+        assert _MODEL_USAGE_TOTALS["test-role"] == {
+            "promptTokens": 20, "completionTokens": 10, "calls": 2,
+        }, _MODEL_USAGE_TOTALS
+
+        def fake_no_usage(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            return {"choices": [{"message": {"content": "x"}}]}
+
+        http_json = fake_no_usage
+        provider.generate({"model": "m", "messages": []})
+        assert _MODEL_USAGE_TOTALS["test-role"]["calls"] == 3
+        assert _MODEL_USAGE_TOTALS["test-role"]["promptTokens"] == 20, "missing usage must not add fake tokens"
+
+        # ------------------------------------------------------------
+        # 3. Retry exactly once on connection-refused/reset; never on an
+        #    HTTP error (already a RuntimeError by the time it reaches
+        #    generate -- see http_json) and never on a timeout.
+        # ------------------------------------------------------------
+        attempts_seen = []
+
+        def fake_refused_then_ok(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            attempts_seen.append(1)
+            if len(attempts_seen) == 1:
+                raise ConnectionRefusedError("refused")
+            return {"choices": [{"message": {"content": "recovered"}}]}
+
+        http_json = fake_refused_then_ok
+        response = provider.generate({"model": "m", "messages": []})
+        assert len(attempts_seen) == 2, "must retry exactly once on connection-refused"
+        assert response["choices"][0]["message"]["content"] == "recovered"
+
+        attempts_seen.clear()
+
+        def fake_refused_twice(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            attempts_seen.append(1)
+            raise ConnectionResetError("reset")
+
+        http_json = fake_refused_twice
+        try:
+            provider.generate({"model": "m", "messages": []})
+            assert False, "must raise once the one retry is also exhausted"
+        except ConnectionResetError:
+            pass
+        assert len(attempts_seen) == 2, "exactly one retry, never more"
+
+        attempts_seen.clear()
+
+        def fake_http_error(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            attempts_seen.append(1)
+            raise RuntimeError("HTTP 500 /v1/chat/completions\nboom")
+
+        http_json = fake_http_error
+        try:
+            provider.generate({"model": "m", "messages": []})
+            assert False, "an HTTP error must propagate"
+        except RuntimeError:
+            pass
+        assert len(attempts_seen) == 1, "an HTTP error body must never be retried"
+
+        attempts_seen.clear()
+
+        def fake_timeout(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            attempts_seen.append(1)
+            raise TimeoutError("timed out")
+
+        http_json = fake_timeout
+        try:
+            provider.generate({"model": "m", "messages": []})
+            assert False, "a timeout must propagate"
+        except TimeoutError:
+            pass
+        assert len(attempts_seen) == 1, "a timeout must never be retried -- idempotency at the server is unknown"
+
+        # ------------------------------------------------------------
+        # 4. Request ids: unique per call; a caller-supplied id is used
+        #    for the first physical attempt.
+        # ------------------------------------------------------------
+        http_json = fake_ok
+        seen_ids = set()
+        for _ in range(5):
+            provider.generate({"model": "m", "messages": []})
+            seen_ids.add(provider.last_request_id)
+        assert len(seen_ids) == 5, "each call must get its own request id"
+
+        provider.generate({"model": "m", "messages": []}, request_id="caller-supplied-1")
+        assert provider.last_request_id == "caller-supplied-1", (
+            "a caller-supplied request_id must be used for the first physical attempt"
+        )
+
+        # ------------------------------------------------------------
+        # 5. capabilities(): probed once, cached, fail-open to {}.
+        # ------------------------------------------------------------
+        probe_calls = []
+
+        def fake_models(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            probe_calls.append(endpoint)
+            return {"data": [{"id": "muse-glimmer"}]}
+
+        http_json = fake_models
+        cap_provider = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="cap-role")
+        caps1 = cap_provider.capabilities()
+        caps2 = cap_provider.capabilities()
+        assert caps1 == {"data": [{"id": "muse-glimmer"}]}
+        assert caps2 == caps1
+        assert probe_calls == ["/v1/models"], "capabilities() must probe /v1/models exactly ONCE, then cache"
+
+        def fake_models_fail(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            raise RuntimeError("HTTP 500 /v1/models")
+
+        http_json = fake_models_fail
+        fail_provider = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="fail-role")
+        assert fail_provider.capabilities() == {}, "a failed probe must degrade to {} honestly, never raise"
+        assert fail_provider.capabilities() == {}, "the failed-probe result is cached too (probed only once)"
+
+        # ------------------------------------------------------------
+        # 6. health(): never raises.
+        # ------------------------------------------------------------
+        def fake_health_down(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            raise ConnectionRefusedError("down")
+
+        http_json = fake_health_down
+        health = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="h").health()
+        assert health.get("ok") is False and "error" in health
+
+        # ------------------------------------------------------------
+        # 7. MODEL_ROLES / _provider_for_role: the documented routing
+        #    seam -- every role present, all pointing at the same
+        #    endpoint today (no live routing yet).
+        # ------------------------------------------------------------
+        assert set(MODEL_ROLES) == {"engineer", "architect", "consult"}
+        assert len(set(MODEL_ROLES.values())) == 1, "every role points at the same endpoint today (routing seam only)"
+        assert _provider_for_role("architect").role == "architect"
+        assert _provider_for_role("unknown-role").role == "engineer", "an unknown role must fail open to engineer"
+
+    finally:
+        http_json = real_http_json
+        _MODEL_USAGE_TOTALS.clear()
+        _MODEL_USAGE_TOTALS.update(real_totals)
+
+    print("model-provider self-check: PASS")
 
 
 # ============================================================
@@ -4255,9 +4627,25 @@ def _evidence_index_selfcheck() -> None:
 # PEG RETRY
 # ============================================================
 
+def _reduced_context_messages(messages):
+    """Task 6.2 (V7 §17 recovery attempt 3): rebuild `messages` down to
+    Tier0 (system + task/contract -- indices 0/1, see the
+    CONTEXT_BUDGET_CHARS/TIER0_BUDGET_PCT tier model above run_engineer)
+    plus the single most recent message -- the immediate failure/tool-
+    result context the model was reacting to when the parser failure
+    hit. Returns None when there's nothing left to usefully reduce
+    (3 or fewer messages already IS system+task+one message -- rebuilding
+    would just repeat the exact request an earlier attempt already
+    tried)."""
+    if len(messages) <= 3:
+        return None
+    return [messages[0], messages[1], messages[-1]]
+
+
 def chat_with_retry(
     payload,
     attempts=3,
+    role="engineer",
 ):
     """
     Call llama-server with adaptive PEG recovery.
@@ -4269,11 +4657,24 @@ def chat_with_retry(
         Disable model thinking for tool-bearing turns so the
         model produces a simpler structured tool-call response.
 
+    One further attempt (V7 §17 recovery tier 3), after the attempts
+    above are exhausted:
+        Reduced context -- rebuild messages as Tier0 (system + task)
+        plus only the single most recent message, thinking still
+        disabled. See _reduced_context_messages.
+
     If parsing still fails after all attempts, the caller's
-    deterministic fail-closed fallback handles the failure.
+    deterministic fail-closed fallback (final_synthesis) handles the
+    failure.
+
+    `role` selects which ModelProvider (see MODEL_ROLES) makes the
+    actual call -- callers pass "architect"/"consult" for those modes;
+    "engineer" (the default) covers the main engineer loop and the
+    delivery-review turn.
     """
 
     last_error = None
+    provider = _provider_for_role(role)
 
     base_payload = dict(payload)
 
@@ -4367,11 +4768,8 @@ def chat_with_retry(
                     f"[PEG DEBUG] payload: {debug_path}"
                 )
 
-            return http_json(
-                "POST",
-                "/v1/chat/completions",
-                request_payload,
-            )
+            request_id = uuid.uuid4().hex[:12]
+            return provider.generate(request_payload, request_id=request_id)
 
         except RuntimeError as exc:
             if (
@@ -4381,17 +4779,26 @@ def chat_with_retry(
                 raise
 
             last_error = exc
+            # The id actually used for the failed attempt (generate()
+            # sets this even when it raises) -- included in the events
+            # below and already printed by ModelProvider.generate itself.
+            request_id = provider.last_request_id
 
             print()
             print(
                 "⚠ PEG parser failure "
-                f"({attempt}/{attempts})"
+                f"({attempt}/{attempts}) [request {request_id}]"
             )
 
             _emit(
                 "parser_recovery",
                 attempt=attempt,
                 payloadPath=str(debug_path) if debug_path else "",
+                requestId=request_id,
+                # Additive (Task 6.2): "thinking_disabled" once reasoning
+                # is off (attempt > 1); omitted for the plain first
+                # attempt, which used neither recovery strategy.
+                **({"strategy": "thinking_disabled"} if peg_recovery_mode else {}),
             )
 
             if attempt < attempts:
@@ -4404,6 +4811,7 @@ def chat_with_retry(
                     "model_retry",
                     attempt=attempt + 1,
                     strategy=strategy,
+                    requestId=request_id,
                 )
                 if "tools" in base_payload:
                     print(
@@ -4415,7 +4823,235 @@ def chat_with_retry(
                         "Retrying same turn..."
                     )
 
+    # ----------------------------------------------------
+    # RECOVERY TIER 3 (V7 §17 attempt 3): reduced context.
+    # ----------------------------------------------------
+    #
+    # One extra attempt after the normal attempts ladder above is
+    # exhausted, before the caller's final_synthesis fail-closed
+    # fallback (attempt 4) takes over. Thinking stays disabled (same
+    # reasoning as attempts 2+ above) on top of the smaller context.
+    reduced_messages = _reduced_context_messages(base_payload.get("messages") or [])
+
+    if reduced_messages is not None:
+        reduced_payload = dict(base_payload)
+        reduced_payload["messages"] = reduced_messages
+        reduced_payload["reasoning_effort"] = "none"
+
+        template_kwargs = dict(reduced_payload.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = False
+        reduced_payload["chat_template_kwargs"] = template_kwargs
+
+        request_id = uuid.uuid4().hex[:12]
+
+        _emit(
+            "model_retry",
+            attempt=attempts + 1,
+            strategy="reduced_context",
+            requestId=request_id,
+        )
+        print()
+        print(
+            "Retrying with reduced context "
+            "(system + task + last message only)..."
+        )
+
+        try:
+            return provider.generate(reduced_payload, request_id=request_id)
+        except RuntimeError as exc:
+            if "peg-native" not in str(exc):
+                raise
+
+            last_error = exc
+            request_id = provider.last_request_id
+
+            print()
+            print(
+                "⚠ PEG parser failure "
+                f"(reduced-context attempt) [request {request_id}]"
+            )
+            _emit(
+                "parser_recovery",
+                attempt=attempts + 1,
+                payloadPath="",
+                strategy="reduced_context",
+                requestId=request_id,
+            )
+
     raise last_error
+
+
+def _recovery_ladder_selfcheck() -> None:
+    """Task 6.2 (V7 §17): chat_with_retry's full recovery ladder --
+    normal -> thinking-disabled (attempts 2..N) -> reduced-context (one
+    extra attempt) -> the caller's final_synthesis fallback (exercised
+    via source inspection: chat_with_retry itself only raises; the
+    caller decides to fall back). Monkeypatches http_json (the shared
+    transport) so no live llama-server is needed. Run with:
+    python3 glimmer-engineer.py --recovery-ladder-selfcheck
+    """
+    import inspect
+    import tempfile
+
+    global http_json, GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    real_http_json = http_json
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "TASK"},
+        {"role": "assistant", "content": "did something"},
+        {"role": "tool", "content": "tool result 1", "tool_call_id": "c1"},
+        {"role": "assistant", "content": "did more"},
+        {"role": "tool", "content": "tool result 2 -- the last one", "tool_call_id": "c2"},
+    ]
+    payload = {
+        "model": "muse-glimmer",
+        "messages": messages,
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+    }
+
+    seen_payloads = []
+
+    def fake_peg_failure(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        seen_payloads.append(payload)
+        raise RuntimeError("peg-native parse failure: bad tool call")
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            events_path = Path(td) / "events.jsonl"
+            events_path.write_text("")
+            GLIMMER_EVENTS_PATH = str(events_path)
+            GLIMMER_SESSION_ID = "sess-ladder"
+
+            http_json = fake_peg_failure
+            try:
+                chat_with_retry(payload, attempts=3)
+                assert False, "must raise once every ladder rung is exhausted"
+            except RuntimeError as exc:
+                assert "peg-native" in str(exc)
+
+            # attempts=3 (normal, thinking-disabled x2) + 1 reduced-context
+            # tier-3 attempt = 4 physical calls total.
+            assert len(seen_payloads) == 4, f"expected 4 ladder attempts, got {len(seen_payloads)}"
+
+            # Attempt 1: normal -- no reasoning_effort/enable_thinking
+            # override, full message history untouched.
+            assert "reasoning_effort" not in seen_payloads[0]
+            assert seen_payloads[0]["messages"] == messages
+
+            # Attempts 2-3: thinking disabled, SAME (full) message history
+            # -- only reasoning changes, not context.
+            for i in (1, 2):
+                assert seen_payloads[i]["reasoning_effort"] == "none"
+                assert seen_payloads[i]["chat_template_kwargs"]["enable_thinking"] is False
+                assert seen_payloads[i]["messages"] == messages
+
+            # Attempt 4: reduced context -- Tier0 (system+task) + last
+            # message only, thinking still disabled.
+            reduced = seen_payloads[3]
+            assert reduced["reasoning_effort"] == "none"
+            assert reduced["chat_template_kwargs"]["enable_thinking"] is False
+            assert reduced["messages"] == [messages[0], messages[1], messages[-1]], (
+                f"reduced-context attempt must be [system, task, last message only], "
+                f"got {reduced['messages']}"
+            )
+            assert len(reduced["messages"]) == 3
+
+            # Events: parser_recovery gains strategy on the recovery
+            # attempts (never on the plain first attempt), and every
+            # emit carries a requestId; model_retry announces the
+            # reduced_context tier by name.
+            events = [json.loads(line) for line in events_path.read_text().splitlines()]
+
+            parser_recovery_events = [e for e in events if e["type"] == "parser_recovery"]
+            assert len(parser_recovery_events) == 4
+            assert "strategy" not in parser_recovery_events[0], "attempt 1's failure has no recovery strategy yet"
+            assert parser_recovery_events[1]["strategy"] == "thinking_disabled"
+            assert parser_recovery_events[2]["strategy"] == "thinking_disabled"
+            assert parser_recovery_events[3]["strategy"] == "reduced_context"
+            assert all(e.get("requestId") for e in parser_recovery_events), "every parser_recovery needs a requestId"
+
+            model_retry_events = [e for e in events if e["type"] == "model_retry"]
+            # 2 mid-ladder retries (announcing attempts 2 and 3) + 1
+            # announcing the reduced-context tier.
+            assert len(model_retry_events) == 3
+            assert model_retry_events[-1]["strategy"] == "reduced_context"
+            assert model_retry_events[-1]["attempt"] == 4
+            assert all(e.get("requestId") for e in model_retry_events)
+
+        # No session dir needed for the remaining sub-checks (payload
+        # shape / return value only) -- avoid emitting into a now-deleted
+        # temp dir.
+        GLIMMER_EVENTS_PATH = None
+        GLIMMER_SESSION_ID = None
+
+        # ------------------------------------------------------------
+        # Fewer than 4 messages: reduced context has nothing left to cut
+        # -- the tier-3 attempt must be skipped (not repeat an identical
+        # request), so exactly `attempts` calls are made, not attempts+1.
+        # ------------------------------------------------------------
+        seen_payloads.clear()
+        small_payload = {
+            "model": "muse-glimmer",
+            "messages": [
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "TASK"},
+            ],
+        }
+        try:
+            chat_with_retry(small_payload, attempts=2)
+            assert False
+        except RuntimeError:
+            pass
+        assert len(seen_payloads) == 2, (
+            f"with only Tier0 messages, the reduced-context tier must be "
+            f"skipped entirely (got {len(seen_payloads)} calls)"
+        )
+
+        # ------------------------------------------------------------
+        # Success at the reduced-context tier: chat_with_retry returns
+        # normally, same as any other successful attempt.
+        # ------------------------------------------------------------
+        call_count = {"n": 0}
+
+        def fake_fail_then_succeed(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            call_count["n"] += 1
+            if call_count["n"] <= 3:
+                raise RuntimeError("peg-native parse failure")
+            return {"choices": [{"message": {"role": "assistant", "content": "recovered"}}]}
+
+        http_json = fake_fail_then_succeed
+        response = chat_with_retry(payload, attempts=3)
+        assert response["choices"][0]["message"]["content"] == "recovered"
+        assert call_count["n"] == 4, "must succeed on exactly the reduced-context (4th) attempt"
+
+        # ------------------------------------------------------------
+        # role routing: chat_with_retry(role=...) actually reaches the
+        # matching ModelProvider; run_architect / _run_consult_architect
+        # actually pass their role (source inspection, same style as
+        # _consult_selfcheck's wiring checks).
+        # ------------------------------------------------------------
+        source = inspect.getsource(chat_with_retry)
+        assert "_provider_for_role(role)" in source
+
+        architect_source = inspect.getsource(run_architect)
+        assert 'role="architect"' in architect_source, (
+            'run_architect must call chat_with_retry with role="architect"'
+        )
+        consult_source = inspect.getsource(_run_consult_architect)
+        assert 'role="consult"' in consult_source, (
+            '_run_consult_architect must call chat_with_retry with role="consult"'
+        )
+
+    finally:
+        http_json = real_http_json
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+
+    print("recovery-ladder self-check: PASS")
 
 
 # ============================================================
@@ -5317,7 +5953,7 @@ def run_architect(task, workspace, max_turns, review_request_path=None):
                 )
 
             try:
-                response = chat_with_retry(payload, attempts=3)
+                response = chat_with_retry(payload, attempts=3, role="architect")
             except RuntimeError as exc:
                 if "peg-native" not in str(exc):
                     raise
@@ -6016,7 +6652,7 @@ def _run_consult_architect(architecture_plan, question):
     payload, question_capped = _build_consult_architect_payload(architecture_plan, question)
 
     try:
-        response = chat_with_retry(payload, attempts=3)
+        response = chat_with_retry(payload, attempts=3, role="consult")
         answer = response["choices"][0]["message"].get("content") or ""
         if not answer.strip():
             answer = "(architect returned an empty answer)"
@@ -8136,6 +8772,14 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--evidence-index-selfcheck"]:
         _evidence_index_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--model-provider-selfcheck"]:
+        _model_provider_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--recovery-ladder-selfcheck"]:
+        _recovery_ladder_selfcheck()
         sys.exit(0)
 
     try:
