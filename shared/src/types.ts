@@ -446,6 +446,26 @@ export interface DeliveryReviewCompletedEvent extends GlimmerEventBase {
   customerReadiness: DeliveryReviewCustomerReadiness;
   confidence: "low" | "medium" | "high";
 }
+// Task 2.4 (V7 §5.5 second half): deterministic mid-implementation
+// advisory triggers, emitted by glimmer-engineer.py's run_engineer loop.
+// Each trigger key fires at most once per session -- see
+// _evaluate_advisory_triggers in glimmer-engineer.py for the three keys
+// (new_file_count_exceeds_plan / edit_outside_candidate_files /
+// turns_high_no_writes). detail is a capped, deterministic reason string
+// (no model text).
+export interface ArchitectConsultAdvisedEvent extends GlimmerEventBase {
+  type: "architect_consult_advised";
+  trigger: string;
+  detail: string;
+}
+// Task 2.4: emitted once per consult_architect tool call (budget-limited
+// to 2/session) -- questionChars/answerChars only, never the question or
+// answer content itself.
+export interface ArchitectConsultedEvent extends GlimmerEventBase {
+  type: "architect_consulted";
+  questionChars: number;
+  answerChars: number;
+}
 
 export type GlimmerEvent =
   | ToolStartedEvent
@@ -477,7 +497,9 @@ export type GlimmerEvent =
   | VisualFindingDetectedEvent
   | VisualVerificationCompletedEvent
   | DeliveryReviewStartedEvent
-  | DeliveryReviewCompletedEvent;
+  | DeliveryReviewCompletedEvent
+  | ArchitectConsultAdvisedEvent
+  | ArchitectConsultedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -492,6 +514,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "visual_verification_started", "visual_finding_detected",
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",
+  "architect_consult_advised", "architect_consulted",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {
