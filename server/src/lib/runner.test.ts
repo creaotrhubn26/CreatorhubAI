@@ -188,6 +188,27 @@ describe("budgets.maxChangedFiles", () => {
   });
 });
 
+// Review round 1 fix: TaskContract.mode was never forwarded at all.
+describe("mode passthrough", () => {
+  it("forwards contract.mode as --mode", () => {
+    const args = buildArgs({ ...CONTRACT, mode: "debug" }, "/tmp/ws");
+    expect(args).toContain("--mode");
+    expect(args[args.indexOf("--mode") + 1]).toBe("debug");
+  });
+
+  it("accepts the new refactor mode", () => {
+    const args = buildArgs({ ...CONTRACT, mode: "refactor" }, "/tmp/ws");
+    expect(args).toContain("--mode");
+    expect(args[args.indexOf("--mode") + 1]).toBe("refactor");
+  });
+
+  it("drops an unrecognized mode instead of forwarding it (defense in depth beyond route validation)", () => {
+    const args = buildArgs({ ...CONTRACT, mode: "rm -rf /" as any }, "/tmp/ws");
+    expect(args).not.toContain("--mode");
+    expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
+  });
+});
+
 describe("validateAdvanced", () => {
   it("accepts a contract with no advanced fields at all", () => {
     expect(validateAdvanced(CONTRACT)).toBeNull();

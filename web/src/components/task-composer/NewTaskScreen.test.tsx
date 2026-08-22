@@ -210,4 +210,25 @@ describe("NewTaskScreen", () => {
       expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe("");
     });
   });
+
+  // Task 2.1 fix round 1 (V7 §5.5): composer preview of the orchestrator's
+  // risk-based architect auto-trigger.
+  describe("architect-risk preview", () => {
+    it("shows nothing at the default form state (multi_package_scope alone is below threshold)", () => {
+      render(withQuery(<NewTaskScreen />));
+      expect(screen.queryByText(/architect mode will auto-trigger/i)).not.toBeInTheDocument();
+    });
+
+    it("shows the deterministic score/signals line once the score crosses the threshold", () => {
+      render(withQuery(<NewTaskScreen />));
+      // Default scopePackage is already "repository" (multi_package_scope, +2);
+      // switching mode to "refactor" (+3) crosses the threshold of 5.
+      fireEvent.change(screen.getByText("Mode").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "refactor" },
+      });
+      expect(
+        screen.getByText("Architect mode will auto-trigger (score 5: mode_refactor, multi_package_scope)")
+      ).toBeInTheDocument();
+    });
+  });
 });

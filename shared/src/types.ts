@@ -62,7 +62,7 @@ export interface TaskContract {
     area?: string;
     paths?: string[];
   };
-  mode: "inspect" | "plan" | "implement" | "debug" | "test" | "review";
+  mode: "inspect" | "plan" | "implement" | "debug" | "test" | "review" | "refactor";
   constraints: {
     minimalChange: boolean;
     noCommit: true;

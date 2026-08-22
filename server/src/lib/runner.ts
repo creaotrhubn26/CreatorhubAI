@@ -16,6 +16,13 @@ const VERIFICATION_COMMANDS: Record<string, string> = {
 // VERIFICATION_COMMANDS above: a value outside this set is dropped, never
 // forwarded. Ranges match the route-level 400 boundary in validateAdvanced.
 const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
+// Review round 1 fix: TaskContract.mode was never forwarded to glimmer-v2.py
+// at all (buildArgs had no --mode push), so every gateway-launched run got
+// v2.1's own "implement" default regardless of what the composer/client
+// contract said. Closed set, same defense-in-depth posture as
+// TOOLCHAIN_MODES -- an out-of-range string from a raw API client is
+// dropped, never forwarded.
+const MODES = new Set(["inspect", "plan", "implement", "debug", "test", "review", "refactor"] as const);
 const MAX_TURNS_RANGE = { min: 1, max: 64 };
 const TIMEOUT_RANGE = { min: 60, max: 3600 };
 // Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles closed range.
@@ -85,6 +92,10 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
   const maxChangedFiles = contract.budgets?.maxChangedFiles;
   if (maxChangedFiles !== undefined && isInRange(maxChangedFiles, MAX_CHANGED_FILES_RANGE)) {
     args.push("--max-changed-files", String(maxChangedFiles));
+  }
+  // Review round 1 fix: was silently missing -- see MODES comment above.
+  if (MODES.has(contract.mode)) {
+    args.push("--mode", contract.mode);
   }
 
   // §7 Advanced controls: typed-only, closed-enum mapping. Every check here
