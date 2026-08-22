@@ -9,6 +9,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, error
@@ -1226,16 +1227,23 @@ def _persist_evidence(tool_name, arguments, content):
     it — so there's no cross-process race to defend against and no need
     for emit()'s uuid-based id scheme. A plain in-process incrementing
     counter gives stable, unique-within-session ids more simply.
+
+    Returns the assigned evidence id (or None when there's no session
+    dir to persist to — see _evidence_file_path). Task 1.1 (V7 §12):
+    execute_tool's ToolEnvelope carries this id in its `evidence` list,
+    so callers need it back rather than only using this for its
+    side effect.
     """
     path = _evidence_file_path()
     if path is None:
-        return
+        return None
 
     global _evidence_seq
     _evidence_seq += 1
 
+    evidence_id = f"{GLIMMER_SESSION_ID}-ev-{_evidence_seq}"
     record = {
-        "id": f"{GLIMMER_SESSION_ID}-ev-{_evidence_seq}",
+        "id": evidence_id,
         "sessionId": GLIMMER_SESSION_ID,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "tool": tool_name,
@@ -1247,6 +1255,8 @@ def _persist_evidence(tool_name, arguments, content):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
         print(f"[glimmer-engineer] failed to persist evidence: {exc}", flush=True)
+
+    return evidence_id
 
 
 def add_evidence(
@@ -1265,7 +1275,7 @@ def add_evidence(
     } | SEMANTIC_TOOL_NAMES  # O4: discovery calls, evidence-worthy like grep/read
 
     if tool_name not in interesting:
-        return
+        return None
 
     ledger.append(
         "TOOL: "
@@ -1279,7 +1289,7 @@ def add_evidence(
         + content[:MAX_EVIDENCE_RESULT]
     )
 
-    _persist_evidence(tool_name, arguments, content)
+    return _persist_evidence(tool_name, arguments, content)
 
 
 def compact_evidence(ledger):
@@ -1855,6 +1865,81 @@ SEMANTIC_TOOL_DEFINITIONS = [
 # TOOL EXECUTION
 # ============================================================
 
+# Task 1.1 (glimmer-v7, V7 §12 "Tool result contract"): execute_tool below
+# builds one ToolEnvelope per call — success, cache hit, policy block, or
+# denial — from which the model-facing message is rendered by the ONE
+# function below (_render_tool_envelope_message), and which is itself
+# persisted to evidence-NN.jsonl (alongside, not instead of, the existing
+# per-tool add_evidence entries) by _persist_tool_envelope. execute_tool's
+# own return type is UNCHANGED — still (message: str, changed: bool) — so
+# none of its ~8 existing call sites (run_engineer's loop, run_architect's
+# loop, every selfcheck that calls execute_tool directly) need to change.
+# `changed` is carried as a top-level extra field on the envelope beyond
+# the spec's {ok,tool,durationMs,data,evidence,warnings,error} shape, since
+# it's this codebase's existing write-detection signal and every envelope
+# should fully describe its call.
+def _build_tool_envelope(
+    *,
+    ok,
+    tool,
+    duration_ms,
+    data=None,
+    evidence=None,
+    warnings=None,
+    error=None,
+    changed=False,
+):
+    return {
+        "ok": ok,
+        "tool": tool,
+        "durationMs": duration_ms,
+        "data": data,
+        "evidence": evidence or [],
+        "warnings": warnings or [],
+        "error": error,
+        "changed": changed,
+    }
+
+
+def _render_tool_envelope_message(envelope):
+    """The single function that renders the model-facing message from a
+    ToolEnvelope. Byte-compatible with every pre-envelope message: an
+    error envelope's message is exactly the blocked/denied message text
+    (unchanged from before this task); a success (or cache-hit) envelope's
+    message is exactly the tool's result content, carried verbatim in
+    envelope["data"]."""
+    if envelope["error"] is not None:
+        return envelope["error"]["message"]
+    return envelope["data"]
+
+
+def _persist_tool_envelope(envelope):
+    """Append the envelope itself to the same evidence-NN.jsonl stream
+    add_evidence/_persist_evidence already write to, tagged with
+    kind="tool_envelope" so it's distinguishable from the existing
+    per-tool entries in that file. Data is capped (reusing the same
+    MAX_EVIDENCE_RESULT bound _persist_evidence already applies) so a
+    huge tool result doesn't double the file's size. Same no-op-with-no-
+    session-dir and never-raises discipline as _persist_evidence."""
+    path = _evidence_file_path()
+    if path is None:
+        return
+
+    record = dict(envelope)
+    data = record.get("data")
+    if isinstance(data, str) and len(data) > MAX_EVIDENCE_RESULT:
+        record["data"] = data[:MAX_EVIDENCE_RESULT] + "\n\n[envelope data truncated]"
+    record["kind"] = "tool_envelope"
+    record["sessionId"] = GLIMMER_SESSION_ID
+    record["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
+        print(f"[glimmer-engineer] failed to persist tool envelope: {exc}", flush=True)
+
+
 def execute_tool(
     tool_name,
     arguments,
@@ -1865,6 +1950,11 @@ def execute_tool(
     validation_allowlist=None,
     mode="engineer",
 ):
+    _envelope_start = time.monotonic()
+
+    def _duration_ms():
+        return int((time.monotonic() - _envelope_start) * 1000)
+
     # C1 (glimmer-v7): architect mode must be STRUCTURALLY incapable of
     # writing, not merely un-offered the tool. run_architect() never puts
     # write_file/edit_file in the tool schema sent to the model, but a
@@ -1891,7 +1981,15 @@ def execute_tool(
         )
         record_blocked_command(workspace, tool_name, "architect mode is read-only")
 
-        return message, False
+        envelope = _build_tool_envelope(
+            ok=False,
+            tool=tool_name,
+            duration_ms=_duration_ms(),
+            error={"code": "POLICY_BLOCK", "message": message},
+        )
+        _persist_tool_envelope(envelope)
+
+        return _render_tool_envelope_message(envelope), False
 
     arguments = secure_tool_arguments(
         tool_name,
@@ -1924,8 +2022,16 @@ def execute_tool(
                 f"\n↻ CACHE: {tool_name}"
             )
 
+            envelope = _build_tool_envelope(
+                ok=True,
+                tool=tool_name,
+                duration_ms=_duration_ms(),
+                data=cache[cache_key],
+            )
+            _persist_tool_envelope(envelope)
+
             return (
-                cache[cache_key],
+                _render_tool_envelope_message(envelope),
                 False,
             )
 
@@ -1988,7 +2094,15 @@ def execute_tool(
             )
             record_blocked_command(workspace, command[:MAX_EVENT_FIELD], reason)
 
-            return message, False
+            envelope = _build_tool_envelope(
+                ok=False,
+                tool=tool_name,
+                duration_ms=_duration_ms(),
+                error={"code": "POLICY_BLOCK", "message": message},
+            )
+            _persist_tool_envelope(envelope)
+
+            return _render_tool_envelope_message(envelope), False
 
         # ----------------------------------------------------
         # REPEAT-COMMAND GUARD (Fix 1, fix-followups-a-c)
@@ -2023,8 +2137,16 @@ def execute_tool(
                     "(already ran this exact command — reusing prior result)"
                 )
 
+                envelope = _build_tool_envelope(
+                    ok=True,
+                    tool=tool_name,
+                    duration_ms=_duration_ms(),
+                    data=cache[cache_key],
+                )
+                _persist_tool_envelope(envelope)
+
                 return (
-                    cache[cache_key],
+                    _render_tool_envelope_message(envelope),
                     False,
                 )
 
@@ -2048,8 +2170,19 @@ def execute_tool(
                 f"\n✗ DENIED: {tool_name}"
             )
 
+            envelope = _build_tool_envelope(
+                ok=False,
+                tool=tool_name,
+                duration_ms=_duration_ms(),
+                error={
+                    "code": "USER_DENIED",
+                    "message": "User denied this tool execution.",
+                },
+            )
+            _persist_tool_envelope(envelope)
+
             return (
-                "User denied this tool execution.",
+                _render_tool_envelope_message(envelope),
                 False,
             )
 
@@ -2144,8 +2277,9 @@ def execute_tool(
     # _evidence_seq counter, producing duplicate evidence ids in one file.
     # Architect exploration evidence is not part of C5's scope; only the
     # architecture-plan.json artifact (a separate, non-numbered file) is.
+    evidence_id = None
     if mode != "architect":
-        add_evidence(
+        evidence_id = add_evidence(
             ledger,
             tool_name,
             arguments,
@@ -2156,7 +2290,17 @@ def execute_tool(
         tool_name in WRITE_TOOLS
     )
 
-    return content, changed
+    envelope = _build_tool_envelope(
+        ok=True,
+        tool=tool_name,
+        duration_ms=_duration_ms(),
+        data=content,
+        evidence=[evidence_id] if evidence_id else [],
+        changed=changed,
+    )
+    _persist_tool_envelope(envelope)
+
+    return _render_tool_envelope_message(envelope), changed
 
 
 def _repeat_guard_selfcheck() -> None:
@@ -2349,6 +2493,138 @@ def _evidence_persistence_selfcheck() -> None:
         _evidence_seq = 0
 
     print("evidence persistence self-check: PASS")
+
+
+def _tool_envelope_selfcheck() -> None:
+    """Task 1.1 (glimmer-v7, V7 §12 "Tool result contract"): proves
+    execute_tool's internal ToolEnvelope for both a success path
+    (read_file) and a policy-blocked path (exec_shell_command denied by
+    shell_policy) — envelope shape, durationMs, evidence ids, and that
+    the model-facing message rendered from the envelope is byte-identical
+    to the pre-envelope legacy return value. No model, no network:
+    http_json is monkeypatched exactly like _repeat_guard_selfcheck above.
+    Run with: python3 glimmer-engineer.py --tool-envelope-selfcheck
+    """
+    import tempfile
+
+    global http_json, GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID, _evidence_seq
+
+    real_http_json = http_json
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+
+    fake_result = {"plain_text_response": "contents of a.py"}
+
+    def fake_http_json(method, endpoint, payload=None, extra_headers=None):
+        return fake_result
+
+    http_json = fake_http_json
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            (session_dir / "events.jsonl").write_text("")
+            (session_dir / "prompt-00.txt").write_text("iteration 0")
+
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-envelope-selfcheck"
+            _evidence_file_path.cache_clear()
+            _evidence_seq = 0
+
+            # Resolved (not "."), matching _semantic_tools_selfcheck's own
+            # workspace convention above: resolve_workspace_path requires
+            # the workspace argument itself to already be the same
+            # (symlink-resolved) form Path.resolve() produces, or a real
+            # path's containment check spuriously fails on platforms where
+            # the temp dir is itself a symlink (e.g. macOS /tmp -> /private/tmp).
+            workspace = Path(td).resolve()
+            (workspace / "a.py").write_text("contents of a.py")
+
+            cache = {}
+            ledger = []
+            approval_state = {"approve_all": True}
+
+            # ------------------------------------------------------
+            # 1. Success envelope: read_file.
+            # ------------------------------------------------------
+            legacy_message = result_text(fake_result)
+
+            message, changed = execute_tool(
+                "read_file",
+                {"path": "a.py"},
+                workspace,
+                approval_state,
+                cache,
+                ledger,
+            )
+
+            assert message == legacy_message, (
+                "message rendered from a success envelope must be "
+                f"byte-identical to the legacy result_text() output, got: {message!r}"
+            )
+            assert changed is False
+
+            evidence_path = session_dir / "evidence-00.jsonl"
+            records = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+            envelopes = [r for r in records if r.get("kind") == "tool_envelope"]
+            assert len(envelopes) == 1, f"expected 1 persisted envelope, got {len(envelopes)}"
+
+            success_env = envelopes[0]
+            assert success_env["ok"] is True
+            assert success_env["tool"] == "read_file"
+            assert isinstance(success_env["durationMs"], int) and success_env["durationMs"] >= 0
+            assert success_env["data"] == message
+            assert success_env["error"] is None
+            assert success_env["warnings"] == []
+            assert success_env["changed"] is False
+            assert (
+                len(success_env["evidence"]) == 1
+                and success_env["evidence"][0].startswith("sess-envelope-selfcheck-ev-")
+            ), "success envelope must carry the evidence id add_evidence assigned for this call"
+
+            # ------------------------------------------------------
+            # 2. Blocked envelope: exec_shell_command outside the
+            #    shell_policy allowlist.
+            # ------------------------------------------------------
+            blocked_message, blocked_changed = execute_tool(
+                "exec_shell_command",
+                {"command": "rm -rf /"},
+                workspace,
+                approval_state,
+                cache,
+                ledger,
+            )
+
+            assert blocked_changed is False
+            assert blocked_message == (
+                "ENGINEERING SECURITY BLOCK: Command executable is "
+                "outside the allowlist: rm"
+            ), blocked_message
+
+            records = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+            envelopes = [r for r in records if r.get("kind") == "tool_envelope"]
+            assert len(envelopes) == 2, f"expected 2 persisted envelopes total, got {len(envelopes)}"
+
+            blocked_env = envelopes[-1]
+            assert blocked_env["ok"] is False
+            assert blocked_env["tool"] == "exec_shell_command"
+            assert blocked_env["error"] == {
+                "code": "POLICY_BLOCK",
+                "message": blocked_message,
+            }
+            assert isinstance(blocked_env["durationMs"], int) and blocked_env["durationMs"] >= 0
+            assert blocked_env["evidence"] == [], "a blocked call must never carry an evidence id"
+            assert blocked_env["changed"] is False
+            assert blocked_env["data"] is None
+
+    finally:
+        http_json = real_http_json
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+        _evidence_file_path.cache_clear()
+        _evidence_seq = 0
+
+    print("tool envelope self-check: PASS")
 
 
 def _architect_mode_selfcheck() -> None:
@@ -6088,6 +6364,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--evidence-selfcheck"]:
         _evidence_persistence_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--tool-envelope-selfcheck"]:
+        _tool_envelope_selfcheck()
         sys.exit(0)
 
     if sys.argv[1:] == ["--architect-mode-selfcheck"]:
