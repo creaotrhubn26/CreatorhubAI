@@ -3196,7 +3196,57 @@ def _architect_review_selfcheck() -> None:
         "diff": "--- a/a.ts\n+++ b/a.ts\n",
     })
     assert "a.ts" in msg and "medium" in msg and "--- a/a.ts" in msg
+    assert "DERIVED TASK LIST" not in msg, "no taskList in the request -> no section, unchanged pre-Task-4.3 message"
     assert _build_review_task_message({}) is not None  # never raises on empty input
+
+    # Task 4.3 ("Architect task-list review"): when glimmer-v2.py's
+    # make_review_request carries a taskList (only on the session's first
+    # review — see that function's docstring), it must show up in the
+    # same review turn's message, not a second model call.
+    msg_with_tasks = _build_review_task_message({
+        "architecturePlan": {"risk": "low"},
+        "changedFiles": [],
+        "diff": "",
+        "taskList": [
+            {"id": "t1", "kind": "implementation", "priority": "required",
+             "description": "Implement restoration hook", "dependsOn": []},
+            {"id": "t2", "kind": "verification", "priority": "recommended",
+             "description": "Run targeted tests", "dependsOn": ["t1"]},
+        ],
+    })
+    assert "DERIVED TASK LIST" in msg_with_tasks
+    assert "Implement restoration hook" in msg_with_tasks
+    assert "depends on: t1" in msg_with_tasks
+    # An empty/malformed taskList must degrade the same as its absence —
+    # never an empty "(none)" section nobody asked for.
+    assert "DERIVED TASK LIST" not in _build_review_task_message({"taskList": []})
+    assert "DERIVED TASK LIST" not in _build_review_task_message({"taskList": "not a list"})
+
+    # Review round 1 (Important 4): task-list observations must be steered
+    # into findings/verificationAdjustments, and only REPLAN_REQUIRED may
+    # be driven by a task-list problem — never a REVISE_IMPLEMENTATION
+    # round burning budget over task-list prose.
+    assert "findings" in msg_with_tasks and "verificationAdjustments" in msg_with_tasks
+    assert "REPLAN_REQUIRED" in msg_with_tasks
+    assert "requiredChanges" in msg_with_tasks and "NEVER" in msg_with_tasks
+
+    # Review round 1 (Minor 8c): a large derived task list is capped, not
+    # dumped verbatim into the prompt -- 50 tasks max, 300 chars per
+    # description, with an honest "+N more" marker instead of silent
+    # truncation.
+    huge_task_list = [
+        {"id": f"t{i}", "kind": "implementation", "priority": "required", "description": f"task {i}", "dependsOn": []}
+        for i in range(60)
+    ]
+    capped_msg = _build_review_task_message({"taskList": huge_task_list})
+    assert "t49" in capped_msg and "t50" not in capped_msg, "only the first 50 tasks are rendered"
+    assert "+10 more tasks" in capped_msg
+
+    long_desc_task = [{"id": "t1", "kind": "implementation", "priority": "required",
+                        "description": "x" * 1000, "dependsOn": []}]
+    long_desc_msg = _build_review_task_message({"taskList": long_desc_task})
+    assert ("x" * 301) not in long_desc_msg, "description must be capped at 300 chars, not embedded whole"
+    assert "…" in long_desc_msg
 
     print("architect review self-check: PASS")
 
@@ -4347,7 +4397,7 @@ def _build_review_task_message(review_request):
         if isinstance(f, dict) and f.get("path")
     ) or "  (none)"
 
-    return (
+    message = (
         "ARCHITECTURE PLAN (produced before implementation began):\n"
         + json.dumps(plan, indent=2) + "\n\n"
         "CHANGED FILES:\n" + files_text + "\n\n"
@@ -4355,6 +4405,67 @@ def _build_review_task_message(review_request):
         "have no tracked diff to show — use your own read-only tools "
         "if you need their full content):\n" + diff_text
     )
+
+    # Task 4.3 ("Architect task-list review"): present only on the FIRST
+    # review of a session (see glimmer-v2.py's run_architect_review call
+    # site) — the derived task list (tasks.json), so this same review turn
+    # also answers V7's task-list-review questions (does it still
+    # implement the plan? anything missing/superfluous/misordered?) without
+    # spending a second model call. Absent on every later round -- no
+    # section is appended then, exactly the pre-Task-4.3 message.
+    task_list = review_request.get("taskList")
+    if isinstance(task_list, list) and task_list:
+        dict_tasks = [t for t in task_list if isinstance(t, dict)]
+        # Review round 1 (Minor 8c): cap what actually reaches the prompt --
+        # this rides along inside an existing review request (V7 §5.6's
+        # ARCHITECT_REVIEW_DIFF_MAX_CHARS-style token budget still applies
+        # to the WHOLE message), so an unusually large derived task list
+        # must degrade to a bounded summary, never balloon the turn.
+        _TASK_LIST_MAX_TASKS = 50
+        _TASK_LIST_DESC_MAX_CHARS = 300
+        shown, overflow = dict_tasks[:_TASK_LIST_MAX_TASKS], len(dict_tasks) - _TASK_LIST_MAX_TASKS
+
+        def _capped_description(t):
+            desc = str(t.get("description") or "")
+            return desc if len(desc) <= _TASK_LIST_DESC_MAX_CHARS else desc[:_TASK_LIST_DESC_MAX_CHARS] + "…"
+
+        tasks_text = "\n".join(
+            f"  - [{t.get('id')}] ({t.get('kind')}, {t.get('priority', 'required')}) "
+            f"{_capped_description(t)}"
+            + (f" — depends on: {', '.join(t.get('dependsOn'))}" if t.get("dependsOn") else "")
+            for t in shown
+        ) or "  (none)"
+        if overflow > 0:
+            tasks_text += f"\n  ... (+{overflow} more tasks not shown)"
+
+        message += (
+            "\n\nDERIVED TASK LIST (produced from the architecture plan before "
+            "implementation began -- also review this as part of your decision: "
+            "does it still implement the plan, is anything important missing or "
+            "superfluous, are dependencies correct, is scope appropriate?):\n"
+            + tasks_text
+            + "\n\n"
+            # Review round 1 (Important 4): task-list prose must never
+            # burn the REVISE_IMPLEMENTATION budget (§5.13) on its own --
+            # a wrong/missing/superfluous/misordered task is a PLANNING
+            # problem, not an implementation defect this round's diff can
+            # fix. Route observations into findings/verificationAdjustments
+            # (non-blocking); only decision=REPLAN_REQUIRED may actually be
+            # driven by a task-list problem, and only when the underlying
+            # plan itself needs to change.
+            "Note on the task list above: report any observations about it "
+            "(missing/superfluous/misordered tasks, wrong dependencies, "
+            "scope drift) via `findings` and, if you want to propose a "
+            "concrete change, `verificationAdjustments` -- NEVER via "
+            "`requiredChanges`, which would trigger a REVISE_IMPLEMENTATION "
+            "round over task-list prose alone and burn the revise/re-review "
+            "budget on something this round's diff cannot fix. If the task "
+            "list is wrong enough that the underlying architecture plan "
+            "itself needs to change, that must be expressed as "
+            "decision=REPLAN_REQUIRED, not REVISE_IMPLEMENTATION."
+        )
+
+    return message
 
 
 def run_architect(task, workspace, max_turns, review_request_path=None):
