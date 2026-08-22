@@ -24,9 +24,13 @@ export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
   const color = RISK_COLOR[plan.risk] ?? "var(--gray)";
   const fileCount = plan.candidateFiles?.length ?? 0;
   const summary = `${plan.risk} risk · ${fileCount} candidate file${fileCount === 1 ? "" : "s"}`;
+  // Task 2.2 (V7 §5.12): "Engineer should always know which
+  // ArchitecturePlan version it is implementing" — surface it in the
+  // panel header too. Absent version means 1 (backward compat).
+  const title = `Architecture Plan (v${plan.version ?? 1})`;
 
   return (
-    <CollapsibleSection title="Architecture Plan" summary={summary}>
+    <CollapsibleSection title={title} summary={summary}>
       <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
         Model-generated plan — not a deterministic fact
       </p>

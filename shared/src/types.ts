@@ -153,6 +153,12 @@ export interface ArchitecturePlan {
   objective: string;
   packages: string[];
   risk: ArchitecturePlanRisk;
+  // Task 2.2 (V7 §5.12): plan version, stamped by glimmer-v2.py (the
+  // trusted layer) — 1 for the architect-first plan, N+1 per re-plan.
+  // Optional/absent means version 1 (backward compat with plans written
+  // before this field existed — validate_architecture_plan defaults the
+  // same way on the Python side).
+  version?: number;
   area?: string;
   existingPatterns?: ArchitecturePlanPattern[];
   candidateFiles?: ArchitecturePlanCandidateFile[];
@@ -367,11 +373,15 @@ export interface ArchitectReviewCompletedEvent extends GlimmerEventBase {
   reviewRound: number;
   decision: ArchitectReviewDecision;
 }
-// architect_replan_started: type defined for the V7 replan flow — no
-// glimmer-v2.py emit site exists yet (no replan path is implemented), so
-// this carries no required fields beyond the base until Round 5 wires one.
+// architect_replan_started (Task 2.2, V7 §5.12): emitted by glimmer-v2.py's
+// review loop right before re-invoking the architect on a REPLAN_REQUIRED
+// decision — fromVersion/toVersion are the ArchitecturePlan.version being
+// replaced/produced, reviewRound is the review round that triggered it.
 export interface ArchitectReplanStartedEvent extends GlimmerEventBase {
   type: "architect_replan_started";
+  fromVersion: number;
+  toVersion: number;
+  reviewRound: number;
 }
 // architect_autotriggered (V7 §5.5, Task 2.1): emitted by glimmer-v2.py's
 // deterministic risk score (compute_architect_risk) only when the score
