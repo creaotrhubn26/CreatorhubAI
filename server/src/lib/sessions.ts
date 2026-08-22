@@ -14,15 +14,19 @@ const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
 // glimmer-v2.py's real manifest["status"] values: initialized, repo-map-only,
 // no-change-verified, no-change-unverified, verified, blocked-<reason>,
 // failed-verifier-mutated-repo, failed-repair-budget-exhausted, and (R6/C2)
-// cancelled-sigterm, failed-aborted, needs-architect-review.
+// cancelled-sigterm, failed-aborted, needs-architect-review(-rejected|-budget-exhausted).
 export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   if (raw === "initialized") return "preflight";
   if (raw === "verified" || raw === "no-change-verified") return "verified";
   if (raw === "no-change-unverified") return "needs_review";
   // C2 (glimmer-v7): terminal status when the architect review gate rejects
   // the implementation or the review budget is exhausted — must never be
-  // promoted to "verified".
-  if (raw === "needs-architect-review") return "needs_review";
+  // promoted to "verified". Prefix match: Task 1.3 splits the legacy
+  // "needs-architect-review" string into "-rejected"/"-budget-exhausted"
+  // variants (see glimmer-v2.py's classify_failure); both must hit this
+  // explicit branch rather than fall through to the generic unknown-status
+  // fallback below (same resulting value today, but only by coincidence).
+  if (raw.startsWith("needs-architect-review")) return "needs_review";
   if (raw.startsWith("blocked-")) return "blocked";
   if (raw.startsWith("failed-")) return "failed";
   // repo-map-only is TERMINAL (glimmer-v2.py writes it and exits immediately,
