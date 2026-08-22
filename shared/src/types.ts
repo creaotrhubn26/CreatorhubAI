@@ -46,6 +46,12 @@ export interface VerificationCheckResult {
   outputTail: string;
   baselineAware: boolean;
   newErrorSignatures: string[];
+  // V7 §18: which tier this check belongs to. Optional -- absent on
+  // manifests written before this task, which every reader treats as
+  // "required" (the only tier that ever existed then). "recommended"
+  // checks are reported here (see VerificationSummary.recommendedChecks)
+  // but never gate VERIFIED.
+  tier?: "required" | "recommended";
 }
 
 export type VerificationOverall =
@@ -59,7 +65,16 @@ export type VerificationOverall =
 
 export interface VerificationSummary {
   overall: VerificationOverall;
+  // required-tier checks only -- these are what `overall`/VERIFIED gating
+  // has always been computed from (see server/src/lib/sessions.ts). A check
+  // predating this task carries no `tier` at all and belongs here by the
+  // same absent-means-required convention as VerificationCheckResult.tier.
   checks: VerificationCheckResult[];
+  // V7 §18: recommended-tier checks -- run, reported, NEVER gating. Absent
+  // (not just empty) on manifests predating this task and on any attempt
+  // whose recommended set was empty (required failed, so recommended never
+  // ran; or the level above had nothing extra to add).
+  recommendedChecks?: VerificationCheckResult[];
 }
 
 export interface TaskContract {
@@ -99,6 +114,15 @@ export interface TaskContract {
   };
 }
 
+// V7 §18: manifest.verificationPlan, command strings (not results) for the
+// CURRENT/latest attempt -- required gates VERIFIED, recommended is run but
+// never gating. See VerificationCheckResult.tier / VerificationSummary.
+// recommendedChecks for the corresponding RESULTS.
+export interface VerificationPlan {
+  required: string[];
+  recommended: string[];
+}
+
 export interface GlimmerSession {
   id: string;
   task: string;
@@ -112,6 +136,9 @@ export interface GlimmerSession {
   completedAt?: string;
   changedFiles: ChangedFile[];
   verification: VerificationSummary;
+  // V7 §18: the latest attempt's required/recommended command split.
+  // Optional -- absent on manifests predating this task.
+  verificationPlan?: VerificationPlan;
   repairsUsed: number;
   repairBudget: number;
   // C2/C3 (glimmer-v7): opt-in architect-mode gate/plan summary and the

@@ -8,6 +8,10 @@ import type {
   ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance,
 } from "@glimmer/shared";
 
+// V7 §18: tier defaults to "required" for any manifest written before this
+// task existed -- the only tier that ever existed then, and the one
+// overallFromManifest/gating has always been computed from.
+
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
   "verified", "failed", "blocked", "needs_review", "cancelled",
 ]);
@@ -57,6 +61,7 @@ function toVerificationCheck(raw: any): VerificationCheckResult {
     outputTail: raw.outputTail ?? "",
     baselineAware: raw.baseline !== undefined || raw.baselineAccepted !== undefined,
     newErrorSignatures: raw.newErrorSignatures ?? [],
+    tier: raw.tier === "recommended" ? "recommended" : "required",
   };
 }
 
@@ -76,7 +81,17 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   const attempts = m.attempts ?? [];
   const lastAttempt = attempts[attempts.length - 1];
   const checks: VerificationCheckResult[] = (lastAttempt?.verificationResults ?? []).map(toVerificationCheck);
-  const verification: VerificationSummary = { overall: overallFromManifest(m), checks };
+  // V7 §18: recommended-tier results, kept off `checks` entirely -- never
+  // consulted by overallFromManifest/gating, only reported. Omitted (not an
+  // empty array) when the attempt genuinely never ran a recommended check.
+  const recommendedRaw: any[] = lastAttempt?.recommendedResults ?? [];
+  const recommendedChecks: VerificationCheckResult[] | undefined =
+    recommendedRaw.length > 0 ? recommendedRaw.map(toVerificationCheck) : undefined;
+  const verification: VerificationSummary = {
+    overall: overallFromManifest(m),
+    checks,
+    ...(recommendedChecks ? { recommendedChecks } : {}),
+  };
   const status = mapManifestStatus(String(m.status ?? ""));
 
   const session: GlimmerSession = {
@@ -98,6 +113,7 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   // carries them — older sessions predating architect mode have none of these
   // keys, and GlimmerSession leaves them optional for exactly that reason.
   if (m.gates) session.gates = m.gates;
+  if (m.verificationPlan) session.verificationPlan = m.verificationPlan;
   if (m.architectPlan) session.architectPlan = m.architectPlan;
   if (m.architectTrigger) session.architectTrigger = m.architectTrigger;
   if (m.failure) session.failure = m.failure;

@@ -57,6 +57,23 @@ function BaselineSummary({ checks }: { checks: VerificationCheckResult[] }) {
   );
 }
 
+// V7 §18: recommended checks run but never gate VERIFIED -- kept visually
+// distinct (muted, its own labeled section) so nobody reads a recommended
+// failure as something that blocked promotion.
+function RecommendedSection({ checks }: { checks: VerificationCheckResult[] | undefined }) {
+  if (!checks || checks.length === 0) return null;
+  return (
+    <div style={{ marginTop: 24, opacity: 0.7 }}>
+      <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 8 }}>
+        Recommended (non-gating)
+      </p>
+      {checks.map((c) => (
+        <CheckCard key={c.command} check={c} />
+      ))}
+    </div>
+  );
+}
+
 // Exported so the IDE shell's bottom-panel VERIFICATION tab can re-home this
 // exact body (session-scoped) without re-implementing the check rendering.
 export function VerificationBody({ verification }: { verification: VerificationSummary | null | undefined }) {
@@ -72,6 +89,7 @@ export function VerificationBody({ verification }: { verification: VerificationS
       {checks.map((c) => (
         <CheckCard key={c.command} check={c} />
       ))}
+      <RecommendedSection checks={verification.recommendedChecks} />
     </div>
   );
 }

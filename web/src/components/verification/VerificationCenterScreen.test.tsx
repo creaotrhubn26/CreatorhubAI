@@ -152,6 +152,34 @@ describe("VerificationCenterScreen", () => {
     expect(screen.queryByText("FAIL")).not.toBeInTheDocument();
   });
 
+  it("shows recommended checks in a separate muted section, never mixed into the gating checks list", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
+      verification: {
+        overall: "VERIFIED",
+        checks: [check({ command: "npm run typecheck" })],
+        recommendedChecks: [check({ command: "npm run lint", status: "CODE_FAIL", ok: false })],
+      },
+    }));
+    render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
+
+    await waitFor(() => expect(screen.getByText("npm run typecheck")).toBeInTheDocument());
+    expect(screen.getByText("npm run lint")).toBeInTheDocument();
+    expect(screen.getByText("Recommended (non-gating)")).toBeInTheDocument();
+    // overall banner stays VERIFIED even though a recommended check failed --
+    // recommended never gates.
+    expect(screen.getByText("VERIFIED")).toBeInTheDocument();
+  });
+
+  it("renders no recommended section when there are no recommended checks (absent or empty)", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
+      verification: { overall: "VERIFIED", checks: [check({})] },
+    }));
+    render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
+
+    await waitFor(() => expect(screen.getByText("VERIFIED")).toBeInTheDocument());
+    expect(screen.queryByText("Recommended (non-gating)")).not.toBeInTheDocument();
+  });
+
   it("shows command, returncode, elapsed, and a collapsible output tail per check", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
       verification: {
