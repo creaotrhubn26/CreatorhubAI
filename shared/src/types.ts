@@ -776,6 +776,24 @@ export interface ArchitectConsultedEvent extends GlimmerEventBase {
   questionChars: number;
   answerChars: number;
 }
+// Task 7.1/7.2 (V7 documentation intelligence): emitted by glimmer-v2.py's
+// finally-block doc pass when the TARGET repo carries a docs/graph.json.
+// Deterministic node ids/statuses/file lists only -- never model text.
+export interface DocumentationImpactDetectedEvent extends GlimmerEventBase {
+  type: "documentation_impact_detected";
+  files: string[];
+  nodeIds: string[];
+}
+export interface DocumentationStaleDetectedEvent extends GlimmerEventBase {
+  type: "documentation_stale_detected";
+  nodeId: string;
+  reason: string;
+}
+export interface DocumentationVerifiedEvent extends GlimmerEventBase {
+  type: "documentation_verified";
+  nodeId: string;
+  status: string;
+}
 
 export type GlimmerEvent =
   | ToolStartedEvent
@@ -810,7 +828,10 @@ export type GlimmerEvent =
   | DeliveryReviewStartedEvent
   | DeliveryReviewCompletedEvent
   | ArchitectConsultAdvisedEvent
-  | ArchitectConsultedEvent;
+  | ArchitectConsultedEvent
+  | DocumentationImpactDetectedEvent
+  | DocumentationStaleDetectedEvent
+  | DocumentationVerifiedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -857,6 +878,58 @@ export interface RepoMap {
   head: string;
   upstream: string | null;
   packages: RepoPackage[];
+}
+
+// Task 7.5 (V7 "System Explorer"): docs/graph.json is written by glimmer-v2.py's
+// doc pass into the TARGET repo's workspace (see server/src/lib/sessions.ts
+// readDocGraph), never by the gateway itself -- these types describe that
+// on-disk shape verbatim, so the Control Center only ever displays what the
+// orchestrator actually wrote (id/status/confidence/provenance), never a
+// fabricated title or status.
+export type DocNodeType = "system" | "service" | "route" | "schema" | "config" | "doc";
+export type DocNodeStatus = "CURRENT" | "STALE" | "UNVERIFIED" | "MISSING" | "DEPRECATED" | "GENERATED";
+// glimmer-v2.py's verify_doc_nodes/build_docs_bootstrap_graph never write a
+// numeric confidence -- always one of these three strings (see DOC_STATUS_*
+// -> confidence mapping in glimmer-v2.py). `string` (not a narrower union)
+// so a hand-edited docs/graph.json with an unrecognized value still displays
+// verbatim instead of failing to parse.
+export type DocNodeConfidence = "high" | "low" | "unknown" | (string & {});
+
+export interface DocProvenance {
+  evidence: string[];
+  sha: string | null;
+  updatedAt?: string;
+}
+
+export interface DocNode {
+  id: string;
+  type: DocNodeType;
+  path: string;
+  title: string;
+  status: DocNodeStatus;
+  confidence: DocNodeConfidence;
+  provenance: DocProvenance;
+}
+
+export interface DocEdge {
+  from: string;
+  to: string;
+  kind: string;
+}
+
+export interface DocGraph {
+  schemaVersion: number;
+  nodes: DocNode[];
+  edges: DocEdge[];
+}
+
+// M6 fix (round-7 review): findDocGraph walks every session's workspace and
+// returns the first docs/graph.json it finds -- with two sessions pointed at
+// different repos, "first found" must never be silently ambiguous. The API
+// response always carries where the graph came from so the UI can label it.
+export interface DocGraphSource {
+  workspace: string;
+  sessionId: string;
 }
 
 export interface ModelStatus {

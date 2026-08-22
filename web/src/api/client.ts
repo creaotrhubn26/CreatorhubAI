@@ -1,7 +1,7 @@
 import type {
   DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask, HumanAcceptance, CreateWorkspaceResult,
-  VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse,
+  VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -129,6 +129,19 @@ export const glimmerApi = {
     return full;
   },
   getRepositoryMap: () => request<RepoMap>("/api/repository/map"),
+  // Task 7.5 (V7 "System Explorer") -- bypasses request() the same way
+  // getVisualVerification does: 404 (no session's workspace carries a
+  // docs/graph.json — the common "repo never ran --docs-bootstrap" case)
+  // is an honest "no graph" fact for the screen to render, not a fetch error.
+  // M6 fix: response carries `source` (the workspace + session the graph was
+  // actually read from) so the screen can label it instead of presenting a
+  // "first found" graph as unambiguously "this repository".
+  getDocGraph: async (): Promise<(DocGraph & { source: DocGraphSource }) | null> => {
+    const res = await fetch(`${API_BASE}/api/repository/doc-graph`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`GET /api/repository/doc-graph failed: ${res.status}`);
+    return res.json() as Promise<DocGraph & { source: DocGraphSource }>;
+  },
   listWorkspaces: () => request<WorkspaceInfo[]>("/api/workspaces"),
   // §27/§4.1 — creates a fresh git worktree+branch off the source repo.
   // Deliberately bypasses the generic `request()` helper: on failure the
