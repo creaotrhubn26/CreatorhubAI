@@ -1341,6 +1341,267 @@ def shell_policy(
     )
 
 
+# ============================================================
+# Task 8.3 (V7 §14/§35): YELLOW approval-boundary classification
+# ============================================================
+#
+# Mirrors glimmer-v2.py's classify_yellow verbatim -- kept in sync
+# deliberately, same discipline as canonical_session_state/mapManifest
+# Status across the Python/TypeScript boundary. The two orchestrator/
+# engineer processes can't import each other (hyphenated filenames aren't
+# importable Python modules; glimmer_events.py is the one module they
+# genuinely share, and only THIS process ever dispatches a shell command).
+# Any change here must be mirrored in glimmer-v2.py.
+#
+# Never widens or replaces shell_policy's own RED enforcement just above --
+# only answers "does this shell_policy-rejected command ALSO qualify for a
+# YELLOW human-approval escalation". None means "stays exactly what
+# shell_policy already said" (RED stays RED).
+YELLOW_DEPENDENCY_INSTALL_TOKENS = frozenset({"install", "i", "ci", "add"})
+YELLOW_MIGRATION_KEYWORDS = ("migrate", "migration", "seed")
+SCOPE_EXPANSION_YELLOW_THRESHOLD = 3
+
+
+def classify_yellow(action_kind: str, command, contract) -> dict | None:
+    """See glimmer-v2.py's classify_yellow for the full docstring (kept
+    identical here on purpose)."""
+    if action_kind == "shell":
+        if not isinstance(command, str) or not command.strip():
+            return None
+        try:
+            tokens = shlex.split(command.strip())
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+
+        executable = tokens[0]
+        lowered = [t.lower() for t in tokens]
+
+        if executable == "npm":
+            if any(t in YELLOW_DEPENDENCY_INSTALL_TOKENS for t in lowered[1:]):
+                return {
+                    "action": "modify_dependencies",
+                    "reason": f"engineer requested a dependency-install command: {command}",
+                    "proposedChanges": ["package.json", "package-lock.json"],
+                    "risk": "medium",
+                }
+            if "run" in tokens:
+                idx = tokens.index("run")
+                if idx + 1 < len(tokens):
+                    script = tokens[idx + 1]
+                    if any(k in script.lower() for k in YELLOW_MIGRATION_KEYWORDS):
+                        return {
+                            "action": "run_migration",
+                            "reason": f"engineer requested a migration-shaped npm script: {script!r}",
+                            "proposedChanges": [],
+                            "risk": "high",
+                        }
+        return None
+
+    if action_kind == "scope":
+        expanded = (contract or {}).get("expandedFiles") or []
+        if len(expanded) >= SCOPE_EXPANSION_YELLOW_THRESHOLD:
+            return {
+                "action": "scope_expansion",
+                "reason": (
+                    f"{len(expanded)} changed file(s) fall outside the declared/expected "
+                    f"scope: {', '.join(expanded[:5])}"
+                ),
+                "proposedChanges": list(expanded[:20]),
+                "risk": "medium",
+            }
+        return None
+
+    return None
+
+
+# --- approvals.json sidecar (V7 §35 file-based approval) -------------------
+#
+# The gateway spawns glimmer-v2.py (which spawns THIS process) with no
+# stdin at all for a UI-launched run (see invoke_engineer's --yes/
+# --auto-approve handling and the module docstring's cross-reference to
+# the gateway auto-approve deadlock lesson) -- an interactive prompt here
+# would deadlock the session exactly like the parked round-7 repro. File-
+# based polling is the only safe mechanism: this process writes the
+# request, the Control Center gateway (a human clicking Approve/Deny)
+# writes the resolution, both to the SAME sidecar file, same "two
+# processes, one JSON file, each writes only its own half" discipline as
+# task-overrides.json (glimmer-v2.py's load_task_overrides / control-
+# center's writeTaskOverride).
+APPROVAL_POLL_INTERVAL_SECONDS = 2
+DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write-to-temp-then-rename, same discipline control-center's
+    writeTaskOverride uses for task-overrides.json: a crash/kill mid-write
+    must never leave a torn file for a concurrent reader (the gateway, or
+    this process's own next poll) to trip over. os.replace is atomic on
+    the same filesystem, and the temp file lives in the same directory so
+    it always is."""
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _approvals_path(session_dir) -> Path:
+    return Path(session_dir) / "approvals.json"
+
+
+def load_approvals(session_dir) -> dict:
+    """Tolerant read, same uniform-degrade-to-{} contract as glimmer-v2.py's
+    load_task_overrides: missing file, unreadable, malformed JSON, or valid
+    JSON that isn't an object all resolve to {}."""
+    try:
+        data = json.loads(_approvals_path(session_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_approval_request(session_dir, approval_id, action, reason, proposed_changes, risk) -> dict:
+    """Read-modify-write over the whole file (there is at most one pending
+    approval per session in practice), same pattern as writeTaskOverride."""
+    existing = load_approvals(session_dir)
+    record = {
+        "action": action,
+        "reason": reason,
+        "proposedChanges": list(proposed_changes or []),
+        "risk": risk,
+        "requestedAt": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    existing[approval_id] = record
+    _atomic_write_json(_approvals_path(session_dir), existing)
+    return record
+
+
+def _patch_manifest_approval_state(session_dir, approval_id, pending: dict | None) -> None:
+    """Best-effort direct patch of manifest.json's status/state/
+    pendingApproval fields -- the ONLY way a human watching the Control
+    Center can see "waiting_for_approval" live, since glimmer-v2.py itself
+    is blocked reading this process's stdout for the entire duration of
+    the wait (invoke_engineer's Popen loop) and cannot update manifest.json
+    until this process exits. Safe: manifest.json has exactly one writer
+    at any given moment -- glimmer-v2.py never touches it while blocked on
+    this subprocess, so there is no concurrent-writer race, only a
+    sequential handoff (same assumption architecture-plan.json/tasks.json/
+    every other session-dir artifact this process writes directly already
+    relies on).
+
+    pending is not None: save the CURRENT status/state (so they can be
+    restored exactly) under a private key, then set status/state to the
+    waiting-for-approval raw string glimmer-v2.py's canonical_session_state
+    recognizes, plus the structured pendingApproval envelope.
+
+    pending is None: restore the previously-saved status/state and drop
+    pendingApproval -- called once the wait resolves (approved/denied/
+    timeout), so the session never reports "waiting_for_approval" after
+    it's no longer true.
+
+    Never raises -- a missing/malformed manifest.json (standalone
+    invocation with no v2 parent, or a torn read mid-write) degrades to
+    "no live status update", never to a crashed session. The actual
+    approval gate (execute_tool's caller) does not depend on this
+    succeeding."""
+    path = Path(session_dir) / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(manifest, dict):
+        return
+
+    if pending is not None:
+        manifest["_preApprovalStatus"] = manifest.get("status")
+        manifest["_preApprovalState"] = manifest.get("state")
+        manifest["status"] = "waiting-for-approval"
+        manifest["state"] = "waiting_for_approval"
+        manifest["pendingApproval"] = {"approvalId": approval_id, **pending}
+    else:
+        if "_preApprovalStatus" in manifest:
+            manifest["status"] = manifest.pop("_preApprovalStatus")
+        if "_preApprovalState" in manifest:
+            manifest["state"] = manifest.pop("_preApprovalState")
+        manifest.pop("pendingApproval", None)
+
+    try:
+        _atomic_write_json(path, manifest)
+    except OSError:
+        pass
+
+
+def request_approval_and_wait(
+    action, reason, proposed_changes, risk,
+    *, timeout_s=None, poll_interval_s=APPROVAL_POLL_INTERVAL_SECONDS,
+) -> tuple:
+    """V7 §35: request human approval for a YELLOW-classified action and
+    block (polling, never an interactive prompt -- see the module note
+    above) until it's approved, denied, or the timeout elapses.
+
+    Returns (decision, detail):
+      decision in {"approved", "denied", "timeout", "unavailable"}.
+      "unavailable" -- no GLIMMER_EVENTS_PATH (no session directory to
+      write the sidecar into, e.g. a standalone/test invocation) -- fails
+      CLOSED (same as "denied") rather than allowing with nothing for a
+      human to actually approve.
+      detail is approvedBy (for "approved"/"denied", when the gateway
+      recorded one) or a short human-readable reason otherwise.
+
+    timeout_s defaults to DEFAULT_APPROVAL_TIMEOUT_SECONDS, overridable via
+    GLIMMER_APPROVAL_TIMEOUT_SECONDS (same env-var-configuration convention
+    as the other GLIMMER_* cross-process settings glimmer-v2.py's spawn env
+    already uses) -- never via a new CLI flag threaded through execute_tool
+    and its ~8 call sites. Both timeout_s and poll_interval_s are
+    parameters (not hardcoded reads of the env var/module constant) purely
+    so a selfcheck can pass tiny values and finish in milliseconds, never a
+    real 300-second sleep.
+    """
+    if timeout_s is None:
+        try:
+            timeout_s = int(os.environ.get("GLIMMER_APPROVAL_TIMEOUT_SECONDS", "") or DEFAULT_APPROVAL_TIMEOUT_SECONDS)
+        except ValueError:
+            timeout_s = DEFAULT_APPROVAL_TIMEOUT_SECONDS
+
+    if not GLIMMER_EVENTS_PATH:
+        return "unavailable", "no session directory available for approval sidecar (fail closed)"
+
+    session_dir = Path(GLIMMER_EVENTS_PATH).parent
+    approval_id = f"{GLIMMER_SESSION_ID or 'session'}-appr-{uuid.uuid4().hex[:8]}"
+
+    pending = _write_approval_request(session_dir, approval_id, action, reason, proposed_changes, risk)
+    _patch_manifest_approval_state(session_dir, approval_id, pending)
+    _emit("approval_requested", approvalId=approval_id, action=action, reason=reason, risk=risk)
+    _emit("agent_state_changed", state="waiting_for_approval")
+
+    print()
+    print("┌─ YELLOW APPROVAL REQUESTED (V7 §35)")
+    print(f"│ {action}: {reason}")
+    print(f"│ waiting up to {timeout_s}s for a human decision (approvals.json) ...")
+    print("└─")
+
+    deadline = time.monotonic() + timeout_s
+    decision, detail = "timeout", f"no approval decision recorded within {timeout_s}s"
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval_s)
+        record = load_approvals(session_dir).get(approval_id)
+        if isinstance(record, dict) and record.get("status") in ("approved", "denied"):
+            decision = record["status"]
+            detail = record.get("approvedBy") or ""
+            break
+
+    _patch_manifest_approval_state(session_dir, approval_id, None)
+    # Cosmetic only (see the STATES/waiting_for_approval stepper entry the
+    # Control Center already carries): move the live stepper off
+    # "waiting_for_approval" now that the wait is over. "implementing" is a
+    # reasonable generic "back to work" bucket -- this loop has no record
+    # of whatever more specific phase preceded the request.
+    _emit("agent_state_changed", state="implementing")
+    print(f"\n{'✓ APPROVED' if decision == 'approved' else '✗ ' + decision.upper()}: {action}")
+    return decision, detail
+
+
 def architect_shell_policy(command, workspace):
     """C1 (glimmer-v7): exec_shell_command policy for architect mode.
 
@@ -3338,6 +3599,30 @@ def execute_tool(
                 workspace,
                 validation_allowlist,
             )
+
+        if not allowed:
+            # Task 8.3 (V7 §14/§35): a shell_policy-rejected command may
+            # STILL be a YELLOW case -- dependency install / migration
+            # keyword -- that a human can unlock via the file-based
+            # approval sidecar, rather than a hard RED block. Never
+            # reached in architect mode (no approval path there -- C1
+            # scoping, see invoke_engineer's docstring) and never changes
+            # what shell_policy/architect_shell_policy actually said for
+            # any command classify_yellow doesn't match (commit/push/
+            # deploy and everything else stay exactly as blocked as
+            # before).
+            yellow = None if mode == "architect" else classify_yellow("shell", command, {})
+            if yellow is not None:
+                decision, detail = request_approval_and_wait(
+                    yellow["action"], yellow["reason"], yellow["proposedChanges"], yellow["risk"],
+                )
+                if decision == "approved":
+                    allowed = True
+                    reason = f"human-approved YELLOW escalation: {yellow['action']}" + (
+                        f" (approved by {detail})" if detail else ""
+                    )
+                else:
+                    reason = f"{reason} [YELLOW escalation {decision}]"
 
         if not allowed:
             message = (
@@ -9501,6 +9786,117 @@ def _doc_tools_selfcheck() -> None:
     print("documentation tools (V7 §7.4) self-check: PASS")
 
 
+def _approval_wait_selfcheck() -> None:
+    """Task 8.3 (V7 §14/§35) self-check: classify_yellow (mirrored copy)
+    plus the approvals.json sidecar + request_approval_and_wait's poll
+    loop. Never sleeps anywhere near the real 300s default -- every
+    timeout_s/poll_interval_s below is a tiny override passed explicitly
+    (request_approval_and_wait takes them as parameters for exactly this
+    reason), and the "resolved while waiting" cases use a short-lived
+    background thread standing in for a human clicking Approve/Deny in
+    the Control Center -- no mocked clock needed, the real waits are
+    already millisecond-scale.
+    Run with: python3 glimmer-engineer.py --approval-wait-selfcheck
+    """
+    import tempfile
+    import threading
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    real_events_path, real_session_id = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    try:
+        # 1. classify_yellow parity spot-check -- the full RED/YELLOW/GREEN
+        #    matrix lives in glimmer-v2.py's own --yellow-approval-selfcheck
+        #    (the two copies are kept in sync deliberately); this just
+        #    proves the mirrored copy here agrees on the cases the wait
+        #    loop actually exercises below.
+        assert classify_yellow("shell", "git push", {}) is None
+        assert classify_yellow("shell", "npm run deploy", {}) is None
+        assert classify_yellow("shell", "git commit -m x", {}) is None
+        yellow = classify_yellow("shell", "npm install left-pad", {})
+        assert yellow is not None and yellow["action"] == "modify_dependencies"
+        assert classify_yellow("shell", "npm run db:migrate", {})["action"] == "run_migration"
+
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            (session_dir / "events.jsonl").write_text("")
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-approval-selfcheck"
+
+            # 2. No manifest.json at all (standalone invocation, no v2
+            #    parent) -- the manifest patch must degrade silently.
+            _patch_manifest_approval_state(
+                session_dir, "appr-x",
+                {"action": "a", "reason": "r", "proposedChanges": [], "risk": "low"},
+            )
+            _patch_manifest_approval_state(session_dir, "appr-x", None)
+
+            manifest_path = session_dir / "manifest.json"
+            manifest_path.write_text(json.dumps({"status": "initialized", "state": "preflight"}))
+
+            # 3. Denied path: a background "human" writes status="denied"
+            #    shortly after the request lands in approvals.json.
+            def _deny_soon():
+                time.sleep(0.03)
+                approvals = load_approvals(session_dir)
+                [approval_id] = approvals.keys()
+                approvals[approval_id]["status"] = "denied"
+                approvals[approval_id]["approvedBy"] = "test-human"
+                _atomic_write_json(_approvals_path(session_dir), approvals)
+
+            threading.Thread(target=_deny_soon, daemon=True).start()
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "install left-pad", ["package.json"], "medium",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "denied", decision
+            assert detail == "test-human", detail
+            # manifest restored to its pre-approval status/state, pendingApproval cleared.
+            after = json.loads(manifest_path.read_text())
+            assert after["status"] == "initialized" and after["state"] == "preflight"
+            assert "pendingApproval" not in after
+            assert "_preApprovalStatus" not in after and "_preApprovalState" not in after
+
+            # 4. Approved path.
+            def _approve_soon():
+                time.sleep(0.03)
+                approvals = load_approvals(session_dir)
+                [approval_id] = [k for k, v in approvals.items() if v.get("status") == "pending"]
+                approvals[approval_id]["status"] = "approved"
+                approvals[approval_id]["approvedBy"] = "daniel"
+                _atomic_write_json(_approvals_path(session_dir), approvals)
+
+            threading.Thread(target=_approve_soon, daemon=True).start()
+            decision, detail = request_approval_and_wait(
+                "run_migration", "npm run db:migrate", [], "high",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "approved" and detail == "daniel"
+
+            # 5. Timeout path: nobody ever resolves it -> fail closed.
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "npm install x", [], "medium",
+                timeout_s=0.05, poll_interval_s=0.01,
+            )
+            assert decision == "timeout", decision
+
+            # 6. Sidecar tolerant of malformed JSON.
+            (session_dir / "approvals.json").write_text("not json{{{")
+            assert load_approvals(session_dir) == {}
+            (session_dir / "approvals.json").write_text(json.dumps(["not", "an", "object"]))
+            assert load_approvals(session_dir) == {}
+
+            # 7. No session directory at all -> "unavailable", fails
+            #    closed immediately (no wait, no allow-by-default).
+            GLIMMER_EVENTS_PATH = None
+            decision, detail = request_approval_and_wait("x", "y", [], "low", timeout_s=1, poll_interval_s=0.01)
+            assert decision == "unavailable", decision
+    finally:
+        GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = real_events_path, real_session_id
+
+    print("approval wait loop (V7 §14/§35) self-check: PASS (7/7)")
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -9716,6 +10112,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--doc-tools-selfcheck"]:
         _doc_tools_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--approval-wait-selfcheck"]:
+        _approval_wait_selfcheck()
         sys.exit(0)
 
     try:

@@ -133,6 +133,16 @@ def canonical_session_state(raw_status: str) -> str:
         return "verified"
     if raw_status == "no-change-unverified":
         return "needs_review"
+    # Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string
+    # directly into manifest.json (the ONLY writer while it's blocked inside
+    # invoke_engineer's subprocess, session directory is shared and no other
+    # writer touches manifest.json during that window) the moment a YELLOW-
+    # classified action needs a human decision, and reverts it to whatever
+    # raw status was there before as soon as the wait resolves (approved,
+    # denied, or timed out) -- so this value is only ever real while a
+    # session is actually paused waiting on approvals.json.
+    if raw_status == "waiting-for-approval":
+        return "waiting_for_approval"
     # C2 (glimmer-v7): terminal status when the architect review gate
     # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
     # or the review budget is exhausted — V7 §5.10's rule: a session in
@@ -480,6 +490,175 @@ def compute_scope_guard(changed: list, contract: dict) -> dict:
         for p in expected
     )]
     return {"inScope": len(expanded) == 0, "expected": expected, "actual": actual, "expandedFiles": expanded}
+
+
+# ============================================================
+# Task 8.3 (V7 §14/§35): YELLOW approval-boundary classification
+# ============================================================
+#
+# Deterministic, pure, no I/O, no model call. Reference implementation --
+# glimmer-engineer.py (the process that actually dispatches shell commands
+# and holds the write-tool loop) carries its own mirrored copy, kept in
+# sync deliberately, same discipline canonical_session_state/mapManifest
+# Status already use across the Python/TypeScript process boundary: the
+# two files can't import each other (glimmer-v2.py/glimmer-engineer.py's
+# hyphenated names aren't importable as Python modules -- glimmer_events.py
+# is the one shared module, and it doesn't need this since only the
+# engineer subprocess ever dispatches a shell command). Any change here
+# must be mirrored there.
+#
+# This function only ever ANSWERS "does this command/fact ALSO qualify for
+# a YELLOW human-approval escalation" -- it never touches, widens, or
+# replaces shell_policy's own RED enforcement (git commit/push/reset/
+# clean/checkout/switch/stash/merge/rebase; npm publish/uninstall/update/
+# exec; any executable outside the {git,npm,python,cargo} allowlist) or
+# its dangerous_fragments block for deploy/publish/release/production/
+# :prod/:live (V7 §35: "commit, push, deploy" stay blocked outright, no
+# escalation offered). None means "not a YELLOW case here" -- RED stays
+# whatever shell_policy already says, GREEN is unaffected.
+YELLOW_DEPENDENCY_INSTALL_TOKENS = frozenset({"install", "i", "ci", "add"})
+YELLOW_MIGRATION_KEYWORDS = ("migrate", "migration", "seed")
+# V7 §15 Scope Guard: "large expansion -> pause for approval". Small/medium
+# expansions stay advisory (existing edit_outside_candidate_files consult
+# nudge in glimmer-engineer.py) -- only a real pile-up of out-of-scope
+# files escalates to an actual human approval gate.
+SCOPE_EXPANSION_YELLOW_THRESHOLD = 3
+
+
+def classify_yellow(action_kind: str, command, contract: dict | None) -> dict | None:
+    """Returns a structured V7 §35 approval-request dict --
+    {"action", "reason", "proposedChanges", "risk"} -- when (action_kind,
+    command, contract) matches a YELLOW trigger, else None.
+
+    action_kind == "shell": `command` is the raw shell command string
+    shell_policy already rejected; `contract` is unused (reserved for
+    future contract-aware shell classification, always safe to pass {}).
+    Detects two V7 §35 triggers: dependency installation (npm install
+    family -- pip is never reachable at all, shell_policy has no pip
+    branch in its executable allowlist, so there is nothing to escalate
+    for it) and database migration (an npm run script whose name contains
+    a migration keyword; deploy/publish/release/production/:prod/:live
+    scripts are deliberately excluded -- those stay RED per V7 §35).
+
+    action_kind == "scope": `command` is unused; `contract` carries an
+    already-computed scope-guard fact, `contract["expandedFiles"]` (see
+    compute_scope_guard's own `expandedFiles`, or glimmer-engineer.py's
+    edit_outside_candidate_files trigger) -- a list of changed-file paths
+    outside the declared/expected scope. SCOPE_EXPANSION_YELLOW_THRESHOLD
+    or more such files is a "large expansion" (V7 §15) that pauses for
+    approval instead of just the existing advisory nudge.
+
+    Any other action_kind, or no match, returns None.
+    """
+    if action_kind == "shell":
+        if not isinstance(command, str) or not command.strip():
+            return None
+        try:
+            tokens = shlex.split(command.strip())
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+
+        executable = tokens[0]
+        lowered = [t.lower() for t in tokens]
+
+        if executable == "npm":
+            if any(t in YELLOW_DEPENDENCY_INSTALL_TOKENS for t in lowered[1:]):
+                return {
+                    "action": "modify_dependencies",
+                    "reason": f"engineer requested a dependency-install command: {command}",
+                    "proposedChanges": ["package.json", "package-lock.json"],
+                    "risk": "medium",
+                }
+            if "run" in tokens:
+                idx = tokens.index("run")
+                if idx + 1 < len(tokens):
+                    script = tokens[idx + 1]
+                    if any(k in script.lower() for k in YELLOW_MIGRATION_KEYWORDS):
+                        return {
+                            "action": "run_migration",
+                            "reason": f"engineer requested a migration-shaped npm script: {script!r}",
+                            "proposedChanges": [],
+                            "risk": "high",
+                        }
+        return None
+
+    if action_kind == "scope":
+        expanded = (contract or {}).get("expandedFiles") or []
+        if len(expanded) >= SCOPE_EXPANSION_YELLOW_THRESHOLD:
+            return {
+                "action": "scope_expansion",
+                "reason": (
+                    f"{len(expanded)} changed file(s) fall outside the declared/expected "
+                    f"scope: {', '.join(expanded[:5])}"
+                ),
+                "proposedChanges": list(expanded[:20]),
+                "risk": "medium",
+            }
+        return None
+
+    return None
+
+
+def _yellow_approval_selfcheck() -> None:
+    """Task 8.3 (V7 §14/§35) self-check. Pure function, no I/O -- run with:
+    python3 glimmer-v2.py --yellow-approval-selfcheck
+    """
+    # 1. RED stays RED: shell_policy's own hard blocks are never touched --
+    #    classify_yellow returns None for every one of them, so the
+    #    existing POLICY_BLOCK path is completely unaffected.
+    for red_command in (
+        "git commit -m x", "git push", "git reset --hard", "git clean -fd",
+        "npm run deploy", "npm run release:prod", "npm publish",
+        "npm uninstall left-pad", "rm -rf /",
+    ):
+        assert classify_yellow("shell", red_command, {}) is None, red_command
+
+    # 2. GREEN unaffected.
+    for green_command in ("git status", "git diff --stat", "npm run typecheck", "npm run test:unit"):
+        assert classify_yellow("shell", green_command, {}) is None, green_command
+
+    # 3. YELLOW: dependency installation.
+    verdict = classify_yellow("shell", "npm install left-pad", {})
+    assert verdict is not None and verdict["action"] == "modify_dependencies"
+    assert verdict["risk"] == "medium"
+    assert classify_yellow("shell", "npm ci", {}) is not None
+    assert classify_yellow("shell", "npm i", {})["action"] == "modify_dependencies"
+
+    # 4. YELLOW: migration keyword (V7 §35's "database migration"), but the
+    #    sibling deploy/production/release scripts above stayed RED (None).
+    verdict = classify_yellow("shell", "npm run db:migrate", {})
+    assert verdict is not None and verdict["action"] == "run_migration"
+    assert verdict["risk"] == "high"
+    assert classify_yellow("shell", "npm run seed:dev", {}) is not None
+
+    # 5. Malformed/edge-case input never raises.
+    assert classify_yellow("shell", "", {}) is None
+    assert classify_yellow("shell", None, {}) is None
+    assert classify_yellow("shell", "unterminated 'quote", {}) is None
+    assert classify_yellow("bogus_action_kind", "npm install x", {}) is None
+
+    # 6. YELLOW: scope expansion, reusing scope-guard facts (contract-
+    #    supplied expandedFiles) -- small expansion stays advisory (None,
+    #    below threshold), large expansion pauses for approval.
+    assert classify_yellow("scope", None, {"expandedFiles": ["a.py", "b.py"]}) is None
+    verdict = classify_yellow("scope", None, {"expandedFiles": ["a.py", "b.py", "c.py", "d.py"]})
+    assert verdict is not None and verdict["action"] == "scope_expansion"
+    assert verdict["risk"] == "medium"
+    assert classify_yellow("scope", None, {}) is None
+    assert classify_yellow("scope", None, None) is None
+
+    # 7. Real compute_scope_guard facts feed classify_yellow end to end.
+    contract = {"scope": {"paths": ["frontend/src/widget/"]}}
+    guard = compute_scope_guard(
+        ["frontend/src/widget/a.ts", "server/x.ts", "server/y.ts", "shared/z.ts"], contract
+    )
+    verdict = classify_yellow("scope", None, guard)
+    assert verdict is not None and verdict["action"] == "scope_expansion"
+    assert "server/x.ts" in verdict["proposedChanges"]
+
+    print("YELLOW approval boundary (V7 §14/§35) self-check: PASS (7/7)")
 
 
 def _scope_guard_selfcheck() -> None:
@@ -11004,6 +11183,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--docs-bootstrap-selfcheck"]:
         _docs_bootstrap_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--yellow-approval-selfcheck"]:
+        _yellow_approval_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:2] == ["--docs-bootstrap"]:
         # Task 7.4: a standalone CLI mode, not a task run -- takes a bare

@@ -55,6 +55,11 @@ EVENT_TYPES = {
     # written, on every exit path (mirrors session_completed's own
     # unconditional emission just after it).
     "delivery_packet_created",
+    # Task 8.3 (V7 §14/§35): emitted by glimmer-engineer.py's
+    # request_approval_and_wait the moment a YELLOW-classified action
+    # (classify_yellow) needs a human decision -- one per approval
+    # request, before the poll loop over approvals.json starts.
+    "approval_requested",
 }
 
 
@@ -154,6 +159,9 @@ def _selfcheck() -> None:
             ("architect_consult_advised", {"trigger": "turns_high_no_writes", "detail": "turn 7/10 (over 60% of the turn budget) with no repository write yet"}),
             ("architect_consulted", {"questionChars": 42, "answerChars": 210}),
             ("delivery_packet_created", {}),
+            ("approval_requested", {"approvalId": "s2-appr-abc123", "action": "modify_dependencies",
+                                     "reason": "engineer requested a dependency-install command: npm install left-pad",
+                                     "risk": "medium"}),
         ]
         for t, fields in new_type_samples:
             emit(path, t, "s2", **fields)
