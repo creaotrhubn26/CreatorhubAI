@@ -8,12 +8,14 @@ import { RepositoryMapScreen } from "./repository/RepositoryMapScreen";
 import { SessionHistoryScreen } from "./history/SessionHistoryScreen";
 import { ModelStatusScreen } from "./model/ModelStatusScreen";
 import { SettingsScreen } from "./settings/SettingsScreen";
+import { SystemExplorerScreen } from "./system-explorer/SystemExplorerScreen";
 import * as client from "../api/client";
 
 vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({ changedFiles: [] } as any);
 vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({ diff: "" });
 vi.spyOn(client.glimmerApi, "getStatus").mockResolvedValue({ verification: null } as any);
 vi.spyOn(client.glimmerApi, "getRepositoryMap").mockRejectedValue(new Error("404"));
+vi.spyOn(client.glimmerApi, "getDocGraph").mockResolvedValue(null);
 vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
 vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
 
@@ -33,7 +35,10 @@ function withProviders(ui: React.ReactElement) {
 
 describe("read-only screens", () => {
   it("mount without throwing", () => {
-    for (const Screen of [DiffReviewScreen, VerificationCenterScreen, RepositoryMapScreen, SessionHistoryScreen, ModelStatusScreen, SettingsScreen]) {
+    for (const Screen of [
+      DiffReviewScreen, VerificationCenterScreen, RepositoryMapScreen, SessionHistoryScreen, ModelStatusScreen, SettingsScreen,
+      SystemExplorerScreen,
+    ]) {
       expect(() => render(withProviders(<Screen />))).not.toThrow();
     }
   });

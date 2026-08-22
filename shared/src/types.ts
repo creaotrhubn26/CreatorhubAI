@@ -880,6 +880,43 @@ export interface RepoMap {
   packages: RepoPackage[];
 }
 
+// Task 7.5 (V7 "System Explorer"): docs/graph.json is written by glimmer-v2.py's
+// doc pass into the TARGET repo's workspace (see server/src/lib/sessions.ts
+// readDocGraph), never by the gateway itself -- these types describe that
+// on-disk shape verbatim, so the Control Center only ever displays what the
+// orchestrator actually wrote (id/status/confidence/provenance), never a
+// fabricated title or status.
+export type DocNodeType = "system" | "service" | "route" | "schema" | "config" | "doc";
+export type DocNodeStatus = "CURRENT" | "STALE" | "UNVERIFIED" | "MISSING" | "DEPRECATED" | "GENERATED";
+
+export interface DocProvenance {
+  evidence: string[];
+  sha: string | null;
+  updatedAt?: string;
+}
+
+export interface DocNode {
+  id: string;
+  type: DocNodeType;
+  path: string;
+  title: string;
+  status: DocNodeStatus;
+  confidence: number;
+  provenance: DocProvenance;
+}
+
+export interface DocEdge {
+  from: string;
+  to: string;
+  kind: string;
+}
+
+export interface DocGraph {
+  schemaVersion: number;
+  nodes: DocNode[];
+  edges: DocEdge[];
+}
+
 export interface ModelStatus {
   status: "ONLINE" | "REACHABLE_AUTH" | "OFFLINE" | "UNKNOWN";
   endpoint: string;

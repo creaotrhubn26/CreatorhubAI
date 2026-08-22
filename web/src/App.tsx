@@ -8,6 +8,7 @@ import { ActiveSessionScreen } from "./components/session/ActiveSessionScreen";
 import { DiffReviewScreen } from "./components/diff/DiffReviewScreen";
 import { VerificationCenterScreen } from "./components/verification/VerificationCenterScreen";
 import { RepositoryMapScreen } from "./components/repository/RepositoryMapScreen";
+import { SystemExplorerScreen } from "./components/system-explorer/SystemExplorerScreen";
 import { SessionHistoryScreen } from "./components/history/SessionHistoryScreen";
 import { ModelStatusScreen } from "./components/model/ModelStatusScreen";
 import { SettingsScreen } from "./components/settings/SettingsScreen";
@@ -45,6 +46,7 @@ export function App() {
         <Route path="/sessions/:id/verification" element={<VerificationCenterScreen />} />
         <Route path="/verification" element={<VerificationCenterScreen />} />
         <Route path="/repository" element={<RepositoryMapScreen />} />
+        <Route path="/system-explorer" element={<SystemExplorerScreen />} />
         <Route path="/model" element={<ModelStatusScreen />} />
         <Route path="/settings" element={<SettingsScreen />} />
       </Routes>

@@ -19,6 +19,12 @@ const COLOR: Record<string, string> = {
   // real reviewed/blocked/warned outcomes once --vision ran.
   pass: "var(--green)", partial: "var(--amber)",
   PASS_WITH_WARNINGS: "var(--amber)", BLOCKED: "var(--amber)", FAIL: "var(--red)",
+  // Task 7.5 (V7 "System Explorer") -- DocNodeStatus. MISSING is red (a
+  // documented node whose target no longer exists is a real problem);
+  // GENERATED/DEPRECATED share --gray, this palette's existing "muted"
+  // color, per the task's "visually muted" requirement.
+  CURRENT: "var(--green)", STALE: "var(--amber)", UNVERIFIED: "var(--amber)", MISSING: "var(--red)",
+  GENERATED: "var(--gray)", DEPRECATED: "var(--gray)",
 };
 
 // Shared with the IDE shell (session-list status dots, tab dots) so every

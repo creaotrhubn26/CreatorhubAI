@@ -38,6 +38,7 @@ export function buildCommands(ctx: PaletteCommandsContext): PaletteCommand[] {
     { id: "goto-sessions", label: "Go to Sessions", run: () => ctx.navigate("/sessions") },
     { id: "goto-verification", label: "Go to Verification Center", run: () => ctx.navigate("/verification") },
     { id: "goto-repository", label: "Go to Repository Map", run: () => ctx.navigate("/repository") },
+    { id: "goto-system-explorer", label: "Go to System Explorer", run: () => ctx.navigate("/system-explorer") },
     { id: "goto-model", label: "Go to Model Status", run: () => ctx.navigate("/model") },
     { id: "goto-settings", label: "Go to Settings", run: () => ctx.navigate("/settings") },
     { id: "toggle-left-panel", label: "Toggle left panel", hint: "[", run: ctx.toggleLeftPanel },

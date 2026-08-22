@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import request from "supertest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -36,5 +36,71 @@ describe("GET /api/repository/map", () => {
     const res = await request(app).get("/api/repository/map");
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
+  });
+});
+
+// Task 7.5 (V7 "System Explorer"): docs/graph.json lives in a session's
+// WORKSPACE (the target repo), not in the session dir — a real fixture
+// needs both a manifest.json (so findDocGraph can learn the workspace path)
+// and an actual workspace directory. Every case cleans its session + temp
+// workspace up in afterEach: findDocGraph walks every session in the shared
+// stateRoot, so a fixture left behind by one case would leak into the next
+// case's expected result.
+describe("GET /api/repository/doc-graph", () => {
+  const graph = {
+    schemaVersion: 1,
+    nodes: [
+      {
+        id: "svc:gateway", type: "service", path: "server/src", title: "Gateway",
+        status: "CURRENT", confidence: 0.9, provenance: { evidence: ["server/src/app.ts"], sha: "abc123" },
+      },
+    ],
+    edges: [],
+  };
+
+  const createdIds: string[] = [];
+  const createdWorkspaces: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(createdIds.splice(0).map((id) => fs.rm(path.join(stateRoot, "sessions", id), { recursive: true, force: true })));
+    await Promise.all(createdWorkspaces.splice(0).map((ws) => fs.rm(ws, { recursive: true, force: true })));
+  });
+
+  async function makeSession(id: string, setup: (ws: string) => Promise<void>) {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-doc-graph-ws-"));
+    createdWorkspaces.push(ws);
+    await setup(ws);
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    createdIds.push(id);
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ task: "test", status: "initialized", workspace: ws, branch: "main", baseline: null, attempts: [] })
+    );
+  }
+
+  it("returns the parsed docs/graph.json from a session's workspace when present", async () => {
+    await makeSession("doc-graph-found", async (ws) => {
+      await fs.mkdir(path.join(ws, "docs"), { recursive: true });
+      await fs.writeFile(path.join(ws, "docs", "graph.json"), JSON.stringify(graph));
+    });
+    const res = await request(app).get("/api/repository/doc-graph");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(graph);
+  });
+
+  it("returns 404 when no session's workspace has a docs/graph.json (opt-in artifact)", async () => {
+    await makeSession("doc-graph-missing", async () => {});
+    const res = await request(app).get("/api/repository/doc-graph");
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 404, not a crash, when docs/graph.json is malformed", async () => {
+    await makeSession("doc-graph-malformed", async (ws) => {
+      await fs.mkdir(path.join(ws, "docs"), { recursive: true });
+      await fs.writeFile(path.join(ws, "docs", "graph.json"), "not json {{{");
+    });
+    const res = await request(app).get("/api/repository/doc-graph");
+    expect(res.status).toBe(404);
   });
 });
