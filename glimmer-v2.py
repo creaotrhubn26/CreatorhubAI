@@ -5084,7 +5084,10 @@ def write_delivery_packet(manifest, session_dir, delivery_review):
     session_dir (V7 §23.16). Never raises: a write failure here must not
     break session finalization -- same fail-tolerant discipline as the
     rest of the `finally` block's bookkeeping writes. Returns the
-    assembled packet dict regardless of whether the write succeeded."""
+    assembled packet dict on success, None when the write failed -- so
+    the caller can gate delivery_packet_created on the artifact actually
+    existing (an event claiming a packet that isn't there would be a
+    fabrication)."""
     packet = compute_delivery_packet(manifest, delivery_review)
     try:
         (Path(session_dir) / "delivery-packet.json").write_text(
@@ -5095,6 +5098,7 @@ def write_delivery_packet(manifest, session_dir, delivery_review):
         )
     except OSError as exc:
         print(f"[V2] WARN: failed to write delivery packet: {exc}")
+        return None
     return packet
 
 
@@ -6887,8 +6891,8 @@ def main():
                 engineer, ws, architecture_plan, _delivery_review_final,
                 session, events_path, sid,
             )
-        write_delivery_packet(manifest, session, _delivery_review_final)
-        emit_event(events_path, "delivery_packet_created", sid)
+        if write_delivery_packet(manifest, session, _delivery_review_final) is not None:
+            emit_event(events_path, "delivery_packet_created", sid)
 
         save()
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
