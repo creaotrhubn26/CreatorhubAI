@@ -429,6 +429,42 @@ export interface VisualVerification {
   findings: VisualFindings | null;
 }
 
+// Task 5.2 (V7 §26/§46): one node in evidence-index.json's graph-lite
+// list, built incrementally by glimmer-engineer.py as evidence persists
+// (add_evidence -> _index_evidence_entry). `kind` is a static per-tool
+// category ("file"/"search"/"shell"/"symbol"/"test-search"/"retrieval"),
+// except exec_shell_command entries are reclassified to "failure" when
+// their output looks like a failing command. `relatesTo` is the
+// graph-lite edge list -- e.g. a find_related_tests entry pointing at
+// {kind: "test"} nodes, or a failing shell entry pointing at
+// {kind: "file"} nodes parsed from its own output.
+export interface EvidenceIndexRelation {
+  path: string;
+  kind: string;
+}
+
+export interface EvidenceIndexEntry {
+  id: string;
+  kind: string;
+  path?: string;
+  toolCall: string;
+  relatesTo?: EvidenceIndexRelation[];
+}
+
+// GET /api/sessions/:id/evidence response body: the whole index by
+// default, or (when ?id= is given) a single resolved entry -- see that
+// route's own comment for why both live behind one endpoint.
+export interface EvidenceIndexResponse {
+  entries: EvidenceIndexEntry[];
+}
+
+export interface EvidenceEntryResponse {
+  id: string;
+  tool?: string;
+  arguments?: unknown;
+  content?: string;
+}
+
 // C3 (glimmer-v7): flat evidence-driven task list, written to tasks.json.
 // kind vocabulary: "implementation" and "verification" transition on real
 // evidence (engineer return code + changed files / a matched verify()
