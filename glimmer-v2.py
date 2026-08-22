@@ -3016,12 +3016,14 @@ def gates_block_verified(gates: dict) -> bool:
     every routes/schema/api/config/auth-touching change permanently
     unable to reach VERIFIED. That is no longer the whole story: Task 7.1/
     7.2's graph-based verification (verify_doc_nodes + map_changed_files_
-    to_doc_nodes + apply_doc_impact/check_doc_drift, composed in main()'s
-    finally block) CAN legitimately produce True -- when a repo has a
-    docs/graph.json and every doc node impacted by this session's diff
-    verifies CURRENT. Repos without a graph still get None (mechanism
-    didn't run -- not applicable, never blocks), so this is additive, not
-    a new way to fail for repos that never opted in.
+    to_doc_nodes + apply_doc_impact/check_doc_drift + compute_doc_gate,
+    composed by run_doc_pass and called from main()'s `if ok:` branch --
+    Review round 7, C1 -- strictly BEFORE this function is consulted, not
+    from `finally` after the fact) CAN legitimately produce True -- when a
+    repo has a docs/graph.json and every doc node impacted by this
+    session's diff verifies CURRENT. Repos without a graph still get None
+    (mechanism didn't run -- not applicable, never blocks), so this is
+    additive, not a new way to fail for repos that never opted in.
 
     Task 4.2: gates.tasksResolved follows the exact same Round-2
     True/False/None contract as architectureApproved/scopeApproved above
@@ -3951,8 +3953,35 @@ _CATEGORY_TO_NODE_TYPE = {
 # node's own markdown -- e.g. `backend/server/services/x.ts` or
 # `README.md`. Deliberately loose (this is a drift *signal*, not a parser):
 # anything that looks like a path reference and doesn't resolve under the
-# workspace root is a finding.
+# workspace root is a finding. _looks_like_doc_path_ref below narrows the
+# raw regex match down to things that are actually plausible paths
+# (Review round 7, M2) -- the regex alone also matches ordinary prose
+# like `Node.js`/`example.com`/`v1.2`, none of which are path references.
 _DOC_PATH_REF_RE = re.compile(r"`([\w][\w./-]*\.[A-Za-z0-9]{1,10})`")
+
+# Review round 7 (M2): extensions allowed to match WITHOUT a "/" in the
+# reference -- root-level doc/config files that legitimately get named
+# bare in prose (`README.md`, `package.json`, `.env`...). Source-code
+# extensions are deliberately excluded here: a bare `Node.js`/`Express.js`
+# is prose about a runtime/framework, not a path, and requiring a "/" for
+# those (matching real code references like `src/api.ts`) is what keeps
+# check_doc_drift from flagging ordinary text as a broken path.
+_DOC_PATH_REF_NO_SLASH_EXTS = {
+    "md", "mdx", "json", "yml", "yaml", "toml", "ini", "cfg", "env", "txt", "rst", "lock",
+}
+
+
+def _looks_like_doc_path_ref(ref: str) -> bool:
+    """Review round 7 (M2): a backticked, dot-extensioned regex match is
+    only treated as a repo path reference when it contains a path
+    separator, or its extension is one of the root-level doc/config
+    types above. Filters out `Node.js`, `example.com`, `v1.2`, `foo.bar`
+    -- prose that matches the loose regex but was never a path -- while
+    still catching real references like `src/api.ts` or `README.md`."""
+    if "/" in ref:
+        return True
+    ext = ref.rsplit(".", 1)[-1].lower()
+    return ext in _DOC_PATH_REF_NO_SLASH_EXTS
 
 
 def load_doc_graph(ws) -> "dict | None":
@@ -3981,12 +4010,22 @@ def _write_doc_graph(ws, graph: dict) -> None:
     """Atomic tmp+replace write of docs/graph.json back into the TARGET
     repo -- same never-crash-the-session discipline as save_tasks: a disk
     write failure here degrades to a log line, it must never take down an
-    otherwise-successful session."""
+    otherwise-successful session.
+
+    Review round 7 (C2): skipped entirely when the serialized graph is
+    byte-identical to what's already on disk -- a verified session that
+    changed nothing in the graph must not touch docs/graph.json (a
+    tracked, human-curated file in the TARGET repo) at all, or every
+    such session would show up as "someone modified the workspace after
+    verification" in the Control Center's own staleness check."""
     path = Path(ws) / DOC_GRAPH_RELATIVE_PATH
+    serialized = json.dumps(graph, indent=2)
     try:
+        if path.is_file() and path.read_text(encoding="utf-8") == serialized:
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-        tmp.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+        tmp.write_text(serialized, encoding="utf-8")
         os.replace(tmp, path)
     except OSError as exc:
         print(f"[V2] WARN: failed to write {DOC_GRAPH_RELATIVE_PATH}: {exc}")
@@ -4021,7 +4060,15 @@ def verify_doc_nodes(graph: dict, ws) -> list:
     writes it back atomically. Returns [{"nodeId", "status"}] for every
     node actually (re)computed, in node order -- callers emit
     documentation_verified from this. Never model-driven: every branch
-    above is a filesystem or git check, never a judgment call."""
+    above is a filesystem or git check, never a judgment call.
+
+    Review round 7 (C2): provenance.updatedAt is only bumped for a node
+    whose status/confidence/missingEvidence actually changed this pass --
+    a repeat run against an unchanged repo must reproduce the exact same
+    graph.json bytes (see _write_doc_graph's identical-content no-op),
+    so a verified session that touched nothing doesn't get fingerprinted
+    as "the workspace changed after verification" purely because this
+    function stamped a fresh timestamp onto every node, every time."""
     now = _task_timestamp()
     results = []
     for node in graph.get("nodes") or []:
@@ -4031,7 +4078,9 @@ def verify_doc_nodes(graph: dict, ws) -> list:
             continue
 
         node_path = node.get("path") or ""
-        provenance = dict(node.get("provenance") or {})
+        old_provenance = dict(node.get("provenance") or {})
+        provenance = dict(old_provenance)
+        provenance.pop("missingEvidence", None)
 
         if not node_path or not (Path(ws) / node_path).exists():
             status = DOC_STATUS_MISSING
@@ -4054,18 +4103,47 @@ def verify_doc_nodes(graph: dict, ws) -> list:
                 else:
                     status = DOC_STATUS_CURRENT
 
-        node["status"] = status
-        node["confidence"] = {
+        confidence = {
             DOC_STATUS_CURRENT: "high",
             DOC_STATUS_STALE: "low",
             DOC_STATUS_MISSING: "low",
         }.get(status, "unknown")
-        provenance["updatedAt"] = now
+        changed = (
+            node.get("status") != status
+            or node.get("confidence") != confidence
+            or old_provenance.get("missingEvidence") != provenance.get("missingEvidence")
+        )
+        node["status"] = status
+        node["confidence"] = confidence
+        if changed:
+            provenance["updatedAt"] = now
+        else:
+            provenance = old_provenance
         node["provenance"] = provenance
         results.append({"nodeId": node["id"], "status": status})
 
     _write_doc_graph(ws, graph)
     return results
+
+
+def _paths_share_area(path: str, node_path: str) -> bool:
+    """Review round 7 (M1): whether a changed file plausibly belongs to
+    the same area of the repo as a graph node's own recorded path --
+    identical, one nested under the other, or sharing an immediate
+    parent directory. Scopes the O2 category heuristic in
+    map_changed_files_to_doc_nodes down from "every node of this type,
+    repo-wide" to "nodes actually near this changed file" -- without
+    this, one changed route file marks every route doc in the repo
+    impacted, regardless of which route it documents."""
+    if not path or not node_path:
+        return False
+    if path == node_path:
+        return True
+    if path.startswith(node_path.rstrip("/") + "/") or node_path.startswith(path.rstrip("/") + "/"):
+        return True
+    path_dir = path.rsplit("/", 1)[0] if "/" in path else ""
+    node_dir = node_path.rsplit("/", 1)[0] if "/" in node_path else ""
+    return bool(path_dir) and path_dir == node_dir
 
 
 def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
@@ -4077,7 +4155,11 @@ def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
          lives under it as a directory prefix.
       2. the existing O2 phase-1 keyword table (_categories_for_path) --
          a changed file's category (routes/schema/config/api/auth) maps
-         to a node type via _CATEGORY_TO_NODE_TYPE.
+         to a node type via _CATEGORY_TO_NODE_TYPE -- narrowed (Review
+         round 7, M1) to nodes of that type whose OWN path also shares an
+         area with the changed file (_paths_share_area), not every node
+         of that type in the graph. Without this, one route file change
+         would mark every route doc in the repo impacted/STALE.
 
     A touched node that is itself type=="doc" is directly impacted. A
     touched node that is NOT a doc is impacted through any "documents"
@@ -4100,7 +4182,10 @@ def map_changed_files_to_doc_nodes(graph: dict, changed_files) -> list:
             if wanted_type is None:
                 continue
             for node in nodes_by_id.values():
-                if node.get("type") == wanted_type:
+                if node.get("type") != wanted_type:
+                    continue
+                node_path = str(node.get("path") or "").replace("\\", "/")
+                if _paths_share_area(path, node_path):
                     touched.add(node["id"])
 
     impacted = {nid for nid in touched if nodes_by_id[nid].get("type") == "doc"}
@@ -4126,7 +4211,25 @@ def apply_doc_impact(graph: dict, ws, changed_files, node_ids: list) -> list:
     whatever verify_doc_nodes computed, e.g. CURRENT). Frozen DEPRECATED/
     GENERATED nodes are left untouched. Writes the graph back atomically.
     Returns [{"nodeId", "reason"}] for the nodes actually flagged --
-    callers emit documentation_stale_detected from this."""
+    callers emit documentation_stale_detected from this.
+
+    Review round 7 (M3): the same-diff exemption is now a real edge back
+    to CURRENT, not just "leave whatever verify_doc_nodes already
+    computed alone" -- editing a doc alongside the code it documents is
+    exactly the deterministic "this is confirmed accurate" signal
+    provenance.sha otherwise has no way to ever receive (nothing else in
+    this file writes it), so a node that drifted STALE once would
+    otherwise stay STALE forever with no path back short of hand-editing
+    graph.json. Stamps provenance.sha to the path's current committed
+    git sha -- the same deterministic _doc_git_sha check verify_doc_nodes
+    itself uses, never a guess.
+    # ponytail: this stamps the PRE-commit sha (sessions leave the diff
+    # uncommitted for human review), so once the human commits, one more
+    # session's verify_doc_nodes pass will legitimately re-flag it STALE
+    # against the new commit before self-healing again on the next
+    # same-diff edit. Upgrade path: a `--docs-verify --accept` command
+    # that re-baselines against HEAD after a human commits, if that one-
+    # cycle lag ever matters in practice."""
     changed_set = {str(f).replace("\\", "/") for f in (changed_files or [])}
     nodes_by_id = {
         n["id"]: n for n in (graph.get("nodes") or [])
@@ -4140,7 +4243,17 @@ def apply_doc_impact(graph: dict, ws, changed_files, node_ids: list) -> list:
             continue
         node_path = str(node.get("path") or "").replace("\\", "/")
         if node_path and node_path in changed_set:
-            continue  # doc updated alongside the code it documents
+            # doc updated alongside the code it documents -- re-baseline,
+            # don't just skip (Review round 7, M3).
+            provenance = dict(node.get("provenance") or {})
+            fresh_sha = _doc_git_sha(ws, node_path)
+            if node.get("status") != DOC_STATUS_CURRENT or provenance.get("sha") != fresh_sha:
+                node["status"] = DOC_STATUS_CURRENT
+                node["confidence"] = "high"
+                provenance["sha"] = fresh_sha
+                provenance["updatedAt"] = now
+                node["provenance"] = provenance
+            continue
         node["status"] = DOC_STATUS_STALE
         node["confidence"] = "low"
         provenance = dict(node.get("provenance") or {})
@@ -4158,7 +4271,10 @@ def check_doc_drift(graph: dict, ws) -> list:
     """Task 7.2 ("Drift detection"): deterministic drift check -- for each
     doc-type node (except frozen DEPRECATED/GENERATED), read its own file
     and regex-scan it for backticked, repo-path-looking references (see
-    _DOC_PATH_REF_RE). Any reference that doesn't resolve to a real path
+    _DOC_PATH_REF_RE), narrowed to plausible paths by
+    _looks_like_doc_path_ref (Review round 7, M2 -- the raw regex alone
+    also matches prose like `Node.js`/`example.com`, which is never a
+    path reference). Any reference that doesn't resolve to a real path
     under `ws` is a drift finding. Findings are capped at 10 per node,
     recorded at node.provenance.driftFindings, and any node with at least
     one finding is flagged STALE. Writes the graph back atomically.
@@ -4181,6 +4297,8 @@ def check_doc_drift(graph: dict, ws) -> list:
 
         findings = []
         for ref in _DOC_PATH_REF_RE.findall(text):
+            if not _looks_like_doc_path_ref(ref):
+                continue
             if (Path(ws) / ref).exists():
                 continue
             findings.append(ref)
@@ -4201,6 +4319,111 @@ def check_doc_drift(graph: dict, ws) -> list:
         })
     _write_doc_graph(ws, graph)
     return flagged
+
+
+def compute_doc_gate(doc_graph, doc_node_ids: list) -> "bool | None":
+    """Task 7.1's tri-state gates["documentationCurrent"] derivation,
+    extracted as a pure function (Review round 7, Minor 1 / the selfcheck
+    gap C1 exposed): both main() and --doc-graph-selfcheck now call this
+    SAME function, instead of the selfcheck asserting against a private
+    re-implementation that could silently drift from what main() actually
+    does -- which is exactly how C1 (the gate never actually blocking)
+    went undetected.
+
+    doc_graph is None: no docs/graph.json in this repo -- ALWAYS None
+    (Review round 7, C3), regardless of what O2 phase 1's one-way
+    detect_documentation_impact detector found. That detector can only
+    ever emit False or None, never True (it has no way to verify docs
+    actually ARE current), so once C1 made this gate's value actually
+    reach gates_block_verified, letting a no-graph repo's False through
+    here would permanently brick every repo that never opted into the
+    graph the instant it touched a routes/schema/api/config/auth-shaped
+    file, with no action the engineer could take to clear it -- exactly
+    the Round-2 deadlock this gate was designed never to reintroduce.
+    That detector's finding still drives its own REQUIRED documentation
+    task (see run_doc_pass) -- it just never reaches the VERIFIED gate
+    for a repo with no graph to verify against.
+    doc_graph present but doc_node_ids is empty: None -- graph-based
+    verification ran and found nothing this diff impacts, honestly "not
+    applicable".
+    doc_graph present and impacted: True only when EVERY impacted node
+    verifies CURRENT; False when any is STALE/MISSING/otherwise
+    unproven -- never a guessed True."""
+    if doc_graph is None:
+        return None
+    if not doc_node_ids:
+        return None
+    doc_nodes_by_id = {n["id"]: n for n in doc_graph.get("nodes") or [] if n.get("id")}
+    impacted_statuses = [doc_nodes_by_id[n]["status"] for n in doc_node_ids if n in doc_nodes_by_id]
+    if any(s in (DOC_STATUS_STALE, DOC_STATUS_MISSING) for s in impacted_statuses):
+        return False
+    if impacted_statuses and all(s == DOC_STATUS_CURRENT for s in impacted_statuses):
+        return True
+    # UNVERIFIED/DEPRECATED/GENERATED among the impacted set: not proven
+    # current, but also not an outright drift finding -- conservative
+    # False, never a guessed True.
+    return False
+
+
+def run_doc_pass(ws, events_path, sid, manifest: dict, tasks, session) -> None:
+    """Task 7.1/7.2, Review round 7 (C1): the full deterministic doc pass
+    -- load the graph, verify nodes, map this session's FINAL changed-
+    file set to impacted doc nodes, apply impact/drift, and derive
+    gates["documentationCurrent"] via compute_doc_gate. Mutates
+    `manifest` in place (gates, documentationImpact*, and -- when a task
+    graph exists -- appends a documentation task via save_tasks).
+
+    Called from exactly ONE place in main() per session (guarded by the
+    `doc_pass_done` flag there), and it must be called BEFORE
+    gates_block_verified is consulted -- this is the fix for C1, where
+    the equivalent logic used to run only in `finally`, strictly AFTER
+    VERIFIED had already been decided, making the gate purely decorative.
+    Requires manifest["finalChangedFiles"] to already reflect the
+    session's true final diff (i.e. collapse() has already run) -- see
+    main()'s call site."""
+    final_changed_files = manifest["finalChangedFiles"]
+    doc_impacts = detect_documentation_impact(final_changed_files)
+    doc_graph = load_doc_graph(ws)
+    doc_node_ids = []
+    if doc_graph is not None:
+        for verified in verify_doc_nodes(doc_graph, ws):
+            emit_event(events_path, "documentation_verified", sid,
+                       nodeId=verified["nodeId"], status=verified["status"])
+
+        doc_node_ids = map_changed_files_to_doc_nodes(doc_graph, final_changed_files)
+        if doc_node_ids:
+            emit_event(events_path, "documentation_impact_detected", sid,
+                       files=final_changed_files, nodeIds=doc_node_ids)
+            for stale in apply_doc_impact(doc_graph, ws, final_changed_files, doc_node_ids):
+                emit_event(events_path, "documentation_stale_detected", sid,
+                           nodeId=stale["nodeId"], reason=stale["reason"])
+        for drifted in check_doc_drift(doc_graph, ws):
+            emit_event(events_path, "documentation_stale_detected", sid,
+                       nodeId=drifted["nodeId"], reason=drifted["reason"])
+
+    # Same merge-not-clobber discipline as every other gates writer (e.g.
+    # architectureApproved, set earlier in the same run) -- read whatever
+    # is already there and add this key onto it.
+    gates = dict(manifest.get("gates") or {})
+    gates["documentationCurrent"] = compute_doc_gate(doc_graph, doc_node_ids)
+    manifest["gates"] = gates
+
+    if doc_impacts:
+        manifest["documentationImpact"] = doc_impacts
+        if doc_node_ids:
+            manifest["documentationImpactNodeIds"] = doc_node_ids
+        # C3's machinery: only append when a task graph actually exists
+        # for this session (--architect-first produced a usable plan). No
+        # tasks.json is ever created just for this -- same zero-behavior-
+        # change-without-a-plan contract C3 itself uses.
+        if tasks is not None:
+            doc_task = documentation_task(_next_task_id(tasks), doc_impacts, doc_node_ids)
+            tasks.append(doc_task)
+            save_tasks(session, tasks)
+            emit_event(events_path, "task_created", sid,
+                       taskId=doc_task["id"], kind=doc_task["kind"],
+                       description=doc_task["description"][:200],
+                       source=doc_task["source"], priority=doc_task["priority"])
 
 
 # ============================================================
@@ -4318,13 +4541,25 @@ def select_matching_adrs(contract, adrs) -> list:
     as select_skills (a raw substring test would let a short area like
     "ui" match unrelated tokens that merely contain those letters) --
     NEVER a model judgment. Ordered by id ascending (stable, reproducible
-    prompt) and capped to ADR_PROMPT_MAX_MATCHED."""
+    prompt) and capped to ADR_PROMPT_MAX_MATCHED.
+
+    Review round 7 (M4): only status=="accepted" ADRs are eligible at
+    all -- the spec's "ADR consultation" section scopes the architect's
+    deference to an ACTIVE ADR ("if Engineer proposes something that
+    conflicts with an active ADR"); a superseded/rejected/still-proposed
+    one is explicitly not that, and the prompt's own instruction ("flag
+    an ARCHITECTURAL DEVIATION instead of silently overriding it") would
+    otherwise tell the architect to defend a decision that was already
+    overturned, or one nobody accepted in the first place. Filtered
+    before the cap, so an accepted ADR is never bumped out by older
+    non-accepted ones."""
     tokens = _adr_contract_tokens(contract)
     if not tokens:
         return []
     matched = [
         adr for adr in (adrs or [])
-        if any(area and area in tokens for area in adr.get("areas") or [])
+        if adr.get("status") == "accepted"
+        and any(area and area in tokens for area in adr.get("areas") or [])
     ]
     matched.sort(key=lambda a: a["id"])
     return matched[:ADR_PROMPT_MAX_MATCHED]
@@ -5026,6 +5261,13 @@ def main():
     # task_list_completed fires at most once per session (see
     # emit_task_transitions's docstring).
     task_list_completed_flag = [False]
+    # Review round 7 (C1): whether run_doc_pass has already run this
+    # session. Set True at the one call site inside the `if ok:` branch
+    # below (the only place a real VERIFIED promotion can happen); the
+    # `finally` block's fallback call is skipped when this is already
+    # True, so the doc pass -- and its graph.json writes/events -- runs
+    # exactly once per session regardless of which exit path is taken.
+    doc_pass_done = False
     try:
         if not args.skip_model_readiness:
             # Task 1.3 (V7 §40): readiness_probe raises V2Error on a hard
@@ -5694,6 +5936,26 @@ def main():
                     # not a contract): record the flag, leave scopeApproved
                     # indeterminate (null), let VERIFIED proceed.
 
+                # Review round 7 (C1): the doc pass (load graph, verify
+                # nodes, map impact, apply impact, drift check, gate
+                # derivation) must run -- and gates["documentationCurrent"]
+                # must be set -- strictly BEFORE gates_block_verified is
+                # consulted below, or the gate is decorative (this is
+                # exactly what C1 found: it used to run only in `finally`,
+                # after VERIFIED was already decided). It needs the
+                # session's FINAL changed-file set, which needs collapse()
+                # to have already run; ok=True always exits this loop
+                # (break, either branch below), so this genuinely is the
+                # last iteration and collapsing here is safe -- the
+                # `finally` block's own collapse()/changed_files() calls
+                # below are idempotent no-ops once this has already run.
+                collapse(ws, baseline)
+                manifest["finalHead"] = head(ws)
+                manifest["finalChangedFiles"] = changed_files(ws, baseline)
+                manifest["checkpointsCollapsed"] = head(ws) == baseline
+                run_doc_pass(ws, events_path, sid, manifest, tasks, session)
+                doc_pass_done = True
+
                 gates = dict(manifest.get("gates") or {})
                 gates["implementationComplete"] = bool(files) and last_engineer_rc == 0
                 gates["verificationPassed"] = True
@@ -5851,81 +6113,29 @@ def main():
         manifest["finalHead"] = head(ws)
         manifest["finalChangedFiles"] = changed_files(ws, baseline)
         manifest["checkpointsCollapsed"] = head(ws) == baseline
+
+        # Review round 7 (C1): the doc pass already ran above, inline in
+        # the `if ok:` branch, on any path that reached a real VERIFIED-
+        # or-blocked decision (doc_pass_done is True there). Every OTHER
+        # exit path (verification never passed, INFRA_BLOCKED/TIMEOUT,
+        # repair budget exhausted, SIGTERM/interrupt, or any exception
+        # before that point) never got a chance to run it -- run it here,
+        # exactly once, as the fallback. collapse()/changed_files() just
+        # above are themselves idempotent no-ops when the `if ok:` branch
+        # already ran them, so this is safe to always execute.
+        if not doc_pass_done:
+            run_doc_pass(ws, events_path, sid, manifest, tasks, session)
+
+        # Review round 7 (C2): fingerprinted AFTER the doc pass (whichever
+        # branch ran it) rather than before -- verify_doc_nodes/apply_doc_
+        # impact/check_doc_drift only write docs/graph.json back when
+        # something in it actually changed (see _write_doc_graph's no-op-
+        # on-no-change guard), so a verified session that alters nothing
+        # in the graph gets the SAME finalDiffHash on every run; one that
+        # legitimately changes a node's status is fingerprinted with that
+        # change already included, instead of going stale the instant the
+        # doc pass writes back.
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
-
-        # O2 phase 1 + Task 7.1/7.2: doc-impact detection runs once here,
-        # against the session's FINAL changed-files set (this is the point
-        # after which changed_files can no longer change -- collapse() just
-        # ran and no further engineer/repair round follows). Same
-        # merge-not-clobber discipline as every other gates writer (C2 sets
-        # gates["architectureApproved"] earlier in this same run) -- read
-        # whatever's already there (possibly nothing at all, on a run
-        # without --architect-first) and add this key onto it.
-        #
-        # documentationCurrent is now real tri-state (Task 7.1): when the
-        # TARGET repo has <workspace>/docs/graph.json, run the deterministic
-        # verify + graph-based impact + drift passes against it and derive
-        # the gate from actual node statuses (True only when every doc node
-        # impacted by this diff verifies CURRENT; False when any is STALE/
-        # MISSING/otherwise unproven). No graph, or a graph with no
-        # impacted nodes at all -> None ("mechanism didn't run/nothing to
-        # verify" -- not applicable, never blocks). No graph falls back to
-        # O2 phase 1's one-way detector (False/None only, same as before).
-        doc_impacts = detect_documentation_impact(manifest["finalChangedFiles"])
-        gates = dict(manifest.get("gates") or {})
-        doc_graph = load_doc_graph(ws)
-        doc_node_ids = []
-        if doc_graph is not None:
-            for verified in verify_doc_nodes(doc_graph, ws):
-                emit_event(events_path, "documentation_verified", sid,
-                           nodeId=verified["nodeId"], status=verified["status"])
-
-            doc_node_ids = map_changed_files_to_doc_nodes(doc_graph, manifest["finalChangedFiles"])
-            if doc_node_ids:
-                emit_event(events_path, "documentation_impact_detected", sid,
-                           files=manifest["finalChangedFiles"], nodeIds=doc_node_ids)
-                for stale in apply_doc_impact(doc_graph, ws, manifest["finalChangedFiles"], doc_node_ids):
-                    emit_event(events_path, "documentation_stale_detected", sid,
-                               nodeId=stale["nodeId"], reason=stale["reason"])
-            for drifted in check_doc_drift(doc_graph, ws):
-                emit_event(events_path, "documentation_stale_detected", sid,
-                           nodeId=drifted["nodeId"], reason=drifted["reason"])
-
-            if doc_node_ids:
-                doc_nodes_by_id = {n["id"]: n for n in doc_graph.get("nodes") or [] if n.get("id")}
-                impacted_statuses = [doc_nodes_by_id[n]["status"] for n in doc_node_ids if n in doc_nodes_by_id]
-                if any(s in (DOC_STATUS_STALE, DOC_STATUS_MISSING) for s in impacted_statuses):
-                    gates["documentationCurrent"] = False
-                elif impacted_statuses and all(s == DOC_STATUS_CURRENT for s in impacted_statuses):
-                    gates["documentationCurrent"] = True
-                else:
-                    # UNVERIFIED/DEPRECATED/GENERATED among the impacted set:
-                    # not proven current, but also not an outright drift
-                    # finding -- conservative False, never a guessed True.
-                    gates["documentationCurrent"] = False
-            else:
-                gates["documentationCurrent"] = None
-        else:
-            gates["documentationCurrent"] = False if doc_impacts else None
-        manifest["gates"] = gates
-        if doc_impacts:
-            manifest["documentationImpact"] = doc_impacts
-            if doc_node_ids:
-                manifest["documentationImpactNodeIds"] = doc_node_ids
-            # C3's machinery: only append when a task graph actually exists
-            # for this session (--architect-first produced a usable plan).
-            # No tasks.json is ever created just for this -- same
-            # zero-behavior-change-without-a-plan contract C3 itself uses.
-            if tasks is not None:
-                doc_task = documentation_task(_next_task_id(tasks), doc_impacts, doc_node_ids)
-                tasks.append(doc_task)
-                save_tasks(session, tasks)
-                # Fix round 1 (MINOR 10): this dynamic task creation was the
-                # one C3/O2 call site that never emitted task_created at all.
-                emit_event(events_path, "task_created", sid,
-                           taskId=doc_task["id"], kind=doc_task["kind"],
-                           description=doc_task["description"][:200],
-                           source=doc_task["source"], priority=doc_task["priority"])
 
         manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
         save()
@@ -7711,17 +7921,33 @@ def _doc_graph_selfcheck() -> None:
         assert drifty["provenance"]["driftFindings"] == ["src/removed.ts"]
         assert drifty["status"] == DOC_STATUS_STALE
 
-        # --- 6. Gate tri-state composition (mirror of main()'s finally logic) ---
-        def gate_for(statuses):
-            if any(s in (DOC_STATUS_STALE, DOC_STATUS_MISSING) for s in statuses):
-                return False
-            if statuses and all(s == DOC_STATUS_CURRENT for s in statuses):
-                return True
-            return False if statuses else None
-        assert gate_for([DOC_STATUS_CURRENT, DOC_STATUS_CURRENT]) is True
-        assert gate_for([DOC_STATUS_CURRENT, DOC_STATUS_STALE]) is False
-        assert gate_for([DOC_STATUS_UNVERIFIED]) is False, "unproven must never gate True"
-        assert gate_for([]) is None
+        # --- 6. Gate tri-state composition: calls compute_doc_gate, the
+        # SAME function main() calls via run_doc_pass (Review round 7,
+        # Minor 1 -- this used to be a private re-implementation here
+        # that could silently drift from what main() actually ran, which
+        # is exactly how C1 went undetected). ---
+        def _gate_graph(statuses):
+            return {"nodes": [{"id": f"n{i}", "status": s} for i, s in enumerate(statuses)]}
+
+        def _ids(n):
+            return [f"n{i}" for i in range(n)]
+
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_CURRENT, DOC_STATUS_CURRENT]), _ids(2)) is True
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_CURRENT, DOC_STATUS_STALE]), _ids(2)) is False
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_UNVERIFIED]), _ids(1)) is False, (
+            "unproven must never gate True"
+        )
+        assert compute_doc_gate(_gate_graph([DOC_STATUS_CURRENT]), []) is None, (
+            "graph present, nothing impacted this diff -> not applicable"
+        )
+        # C3: no graph at all -- ALWAYS None, even when O2 phase 1's
+        # one-way detector fired (that finding still drives its own
+        # REQUIRED task via run_doc_pass -- it just never reaches this
+        # gate for a repo with no graph to verify against). Getting this
+        # wrong (a no-graph repo's False reaching gates_block_verified)
+        # would permanently brick every non-graph repo the instant it
+        # touched a routes/schema/api/config/auth-shaped file.
+        assert compute_doc_gate(None, []) is None, "no graph -> never applicable, regardless of doc_impacts"
 
     print("doc-graph (Task 7.1/7.2) self-check: PASS")
 
@@ -7947,14 +8173,16 @@ def _gates_selfcheck() -> None:
 
     # ------------------------------------------------------------
     # 4. gates_block_verified: implementationComplete/verificationPassed
-    #    must be exactly True; architectureApproved/scopeApproved may be
-    #    True OR None, only False blocks. documentationCurrent is
-    #    deliberately NOT in the blocking set (review round 1, Important)
-    #    -- it can only ever be False or None, never True, so wiring it
-    #    in would make EVERY doc-relevant change permanently unable to
-    #    reach VERIFIED; also its producer runs in main()'s finally block,
-    #    strictly AFTER this function's caller already decided VERIFIED
-    #    vs. not, so it would be decorative even if wired in.
+    #    must be exactly True; architectureApproved/scopeApproved/
+    #    tasksResolved/documentationCurrent may be True OR None, only
+    #    False blocks. documentationCurrent IS in the blocking set (Task
+    #    7.1, reversing the Round-2 deferral) -- graph-based verification
+    #    (verify_doc_nodes + map_changed_files_to_doc_nodes + apply_doc_
+    #    impact/check_doc_drift, composed by run_doc_pass) can legitimately
+    #    produce True, so False is a real block, not decorative. Review
+    #    round 7 (C1): run_doc_pass now runs from main()'s `if ok:` branch
+    #    -- BEFORE gates_block_verified is consulted below -- not from
+    #    `finally` (see section 6's source-ordering proof).
     # ------------------------------------------------------------
     all_true = {
         "implementationComplete": True, "architectureApproved": True,
@@ -8073,6 +8301,21 @@ def _gates_selfcheck() -> None:
     )
     assert consistency_call_idx < gates_block_idx < verified_label_idx, (
         "gates_block_verified's decision must be made, and consulted, BEFORE the VERIFIED promotion"
+    )
+
+    # 5a. Review round 7 (C1): the doc pass (run_doc_pass, which sets
+    #     gates["documentationCurrent"]) must run BEFORE gates_block_
+    #     verified is consulted -- otherwise the gate is decorative. This
+    #     is exactly the assertion the round-7 review found missing: C1
+    #     shipped with the doc gate wired into gates_block_verified's
+    #     blocking set, but computed only in `finally`, strictly AFTER
+    #     the VERIFIED/blocked decision above had already been made.
+    #     `.index` finds the FIRST occurrence -- the call inside the
+    #     `if ok:` branch -- not the `finally` block's own fallback call.
+    doc_pass_call_idx = main_source.index("run_doc_pass(ws, events_path, sid, manifest, tasks, session)")
+    assert doc_pass_call_idx < gates_block_idx, (
+        "run_doc_pass must execute before gates_block_verified is consulted, or "
+        "documentationCurrent can never actually block a VERIFIED promotion"
     )
 
     # 5b. Review round 1 (minor): once flagged, consistency_gate's default
@@ -9101,7 +9344,7 @@ def _adr_selfcheck() -> None:
         (decisions / "ADR-0002.md").write_text(
             "---\n"
             "id: ADR-0002\n"
-            "status: proposed\n"
+            "status: accepted\n"
             "areas: [billing]\n"
             "title: Billing retries\n"
             "---\n"
@@ -9161,6 +9404,32 @@ def _adr_selfcheck() -> None:
 
         contract_none = {"objective": "unrelated task", "scope": {"package": "frontend"}}
         assert select_matching_adrs(contract_none, adrs) == []
+
+        # ------------------------------------------------------------
+        # 2b. Review round 7 (M4): superseded/proposed/rejected ADRs are
+        #     never eligible, even when their areas would otherwise match
+        #     -- only status=="accepted" is fed to the architect prompt.
+        # ------------------------------------------------------------
+        (decisions / "ADR-0010.md").write_text(
+            "---\nid: ADR-0010\nstatus: superseded\nareas: [auth]\ntitle: Old auth decision\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        (decisions / "ADR-0011.md").write_text(
+            "---\nid: ADR-0011\nstatus: proposed\nareas: [auth]\ntitle: New auth idea\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        (decisions / "ADR-0012.md").write_text(
+            "---\nid: ADR-0012\nstatus: rejected\nareas: [auth]\ntitle: Rejected auth idea\n---\nBody.\n",
+            encoding="utf-8",
+        )
+        adrs_with_inactive = load_adrs(ws)
+        inactive_matched = select_matching_adrs(contract_auth, adrs_with_inactive)
+        assert [a["id"] for a in inactive_matched] == ["ADR-0001"], (
+            f"superseded/proposed/rejected ADRs must never match, got {inactive_matched}"
+        )
+        assert select_matching_adr_ids(contract_auth, ws) == ["ADR-0001"], (
+            "select_matching_adr_ids must exclude non-accepted ADRs the same way"
+        )
 
         # select_matching_adr_ids mirrors select_matching_adrs, just ids;
         # None/empty ws never raises.

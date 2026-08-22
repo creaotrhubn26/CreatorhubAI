@@ -2801,10 +2801,27 @@ _CATEGORY_TO_NODE_TYPE = {
 }
 
 
+def _paths_share_area(path, node_path):
+    """Replica of glimmer-v2.py's _paths_share_area (Review round 7, M1)
+    -- see that function's docstring for the full rationale. Scopes the
+    category heuristic below to nodes actually near the changed file
+    instead of every node of that type in the graph."""
+    if not path or not node_path:
+        return False
+    if path == node_path:
+        return True
+    if path.startswith(node_path.rstrip("/") + "/") or node_path.startswith(path.rstrip("/") + "/"):
+        return True
+    path_dir = path.rsplit("/", 1)[0] if "/" in path else ""
+    node_dir = node_path.rsplit("/", 1)[0] if "/" in node_path else ""
+    return bool(path_dir) and path_dir == node_dir
+
+
 def _map_changed_files_to_doc_nodes(graph, changed_files):
     """Replica of glimmer-v2.py's map_changed_files_to_doc_nodes -- see
     that function's docstring for the full two-signal (path-prefix +
-    keyword-category) rationale. Pure, no I/O."""
+    keyword-category) rationale, including the M1 path-scoping fix on
+    the category signal (Review round 7). Pure, no I/O."""
     nodes_by_id = {
         n["id"]: n for n in (graph.get("nodes") or [])
         if isinstance(n, dict) and n.get("id")
@@ -2821,7 +2838,10 @@ def _map_changed_files_to_doc_nodes(graph, changed_files):
             if wanted_type is None:
                 continue
             for node in nodes_by_id.values():
-                if node.get("type") == wanted_type:
+                if node.get("type") != wanted_type:
+                    continue
+                node_path = str(node.get("path") or "").replace("\\", "/")
+                if _paths_share_area(path, node_path):
                     touched.add(node["id"])
 
     impacted = {nid for nid in touched if nodes_by_id[nid].get("type") == "doc"}
