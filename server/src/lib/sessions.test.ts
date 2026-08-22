@@ -469,6 +469,21 @@ describe("visual verification reads + finalStatus.visual override (V7 §22.14/§
     expect(session?.finalStatus.functional).toBe("VERIFIED");
   });
 
+  it("readSession falls back to not_run for an unrecognized findings.json status", async () => {
+    const id = "20260822-000052b-glimmer-visual-bad-status";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    const visualDir = path.join(dir, "visual");
+    await fs.mkdir(visualDir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(visualDir, "findings.json"),
+      JSON.stringify({ status: "SOMETHING_UNKNOWN", viewport: "multi", viewports: ["1440x900"], findings: [] })
+    );
+    const session = await sessionsIsolated.readSession(id);
+    expect(session?.finalStatus.visual).toBe("not_run");
+  });
+
   it("readSession leaves finalStatus.visual as not_run when no visual/ dir exists", async () => {
     const id = "20260822-000053-glimmer-no-visual-session";
     const dir = path.join(contractStateRoot, "sessions", id);
@@ -620,6 +635,9 @@ describe("session-level verification freeze (V7 §20)", () => {
 
       const session = await sessionsIsolated.readSession(id, { computeStale: true });
       expect(session?.status).toBe("stale");
+      // V7 §22.17: the gate object must agree with §20 staleness -- a stale
+      // session's finalStatus.functional must not still read VERIFIED.
+      expect(session?.finalStatus.functional).toBe("NEEDS_REVIEW");
     });
 
     it("readSession with computeStale is NOT stale again once content is restored EXACTLY (hash equality, not mtime)", async () => {

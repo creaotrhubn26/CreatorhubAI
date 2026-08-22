@@ -280,6 +280,8 @@ export function readVisualFindings(id: string): Promise<VisualFindings | null> {
   return readSessionJsonFile<VisualFindings>(id, path.join("visual", "findings.json"));
 }
 
+const KNOWN_VISUAL_FINDINGS_STATUSES = new Set(["NOT_RUN", "PASS", "FAIL", "BLOCKED", "PASS_WITH_WARNINGS"]);
+
 const ARCHITECT_REVIEW_FILE_RE = /^architect-review-\d+-\d+\.json$/;
 
 // architect-review-NN-MM.json is a collection (one file per review round), so
@@ -384,7 +386,11 @@ export async function readSession(
   // (above) already set every other leg synchronously. No visual/ dir at
   // all (the common case) leaves it "not_run", set by composeFinalStatus.
   const visualFindings = await readVisualFindings(real);
-  if (visualFindings) {
+  // NIT (fix round 3): findings.json is read straight off disk with no
+  // runtime schema check -- an unrecognized status value degrades to the
+  // same honest "not_run" fallback composeFinalStatus already uses, rather
+  // than passing an untrusted/malformed string straight into finalStatus.
+  if (visualFindings && KNOWN_VISUAL_FINDINGS_STATUSES.has(visualFindings.status)) {
     session = { ...session, finalStatus: { ...session.finalStatus, visual: visualFindings.status } };
   }
   // Missing finalDiffHash (manifest predates this task) -> never stale, same
@@ -393,7 +399,16 @@ export async function readSession(
   if (opts.computeStale && session.status === "verified" && session.finalDiffHash) {
     const current = await currentDiffHash(session.workspace, session.baselineSha);
     if (current !== null && current !== session.finalDiffHash) {
-      session = { ...session, status: "stale" };
+      // V7 §22.17: keep the finalStatus gate object in agreement with §20
+      // staleness -- a stale session's workspace no longer matches what was
+      // verified, so the gate object's `functional` leg (composeFinalStatus
+      // set it to the manifest's VERIFIED overall) must not still claim
+      // VERIFIED alongside status: "stale".
+      session = {
+        ...session,
+        status: "stale",
+        finalStatus: { ...session.finalStatus, functional: "NEEDS_REVIEW" },
+      };
     }
   }
   return session;
