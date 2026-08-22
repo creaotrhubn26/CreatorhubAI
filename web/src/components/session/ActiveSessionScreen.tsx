@@ -11,6 +11,7 @@ import { RepairCycleStepper } from "./RepairCycleStepper";
 import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
 import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
+import { GatesRow } from "./GatesRow";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 
 // Non-success terminal states where a `failure` cause (if present) is worth
@@ -144,7 +145,18 @@ export function ActiveSessionScreen() {
           ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
           : "Not yet accepted"}
       </p>
+      {session.architectTrigger && session.architectTrigger.mode !== "off" && (
+        // Deterministic fact from the orchestrator: how architect mode was
+        // actually decided for THIS run (the composer preview is only an
+        // estimate computed before the run existed).
+        <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          architect: {session.architectTrigger.mode}
+          {session.architectTrigger.score !== undefined && ` (score ${session.architectTrigger.score}${
+            session.architectTrigger.signals?.length ? `: ${session.architectTrigger.signals.join(", ")}` : ""})`}
+        </p>
+      )}
       <RepairCycleStepper session={session} />
+      <GatesRow gates={session.gates} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}

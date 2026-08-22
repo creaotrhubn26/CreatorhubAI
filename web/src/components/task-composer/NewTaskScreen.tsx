@@ -3,6 +3,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
+import { computeArchitectRisk, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
@@ -32,6 +33,17 @@ function buildSummaryLine(form: TaskComposerFormState): string {
     : `${form.verification.length} verification check${form.verification.length === 1 ? "" : "s"}`;
   const repairs = `${form.repairBudget} repair${form.repairBudget === 1 ? "" : "s"}`;
   return `${form.mode} · ${scope} · ${verification} · ${repairs}`;
+}
+
+// Task 2.1 fix round 1 (V7 §5.5): deterministic preview of the
+// orchestrator's risk-based architect auto-trigger (compute_architect_risk
+// in glimmer-v2.py; mirrored client-side in state/architectRisk.ts). null
+// below threshold -- render nothing, exactly per the spec ("when below:
+// nothing").
+function buildArchitectRiskLine(form: TaskComposerFormState): string | null {
+  const risk = computeArchitectRisk(buildTaskContract(form));
+  if (risk.score < ARCHITECT_RISK_THRESHOLD) return null;
+  return `Architect mode will auto-trigger (score ${risk.score}: ${risk.signals.join(", ")})`;
 }
 
 export function NewTaskScreen() {
@@ -130,7 +142,7 @@ export function NewTaskScreen() {
             <fieldset>
               <legend>Mode</legend>
               <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as any })}>
-                {["inspect", "plan", "implement", "debug", "test", "review"].map((m) => (
+                {["inspect", "plan", "implement", "debug", "test", "review", "refactor"].map((m) => (
                   <option key={m} value={m}>{m}</option>
                 ))}
               </select>
@@ -257,6 +269,9 @@ export function NewTaskScreen() {
 
       <div className="composer__runbar">
         <p className="composer__summary">{buildSummaryLine(form)}</p>
+        {buildArchitectRiskLine(form) && (
+          <p className="composer__architect-risk">{buildArchitectRiskLine(form)}</p>
+        )}
         <button
           className="btn-primary"
           onClick={() => runMutation.mutate()}

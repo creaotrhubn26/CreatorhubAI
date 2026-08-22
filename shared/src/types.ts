@@ -62,7 +62,7 @@ export interface TaskContract {
     area?: string;
     paths?: string[];
   };
-  mode: "inspect" | "plan" | "implement" | "debug" | "test" | "review";
+  mode: "inspect" | "plan" | "implement" | "debug" | "test" | "review" | "refactor";
   constraints: {
     minimalChange: boolean;
     noCommit: true;
@@ -117,8 +117,25 @@ export interface GlimmerSession {
     // no impact or detector didn't run. Never true — phase 1 cannot verify
     // documentation currency, only flag the need.
     documentationCurrent?: boolean | null;
+    // Task 2.3 (V7 §5.11): the remaining two of the five final-acceptance
+    // gates. implementationComplete/verificationPassed are always
+    // computable once a session reaches the post-verify promotion decision
+    // (never optional/absent there — but the field itself is optional on
+    // this type for older archived sessions/manifests predating this
+    // task). scopeApproved folds the existing contract-scope guard AND the
+    // new plan.candidateFiles/expectedScope.maxFiles consistency check —
+    // true only when both hold, null when either is indeterminate, false
+    // when either found a real violation.
+    implementationComplete?: boolean | null;
+    verificationPassed?: boolean | null;
+    scopeApproved?: boolean | null;
   };
   architectPlan?: { used: boolean; risk: string | null };
+  // Task 2.1 (V7 §5.5): how architect mode was decided for this run —
+  // manual (--architect-first), auto (risk score crossed the threshold),
+  // or off. score/signals present only for scored decisions; mirrors
+  // manifest.architectTrigger verbatim (deterministic fact).
+  architectTrigger?: { mode: "manual" | "auto" | "off"; score?: number; signals?: string[] };
   failure?: { class: string; detail: string; evidenceIds: string[] };
   // §14 Diff Review — human "accept for review" fact. Written ONLY by the
   // gateway (POST /sessions/:id/accept), never by the orchestrator/model:
@@ -153,6 +170,12 @@ export interface ArchitecturePlan {
   objective: string;
   packages: string[];
   risk: ArchitecturePlanRisk;
+  // Task 2.2 (V7 §5.12): plan version, stamped by glimmer-v2.py (the
+  // trusted layer) — 1 for the architect-first plan, N+1 per re-plan.
+  // Optional/absent means version 1 (backward compat with plans written
+  // before this field existed — validate_architecture_plan defaults the
+  // same way on the Python side).
+  version?: number;
   area?: string;
   existingPatterns?: ArchitecturePlanPattern[];
   candidateFiles?: ArchitecturePlanCandidateFile[];
@@ -355,6 +378,9 @@ export interface ArchitectPlanCreatedEvent extends GlimmerEventBase {
   type: "architect_plan_created";
   risk?: ArchitecturePlanRisk;
   packages?: string[];
+  // Task 2.2 fix round 1 (LOW): 1 for the architect-first plan, N+1 per
+  // replan — matches ArchitecturePlan.version.
+  version?: number;
 }
 export interface ArchitectReviewRequestedEvent extends GlimmerEventBase {
   type: "architect_review_requested";
@@ -367,11 +393,25 @@ export interface ArchitectReviewCompletedEvent extends GlimmerEventBase {
   reviewRound: number;
   decision: ArchitectReviewDecision;
 }
-// architect_replan_started: type defined for the V7 replan flow — no
-// glimmer-v2.py emit site exists yet (no replan path is implemented), so
-// this carries no required fields beyond the base until Round 5 wires one.
+// architect_replan_started (Task 2.2, V7 §5.12): emitted by glimmer-v2.py's
+// review loop right before re-invoking the architect on a REPLAN_REQUIRED
+// decision — fromVersion/toVersion are the ArchitecturePlan.version being
+// replaced/produced, reviewRound is the review round that triggered it.
 export interface ArchitectReplanStartedEvent extends GlimmerEventBase {
   type: "architect_replan_started";
+  fromVersion: number;
+  toVersion: number;
+  reviewRound: number;
+}
+// architect_autotriggered (V7 §5.5, Task 2.1): emitted by glimmer-v2.py's
+// deterministic risk score (compute_architect_risk) only when the score
+// crosses the threshold and --no-architect was not passed. score/
+// threshold/signals mirror manifest.architectTrigger verbatim.
+export interface ArchitectAutotriggeredEvent extends GlimmerEventBase {
+  type: "architect_autotriggered";
+  score: number;
+  threshold: number;
+  signals: string[];
 }
 export interface TaskCreatedEvent extends GlimmerEventBase {
   type: "task_created";
@@ -411,6 +451,26 @@ export interface DeliveryReviewCompletedEvent extends GlimmerEventBase {
   customerReadiness: DeliveryReviewCustomerReadiness;
   confidence: "low" | "medium" | "high";
 }
+// Task 2.4 (V7 §5.5 second half): deterministic mid-implementation
+// advisory triggers, emitted by glimmer-engineer.py's run_engineer loop.
+// Each trigger key fires at most once per session -- see
+// _evaluate_advisory_triggers in glimmer-engineer.py for the three keys
+// (new_file_count_exceeds_plan / edit_outside_candidate_files /
+// turns_high_no_writes). detail is a capped, deterministic reason string
+// (no model text).
+export interface ArchitectConsultAdvisedEvent extends GlimmerEventBase {
+  type: "architect_consult_advised";
+  trigger: string;
+  detail: string;
+}
+// Task 2.4: emitted once per consult_architect tool call (budget-limited
+// to 2/session) -- questionChars/answerChars only, never the question or
+// answer content itself.
+export interface ArchitectConsultedEvent extends GlimmerEventBase {
+  type: "architect_consulted";
+  questionChars: number;
+  answerChars: number;
+}
 
 export type GlimmerEvent =
   | ToolStartedEvent
@@ -434,6 +494,7 @@ export type GlimmerEvent =
   | ArchitectReviewRequestedEvent
   | ArchitectReviewCompletedEvent
   | ArchitectReplanStartedEvent
+  | ArchitectAutotriggeredEvent
   | TaskCreatedEvent
   | TaskStatusChangedEvent
   | TaskListCompletedEvent
@@ -441,7 +502,9 @@ export type GlimmerEvent =
   | VisualFindingDetectedEvent
   | VisualVerificationCompletedEvent
   | DeliveryReviewStartedEvent
-  | DeliveryReviewCompletedEvent;
+  | DeliveryReviewCompletedEvent
+  | ArchitectConsultAdvisedEvent
+  | ArchitectConsultedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -451,11 +514,12 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "session_created", "skill_loaded", "model_retry", "context_selected",
   "architect_planning_started", "architect_plan_created",
   "architect_review_requested", "architect_review_completed",
-  "architect_replan_started",
+  "architect_replan_started", "architect_autotriggered",
   "task_created", "task_status_changed", "task_list_completed",
   "visual_verification_started", "visual_finding_detected",
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",
+  "architect_consult_advised", "architect_consulted",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {
