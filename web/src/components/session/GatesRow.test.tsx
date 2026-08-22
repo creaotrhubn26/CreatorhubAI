@@ -8,7 +8,7 @@ describe("GatesRow", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders all 5 gates as chips, true/false/null -> ✓/✗/—", () => {
+  it("renders all 6 gates as chips, true/false/null -> ✓/✗/—", () => {
     const { getByText } = render(
       <GatesRow
         gates={{
@@ -17,6 +17,7 @@ describe("GatesRow", () => {
           verificationPassed: true,
           scopeApproved: null,
           documentationCurrent: null,
+          tasksResolved: false,
         }}
       />
     );
@@ -25,11 +26,13 @@ describe("GatesRow", () => {
     expect(getByText("Verification ✓")).toBeInTheDocument();
     expect(getByText("Scope —")).toBeInTheDocument();
     expect(getByText("Docs —")).toBeInTheDocument();
+    expect(getByText("Tasks ✗")).toBeInTheDocument();
   });
 
   it("reads a missing key on an older manifest as — (never-ran), not a failure", () => {
     const { getByText } = render(<GatesRow gates={{ architectureApproved: true }} />);
     expect(getByText("Implementation —")).toBeInTheDocument();
     expect(getByText("Docs —")).toBeInTheDocument();
+    expect(getByText("Tasks —")).toBeInTheDocument();
   });
 });

@@ -2,13 +2,16 @@ import type { GlimmerSession } from "@glimmer/shared";
 
 type Gates = NonNullable<GlimmerSession["gates"]>;
 
-// V7 §5.11: the five final-acceptance gates, in the spec's own order.
+// V7 §5.11: the five final-acceptance gates, in the spec's own order, plus
+// Task 4.2's tasksResolved (fix round 1, MODERATE 6) -- same missing-key-is-
+// honest-"—" convention as the other five.
 const GATE_LABELS: Array<[keyof Gates, string]> = [
   ["implementationComplete", "Implementation"],
   ["architectureApproved", "Architecture"],
   ["verificationPassed", "Verification"],
   ["scopeApproved", "Scope"],
   ["documentationCurrent", "Docs"],
+  ["tasksResolved", "Tasks"],
 ];
 
 function gateSymbol(value: boolean | null | undefined): string {
