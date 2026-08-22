@@ -12,6 +12,7 @@ import { RiskAndScopeSummary } from "./RiskAndScopeSummary";
 import { ArchitecturePlanPanel } from "./ArchitecturePlanPanel";
 import { ArchitectReviewPanel } from "./ArchitectReviewPanel";
 import { GatesRow } from "./GatesRow";
+import { StatusesRow } from "./StatusesRow";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 import { VisualVerificationPanel } from "./VisualVerificationPanel";
 import { EvidencePanel } from "./EvidencePanel";
@@ -171,6 +172,7 @@ export function ActiveSessionScreen() {
       )}
       <RepairCycleStepper session={session} />
       <GatesRow gates={session.gates} />
+      <StatusesRow statuses={session.statuses} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
       {id && <ArchitecturePlanPanel sessionId={id} />}
       {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}

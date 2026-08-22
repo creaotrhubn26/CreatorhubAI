@@ -3,7 +3,10 @@ import type { DeliveryReviewCustomerReadiness, NextStepPriority } from "@glimmer
 import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
 
-const READINESS_COLOR: Record<DeliveryReviewCustomerReadiness, string> = {
+// Exported for StatusesRow (Task 8.1, V7 §23.11) -- the delivery/overall
+// legs there use this exact same 5-level vocabulary, one color map instead
+// of two independently-drifting ones.
+export const READINESS_COLOR: Record<DeliveryReviewCustomerReadiness, string> = {
   ready_to_ship: "var(--green)",
   ready_with_known_limitations: "var(--amber)",
   needs_polish: "var(--amber)",

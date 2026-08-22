@@ -110,6 +110,30 @@ describe("parseManifest", () => {
     expect(session.failure).toBeUndefined();
   });
 
+  // Task 8.1 (V7 §23.11): manifest["statuses"], same optional-pass-through
+  // discipline as gates/architectPlan/failure above.
+  it("passes through statuses when the manifest carries them", () => {
+    const session = parseManifest(
+      {
+        ...REAL_MANIFEST,
+        statuses: {
+          technical: "VERIFIED", architecture: "approved", documentation: "not_run",
+          visual: "not_run", delivery: "needs_polish", overall: "needs_polish",
+        },
+      },
+      "sid-statuses-1"
+    );
+    expect(session.statuses).toEqual({
+      technical: "VERIFIED", architecture: "approved", documentation: "not_run",
+      visual: "not_run", delivery: "needs_polish", overall: "needs_polish",
+    });
+  });
+
+  it("leaves statuses undefined for a manifest predating Task 8.1", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-statuses-2");
+    expect(session.statuses).toBeUndefined();
+  });
+
   it("passes through a real failure object", () => {
     const session = parseManifest(
       { ...REAL_MANIFEST, failure: { class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] } },

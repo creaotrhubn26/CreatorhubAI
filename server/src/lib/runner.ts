@@ -27,6 +27,14 @@ const MAX_TURNS_RANGE = { min: 1, max: 64 };
 const TIMEOUT_RANGE = { min: 60, max: 3600 };
 // Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles closed range.
 const MAX_CHANGED_FILES_RANGE = { min: 1, max: 500 };
+// Task 8.1 (V7 §23.10): closed set for qualityGates.minimumCustomerReadiness,
+// mirroring @glimmer/shared's DeliveryReviewCustomerReadiness union and
+// glimmer-v2.py's CUSTOMER_READINESS_ORDER -- a membership check only, the
+// ORDER itself lives in glimmer-v2.py's own compare_customer_readiness.
+const CUSTOMER_READINESS_VALUES = new Set([
+  "ready_to_ship", "ready_with_known_limitations", "needs_polish",
+  "needs_rework", "not_customer_ready",
+]);
 
 function isValidModelReadinessUrl(value: string): boolean {
   // modelReadinessUrl becomes a single argv element after its flag — it is
@@ -55,6 +63,19 @@ export function validateAdvanced(contract: TaskContract): string | null {
   const maxChangedFiles = contract.budgets?.maxChangedFiles;
   if (maxChangedFiles !== undefined && !isInRange(maxChangedFiles, MAX_CHANGED_FILES_RANGE)) {
     return `budgets.maxChangedFiles must be an integer between ${MAX_CHANGED_FILES_RANGE.min} and ${MAX_CHANGED_FILES_RANGE.max}`;
+  }
+  // Task 8.1 (V7 §23.10): checked here, BEFORE the `advanced` early return
+  // below -- qualityGates is its own top-level contract field (like budgets
+  // above), not nested under `advanced`, so it must never be skipped when a
+  // request carries qualityGates but no advanced controls at all.
+  const qualityGates = contract.qualityGates;
+  if (qualityGates?.customerReadinessRequired !== undefined
+      && typeof qualityGates.customerReadinessRequired !== "boolean") {
+    return "qualityGates.customerReadinessRequired must be a boolean";
+  }
+  if (qualityGates?.minimumCustomerReadiness !== undefined
+      && !CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)) {
+    return `qualityGates.minimumCustomerReadiness must be one of ${[...CUSTOMER_READINESS_VALUES].join(", ")}`;
   }
   const advanced = contract.advanced;
   if (!advanced) return null;
@@ -114,6 +135,18 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
   }
   if (advanced?.architectFirst === true) {
     args.push("--architect-first");
+  }
+
+  // Task 8.1 (V7 §23.10): qualityGates -- same duplicated-boundary posture
+  // as the advanced fields above (defense in depth); an invalid/unrecognized
+  // value is dropped silently rather than forwarded.
+  const qualityGates = contract.qualityGates;
+  if (qualityGates?.customerReadinessRequired === true) {
+    args.push("--customer-readiness-required");
+  }
+  if (qualityGates?.minimumCustomerReadiness !== undefined
+      && CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)) {
+    args.push("--minimum-customer-readiness", qualityGates.minimumCustomerReadiness);
   }
 
   // --auto-approve is required for gateway-launched runs: glimmer-engineer.py's

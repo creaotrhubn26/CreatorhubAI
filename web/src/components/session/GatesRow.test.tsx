@@ -8,7 +8,7 @@ describe("GatesRow", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders all 6 gates as chips, true/false/null -> ✓/✗/—", () => {
+  it("renders all 7 gates as chips, true/false/null -> ✓/✗/—", () => {
     const { getByText } = render(
       <GatesRow
         gates={{
@@ -18,6 +18,7 @@ describe("GatesRow", () => {
           scopeApproved: null,
           documentationCurrent: null,
           tasksResolved: false,
+          customerReadinessApproved: false,
         }}
       />
     );
@@ -27,6 +28,7 @@ describe("GatesRow", () => {
     expect(getByText("Scope —")).toBeInTheDocument();
     expect(getByText("Docs —")).toBeInTheDocument();
     expect(getByText("Tasks ✗")).toBeInTheDocument();
+    expect(getByText("Delivery ✗")).toBeInTheDocument();
   });
 
   it("reads a missing key on an older manifest as — (never-ran), not a failure", () => {
@@ -34,6 +36,7 @@ describe("GatesRow", () => {
     expect(getByText("Implementation —")).toBeInTheDocument();
     expect(getByText("Docs —")).toBeInTheDocument();
     expect(getByText("Tasks —")).toBeInTheDocument();
+    expect(getByText("Delivery —")).toBeInTheDocument();
   });
 
   it("marks Tasks ✓ (human) distinctly when tasksResolvedBy is human, not a plain ✓", () => {

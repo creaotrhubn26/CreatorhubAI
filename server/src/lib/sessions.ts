@@ -155,6 +155,10 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   // every exit path, right after collapse() -- see the field's own comment
   // on GlimmerSession for what it actually captures and why.
   if (m.finalDiffHash) session.finalDiffHash = m.finalDiffHash;
+  // Task 8.1 (V7 §23.11): manifest["statuses"], written once by glimmer-v2.py's
+  // `finally` block -- same optional-pass-through discipline as gates/
+  // architectPlan/failure above (absent on sessions predating this task).
+  if (m.statuses) session.statuses = m.statuses;
   return session;
 }
 

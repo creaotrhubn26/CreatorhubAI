@@ -134,6 +134,18 @@ export interface TaskContract {
     modelReadinessUrl?: string;
     architectFirst?: boolean;
   };
+  // Task 8.1 (V7 §23.10): "would I send this to a customer?" quality gate.
+  // Omitted entirely (or customerReadinessRequired omitted/false) means the
+  // gate is never applicable for this task -- same omit-when-unset contract
+  // as budgets/advanced above. minimumCustomerReadiness is meaningful only
+  // alongside customerReadinessRequired: true; DeliveryReviewCustomerReadiness
+  // is the same ordered vocabulary glimmer-v2.py's CUSTOMER_READINESS_ORDER
+  // compares against (best to worst: ready_to_ship, ready_with_known_
+  // limitations, needs_polish, needs_rework, not_customer_ready).
+  qualityGates?: {
+    customerReadinessRequired?: boolean;
+    minimumCustomerReadiness?: DeliveryReviewCustomerReadiness;
+  };
 }
 
 // V7 §18: manifest.verificationPlan, command strings (not results) for the
@@ -199,6 +211,32 @@ export interface GlimmerSession {
     // on real evidence alone -- a human decision must stay visibly
     // distinct from evidence, never blended into a plain "✓".
     tasksResolvedBy?: "human";
+    // Task 8.1 (V7 §23.10): compute_customer_readiness_gate's result --
+    // same True/False/None contract as the other optional gates above.
+    // null when contract.qualityGates.customerReadinessRequired was never
+    // set (gate not requested — not applicable); false when required but
+    // the session's DeliveryReview is missing, unparseable, or doesn't meet
+    // qualityGates.minimumCustomerReadiness.
+    customerReadinessApproved?: boolean | null;
+  };
+  // Task 8.1 (V7 §23.11): combined statuses, written once by glimmer-v2.py's
+  // `finally` block (every exit path, not just VERIFIED-reaching ones) —
+  // mirrored from manifest["statuses"] verbatim, same "additive, optional,
+  // absent on sessions predating this task" convention as gates/
+  // architectPlan/failure above. Distinct from this type's own finalStatus
+  // (V7 §22.17, composed at READ time by control-center itself) — this one
+  // is the orchestrator's own self-report. technical/architecture/
+  // documentation/visual/delivery each keep their own natural vocabulary
+  // (see glimmer-v2.py's compute_statuses docstring); overall is expressed
+  // in DeliveryReviewCustomerReadiness's 5-level vocabulary (plus "not_run"),
+  // the only one granular enough to rank every other leg against.
+  statuses?: {
+    technical: "VERIFIED" | "FAILED" | "NOT_RUN";
+    architecture: "approved" | "rejected" | "not_run";
+    documentation: "approved" | "rejected" | "not_run";
+    visual: VisualFindingsStatus | "not_run";
+    delivery: DeliveryReviewCustomerReadiness | "not_run";
+    overall: DeliveryReviewCustomerReadiness | "not_run";
   };
   architectPlan?: { used: boolean; risk: string | null };
   // Task 2.1 (V7 §5.5): how architect mode was decided for this run —

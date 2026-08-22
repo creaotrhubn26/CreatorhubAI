@@ -209,6 +209,81 @@ describe("mode passthrough", () => {
   });
 });
 
+// Task 8.1 (V7 §23.10): qualityGates.
+describe("qualityGates", () => {
+  it("maps customerReadinessRequired: true to a bare --customer-readiness-required flag", () => {
+    const args = buildArgs({ ...CONTRACT, qualityGates: { customerReadinessRequired: true } }, "/tmp/ws");
+    expect(args).toContain("--customer-readiness-required");
+  });
+
+  it("omits --customer-readiness-required when false or absent", () => {
+    expect(
+      buildArgs({ ...CONTRACT, qualityGates: { customerReadinessRequired: false } }, "/tmp/ws")
+    ).not.toContain("--customer-readiness-required");
+    expect(buildArgs(CONTRACT, "/tmp/ws")).not.toContain("--customer-readiness-required");
+  });
+
+  it("maps minimumCustomerReadiness to --minimum-customer-readiness", () => {
+    const args = buildArgs(
+      { ...CONTRACT, qualityGates: { minimumCustomerReadiness: "needs_polish" } },
+      "/tmp/ws"
+    );
+    expect(args).toContain("--minimum-customer-readiness");
+    expect(args[args.indexOf("--minimum-customer-readiness") + 1]).toBe("needs_polish");
+  });
+
+  it("emits neither flag when qualityGates is omitted entirely (zero behavior change when untouched)", () => {
+    const args = buildArgs(CONTRACT, "/tmp/ws");
+    expect(args).not.toContain("--customer-readiness-required");
+    expect(args).not.toContain("--minimum-customer-readiness");
+  });
+
+  it("silently drops an unrecognized minimumCustomerReadiness instead of forwarding it (defense in depth beyond route validation)", () => {
+    const args = buildArgs(
+      { ...CONTRACT, qualityGates: { minimumCustomerReadiness: "extremely_ready" as any } },
+      "/tmp/ws"
+    );
+    expect(args).not.toContain("--minimum-customer-readiness");
+  });
+
+  it("keeps '--' as the second-to-last element and the objective last, even with qualityGates set", () => {
+    const args = buildArgs(
+      { ...CONTRACT, qualityGates: { customerReadinessRequired: true, minimumCustomerReadiness: "ready_to_ship" } },
+      "/tmp/ws"
+    );
+    expect(args[args.length - 2]).toBe("--");
+    expect(args[args.length - 1]).toBe(CONTRACT.objective);
+  });
+
+  it("accepts a contract with no qualityGates at all", () => {
+    expect(validateAdvanced(CONTRACT)).toBeNull();
+  });
+
+  it("accepts each closed-enum minimumCustomerReadiness value", () => {
+    for (const value of [
+      "ready_to_ship", "ready_with_known_limitations", "needs_polish", "needs_rework", "not_customer_ready",
+    ] as const) {
+      expect(validateAdvanced({ ...CONTRACT, qualityGates: { minimumCustomerReadiness: value } })).toBeNull();
+    }
+  });
+
+  it("rejects a minimumCustomerReadiness outside the closed enum (fail closed, never guessed)", () => {
+    expect(
+      validateAdvanced({ ...CONTRACT, qualityGates: { minimumCustomerReadiness: "extremely_ready" as any } })
+    ).not.toBeNull();
+  });
+
+  it("rejects a non-boolean customerReadinessRequired", () => {
+    expect(
+      validateAdvanced({ ...CONTRACT, qualityGates: { customerReadinessRequired: "yes" as any } })
+    ).not.toBeNull();
+  });
+
+  it("accepts customerReadinessRequired: true with no minimum given", () => {
+    expect(validateAdvanced({ ...CONTRACT, qualityGates: { customerReadinessRequired: true } })).toBeNull();
+  });
+});
+
 describe("validateAdvanced", () => {
   it("accepts a contract with no advanced fields at all", () => {
     expect(validateAdvanced(CONTRACT)).toBeNull();
