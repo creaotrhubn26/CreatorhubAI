@@ -39,6 +39,12 @@ EVENT_TYPES = {
     "visual_verification_started", "visual_finding_detected",
     "visual_verification_completed",
     "delivery_review_started", "delivery_review_completed",
+    # Task 2.4 (V7 §5.5 second half): emitted by glimmer-engineer.py's
+    # run_engineer loop -- "architect_consult_advised" for each
+    # deterministic mid-implementation trigger that fires (at most once
+    # per key per session), "architect_consulted" for each actual
+    # consult_architect tool call (budget-limited).
+    "architect_consult_advised", "architect_consulted",
 }
 
 
@@ -128,6 +134,8 @@ def _selfcheck() -> None:
             ("visual_verification_completed", {"status": "PASS"}),
             ("delivery_review_started", {}),
             ("delivery_review_completed", {"customerReadiness": "ready_to_ship", "confidence": "high"}),
+            ("architect_consult_advised", {"trigger": "turns_high_no_writes", "detail": "turn 7/10 (over 60% of the turn budget) with no repository write yet"}),
+            ("architect_consulted", {"questionChars": 42, "answerChars": 210}),
         ]
         for t, fields in new_type_samples:
             emit(path, t, "s2", **fields)

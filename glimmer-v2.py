@@ -1813,7 +1813,7 @@ Repair only failures introduced by this task. Preserve correct prior work and pr
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
-                     plan_candidate_count=0, review_request=None):
+                     plan_candidate_count=0, review_request=None, architect_consult_enabled=False):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -1829,6 +1829,16 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         cmd += ["--review-request", str(review_request)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
+    # Task 2.4 (V7 §5.5 second half): only ever passed True alongside a
+    # real engineer run (mode is None) that has a usable architecture
+    # plan — every caller below gates this on `architecture_plan is not
+    # None`, mirroring plan_candidate_count's own gating just above.
+    # glimmer-engineer.py itself still requires a plan to exist at
+    # startup before it offers consult_architect at all (see
+    # _augment_tools_with_consult_architect), so this flag alone can
+    # never enable the tool without one.
+    if architect_consult_enabled:
+        cmd.append("--architect-consult-enabled")
     # Architect mode has no approval path (C1 scoping): it runs unattended
     # with no interactive stdin, so it must always get --yes regardless of
     # what the caller's own --auto-approve flag says.
@@ -3350,7 +3360,8 @@ def main():
                 save_tasks(session, tasks)
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
-                                 plan_candidate_count=len(candidate_evidence))
+                                 plan_candidate_count=len(candidate_evidence),
+                                 architect_consult_enabled=architecture_plan is not None)
             # Task 2.3 (V7 §5.11): gates.implementationComplete tracks the
             # MOST RECENT engineer invocation this iteration -- a revise
             # round below reassigns this to revise_rc, exactly mirroring
@@ -3625,6 +3636,7 @@ def main():
                         engineer, ws, revise_prompt, args.auto_approve, args.max_turns,
                         session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
                         events_path, sid, plan_candidate_count=len(candidate_evidence),
+                        architect_consult_enabled=architecture_plan is not None,
                     )
                     last_engineer_rc = revise_rc
                     files = changed_files(ws, baseline)
