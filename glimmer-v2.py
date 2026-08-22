@@ -3782,6 +3782,67 @@ def load_task_overrides(session_dir) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _matching_task_override(task: dict, overrides: dict) -> dict | None:
+    """Task 4.3 / review round 1 (Important 3): returns the override
+    record for `task` from task-overrides.json ONLY when it still
+    describes the SAME task, else None. Task ids are NOT stable across a
+    replan (merge_replanned_tasks/_next_task_id can renumber), so an
+    override recorded for an id that got reassigned to an unrelated task
+    must not be silently applied to that new task. An override is
+    trusted by id alone only when it carries no kind/description at all
+    (a legacy record, written before this round existed); otherwise both
+    must match the task's CURRENT kind/description exactly, or this
+    returns None (a stale/recycled-id override -- ignored, same
+    "id + facts must both check out" discipline control-center's
+    applyTaskOverrides applies for display)."""
+    override = overrides.get(task.get("id"))
+    if not isinstance(override, dict) or override.get("action") not in ("skip", "approve"):
+        return None
+    if "kind" in override or "description" in override:
+        if override.get("kind") != task.get("kind") or override.get("description") != task.get("description"):
+            return None
+    return override
+
+
+def _tasks_resolved_by_override(tasks, overrides: dict | None = None) -> list:
+    """Task 4.3 / review round 1 (Important 1): the (taskId, action) pairs
+    -- in tasks order -- for every priority=="required" task whose
+    resolution comes from a matching human override rather than
+    orchestrator-derived evidence (complete / superseded-by-repair).
+    Shares required_tasks_resolved's exact same per-task resolution
+    order/logic (kept in lockstep deliberately: both walk "complete? ->
+    superseded? -> matching override?" for the same reason) so the two
+    can never silently disagree about which tasks are override-resolved.
+    Used both to decide gates["tasksResolvedBy"] and to emit one
+    task_override_applied event per such task, at gate-computation time
+    -- see both call sites in main()."""
+    if not tasks:
+        return []
+    overrides = overrides or {}
+    out = []
+    for t in tasks:
+        if t.get("priority") != "required":
+            continue
+        status = t.get("status")
+        if status == "complete" or (status == "failed" and _superseded_by_repair(t, tasks)):
+            continue
+        override = _matching_task_override(t, overrides)
+        if override is not None:
+            out.append((t.get("id"), override.get("action")))
+    return out
+
+
+def any_task_resolved_by_human_override(tasks, overrides: dict | None = None) -> bool:
+    """Task 4.3 / review round 1 (Important 1): True iff at least one
+    required task's resolution came from a human skip/approve override.
+    Only meaningful when required_tasks_resolved(tasks, overrides) is
+    ALREADY True for the same tasks/overrides -- see the gates.
+    tasksResolvedBy call sites in main(), which only stamp "human" when
+    it is. A human decision must read visibly differently from a plain
+    evidence-derived ✓ (control-center's GatesRow)."""
+    return bool(_tasks_resolved_by_override(tasks, overrides))
+
+
 def required_tasks_resolved(tasks, overrides: dict | None = None) -> bool:
     """Task 4.2 (V7 session completion rule): deterministic gate --
     True iff every priority=="required" task has reached a resolved
@@ -3791,12 +3852,14 @@ def required_tasks_resolved(tasks, overrides: dict | None = None) -> bool:
         (an exact-matched repair task already proved the underlying check
         now passes -- see that function's docstring for why this is
         honest, not a loophole), OR
-      - Task 4.3: a human recorded a skip or approve override for this
-        task in task-overrides.json (see load_task_overrides) -- a human
-        decision counts as resolved regardless of the task's own status.
-        This is deliberately NOT orchestrator-derived evidence; it's the
-        same "a human can accept/skip what the machine can't verify"
-        trust model as §14's human-acceptance.json.
+      - Task 4.3: a human recorded a matching skip or approve override for
+        this task in task-overrides.json (see load_task_overrides and
+        _matching_task_override -- "matching" means the id AND, when
+        captured, the kind/description all still describe this same
+        task) -- a human decision counts as resolved regardless of the
+        task's own status. This is deliberately NOT orchestrator-derived
+        evidence; it's the same "a human can accept/skip what the
+        machine can't verify" trust model as §14's human-acceptance.json.
     Any other status ("pending", "in_progress", or a genuine unsuperseded,
     un-overridden "failed") makes this False -- fail-closed, matching
     every other gate in this file.
@@ -3818,8 +3881,7 @@ def required_tasks_resolved(tasks, overrides: dict | None = None) -> bool:
             continue
         if status == "failed" and _superseded_by_repair(t, tasks):
             continue
-        override = overrides.get(t.get("id"))
-        if isinstance(override, dict) and override.get("action") in ("skip", "approve"):
+        if _matching_task_override(t, overrides) is not None:
             continue
         return False
     return True
@@ -4320,9 +4382,22 @@ def main():
                         # overrides.json, gateway-owned) can resolve a
                         # required task the orchestrator itself never saw
                         # complete -- see required_tasks_resolved.
+                        task_overrides = load_task_overrides(session) if tasks is not None else None
                         gates["tasksResolved"] = (
-                            required_tasks_resolved(tasks, load_task_overrides(session)) if tasks is not None else None
+                            required_tasks_resolved(tasks, task_overrides) if tasks is not None else None
                         )
+                        # Review round 1 (Important 1): a human override
+                        # (not orchestrator evidence) resolving a required
+                        # task must read visibly differently -- stamp
+                        # provenance and emit one task_override_applied
+                        # event per such task, at this gate-computation
+                        # moment (see _tasks_resolved_by_override).
+                        if gates["tasksResolved"] and tasks is not None:
+                            override_resolutions = _tasks_resolved_by_override(tasks, task_overrides)
+                            if override_resolutions:
+                                gates["tasksResolvedBy"] = "human"
+                                for task_id, action in override_resolutions:
+                                    emit_event(events_path, "task_override_applied", sid, taskId=task_id, action=action)
                         manifest["gates"] = gates
 
                         if gates["tasksResolved"] is False:
@@ -4755,9 +4830,19 @@ def main():
                 # other optional gate above already follows. Task 4.3: a
                 # human skip/approve override can also resolve a required
                 # task -- see required_tasks_resolved.
+                task_overrides = load_task_overrides(session) if tasks is not None else None
                 gates["tasksResolved"] = (
-                    required_tasks_resolved(tasks, load_task_overrides(session)) if tasks is not None else None
+                    required_tasks_resolved(tasks, task_overrides) if tasks is not None else None
                 )
+                # Review round 1 (Important 1): same provenance stamp +
+                # event emission as the no-change-verified path above --
+                # see that site's comment for why.
+                if gates["tasksResolved"] and tasks is not None:
+                    override_resolutions = _tasks_resolved_by_override(tasks, task_overrides)
+                    if override_resolutions:
+                        gates["tasksResolvedBy"] = "human"
+                        for task_id, action in override_resolutions:
+                            emit_event(events_path, "task_override_applied", sid, taskId=task_id, action=action)
                 manifest["gates"] = gates
 
                 if gates_block_verified(gates):
@@ -6386,6 +6471,57 @@ def _tasks_selfcheck() -> None:
         assert load_task_overrides(overrides_dir) == real_overrides
 
     # ------------------------------------------------------------
+    # 10c. Review round 1 (Important 1 + 3): provenance (any_task_resolved_
+    #      by_human_override / gates.tasksResolvedBy) and id-stability
+    #      (kind+description must also match, not id alone -- ids get
+    #      recycled across a replan).
+    # ------------------------------------------------------------
+    real_task = {"id": "t2", "priority": "required", "status": "pending",
+                 "kind": "verification", "description": "Run the typecheck"}
+
+    # A matching override (id + kind + description) resolves the task AND
+    # is reported as human-resolved.
+    matching_override = {"t2": {"action": "skip", "at": "x", "kind": "verification", "description": "Run the typecheck"}}
+    assert required_tasks_resolved([real_task], matching_override) is True
+    assert any_task_resolved_by_human_override([real_task], matching_override) is True
+    assert _tasks_resolved_by_override([real_task], matching_override) == [("t2", "skip")]
+
+    # A legacy override (no kind/description captured at all) is trusted by
+    # id alone -- back-compat for a record written before this round.
+    legacy_override = {"t2": {"action": "approve", "at": "x"}}
+    assert required_tasks_resolved([real_task], legacy_override) is True
+    assert any_task_resolved_by_human_override([real_task], legacy_override) is True
+
+    # Replay: a replan renumbers the task list (merge_replanned_tasks can
+    # do exactly this), so id "t2" now names a COMPLETELY different task --
+    # the override recorded for the OLD t2 must NOT silently resolve it.
+    new_t2_after_replan = {"id": "t2", "priority": "required", "status": "pending",
+                            "kind": "implementation", "description": "Add telemetry for the new flow"}
+    stale_override = {"t2": {"action": "skip", "at": "x", "kind": "verification", "description": "Run the typecheck"}}
+    assert required_tasks_resolved([new_t2_after_replan], stale_override) is False, (
+        "an override recorded for a DIFFERENT task that used to hold this id must not resolve the new one"
+    )
+    assert any_task_resolved_by_human_override([new_t2_after_replan], stale_override) is False
+    assert _matching_task_override(new_t2_after_replan, stale_override) is None
+
+    # A task with no priority=="required" entries at all reports no
+    # override-resolution, even with overrides present (nothing to resolve).
+    assert any_task_resolved_by_human_override(
+        [{"id": "t1", "priority": "recommended", "status": "pending"}],
+        {"t1": {"action": "skip", "at": "x"}},
+    ) is False
+    assert _tasks_resolved_by_override(None, {"t1": {"action": "skip", "at": "x"}}) == []
+
+    # A task resolved on real evidence (complete), not an override, must
+    # NOT be reported as human-resolved even when an (irrelevant, matching)
+    # override also happens to exist for it.
+    already_complete = {"id": "t3", "priority": "required", "status": "complete",
+                         "kind": "implementation", "description": "x"}
+    assert any_task_resolved_by_human_override(
+        [already_complete], {"t3": {"action": "skip", "at": "x", "kind": "implementation", "description": "x"}},
+    ) is False, "already resolved by real evidence -- override is irrelevant here, not the resolution source"
+
+    # ------------------------------------------------------------
     # 11. Task 4.2: make_prompt's FOCUS block -- additive, byte-identical
     #     when tasks is None/absent; present (first pending required task,
     #     in list order) otherwise; absent again once nothing is pending.
@@ -6950,6 +7086,15 @@ def _gates_selfcheck() -> None:
     assert no_change_if_idx < no_change_ok_idx < impl_null_idx < tasks_resolved_idx < tasks_resolved_check_idx, (
         "the no-change path must compute implementationComplete=null and tasksResolved, "
         "in that order, before deciding whether tasksResolved blocks"
+    )
+    # Review round 1 (Minor 8a): the anchor above only pins the assignment's
+    # `gates["tasksResolved"] = (` prefix (needed once the RHS became a
+    # multi-line ternary) -- confirm the actual required_tasks_resolved(
+    # call, not just that prefix, genuinely sits inside this same span, so
+    # a future edit can't hollow out the assignment while leaving the
+    # anchor text intact.
+    assert "required_tasks_resolved(" in main_source[tasks_resolved_idx:tasks_resolved_check_idx], (
+        "gates[\"tasksResolved\"] must actually be computed via required_tasks_resolved(...) in this span"
     )
     assert tasks_resolved_check_idx < no_change_verified_label_idx, (
         "the tasksResolved==False block must be checked BEFORE the no-change-verified success path -- no bypass"

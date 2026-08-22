@@ -3222,6 +3222,32 @@ def _architect_review_selfcheck() -> None:
     assert "DERIVED TASK LIST" not in _build_review_task_message({"taskList": []})
     assert "DERIVED TASK LIST" not in _build_review_task_message({"taskList": "not a list"})
 
+    # Review round 1 (Important 4): task-list observations must be steered
+    # into findings/verificationAdjustments, and only REPLAN_REQUIRED may
+    # be driven by a task-list problem — never a REVISE_IMPLEMENTATION
+    # round burning budget over task-list prose.
+    assert "findings" in msg_with_tasks and "verificationAdjustments" in msg_with_tasks
+    assert "REPLAN_REQUIRED" in msg_with_tasks
+    assert "requiredChanges" in msg_with_tasks and "NEVER" in msg_with_tasks
+
+    # Review round 1 (Minor 8c): a large derived task list is capped, not
+    # dumped verbatim into the prompt -- 50 tasks max, 300 chars per
+    # description, with an honest "+N more" marker instead of silent
+    # truncation.
+    huge_task_list = [
+        {"id": f"t{i}", "kind": "implementation", "priority": "required", "description": f"task {i}", "dependsOn": []}
+        for i in range(60)
+    ]
+    capped_msg = _build_review_task_message({"taskList": huge_task_list})
+    assert "t49" in capped_msg and "t50" not in capped_msg, "only the first 50 tasks are rendered"
+    assert "+10 more tasks" in capped_msg
+
+    long_desc_task = [{"id": "t1", "kind": "implementation", "priority": "required",
+                        "description": "x" * 1000, "dependsOn": []}]
+    long_desc_msg = _build_review_task_message({"taskList": long_desc_task})
+    assert ("x" * 301) not in long_desc_msg, "description must be capped at 300 chars, not embedded whole"
+    assert "…" in long_desc_msg
+
     print("architect review self-check: PASS")
 
 
@@ -4389,19 +4415,54 @@ def _build_review_task_message(review_request):
     # section is appended then, exactly the pre-Task-4.3 message.
     task_list = review_request.get("taskList")
     if isinstance(task_list, list) and task_list:
+        dict_tasks = [t for t in task_list if isinstance(t, dict)]
+        # Review round 1 (Minor 8c): cap what actually reaches the prompt --
+        # this rides along inside an existing review request (V7 §5.6's
+        # ARCHITECT_REVIEW_DIFF_MAX_CHARS-style token budget still applies
+        # to the WHOLE message), so an unusually large derived task list
+        # must degrade to a bounded summary, never balloon the turn.
+        _TASK_LIST_MAX_TASKS = 50
+        _TASK_LIST_DESC_MAX_CHARS = 300
+        shown, overflow = dict_tasks[:_TASK_LIST_MAX_TASKS], len(dict_tasks) - _TASK_LIST_MAX_TASKS
+
+        def _capped_description(t):
+            desc = str(t.get("description") or "")
+            return desc if len(desc) <= _TASK_LIST_DESC_MAX_CHARS else desc[:_TASK_LIST_DESC_MAX_CHARS] + "…"
+
         tasks_text = "\n".join(
             f"  - [{t.get('id')}] ({t.get('kind')}, {t.get('priority', 'required')}) "
-            f"{t.get('description')}"
+            f"{_capped_description(t)}"
             + (f" — depends on: {', '.join(t.get('dependsOn'))}" if t.get("dependsOn") else "")
-            for t in task_list
-            if isinstance(t, dict)
+            for t in shown
         ) or "  (none)"
+        if overflow > 0:
+            tasks_text += f"\n  ... (+{overflow} more tasks not shown)"
+
         message += (
             "\n\nDERIVED TASK LIST (produced from the architecture plan before "
             "implementation began -- also review this as part of your decision: "
             "does it still implement the plan, is anything important missing or "
             "superfluous, are dependencies correct, is scope appropriate?):\n"
             + tasks_text
+            + "\n\n"
+            # Review round 1 (Important 4): task-list prose must never
+            # burn the REVISE_IMPLEMENTATION budget (§5.13) on its own --
+            # a wrong/missing/superfluous/misordered task is a PLANNING
+            # problem, not an implementation defect this round's diff can
+            # fix. Route observations into findings/verificationAdjustments
+            # (non-blocking); only decision=REPLAN_REQUIRED may actually be
+            # driven by a task-list problem, and only when the underlying
+            # plan itself needs to change.
+            "Note on the task list above: report any observations about it "
+            "(missing/superfluous/misordered tasks, wrong dependencies, "
+            "scope drift) via `findings` and, if you want to propose a "
+            "concrete change, `verificationAdjustments` -- NEVER via "
+            "`requiredChanges`, which would trigger a REVISE_IMPLEMENTATION "
+            "round over task-list prose alone and burn the revise/re-review "
+            "budget on something this round's diff cannot fix. If the task "
+            "list is wrong enough that the underlying architecture plan "
+            "itself needs to change, that must be expressed as "
+            "decision=REPLAN_REQUIRED, not REVISE_IMPLEMENTATION."
         )
 
     return message
