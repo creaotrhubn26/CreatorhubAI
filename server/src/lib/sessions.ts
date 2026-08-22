@@ -98,6 +98,7 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   // keys, and GlimmerSession leaves them optional for exactly that reason.
   if (m.gates) session.gates = m.gates;
   if (m.architectPlan) session.architectPlan = m.architectPlan;
+  if (m.architectTrigger) session.architectTrigger = m.architectTrigger;
   if (m.failure) session.failure = m.failure;
   return session;
 }

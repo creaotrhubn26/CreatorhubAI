@@ -173,6 +173,29 @@ describe("ActiveSessionScreen", () => {
     expect(screen.getByRole("link", { name: /see verification/i })).toHaveAttribute("href", "/sessions/s1/verification");
   });
 
+  it("renders the architect trigger line for an auto-triggered run", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1", task: "Refactor auth flow", status: "verified", workspace: "/ws", branch: "glimmer/x",
+      baselineSha: "abc", changedFiles: [], verification: { overall: "VERIFIED", checks: [] },
+      repairsUsed: 0, repairBudget: 2,
+      architectTrigger: { mode: "auto", score: 6, signals: ["protected_area", "verification_full"] },
+    } as any);
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("architect: auto (score 6: protected_area, verification_full)")).toBeInTheDocument()
+    );
+  });
+
   it("renders a gray USER_CANCELLED banner for a cancelled session carrying a failure", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
       id: "s1", task: "Fix dialog parser", status: "cancelled", workspace: "/ws", branch: "glimmer/x",

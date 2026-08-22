@@ -131,6 +131,11 @@ export interface GlimmerSession {
     scopeApproved?: boolean | null;
   };
   architectPlan?: { used: boolean; risk: string | null };
+  // Task 2.1 (V7 §5.5): how architect mode was decided for this run —
+  // manual (--architect-first), auto (risk score crossed the threshold),
+  // or off. score/signals present only for scored decisions; mirrors
+  // manifest.architectTrigger verbatim (deterministic fact).
+  architectTrigger?: { mode: "manual" | "auto" | "off"; score?: number; signals?: string[] };
   failure?: { class: string; detail: string; evidenceIds: string[] };
   // §14 Diff Review — human "accept for review" fact. Written ONLY by the
   // gateway (POST /sessions/:id/accept), never by the orchestrator/model:

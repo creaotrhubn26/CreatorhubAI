@@ -145,6 +145,16 @@ export function ActiveSessionScreen() {
           ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
           : "Not yet accepted"}
       </p>
+      {session.architectTrigger && session.architectTrigger.mode !== "off" && (
+        // Deterministic fact from the orchestrator: how architect mode was
+        // actually decided for THIS run (the composer preview is only an
+        // estimate computed before the run existed).
+        <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          architect: {session.architectTrigger.mode}
+          {session.architectTrigger.score !== undefined && ` (score ${session.architectTrigger.score}${
+            session.architectTrigger.signals?.length ? `: ${session.architectTrigger.signals.join(", ")}` : ""})`}
+        </p>
+      )}
       <RepairCycleStepper session={session} />
       <GatesRow gates={session.gates} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
