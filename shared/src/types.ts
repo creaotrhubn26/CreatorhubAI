@@ -888,6 +888,12 @@ export interface RepoMap {
 // fabricated title or status.
 export type DocNodeType = "system" | "service" | "route" | "schema" | "config" | "doc";
 export type DocNodeStatus = "CURRENT" | "STALE" | "UNVERIFIED" | "MISSING" | "DEPRECATED" | "GENERATED";
+// glimmer-v2.py's verify_doc_nodes/build_docs_bootstrap_graph never write a
+// numeric confidence -- always one of these three strings (see DOC_STATUS_*
+// -> confidence mapping in glimmer-v2.py). `string` (not a narrower union)
+// so a hand-edited docs/graph.json with an unrecognized value still displays
+// verbatim instead of failing to parse.
+export type DocNodeConfidence = "high" | "low" | "unknown" | (string & {});
 
 export interface DocProvenance {
   evidence: string[];
@@ -901,7 +907,7 @@ export interface DocNode {
   path: string;
   title: string;
   status: DocNodeStatus;
-  confidence: number;
+  confidence: DocNodeConfidence;
   provenance: DocProvenance;
 }
 

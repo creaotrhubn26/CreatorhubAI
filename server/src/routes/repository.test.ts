@@ -52,7 +52,7 @@ describe("GET /api/repository/doc-graph", () => {
     nodes: [
       {
         id: "svc:gateway", type: "service", path: "server/src", title: "Gateway",
-        status: "CURRENT", confidence: 0.9, provenance: { evidence: ["server/src/app.ts"], sha: "abc123" },
+        status: "CURRENT", confidence: "high", provenance: { evidence: ["server/src/app.ts"], sha: "abc123" },
       },
     ],
     edges: [],

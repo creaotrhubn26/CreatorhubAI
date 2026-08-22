@@ -4,7 +4,7 @@ import { edgesForNode, filterDocNodes, groupDocNodesByType } from "./docGraph";
 
 function node(overrides: Partial<DocNode>): DocNode {
   return {
-    id: "n1", type: "service", path: "server/src", title: "Gateway", status: "CURRENT", confidence: 0.9,
+    id: "n1", type: "service", path: "server/src", title: "Gateway", status: "CURRENT", confidence: "high",
     provenance: { evidence: [], sha: null },
     ...overrides,
   };
