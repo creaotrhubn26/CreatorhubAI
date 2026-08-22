@@ -1248,9 +1248,21 @@ TEST_FILE_PATH_RE = re.compile(r"[\w./-]+\.(?:test|spec)\.[jt]sx?")
 
 def extract_existing_test_files(output_text, ws):
     found = []
+    ws_resolved = Path(ws).resolve()
     for m in TEST_FILE_PATH_RE.finditer(output_text or ""):
         rel = m.group(0)
-        if rel not in found and (ws / rel).is_file():
+        # Containment guard: failure output is model/tool-adjacent text — a
+        # match like "../secret.test.ts" must never leak path-existence
+        # outside the workspace into allowedFiles/repair-NN.json.
+        if ".." in rel.split("/"):
+            continue
+        candidate = (ws_resolved / rel)
+        try:
+            if not candidate.resolve().is_relative_to(ws_resolved):
+                continue
+        except OSError:
+            continue
+        if rel not in found and candidate.is_file():
             found.append(rel)
     return found
 
@@ -6192,6 +6204,17 @@ def _repair_contract_selfcheck() -> None:
         }]
         rc6 = build_repair_contract(1, typecheck_mentioning_test, ["src/Dialog.ts"], ws)
         assert rc6["allowedFiles"] == ["src/Dialog.ts"]
+
+        # 6b. Fix round 1 (MED): path-traversal containment — a failure
+        #     output naming "../escape.test.ts" (which EXISTS one level
+        #     above the workspace) must never land in allowedFiles.
+        (ws.parent / "escape.test.ts").write_text("x")
+        traversal_results = [{
+            "command": "npm run test", "ok": False, "status": "CODE_FAIL",
+            "outputTail": "FAIL ../escape.test.ts",
+        }]
+        rc6b = build_repair_contract(1, traversal_results, ["src/Dialog.ts"], ws)
+        assert rc6b["allowedFiles"] == ["src/Dialog.ts"], rc6b["allowedFiles"]
 
         # 7. compute_repair_writes_outside_allowed: advisory-only detection.
         contract = {"allowedFiles": ["src/Dialog.ts", "src/Dialog.test.ts"]}
