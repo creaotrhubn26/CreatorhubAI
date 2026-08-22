@@ -346,7 +346,7 @@ export interface ArchitectPlanningStartedEvent extends GlimmerEventBase {
 }
 export interface ArchitectPlanCreatedEvent extends GlimmerEventBase {
   type: "architect_plan_created";
-  risk?: string;
+  risk?: ArchitecturePlanRisk;
   packages?: string[];
 }
 export interface ArchitectReviewRequestedEvent extends GlimmerEventBase {
@@ -358,7 +358,7 @@ export interface ArchitectReviewCompletedEvent extends GlimmerEventBase {
   type: "architect_review_completed";
   iteration: number;
   reviewRound: number;
-  decision: string;
+  decision: ArchitectReviewDecision;
 }
 // architect_replan_started: type defined for the V7 replan flow — no
 // glimmer-v2.py emit site exists yet (no replan path is implemented), so
