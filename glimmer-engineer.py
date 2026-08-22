@@ -941,6 +941,18 @@ def check_write_path(
             f"Lockfile writes are blocked: {relative}"
         )
 
+    # CR1 (round-7 re-review 2): docs/graph.json is orchestrator-owned
+    # bookkeeping that changed_files() deliberately excludes from model
+    # attribution/scope/budget -- so a MODEL write here would be invisible
+    # to every downstream guard and mislabeled as orchestrator output.
+    # Exact relative-path check, not PROTECTED_FILES (that matches on
+    # path.name and would block any graph.json anywhere in the repo).
+    if relative.as_posix() == DOC_GRAPH_RELATIVE_PATH:
+        raise PermissionError(
+            "docs/graph.json is orchestrator-owned documentation "
+            f"bookkeeping; model writes are blocked: {relative}"
+        )
+
 
 def secure_tool_arguments(
     tool_name,
@@ -9242,6 +9254,24 @@ def _doc_tools_selfcheck() -> None:
                 ws, "status", "--short", "--", ".", f":(exclude){DOC_GRAPH_RELATIVE_PATH}",
             )
             assert "extra.ts" in dirty_status, "a genuinely dirty OTHER path must still trip the gate"
+
+            # ------------------------------------------------------------
+            # CR1 (round-7 re-review 2): the MODEL must never be able to
+            # write docs/graph.json -- changed_files() excludes that path
+            # from attribution/scope/budget on the assumption that only
+            # run_doc_pass writes it, so a model write there would be
+            # invisible to every downstream guard. check_write_path is
+            # the enforcement point; assert both tools are blocked, and
+            # that only the exact repo-root path is protected.
+            # ------------------------------------------------------------
+            for blocked in (ws / "docs" / "graph.json",):
+                try:
+                    check_write_path(blocked, ws)
+                    raise AssertionError("model write to docs/graph.json must be blocked")
+                except PermissionError:
+                    pass
+            for allowed in (ws / "docs" / "other.md", ws / "nested" / "docs" / "graph.json"):
+                check_write_path(allowed, ws)  # must NOT raise
     finally:
         _loaded_doc_graph = saved_graph
 

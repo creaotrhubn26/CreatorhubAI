@@ -4019,13 +4019,17 @@ def _looks_like_doc_path_ref(ref: str) -> bool:
     return ext in _DOC_PATH_REF_NO_SLASH_EXTS
 
 
-# Round 7 live checkpoint (L1): a run of 3+ identical letters (`NNNN`,
-# `XXXX`) or an angle-bracket segment (`<name>`) inside a doc path
-# reference is an obvious template placeholder from example prose
-# ("see `decisions/ADR-NNNN.md`"), never a real path this repo could
-# contain -- check_doc_drift skips these rather than flagging them as
-# broken links.
-_DOC_PATH_REF_PLACEHOLDER_RE = re.compile(r"([A-Za-z])\1{2,}")
+# Round 7 live checkpoint (L1), tightened re-review 2 (MN1): an
+# UPPERCASE run of 3+ identical letters filling a whole path segment or
+# a whole stem (`NNNN`, `ADR-XXXX.md`) or an angle-bracket segment
+# (`<name>`) is an obvious template placeholder from example prose
+# ("see `decisions/ADR-NNNN.md`") -- check_doc_drift skips these rather
+# than flagging them as broken links. Lowercase/partial runs
+# (`wwwroot/appsettings.json`, `src/aaa.ts`) are real names and stay
+# eligible for drift flagging.
+_DOC_PATH_REF_PLACEHOLDER_RE = re.compile(
+    r"(?:^|/|-|_|\.)([A-Z])\1{2,}(?=$|/|-|_|\.)"
+)
 
 
 def _ref_has_placeholder(ref: str) -> bool:
@@ -8041,6 +8045,12 @@ def _doc_graph_selfcheck() -> None:
         assert _ref_has_placeholder("decisions/ADR-NNNN.md") is True
         assert _ref_has_placeholder("<id>/file.ts") is True
         assert _ref_has_placeholder("src/api.ts") is False
+        # MN1 (re-review 2): lowercase/partial runs are real names, never
+        # placeholders -- only uppercase whole-segment/whole-stem runs are.
+        assert _ref_has_placeholder("wwwroot/appsettings.json") is False
+        assert _ref_has_placeholder("src/aaa.ts") is False
+        assert _ref_has_placeholder("WWW.md") is True
+        assert _ref_has_placeholder("XXXX/notes.md") is True
 
         # --- 6. Gate tri-state composition: calls compute_doc_gate, the
         # SAME function main() calls via run_doc_pass (Review round 7,
