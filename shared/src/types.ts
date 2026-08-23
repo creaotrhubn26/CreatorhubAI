@@ -474,6 +474,13 @@ export interface DeliveryPacket {
   forwardPlan: { nextSteps: DeliveryNextStep[]; provenance: DataProvenance; reviewFailed?: true } | null;
   confidence: { level: "low" | "medium" | "high"; reason: string; provenance: DataProvenance; reviewFailed?: true } | null;
   humanReviewStatus: string;
+  // Round-8 re-review NEW-MN2/NEW-MN1: written by glimmer-v2.py since
+  // MJ4/MN1 fixes -- optional so pre-fix packets still parse.
+  blockedGates?: string[];
+  architectEscalation?:
+    | { question: string; answer: string }
+    | { consultationFailed: true; reason: string }
+    | null;
 }
 
 // V7 §22.14 visual evidence store — these mirror glimmer-visual.py's real
