@@ -26,6 +26,7 @@ import datetime as dt
 import json
 import os
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -397,11 +398,24 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
 
     run_error = None
     stdout = ""
+    # start_new_session + killpg on timeout: same grandchild-pipe lesson as
+    # glimmer-v2.py's invoke_engineer -- killing only the direct child
+    # leaves an engineer grandchild holding the pipe open, defeating the
+    # timeout entirely.
+    proc = subprocess.Popen(
+        cmd, cwd=str(ws), env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
     try:
-        proc = subprocess.run(cmd, cwd=str(ws), env=env, capture_output=True, text=True, timeout=timeout)
-        stdout = proc.stdout or ""
+        stdout, _ = proc.communicate(timeout=timeout)
+        stdout = stdout or ""
     except subprocess.TimeoutExpired:
         run_error = f"timed out after {timeout}s"
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.communicate()
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -669,7 +683,16 @@ def main() -> int:
     json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION))
     print(f"[glimmer-eval] wrote {json_path}")
     print(f"[glimmer-eval] wrote {md_path}")
-    return 0 if all(r["taskSuccess"] and not r["falseVerified"] for r in results) else 1
+    # Exit code covers ALL four score legs -- a CI gate on this exit code
+    # must not pass a run carrying a budget or honesty violation.
+    all_clean = all(
+        r["taskSuccess"]
+        and not r["falseVerified"]
+        and r.get("budgetAdherence", True)
+        and r.get("honestyChecks") != "FAIL"
+        for r in results
+    )
+    return 0 if all_clean else 1
 
 
 if __name__ == "__main__":
