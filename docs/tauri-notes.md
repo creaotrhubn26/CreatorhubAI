@@ -8,13 +8,59 @@ sparkle) is the single source. Regenerate every platform icon with:
 cd src-tauri && npx @tauri-apps/cli icon icon-source.png
 ```
 
+## Bundled gateway
+The gateway (`server/dist` + `@glimmer/shared` + its prod npm deps) is
+bundled as a Tauri `resources` entry, so a moved .app no longer needs the
+repo checkout to find `dist/index.js` or `node_modules`.
+
+```
+src-tauri/scripts/prepare-gateway.sh
+```
+
+- Builds `shared` and `server` (`tsc`), then assembles
+  `src-tauri/resources/gateway/` as an isolated copy: `dist/` from
+  `server/dist`, `node_modules/@glimmer/shared` vendored directly from
+  `shared/dist` (not installed — it isn't published to a registry), and a
+  generated `package.json` (server's `dependencies` minus `@glimmer/shared`)
+  installed with `npm install --omit=dev` so only the gateway's actual
+  runtime deps (express, cors, transitively ~70 packages, ~4.3MB) land
+  there — not the whole hoisted monorepo `node_modules`.
+- Gitignored, regenerated fresh each build, same convention as
+  `binaries/glimmer-node-*`.
+- **Required before `cargo build`/`tauri build`** if you want the bundled
+  path exercised — `tauri-build` copies `bundle.resources` into
+  `target/<profile>/resources/` at *compile* time (`build.rs`), so this
+  also takes effect under plain `cargo run`/`tauri dev`, not just release
+  bundles. `npm run tauri:build` runs it automatically (added to that
+  script alongside `prepare-sidecar.sh`).
+- Runtime resolution (`src/lib.rs::gateway_dir`): `GLIMMER_GATEWAY_DIR` env
+  override wins first; then the bundled resource dir
+  (`app.path().resolve("resources/gateway", BaseDirectory::Resource)`) if
+  `dist/index.js` exists there; then, in debug builds only, the
+  compile-time repo path (`CARGO_MANIFEST_DIR/../server`) so a checkout
+  that hasn't run the prepare script yet still works in dev. That last
+  branch is compiled out of release builds.
+- **Verified live**: with `server/dist` renamed out of the way (so the dev
+  repo-path fallback would 404 if it were ever hit), running the debug
+  binary spawned the gateway from
+  `target/debug/resources/gateway` via the bundled `glimmer-node` sidecar
+  and served real data on `GET /api/status`.
+
+### What's still NOT bundled — external requirement, by design
+`CONFIG.glimmerV2Path` / `CONFIG.engineerPath` (see `server/src/config.ts`)
+default to `~/AI/muse-glimmer/glimmer-v2.py` /
+`~/AI/muse-glimmer/glimmer-engineer.py` — the Python orchestrator. That
+orchestrator is a separate project, is not built or shipped by this repo,
+and is not part of this bundling work. `CONFIG.stateRoot` already defaults
+sanely to `~/.muse-glimmer` (no change needed there). A machine without the
+orchestrator checked out at that path will run the gateway and serve the
+API fine, but any action that shells out to the orchestrator scripts will
+fail — that's a real external dependency of the product, not a Tauri
+packaging gap, and is out of scope here.
+
 ## Bundled Node sidecar
 The gateway needs Node. Bundled builds ship it as a Tauri `externalBin`
 sidecar so the app has zero runtime dependency on a machine-installed node.
-**The bundle is still not fully self-contained**: `gateway_dir()` falls back
-to the compile-time repo path (`CARGO_MANIFEST_DIR/../server`), so a moved
-.app on a machine without the repo checkout + built `server/dist` shows
-"Unavailable" — bundling the gateway itself is the remaining follow-up.
 
 ```
 src-tauri/scripts/prepare-sidecar.sh
