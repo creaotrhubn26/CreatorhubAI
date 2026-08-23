@@ -55,6 +55,19 @@ _architect_consult_enabled = False
 # instead of a new threaded-through parameter.
 _loaded_doc_graph = None
 
+# V7 §15 follow-up ("large expansion -> pause for approval"): the
+# contract's declared scope, as a flat list of boundary-safe path
+# prefixes -- set once at run_engineer startup from GLIMMER_CONTRACT_SCOPE
+# (see _load_contract_scope_prefixes below), None whenever glimmer-v2.py
+# didn't set that env var at all (no bounded scope, or this process was
+# invoked standalone / in a mode other than plain engineer). None is the
+# ONLY value that disables the check in check_write_path -- absent env is
+# byte-identical to pre-follow-up behavior (no per-write scope check at
+# all; glimmer-v2.py's own post-hoc compute_scope_guard/scopeApproved gate
+# computation is completely unaffected either way, see its own module
+# comment in glimmer-v2.py).
+_contract_scope_prefixes = None
+
 
 def _emit(event_type: str, **fields) -> None:
     # No-op when the events file isn't configured (e.g. direct standalone
@@ -932,9 +945,65 @@ class ToolPolicyBlock(PermissionError):
     contract for the OTHER guards, which is out of this finding's scope."""
 
 
+def _load_contract_scope_prefixes():
+    """V7 §15 follow-up: parses GLIMMER_CONTRACT_SCOPE (a JSON list of
+    boundary-safe path-prefix strings -- see glimmer-v2.py's
+    _expected_prefixes/invoke_engineer, the ONLY writer of this env var)
+    into the list check_write_path guards writes against.
+
+    Returns None on ANY malformed/absent input -- a missing env var, a
+    parse failure, or a value that isn't a non-empty list of non-empty
+    strings all collapse to the SAME "no scope guard active" state as a
+    contract with no bounded scope at all (compute_scope_guard's own
+    `expected` can be legitimately empty for a "repository" scope). Never
+    raises: a broken env var must degrade to today's behavior, not fail
+    closed by accident on a parse error.
+    """
+    raw = os.environ.get("GLIMMER_CONTRACT_SCOPE")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, list) or not data or not all(
+        isinstance(p, str) and p for p in data
+    ):
+        return None
+    return data
+
+
+def _path_in_scope(relative, prefixes) -> bool:
+    """Boundary-safe prefix match -- deliberately mirrors glimmer-v2.py's
+    compute_scope_guard/_expected_prefixes rule (a path is in scope only
+    if it equals a declared prefix exactly, or starts with `prefix + "/"`,
+    after stripping any trailing slash from the prefix) so a file that is
+    reported in-scope by the orchestrator's post-hoc gate can never be
+    reported out-of-scope by this live, per-write check, or vice versa.
+    No shared module between the two processes (existing convention --
+    see classify_yellow's own module comment), so this is a deliberate,
+    cross-linked mirror, not a new scheme."""
+    posix = relative.as_posix()
+    return any(
+        posix == p.rstrip("/") or posix.startswith(p.rstrip("/") + "/")
+        for p in prefixes
+    )
+
+
 def check_write_path(
     path,
     workspace,
+    tool_name=None,
+    *,
+    # Test-only override hooks (never passed by secure_tool_arguments'
+    # real call site below): let the selfcheck exercise a real, resolved
+    # approve/deny/timeout round-trip through request_approval_and_wait in
+    # milliseconds instead of the real 300s/2s production defaults, the
+    # same way _approval_wait_selfcheck already does for classify_yellow's
+    # own approval calls. None means "use request_approval_and_wait's own
+    # defaults" -- production behavior is completely unaffected.
+    approval_timeout_s=None,
+    approval_poll_interval_s=None,
 ):
     relative = path.relative_to(workspace)
 
@@ -974,6 +1043,26 @@ def check_write_path(
             f"bookkeeping; model writes are blocked: {relative}"
         )
 
+    # V7 §15 follow-up ("large expansion -> pause for approval"): only
+    # active when glimmer-v2.py declared a real bounded scope for this
+    # session (_contract_scope_prefixes is not None) -- absent env, this
+    # is a no-op and every check above already ran unchanged, so a
+    # session with no GLIMMER_CONTRACT_SCOPE is byte-identical to before
+    # this follow-up. check_write_path is the single choke point both
+    # write_file and edit_file dispatch through (secure_tool_arguments
+    # below), so this can't be bypassed per-tool by construction -- the
+    # same discipline classify_yellow's own docstring credits to routing
+    # every YELLOW arm through one shared entry point, applied here to
+    # the write path instead of the shell-command path.
+    if (
+        _contract_scope_prefixes is not None
+        and not _path_in_scope(relative, _contract_scope_prefixes)
+    ):
+        _enforce_scope_expansion_approval(
+            relative, tool_name,
+            timeout_s=approval_timeout_s, poll_interval_s=approval_poll_interval_s,
+        )
+
 
 def secure_tool_arguments(
     tool_name,
@@ -1005,6 +1094,7 @@ def secure_tool_arguments(
         check_write_path(
             resolved,
             workspace,
+            tool_name,
         )
 
     if tool_name == "write_file":
@@ -1814,6 +1904,60 @@ def request_approval_and_wait(
     _emit("agent_state_changed", state="implementing")
     print(f"\n{'✓ APPROVED' if decision == 'approved' else '✗ ' + decision.upper()}: {action}")
     return decision, detail
+
+
+def _enforce_scope_expansion_approval(relative, tool_name, *, timeout_s=None, poll_interval_s=None) -> None:
+    """V7 §15 follow-up: called only from check_write_path, only when
+    _contract_scope_prefixes is set AND `relative` falls outside it --
+    the write-path equivalent of classify_yellow's YELLOW escalation,
+    reusing the exact same request_approval_and_wait sidecar (V7 §35).
+
+    Approved: returns normally (the write proceeds) and emits a
+    scope_expanded event of its own, carrying who approved it. This does
+    NOT retroactively make the write "in scope" -- glimmer-v2.py's own
+    post-hoc compute_scope_guard/gates.scopeApproved computation, run
+    after this session exits, is completely untouched by this function
+    and still reports the same file as expanded; approval only decides
+    whether the write itself was allowed to happen, with its own honest,
+    separately-provenanced record of why.
+
+    Denied/timeout/unavailable: raises ToolPolicyBlock -- fails closed,
+    same as every other check_write_path rejection (tool_blocked +
+    record_blocked_command + a POLICY_BLOCK envelope, via execute_tool's
+    existing ToolPolicyBlock catch).
+
+    timeout_s/poll_interval_s: test-only overrides forwarded verbatim from
+    check_write_path's own same-named kwargs (see that function's
+    docstring) -- omitted entirely (not passed at all) unless a caller
+    explicitly set one, so request_approval_and_wait's own real defaults
+    apply for every production call, unchanged."""
+    posix = relative.as_posix()
+    kwargs = {}
+    if timeout_s is not None:
+        kwargs["timeout_s"] = timeout_s
+    if poll_interval_s is not None:
+        kwargs["poll_interval_s"] = poll_interval_s
+    decision, detail = request_approval_and_wait(
+        "scope_expansion",
+        f"write outside declared task scope: {posix}",
+        [posix],
+        "medium",
+        tool_name=tool_name or "write_file",
+        command=posix,
+        **kwargs,
+    )
+    if decision == "approved":
+        _emit(
+            "scope_expanded",
+            expected=list(_contract_scope_prefixes or []),
+            actual=[posix],
+            approved=True,
+            approvedBy=detail or None,
+        )
+        return
+    raise ToolPolicyBlock(
+        f"out-of-scope write requires human approval [{decision}]: {posix}"
+    )
 
 
 def architect_shell_policy(command, workspace):
@@ -9189,10 +9333,15 @@ def run_engineer(
     # doesn't change mid-session. Drives both the deterministic advisory
     # triggers (regardless of architect_consult_enabled) and, gated by
     # that flag too, whether consult_architect is offered at all.
-    global _loaded_architecture_plan, _architect_consult_enabled
+    global _loaded_architecture_plan, _architect_consult_enabled, _contract_scope_prefixes
     _loaded_architecture_plan = _load_architecture_plan_for_engineer()
     architecture_plan = _loaded_architecture_plan
     _architect_consult_enabled = architect_consult_enabled
+
+    # V7 §15 follow-up: load once per session, same convention as the
+    # architecture plan just above -- GLIMMER_CONTRACT_SCOPE doesn't
+    # change mid-session either.
+    _contract_scope_prefixes = _load_contract_scope_prefixes()
 
     _augment_tools_with_consult_architect(
         metadata, tools, architecture_plan, architect_consult_enabled,
@@ -10651,6 +10800,155 @@ def _approval_wait_selfcheck() -> None:
     print("approval wait loop (V7 §14/§35) self-check: PASS (12/12)")
 
 
+def _scope_expansion_selfcheck() -> None:
+    """V7 §15 follow-up ("large expansion -> pause for approval") self-
+    check. Same tiny-timeout/no-real-sleep discipline as
+    _approval_wait_selfcheck: every approval round-trip below resolves in
+    milliseconds via check_write_path's test-only approval_timeout_s/
+    approval_poll_interval_s overrides, never the real 300s/2s production
+    defaults.
+
+    Run with: python3 glimmer-engineer.py --scope-approval-selfcheck
+    """
+    import tempfile
+    import threading
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID, _contract_scope_prefixes
+    real_events_path, real_session_id = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    real_scope_prefixes = _contract_scope_prefixes
+
+    try:
+        with tempfile.TemporaryDirectory() as wd:
+            ws = Path(wd)
+            (ws / "src" / "dialog").mkdir(parents=True)
+            (ws / "backend").mkdir()
+            in_scope = ws / "src" / "dialog" / "file.ts"
+            out_of_scope = ws / "backend" / "x.ts"
+
+            # 1. Absent env, no session dir at all: legacy behavior byte-
+            #    identical -- an out-of-scope-shaped write is never
+            #    blocked or paused. If this accidentally DID try to
+            #    request approval, request_approval_and_wait would fail
+            #    closed to "unavailable" (no GLIMMER_EVENTS_PATH) and this
+            #    would raise instead of returning -- so this also proves
+            #    the check is a true no-op, not silently swallowed.
+            _contract_scope_prefixes = None
+            GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = None, None
+            check_write_path(out_of_scope, ws, "write_file")  # must NOT raise
+
+            with tempfile.TemporaryDirectory() as td:
+                session_dir = Path(td)
+                events_path = session_dir / "events.jsonl"
+                events_path.write_text("")
+                GLIMMER_EVENTS_PATH = str(events_path)
+                GLIMMER_SESSION_ID = "sess-scope-selfcheck"
+
+                # 2. A real session dir now exists, but GLIMMER_CONTRACT_
+                #    SCOPE was never set (_contract_scope_prefixes stays
+                #    None) -- still a complete no-op: no approval request,
+                #    no scope_expanded event, write proceeds.
+                check_write_path(out_of_scope, ws, "write_file")  # must NOT raise
+                assert load_approvals(session_dir) == {}
+                assert events_path.read_text() == ""
+
+                # 3. Explicit scope declared: an IN-scope write is
+                #    completely untouched -- no approval requested.
+                _contract_scope_prefixes = ["src/dialog"]
+                check_write_path(in_scope, ws, "write_file")  # must NOT raise
+                assert load_approvals(session_dir) == {}
+
+                # 4. Out-of-scope + explicit scope + approved: bound to
+                #    the exact relative path, write proceeds, and a
+                #    scope_expanded event carries approval provenance.
+                #    v2.py's own post-hoc scopeApproved gate computation is
+                #    untouched by any of this (a separate process/file);
+                #    this only asserts what THIS process's write-time
+                #    check does.
+                def _approve_soon():
+                    time.sleep(0.03)
+                    approvals = load_approvals(session_dir)
+                    [approval_id] = approvals.keys()
+                    record = approvals[approval_id]
+                    assert record["boundTool"] == "write_file", record
+                    assert record["boundCommand"] == "backend/x.ts", record
+                    record["status"] = "approved"
+                    record["approvedBy"] = "daniel"
+                    _atomic_write_json(_approvals_path(session_dir), approvals)
+
+                threading.Thread(target=_approve_soon, daemon=True).start()
+                check_write_path(
+                    out_of_scope, ws, "write_file",
+                    approval_timeout_s=2, approval_poll_interval_s=0.01,
+                )  # must NOT raise
+                scope_events = [
+                    json.loads(line) for line in events_path.read_text().splitlines()
+                    if json.loads(line).get("type") == "scope_expanded"
+                ]
+                assert len(scope_events) == 1, scope_events
+                assert scope_events[0]["expected"] == ["src/dialog"]
+                assert scope_events[0]["actual"] == ["backend/x.ts"]
+                assert scope_events[0]["approved"] is True
+                assert scope_events[0]["approvedBy"] == "daniel"
+
+                # 5. Out-of-scope + explicit scope + denied: fails closed
+                #    (ToolPolicyBlock -- the same exception class every
+                #    other check_write_path rejection raises, so
+                #    execute_tool's existing catch routes it through the
+                #    normal tool_blocked/POLICY_BLOCK audit path with no
+                #    new plumbing).
+                def _deny_soon():
+                    time.sleep(0.03)
+                    approvals = load_approvals(session_dir)
+                    pending = [k for k, v in approvals.items() if v.get("status") == "pending"]
+                    [approval_id] = pending
+                    approvals[approval_id]["status"] = "denied"
+                    approvals[approval_id]["approvedBy"] = "daniel"
+                    _atomic_write_json(_approvals_path(session_dir), approvals)
+
+                threading.Thread(target=_deny_soon, daemon=True).start()
+                try:
+                    check_write_path(
+                        out_of_scope, ws, "write_file",
+                        approval_timeout_s=2, approval_poll_interval_s=0.01,
+                    )
+                    raise AssertionError("a denied scope expansion must raise ToolPolicyBlock")
+                except ToolPolicyBlock as exc:
+                    assert "denied" in str(exc), exc
+
+                # 6. Out-of-scope + explicit scope + nobody ever decides:
+                #    timeout also fails closed.
+                try:
+                    check_write_path(
+                        out_of_scope, ws, "write_file",
+                        approval_timeout_s=0.05, approval_poll_interval_s=0.01,
+                    )
+                    raise AssertionError("an unresolved scope expansion must time out closed")
+                except ToolPolicyBlock as exc:
+                    assert "timeout" in str(exc), exc
+
+                # 7. Composition/traversal can't sneak past this check:
+                #    resolve_workspace_path's containment guard runs
+                #    BEFORE check_write_path even sees a path (secure_
+                #    tool_arguments' existing call order), so a traversal
+                #    attempt never reaches the scope check at all -- no
+                #    approval request, no scope_expanded event, just the
+                #    pre-existing "escapes repository" block.
+                before = load_approvals(session_dir)
+                try:
+                    secure_tool_arguments("write_file", {"path": "../outside.txt"}, ws)
+                    raise AssertionError("a path escaping the workspace must still be blocked")
+                except ToolPolicyBlock as exc:
+                    assert "escapes repository" in str(exc), exc
+                assert load_approvals(session_dir) == before, (
+                    "a blocked traversal attempt must never reach the scope-expansion check"
+                )
+    finally:
+        GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = real_events_path, real_session_id
+        _contract_scope_prefixes = real_scope_prefixes
+
+    print("scope-expansion approval (V7 §15 follow-up) self-check: PASS (7/7)")
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -10870,6 +11168,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--approval-wait-selfcheck"]:
         _approval_wait_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--scope-approval-selfcheck"]:
+        _scope_expansion_selfcheck()
         sys.exit(0)
 
     try:

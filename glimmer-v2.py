@@ -2590,7 +2590,7 @@ a genuine fix may still require another file if the evidence supports it.
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
                      plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
-                     consult_request=None, timeout=None):
+                     consult_request=None, timeout=None, scope_prefixes=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -2640,6 +2640,15 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     # its own budget/turns are untouched (C1 task scoping).
     if plan_candidate_count > 0:
         env["GLIMMER_PLAN_CANDIDATES"] = str(plan_candidate_count)
+    # V7 §15 follow-up ("large expansion -> pause for approval"): same
+    # spawn-env plumbing again -- only ever set when the caller resolved a
+    # real, non-empty list of expected prefixes (see _expected_prefixes),
+    # i.e. only for the real engineer run (mode is None); architect/
+    # consult/review calls never pass this. Additive and opt-in: no
+    # scope_prefixes means no env var at all, which is exactly today's
+    # behavior in glimmer-engineer.py (see _contract_scope_prefixes there).
+    if scope_prefixes:
+        env["GLIMMER_CONTRACT_SCOPE"] = json.dumps(list(scope_prefixes))
     with log_path.open("w", encoding="utf-8") as log:
         # Round 8 whole-round review (MJ4): `start_new_session` only when a
         # `timeout` is actually set (only run_architect_escalation ever
@@ -6315,6 +6324,19 @@ def main():
                                source=t.get("source"), priority=t.get("priority"))
             save()
 
+        # V7 §15 follow-up ("large expansion -> pause for approval"):
+        # computed once, deterministically, from the fixed task contract --
+        # not re-derived per repair iteration, same convention as
+        # candidate_evidence above. `or None` collapses an empty list
+        # (contract has no bounded scope -- e.g. scope.package ==
+        # "repository") to the same "don't set the env var at all" state
+        # invoke_engineer's own `if scope_prefixes:` guard already treats
+        # identically -- absent env is glimmer-engineer.py's one and only
+        # "no scope guard active" signal (see _contract_scope_prefixes
+        # there), so this must never pass an empty list as if it meant
+        # something.
+        engineer_scope_prefixes = _expected_prefixes(contract.get("scope") or {}) or None
+
         for iteration in range(args.max_repairs + 1):
             if iteration > 0:
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
@@ -6332,7 +6354,8 @@ def main():
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
                                  plan_candidate_count=len(candidate_evidence),
-                                 architect_consult_enabled=architecture_plan is not None)
+                                 architect_consult_enabled=architecture_plan is not None,
+                                 scope_prefixes=engineer_scope_prefixes)
             # Task 2.3 (V7 §5.11): gates.implementationComplete tracks the
             # MOST RECENT engineer invocation this iteration -- a revise
             # round below reassigns this to revise_rc, exactly mirroring
@@ -6723,6 +6746,7 @@ def main():
                         session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
                         events_path, sid, plan_candidate_count=len(candidate_evidence),
                         architect_consult_enabled=architecture_plan is not None,
+                        scope_prefixes=engineer_scope_prefixes,
                     )
                     last_engineer_rc = revise_rc
                     files = changed_files(ws, baseline)
