@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -133,6 +134,16 @@ def canonical_session_state(raw_status: str) -> str:
         return "verified"
     if raw_status == "no-change-unverified":
         return "needs_review"
+    # Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string
+    # directly into manifest.json (the ONLY writer while it's blocked inside
+    # invoke_engineer's subprocess, session directory is shared and no other
+    # writer touches manifest.json during that window) the moment a YELLOW-
+    # classified action needs a human decision, and reverts it to whatever
+    # raw status was there before as soon as the wait resolves (approved,
+    # denied, or timed out) -- so this value is only ever real while a
+    # session is actually paused waiting on approvals.json.
+    if raw_status == "waiting-for-approval":
+        return "waiting_for_approval"
     # C2 (glimmer-v7): terminal status when the architect review gate
     # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
     # or the review budget is exhausted — V7 §5.10's rule: a session in
@@ -163,6 +174,78 @@ def canonical_session_state(raw_status: str) -> str:
     # Unrecognized raw status: never default to in-flight — surface it for a
     # human to look at instead of misreporting a live session.
     return "needs_review"
+
+
+def _resolve_orphaned_pending_approval(session_dir) -> None:
+    """8.3 review fix-round (M3, V7 §14/§35): called ONCE, first thing in
+    main()'s unconditional `finally` block, so a session that ends while a
+    YELLOW approval is still genuinely pending never leaves a stale
+    Approve/Deny card behind. This happens when the glimmer-engineer.py
+    subprocess is killed mid-wait (e.g. a Control Center Cancel/SIGTERM
+    while request_approval_and_wait's poll loop is sleeping) before its
+    own cleanup ever runs -- its manifest.json patch and approvals.json
+    request are both still sitting there as "pending".
+
+    Reads manifest.json FRESH from disk, not v2's own in-memory `manifest`
+    dict -- that dict never carries "pendingApproval" at all (only the
+    engineer subprocess's direct, out-of-band patch does, per save()'s
+    single-writer-invariant comment above), so this is the only place
+    that fact is observable. This function's own manifest.json write is
+    otherwise-redundant-but-harmless (the finally block's later save()
+    call overwrites it again momentarily afterward, from v2's clean
+    in-memory state, with no "pendingApproval" key either way) -- the
+    genuinely non-redundant part is resolving the approvals.json sidecar
+    record itself, which nothing else in this process ever touches.
+
+    Never raises -- every read/write here is best-effort, tolerant of a
+    missing/malformed manifest.json or approvals.json, matching every
+    other session-dir reader/writer in this file."""
+    manifest_path = Path(session_dir) / "manifest.json"
+    try:
+        on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(on_disk, dict):
+        return
+    pending = on_disk.get("pendingApproval")
+    if not isinstance(pending, dict):
+        return  # the common case: nothing was ever left pending
+
+    resolved_by = "system: session ended before a human decided (orphaned)"
+    resolved_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    approval_id = pending.get("approvalId")
+    if approval_id:
+        approvals_path = Path(session_dir) / "approvals.json"
+        try:
+            approvals = json.loads(approvals_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            approvals = {}
+        if not isinstance(approvals, dict):
+            approvals = {}
+        record = approvals.get(approval_id)
+        if isinstance(record, dict) and record.get("status") == "pending":
+            record["status"] = "denied"
+            record["approvedBy"] = resolved_by
+            record["resolvedAt"] = resolved_at
+            approvals[approval_id] = record
+            try:
+                approvals_path.write_text(json.dumps(approvals, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+            print(f"[V2] orphaned YELLOW approval {approval_id!r} resolved: denied ({resolved_by})")
+
+    if "_preApprovalStatus" in on_disk:
+        on_disk["status"] = on_disk.pop("_preApprovalStatus")
+    if "_preApprovalState" in on_disk:
+        on_disk["state"] = on_disk.pop("_preApprovalState")
+    else:
+        on_disk["state"] = canonical_session_state(on_disk.get("status") or "")
+    on_disk.pop("pendingApproval", None)
+    try:
+        manifest_path.write_text(json.dumps(on_disk, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def read_session_events(events_path: Path) -> list:
@@ -480,6 +563,32 @@ def compute_scope_guard(changed: list, contract: dict) -> dict:
         for p in expected
     )]
     return {"inScope": len(expanded) == 0, "expected": expected, "actual": actual, "expandedFiles": expanded}
+
+
+# Task 8.3 (V7 §14/§35) YELLOW approval-boundary classification lives ONLY
+# in glimmer-engineer.py now (classify_yellow there), not here. 8.3 review
+# fix-round (C1/C2/C3): the original version of this function -- in BOTH
+# files -- was an independent token scan that re-implemented shell_policy's
+# own parsing with none of its preamble (composition/substitution/quoting
+# rejection, --prefix containment, position-exact subcommand extraction),
+# letting `git push`/`npm run deploy` and friends execute after a card that
+# said "modify_dependencies / medium risk". The fix delegates the real
+# verdict to shell_policy itself (its new yellow_relax hook) -- but
+# shell_policy, and every command it dispatches, lives ONLY in
+# glimmer-engineer.py; this file has no workspace/exec_shell_command
+# concept to delegate through at all. A copy here could therefore never be
+# held to the same standard as the real one and would only invite the two
+# copies drifting apart (exactly the shape of bug that caused this
+# fix-round) -- removed rather than "fixed" a second time. See
+# glimmer-engineer.py's classify_yellow for the real implementation and its
+# --approval-wait-selfcheck for the reproduction-command coverage.
+#
+# V7 §15 scope-expansion YELLOW ("large expansion -> pause for approval")
+# was dropped in the same fix-round for an unrelated reason (M4): it had no
+# caller in either process -- glimmer-engineer.py has no structured
+# contract.scope to check it against without new spawn-env plumbing, out
+# of scope here -- and shipping an unreachable classifier arm is worse
+# than not having one. Tracked as future work, not shipped.
 
 
 def _scope_guard_selfcheck() -> None:
@@ -2460,12 +2569,14 @@ a genuine fix may still require another file if the evidence supports it.
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
-                     plan_candidate_count=0, review_request=None, architect_consult_enabled=False):
+                     plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
+                     consult_request=None, timeout=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
         # sets this — reuses this same spawn shape (same env plumbing,
         # same stdout/log tee) instead of a second subprocess helper.
+        # Task 8.2 additively reuses it a second time for mode="consult".
         cmd += ["--mode", mode]
     if review_request is not None:
         # C2 (glimmer-v7): only ever set alongside mode="architect" —
@@ -2474,6 +2585,10 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         # branches on this flag's presence). No new mode string, so every
         # existing architect read-only guard still applies unchanged.
         cmd += ["--review-request", str(review_request)]
+    if consult_request is not None:
+        # Task 8.2 (V7 §23.15): only ever set alongside mode="consult" —
+        # see run_architect_escalation below.
+        cmd += ["--consult-request", str(consult_request)]
     if max_turns is not None:
         cmd += ["--max-turns", str(max_turns)]
     # Task 2.4 (V7 §5.5 second half): only ever passed True alongside a
@@ -2506,13 +2621,37 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     if plan_candidate_count > 0:
         env["GLIMMER_PLAN_CANDIDATES"] = str(plan_candidate_count)
     with log_path.open("w", encoding="utf-8") as log:
+        # Round 8 whole-round review (MJ4): `start_new_session` only when a
+        # `timeout` is actually set (only run_architect_escalation ever
+        # passes one -- every other caller is unaffected) -- puts this
+        # subprocess in its own process group so a timeout kill can reach
+        # any grandchildren it spawns too. Confirmed necessary, not just
+        # defensive: killing only the direct child left a still-running
+        # grandchild holding the stdout pipe open, so `for line in
+        # p.stdout` below never saw EOF and the "timeout" silently waited
+        # out the full hang anyway.
         p = subprocess.Popen(cmd, cwd=str(ws), text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, env=env, bufsize=1)
+                             stderr=subprocess.STDOUT, env=env, bufsize=1,
+                             start_new_session=bool(timeout))
         assert p.stdout is not None
-        for line in p.stdout:
-            sys.stdout.write(line)
-            log.write(line)
-        return p.wait()
+
+        def _kill_on_timeout():
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                p.kill()
+
+        timer = threading.Timer(timeout, _kill_on_timeout) if timeout else None
+        if timer is not None:
+            timer.start()
+        try:
+            for line in p.stdout:
+                sys.stdout.write(line)
+                log.write(line)
+            return p.wait()
+        finally:
+            if timer is not None:
+                timer.cancel()
 
 
 # ============================================================
@@ -3066,30 +3205,40 @@ def gates_block_verified(gates: dict) -> bool:
     resolved(tasks) returned False -- some required task is unresolved)
     blocks. None means no tasks.json (C3's task graph never ran for this
     session), same "mechanism didn't run -- not applicable" pass-through
-    every other optional gate here already uses."""
+    every other optional gate here already uses.
+
+    Task 8.1 (V7 §23.10): gates.customerReadinessApproved joins the same
+    True/False/None contract -- computed by compute_customer_readiness_gate
+    from the contract's optional qualityGates plus the session's
+    DeliveryReview. None means qualityGates.customerReadinessRequired was
+    never set (gate not requested for this task), same "not applicable"
+    pass-through as the others; False (required but missing/failed review,
+    or a real review that didn't meet qualityGates.minimumCustomerReadiness)
+    blocks exactly like documentationCurrent=False does."""
     if gates.get("implementationComplete") is not True:
         return True
     if gates.get("verificationPassed") is not True:
         return True
     return any(gates.get(key) is False for key in
                 ("architectureApproved", "scopeApproved", "tasksResolved",
-                 "documentationCurrent"))
+                 "documentationCurrent", "customerReadinessApproved"))
 
 
 def blocked_gate_names(gates: dict) -> list:
-    """Review round 1 (Important) + Task 4.2 + Task 7.1: which gate(s)
-    actually caused gates_block_verified to return True, in the same
-    checked order -- mirrors gates_block_verified exactly (same two
+    """Review round 1 (Important) + Task 4.2 + Task 7.1 + Task 8.1: which
+    gate(s) actually caused gates_block_verified to return True, in the
+    same checked order -- mirrors gates_block_verified exactly (same two
     hard-required keys, same not-False-only set, now including
-    tasksResolved and documentationCurrent) so the two can never silently
-    drift apart. Feeds describe_blocked_gates' honest, cause-naming
-    failure detail."""
+    tasksResolved, documentationCurrent, and customerReadinessApproved) so
+    the two can never silently drift apart. Feeds describe_blocked_gates'
+    honest, cause-naming failure detail."""
     blocked = []
     if gates.get("implementationComplete") is not True:
         blocked.append("implementationComplete")
     if gates.get("verificationPassed") is not True:
         blocked.append("verificationPassed")
-    for key in ("architectureApproved", "scopeApproved", "tasksResolved", "documentationCurrent"):
+    for key in ("architectureApproved", "scopeApproved", "tasksResolved",
+                "documentationCurrent", "customerReadinessApproved"):
         if gates.get(key) is False:
             blocked.append(key)
     return blocked
@@ -3146,6 +3295,95 @@ def describe_blocked_gates(manifest: dict) -> str:
     if not parts:
         return "one or more V7 §5.11 gates blocked promotion to verified"
     return "; ".join(parts)
+
+
+# ============================================================
+# Task 8.1 (V7 §23.10/§23.11): "would I send this to a customer?" quality
+# gate. glimmer-engineer.py already writes delivery-review.json (V7 §23.7,
+# validate_delivery_review's DELIVERY_REVIEW_READINESS_VALUES) at the end
+# of its own run, in the SAME session dir this orchestrator owns -- these
+# helpers only ever READ that file, never write it. Best-to-worst order,
+# identical to @glimmer/shared's DeliveryReviewCustomerReadiness union and
+# glimmer-engineer.py's DELIVERY_REVIEW_READINESS_VALUES (that one's a set,
+# unordered -- this tuple is the one place the ORDER is a fact, needed for
+# both the gate comparison below and statuses.overall's worst-of below).
+# ============================================================
+CUSTOMER_READINESS_ORDER = (
+    "ready_to_ship",
+    "ready_with_known_limitations",
+    "needs_polish",
+    "needs_rework",
+    "not_customer_ready",
+)
+
+
+def compare_customer_readiness(readiness: str, minimum: str) -> bool:
+    """Pure comparison over CUSTOMER_READINESS_ORDER: True iff `readiness`
+    is at least as good as `minimum` (equal or earlier in the best-to-worst
+    order). Fails closed (returns False, never raises) on either argument
+    not being a recognized value -- upstream callers only ever pass values
+    already validated (contract.qualityGates.minimumCustomerReadiness via
+    argparse `choices=`/control-center's validateAdvanced; the review's own
+    customerReadiness via validate_delivery_review), but this function's own
+    contract is "never fabricate True from garbage input", independent of
+    whether an upstream check happens to hold."""
+    if readiness not in CUSTOMER_READINESS_ORDER or minimum not in CUSTOMER_READINESS_ORDER:
+        return False
+    return CUSTOMER_READINESS_ORDER.index(readiness) <= CUSTOMER_READINESS_ORDER.index(minimum)
+
+
+def compute_customer_readiness_gate(quality_gates, delivery_review) -> "bool | None":
+    """V7 §23.10's gate, as a pure function of already-loaded data (same
+    discipline as compute_doc_gate -- both main() and
+    --quality-gates-selfcheck call this SAME function). Returns:
+
+    None  -- qualityGates.customerReadinessRequired was never set (absent
+             contract section, or explicitly False): gate not requested for
+             this task, "not applicable", never blocks. Backend-only/
+             internal tasks (V7 §23.10's own guidance) simply never pass
+             --customer-readiness-required, so this is the default for
+             every existing session, unchanged behavior.
+    False -- required but: no delivery-review.json exists for this session
+             (fail closed -- never fabricate a passing review that was
+             never generated), or its customerReadiness isn't a recognized
+             value, or it IS recognized but doesn't meet
+             qualityGates.minimumCustomerReadiness (when given).
+    True  -- required, a real review exists, and either no minimum was
+             given (customerReadinessRequired alone only asks "did the
+             self-review actually run", not "did it clear some bar") or the
+             review's customerReadiness meets/exceeds the given minimum.
+    """
+    if not quality_gates or not quality_gates.get("customerReadinessRequired"):
+        return None
+    if not isinstance(delivery_review, dict):
+        return False
+    readiness = delivery_review.get("customerReadiness")
+    if readiness not in CUSTOMER_READINESS_ORDER:
+        return False
+    minimum = quality_gates.get("minimumCustomerReadiness")
+    if minimum is None:
+        return True
+    return compare_customer_readiness(readiness, minimum)
+
+
+def load_delivery_review(session_dir):
+    """Load delivery-review.json from the session dir (same convention as
+    load_architecture_plan above -- glimmer-engineer.py's
+    _delivery_review_file_path writes to the parent of GLIMMER_EVENTS_PATH,
+    which IS session_dir from this side). Returns the parsed dict, or None
+    uniformly for every degraded case: file missing, unreadable, not valid
+    JSON, or not a JSON object. Unlike load_architecture_plan, a
+    reviewFailed review is NOT discarded here -- _fallback_delivery_review
+    already sets customerReadiness to "not_customer_ready" (the worst real
+    value), which is exactly correct fail-closed input for
+    compute_customer_readiness_gate above; a generation failure should read
+    as "definitely not customer ready", not as "no evidence either way"."""
+    path = Path(session_dir) / "delivery-review.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def architect_review_failure_text(review):
@@ -4514,6 +4752,558 @@ def run_doc_pass(ws, events_path, sid, manifest: dict, tasks, session) -> None:
 
 
 # ============================================================
+# Task 8.1 (V7 §23.11): combined statuses -- a single honest composite
+# object (manifest["statuses"]), separate from the per-gate booleans above
+# and from control-center's own (independently computed, read-time)
+# finalStatus (server/src/lib/sessions.ts composeFinalStatus/§22.17). Both
+# exist for different reasons: finalStatus is the gateway's own read-time
+# summary of the SAME manifest facts; this is the orchestrator's own
+# self-report, written once, at session close-out, mirroring V7 §23.11's
+# example shape ("Do not overload one status field").
+#
+# Each leg keeps ITS OWN natural vocabulary rather than a fabricated shared
+# one -- reusing exactly what already exists elsewhere in this codebase
+# (ladder: reuse before inventing): "VERIFIED"/"FAILED"/"NOT_RUN" for
+# technical (a deliberately coarser mirror of control-center's richer
+# VerificationOverall -- see compute_technical_status's own docstring for
+# the ceiling), "approved"/"rejected"/"not_run" for architecture/
+# documentation (control-center's own FinalGateStatus), the exact
+# NOT_RUN/PASS/FAIL/BLOCKED/PASS_WITH_WARNINGS vocabulary glimmer-visual.py
+# itself already writes to findings.json for visual (plus the "not_run"
+# sentinel for "no visual/ dir at all", same distinction control-center's
+# FinalStatus.visual already draws), and CUSTOMER_READINESS_ORDER's 5-level
+# vocabulary for delivery. overall is expressed in that same 5-level
+# vocabulary -- the only one granular enough to rank every leg's outcome
+# against each other -- via compute_overall_status's worst-of composition.
+# ============================================================
+
+VISUAL_FINDINGS_STATUSES = ("NOT_RUN", "PASS", "FAIL", "BLOCKED", "PASS_WITH_WARNINGS")
+
+
+def compute_technical_status(manifest: dict) -> str:
+    """statuses.technical: "NOT_RUN" when this session's last attempt never
+    reached a real verificationResults list (no attempts at all -- e.g.
+    --repo-map-only -- or the one attempt recorded exited before verify()
+    ever ran, e.g. a changed-files-budget-exceeded break); otherwise
+    "VERIFIED" when every recorded check's own ok is True, "FAILED" when
+    any required check's own ok is False.
+
+    Round 8 whole-round review (MJ2): derived ONLY from this attempt's own
+    verificationResults, never from manifest["status"] -- a session can
+    reach a terminal "needs-architect-review-consistency-rejected" (or any
+    other non-VERIFIED-non-FAILED-terminal) status purely because a
+    non-technical gate (delivery-readiness, architecture, consistency)
+    blocked promotion, with every verification check having actually
+    passed; reading manifest["status"] there reported a fabricated FAILED
+    for a session with zero technical failures, poisoning statuses.overall
+    with it. This mirrors control-center's own overallFromManifest
+    (server/src/lib/sessions.ts) at the same 3-state ceiling this leg has
+    always deliberately kept -- see the ceiling note below.
+
+    Deliberately a coarser 3-state mirror of control-center's own
+    VerificationOverall (which also distinguishes PARTIAL/BLOCKED/
+    BASELINE_FAILURE/NEEDS_REVIEW -- states derived partly from gateway-
+    side facts, like human override history, that never live in this
+    manifest at all): this is an honest, best-effort orchestrator self-
+    report, not a replacement for control-center's own richer read-time
+    computation. ponytail: 3-state ceiling; widen to match VerificationOverall
+    exactly if a future task needs statuses.technical to drive UI logic
+    beyond a plain badge.
+    """
+    attempts = manifest.get("attempts") or []
+    if not attempts:
+        return "NOT_RUN"
+    last = attempts[-1] if isinstance(attempts[-1], dict) else {}
+    results = last.get("verificationResults")
+    if not results:
+        return "NOT_RUN"
+    return "VERIFIED" if all(isinstance(r, dict) and r.get("ok") for r in results) else "FAILED"
+
+
+def _gate_to_status_leg(value) -> str:
+    """True/False/None -> "approved"/"rejected"/"not_run" -- the exact
+    mapping control-center's own gateToFinalStatus (server/src/lib/
+    sessions.ts) already uses for gates.architectureApproved/
+    documentationCurrent, reused verbatim here for the same two gates'
+    statuses legs."""
+    if value is True:
+        return "approved"
+    if value is False:
+        return "rejected"
+    return "not_run"
+
+
+def read_visual_status_leg(session_dir) -> str:
+    """statuses.visual: "not_run" when this session never produced a
+    visual/ dir at all (the "visual" verify token was never opted into --
+    same distinction control-center's readSession draws between its own
+    "not_run" sentinel and VisualFindingsStatus's own "NOT_RUN"). Once the
+    dir exists, read findings.json's own "status" field verbatim (already
+    exactly VISUAL_FINDINGS_STATUSES -- glimmer-visual.py's build_findings
+    is the sole writer); missing/unreadable/malformed/unrecognized findings
+    honestly degrade to "NOT_RUN" (capture ran, but nothing readable to
+    report), never fabricated as PASS."""
+    visual_dir = Path(session_dir) / "visual"
+    if not visual_dir.is_dir():
+        return "not_run"
+    try:
+        findings_doc = json.loads((visual_dir / "findings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "NOT_RUN"
+    status = findings_doc.get("status") if isinstance(findings_doc, dict) else None
+    return status if status in VISUAL_FINDINGS_STATUSES else "NOT_RUN"
+
+
+def compute_delivery_status_leg(delivery_review) -> str:
+    """statuses.delivery: the DeliveryReview's own customerReadiness
+    verbatim (already one of CUSTOMER_READINESS_ORDER's 5 values --
+    validate_delivery_review/_fallback_delivery_review both guarantee
+    this), or "not_run" when no delivery-review.json exists for this
+    session at all (never fabricated as a specific readiness level)."""
+    if not isinstance(delivery_review, dict):
+        return "not_run"
+    readiness = delivery_review.get("customerReadiness")
+    return readiness if readiness in CUSTOMER_READINESS_ORDER else "not_run"
+
+
+# Per-leg rank functions: map each leg's OWN vocabulary onto
+# CUSTOMER_READINESS_ORDER's index space (0 = best, len-1 = worst) purely
+# for worst-of comparison purposes -- None means "this leg never produced a
+# real judgment", excluded from the comparison entirely (an absent/
+# not-run subsystem must never drag `overall` down, V7 §23.11's own
+# "honest, not fabricated" requirement).
+_TECHNICAL_RANK = {"VERIFIED": 0, "FAILED": len(CUSTOMER_READINESS_ORDER) - 1}
+_GATE_RANK = {"approved": 0, "rejected": len(CUSTOMER_READINESS_ORDER) - 1}
+_VISUAL_RANK = {"PASS": 0, "PASS_WITH_WARNINGS": 1, "BLOCKED": 3, "FAIL": len(CUSTOMER_READINESS_ORDER) - 1}
+
+
+def compute_overall_status(technical: str, architecture: str, documentation: str,
+                            visual: str, delivery: str) -> str:
+    """statuses.overall: worst-of composition across every leg that
+    actually produced a real judgment, expressed in CUSTOMER_READINESS_
+    ORDER's own vocabulary (the only leg-vocabulary granular enough to rank
+    every other leg's outcome against it -- see this section's own header
+    comment). "not_run" only when EVERY leg is absent/not-run -- an honest
+    "nothing to report" rather than a fabricated best-case default."""
+    ranks = [r for r in (
+        _TECHNICAL_RANK.get(technical),
+        _GATE_RANK.get(architecture),
+        _GATE_RANK.get(documentation),
+        _VISUAL_RANK.get(visual),
+        CUSTOMER_READINESS_ORDER.index(delivery) if delivery in CUSTOMER_READINESS_ORDER else None,
+    ) if r is not None]
+    if not ranks:
+        return "not_run"
+    return CUSTOMER_READINESS_ORDER[max(ranks)]
+
+
+def compute_statuses(manifest: dict, session_dir) -> dict:
+    """Compose manifest["statuses"] (V7 §23.11) from facts already on
+    `manifest` (gates, attempts, status) plus two session-dir file reads
+    (visual/findings.json, delivery-review.json) -- same "pure function
+    called by both main() and its own selfcheck" discipline as
+    compute_doc_gate. Called exactly once, from main()'s `finally` block,
+    so it runs on EVERY exit path (same unconditional-coverage reasoning as
+    finalDiffHash just above its call site) -- even a session that never
+    reached a single gate gets an honest all-"not_run"-except-technical
+    statuses object, never an absent field."""
+    gates = manifest.get("gates") or {}
+    technical = compute_technical_status(manifest)
+    architecture = _gate_to_status_leg(gates.get("architectureApproved"))
+    documentation = _gate_to_status_leg(gates.get("documentationCurrent"))
+    visual = read_visual_status_leg(session_dir)
+    delivery = compute_delivery_status_leg(load_delivery_review(session_dir))
+    return {
+        "technical": technical,
+        "architecture": architecture,
+        "documentation": documentation,
+        "visual": visual,
+        "delivery": delivery,
+        "overall": compute_overall_status(technical, architecture, documentation, visual, delivery),
+    }
+
+
+# ============================================================
+# Task 8.2 (V7 §23.15): architect escalation for a delivery-review high/
+# critical concern. Purely deterministic TRIGGER (a severity match on the
+# review's own concerns[].severity -- no model judgment in the decision
+# to escalate, only in the resulting consultation), evaluated in main()'s
+# `finally` block, strictly AFTER every real terminal status is already
+# decided -- this can only ever add a second-opinion artifact, never
+# change session outcome. Reuses glimmer-engineer.py's existing consult_
+# architect model-call machinery via a new, minimal `--mode consult`
+# subprocess (see run_architect_escalation) rather than its live
+# consult_architect TOOL, whose CONSULT_ARCHITECT_BUDGET counter lives
+# and dies inside the (different, already-finished) engineering
+# subprocess's own memory.
+# ============================================================
+
+ESCALATION_SEVERITIES = {"high", "critical"}
+# Cheap, deterministic cap on how many concerns feed the escalation
+# question -- keeps the prompt small and focused, same reasoning as
+# ARCHITECT_REVIEW_DIFF_MAX_CHARS capping the review diff above.
+ESCALATION_MAX_CONCERNS = 3
+# Round 8 whole-round review (MJ4): invoke_engineer's Popen has no timeout
+# anywhere else in this file (the main engineering run is bounded by
+# --max-turns/the approval-wait poll loop instead) -- but this escalation
+# runs inside main()'s unconditional `finally`, strictly before the final
+# save(), so an unresponsive model subprocess here must not block session
+# finalization indefinitely. Conservative fixed budget for a single-
+# question consult call (V7 §23.15: a second opinion, not a second gate).
+ARCHITECT_ESCALATION_TIMEOUT_SECONDS = 300
+
+
+def compute_architect_escalation_trigger(delivery_review, architect_enabled) -> bool:
+    """V7 §23.15: True only when BOTH architect_enabled (this session had
+    architect mode on -- main()'s own `run_architect`, manual --architect-
+    first or the risk-based auto-trigger) AND delivery_review carries at
+    least one concern with severity "high" or "critical". False for every
+    other combination, including delivery_review being None (missing,
+    never generated, or unreadable) -- there is nothing real to escalate
+    without a concern to point at, and an architect-disabled session
+    never gets a second architect opinion it never asked for in the first
+    place."""
+    if not architect_enabled or not isinstance(delivery_review, dict):
+        return False
+    concerns = delivery_review.get("concerns")
+    if not isinstance(concerns, list):
+        return False
+    return any(
+        isinstance(c, dict) and c.get("severity") in ESCALATION_SEVERITIES
+        for c in concerns
+    )
+
+
+def build_escalation_question(delivery_review) -> str:
+    """Deterministic prompt text built ONLY from delivery_review's own
+    high/critical concerns (capped at ESCALATION_MAX_CONCERNS) -- no
+    other session data folded in, so this stays a small, focused
+    second-opinion ask rather than a second full architect review."""
+    concerns = [
+        c for c in (delivery_review.get("concerns") or [])
+        if isinstance(c, dict) and c.get("severity") in ESCALATION_SEVERITIES
+    ]
+    lines = [
+        f"[{c.get('severity')}/{c.get('category')}] {c.get('description', '')}"
+        for c in concerns[:ESCALATION_MAX_CONCERNS]
+    ]
+    return (
+        "The delivery self-review flagged the following high/critical "
+        "concern(s) about this session's implementation. Does this "
+        "indicate the implementation is architecturally unsound and "
+        "needs rework, or is the current approach still acceptable?\n\n"
+        + "\n".join(lines)
+    )[:2000]
+
+
+def load_architect_escalation(session_dir):
+    """Load architect-escalation.json (written by glimmer-engineer.py's
+    `--mode consult`, see run_architect_escalation below). Same uniform-
+    None-on-any-degraded-case contract as load_delivery_review: file
+    missing, unreadable, not valid JSON, or not a JSON object all return
+    None -- callers treat None as "no escalation for this session"
+    (never triggered, or the trigger fired but the subprocess never got
+    as far as writing anything at all)."""
+    path = Path(session_dir) / "architect-escalation.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, session, events_path, sid):
+    """V7 §23.15: exactly ONE architect consultation over a high/critical
+    delivery-review concern, spawned only when the caller's own compute_
+    architect_escalation_trigger already returned True. No re-review
+    loop: one question, one answer, written to architect-escalation.json
+    regardless of what the answer says -- §23.15 asks for a second
+    opinion, not a second gate that could block anything.
+
+    Must never affect session outcome: called only from main()'s
+    unconditional `finally` block, strictly after every real terminal
+    status is already decided. Any failure (subprocess spawn error, the
+    subprocess producing no output at all) degrades to a
+    consultationFailed architect-escalation.json rather than raising --
+    same fail-open contract as run_architect_first/run_architect_review.
+    A model-down failure INSIDE the subprocess is glimmer-engineer.py's
+    own run_consult_escalation's job to record honestly; this function's
+    own except/no-output guard below only covers failures that happen
+    OUTSIDE that subprocess (or before it can write anything).
+
+    Round 8 whole-round review (MJ4): the invoke_engineer call is capped by
+    ARCHITECT_ESCALATION_TIMEOUT_SECONDS -- an unresponsive model subprocess
+    here must not hang main()'s `finally` before the final save(). Both
+    escalation_path.write_text calls below are ALSO individually guarded
+    against OSError (fault-injection proved they weren't before: a session
+    dir that can't be written to -- e.g. chmod 0555 -- made the FIRST one
+    raise straight out of this function's own except handler, which then
+    propagated out of the unconditional `finally` itself). This function
+    now genuinely never raises, matching the promise above.
+    """
+    print("\n" + "=" * 72)
+    print(" [V2] Architect escalation: high/critical delivery-review concern")
+    print("=" * 72)
+
+    request_path = session / "escalation-request.json"
+    escalation_path = session / "architect-escalation.json"
+    rc = None
+
+    def _write_escalation_record(record) -> None:
+        try:
+            escalation_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        except OSError as write_exc:
+            print(f"[V2] WARN: failed to write architect-escalation.json: {write_exc}")
+
+    try:
+        request_path.write_text(
+            json.dumps({
+                "architecturePlan": architecture_plan,
+                "question": build_escalation_question(delivery_review),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        rc = invoke_engineer(
+            engineer, ws,
+            "Answer the architect escalation question in --consult-request.",
+            True,  # consult mode has no approval path -- same as architect mode
+            None,  # consult mode makes exactly one model call; no turn budget to set
+            session / "architect-escalation.log",
+            events_path, sid, mode="consult", consult_request=request_path,
+            timeout=ARCHITECT_ESCALATION_TIMEOUT_SECONDS,
+        )
+        print(f"[V2] Architect escalation subprocess exited with code {rc}")
+    except Exception as exc:  # noqa: BLE001 - escalation must never affect session outcome
+        print(f"[V2] WARN: architect escalation subprocess failed to run: {exc}")
+        _write_escalation_record({
+            "consultationFailed": True,
+            "reason": f"{type(exc).__name__}: {exc}",
+        })
+        return
+
+    if not escalation_path.exists():
+        # Subprocess never ran, crashed before writing, or the spawn
+        # itself raised above -- either way, no consultation artifact
+        # exists yet. Recorded honestly (never silent) so a session that
+        # triggered escalation always ends up with SOME architect-
+        # escalation.json, even a failed one.
+        _write_escalation_record({
+            "consultationFailed": True,
+            "reason": f"architect escalation subprocess (exit {rc}) produced no output",
+        })
+
+
+# ============================================================
+# Task 8.2 (V7 §23.16): final delivery packet -- a concise, entirely-
+# derived-from-existing-facts JSON handoff document, assembled exactly
+# once per session in the SAME unconditional `finally` block that already
+# assembles manifest["statuses"]. Every field is either a deterministic
+# session fact already on `manifest`/on disk, or (customerReadiness/
+# limitations/forwardPlan/confidence) the DeliveryReview's own model
+# output, carried through with an explicit "model-output" provenance tag
+# -- the same convention @glimmer/shared's SessionAssistantAnswer.
+# provenance already uses for the one other model-output-carrying API
+# response. Never fabricates: an artifact that never existed for this
+# session (no delivery-review.json, no architecture plan) reads back as
+# a real null, not an invented default.
+# ============================================================
+
+def compute_delivery_packet(manifest: dict, delivery_review, escalation=None) -> dict:
+    """Pure function of already-computed facts -- manifest (which by the
+    finally-block call site already carries statuses/gates/attempts/
+    finalChangedFiles/orchestratorUpdatedFiles/architectPlan) plus the
+    DeliveryReview dict already loaded by the caller (or None), plus
+    (MN1, round 8 whole-round review) the architect-escalation.json record
+    the SAME finally block writes strictly before this packet is assembled
+    (see the quality-gates selfcheck's MJ1 ordering assertion) -- None when
+    escalation never triggered for this session. Same "called by both
+    main() and its own selfcheck" discipline as compute_statuses."""
+    statuses = manifest.get("statuses") or {}
+    gates = manifest.get("gates") or {}
+    architect_plan_record = manifest.get("architectPlan")
+
+    attempts = manifest.get("attempts") or []
+    last_attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+
+    if isinstance(delivery_review, dict):
+        review_failed = bool(delivery_review.get("reviewFailed"))
+        customer_readiness = {
+            "value": delivery_review.get("customerReadiness"),
+            "provenance": "model-output",
+        }
+        limitations = {
+            "unresolvedItems": delivery_review.get("unresolvedItems") or [],
+            "intentionallyNotChanged": delivery_review.get("intentionallyNotChanged") or [],
+            "concerns": delivery_review.get("concerns") or [],
+            "provenance": "model-output",
+        }
+        forward_plan = {
+            "nextSteps": delivery_review.get("nextSteps") or [],
+            "provenance": "model-output",
+        }
+        confidence = dict(delivery_review.get("confidence") or {})
+        confidence["provenance"] = "model-output"
+        if review_failed:
+            # _fallback_delivery_review's degrade path -- still a REAL file
+            # on disk, just not a real review. Labeled rather than passed
+            # through silently, so a packet reader can't mistake a
+            # generation failure for genuine (if pessimistic) judgment.
+            customer_readiness["reviewFailed"] = True
+            limitations["reviewFailed"] = True
+            forward_plan["reviewFailed"] = True
+            confidence["reviewFailed"] = True
+    else:
+        customer_readiness = None
+        limitations = None
+        forward_plan = None
+        confidence = None
+
+    return {
+        "task": manifest.get("task"),
+        "planRef": {
+            "architectUsed": bool(architect_plan_record and architect_plan_record.get("used")),
+            "architectureApproved": gates.get("architectureApproved"),
+        } if architect_plan_record is not None else None,
+        "changedFiles": manifest.get("finalChangedFiles") or [],
+        "orchestratorUpdatedFiles": manifest.get("orchestratorUpdatedFiles") or [],
+        "verification": {
+            "status": statuses.get("technical", "NOT_RUN"),
+            "results": last_attempt.get("verificationResults"),
+        },
+        "visual": statuses.get("visual", "not_run"),
+        "statuses": statuses,
+        # NEW-MN1 (round-8 re-review): a gate-blocked session's summary
+        # must say so -- technical VERIFIED alone would read as shippable.
+        "blockedGates": manifest.get("blockedGates") or [],
+        "customerReadiness": customer_readiness,
+        "limitations": limitations,
+        "forwardPlan": forward_plan,
+        "confidence": confidence,
+        # The gateway (control-center), not this orchestrator, records a
+        # human's actual accept decision (human-acceptance.json, written
+        # later by POST /sessions/:id/accept) -- this packet is generated
+        # once, at session close-out, strictly BEFORE any human could have
+        # reviewed it. "pending" is therefore the one honest constant
+        # here, never a fabricated guess at a future human decision.
+        "humanReviewStatus": "pending",
+        # MN1 (round 8 whole-round review): passed through verbatim -- a
+        # real {"question", "answer"} record, a {"consultationFailed": True,
+        # "reason"} degrade record, or None (escalation never triggered).
+        # Never fabricated: this packet does not re-derive whether an
+        # escalation happened, it only reports what's already on disk.
+        "architectEscalation": escalation,
+    }
+
+
+def render_packet_summary(packet: dict) -> str:
+    """Deterministic plain-text rendering of `packet` -- NO model call,
+    matching V7 §23.16/§23.17's "concise delivery packet" prose shape.
+    Every line is a straight lookup on already-computed packet fields; an
+    absent (None) section renders as "Unavailable" rather than being
+    silently skipped, so the summary always has the same fixed shape
+    regardless of which artifacts this session actually produced."""
+    lines = ["DELIVERY PACKET", "=" * 40]
+    lines.append(f"Task: {packet.get('task') or 'Unavailable'}")
+
+    plan_ref = packet.get("planRef")
+    if plan_ref is None:
+        lines.append("Architecture: not engaged for this session")
+    else:
+        lines.append(
+            f"Architecture: used={plan_ref['architectUsed']} "
+            f"approved={plan_ref['architectureApproved']}"
+        )
+
+    changed = packet.get("changedFiles") or []
+    lines.append(f"Changed files ({len(changed)}): " + (", ".join(changed) if changed else "none"))
+
+    orch_files = packet.get("orchestratorUpdatedFiles") or []
+    if orch_files:
+        lines.append(f"Orchestrator-updated files: {', '.join(orch_files)}")
+
+    verification = packet.get("verification") or {}
+    lines.append(f"Verification: {verification.get('status', 'NOT_RUN')}")
+    lines.append(f"Visual: {packet.get('visual', 'not_run')}")
+
+    # NEW-MN1: overall + blocked gates in the summary -- "Verification:
+    # VERIFIED" on a gate-blocked session must not read as shippable.
+    statuses = packet.get("statuses") or {}
+    lines.append(f"Overall: {statuses.get('overall', 'not_run')}")
+    blocked = packet.get("blockedGates") or []
+    if blocked:
+        lines.append(f"Blocked gates: {', '.join(blocked)}")
+
+    readiness = packet.get("customerReadiness")
+    lines.append(f"Customer readiness: {readiness['value'] if readiness else 'Unavailable'}")
+
+    limitations = packet.get("limitations")
+    if limitations:
+        unresolved = limitations.get("unresolvedItems") or []
+        lines.append(
+            f"Known limitations ({len(unresolved)}): "
+            + ("; ".join(unresolved) if unresolved else "none reported")
+        )
+    else:
+        lines.append("Known limitations: Unavailable")
+
+    forward = packet.get("forwardPlan")
+    if forward:
+        steps = forward.get("nextSteps") or []
+        lines.append(
+            f"Plan forward ({len(steps)}): "
+            + ("; ".join(s.get("action", "") for s in steps if isinstance(s, dict)) if steps else "none proposed")
+        )
+    else:
+        lines.append("Plan forward: Unavailable")
+
+    confidence = packet.get("confidence")
+    lines.append(f"Confidence: {confidence.get('level') if confidence else 'Unavailable'}")
+
+    lines.append(f"Human review status: {packet.get('humanReviewStatus') or 'Unavailable'}")
+
+    # MN1 (round 8 whole-round review): packet-summary.txt is §23.16's
+    # human-handoff artifact -- a second architect opinion on a concern this
+    # SAME summary's "Known limitations" line just named must be visible
+    # here too, not only via the API/UI's separate DeliveryReview surface.
+    escalation = packet.get("architectEscalation")
+    if not isinstance(escalation, dict):
+        lines.append("Architect escalation: not triggered")
+    elif escalation.get("consultationFailed"):
+        lines.append(f"Architect escalation: consultation failed ({escalation.get('reason', 'unknown reason')})")
+    else:
+        lines.append(f"Architect escalation: {escalation.get('answer', '(see architect-escalation.json)')}")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_delivery_packet(manifest, session_dir, delivery_review):
+    """Assembles + writes delivery-packet.json and packet-summary.txt to
+    session_dir (V7 §23.16). Never raises: a write failure here must not
+    break session finalization -- same fail-tolerant discipline as the
+    rest of the `finally` block's bookkeeping writes. Returns the
+    assembled packet dict on success, None when the write failed -- so
+    the caller can gate delivery_packet_created on the artifact actually
+    existing (an event claiming a packet that isn't there would be a
+    fabrication). MN1 (round 8 whole-round review): also reads
+    architect-escalation.json for this session -- main()'s finally block
+    already runs the escalation strictly before this call (see the
+    quality-gates selfcheck's MJ1 ordering assertion), so the record, if
+    any, is already on disk by the time this reads it."""
+    packet = compute_delivery_packet(manifest, delivery_review, load_architect_escalation(session_dir))
+    try:
+        (Path(session_dir) / "delivery-packet.json").write_text(
+            json.dumps(packet, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        (Path(session_dir) / "packet-summary.txt").write_text(
+            render_packet_summary(packet), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"[V2] WARN: failed to write delivery packet: {exc}")
+        return None
+    return packet
+
+
+# ============================================================
 # Task 7.3 (V7 "Architecture Decision Records" / "ADR consultation"): the
 # ADR store lives at <workspace>/docs/decisions/ADR-NNNN.md, one file per
 # decision, a simple frontmatter block (not a real YAML parser -- stdlib
@@ -5131,6 +5921,21 @@ def main():
     ap.add_argument("--no-architect", action="store_true",
                     help="Explicitly opt out of the risk-based architect auto-trigger (V7 §5.5). "
                          "Errors if combined with --architect-first.")
+    # Task 8.1 (V7 §23.10): contract.qualityGates. `choices=` is the CLI-level
+    # fail-closed rejection for an unrecognized minimum -- argparse exits 2
+    # before any session dir is even created, same "reject, don't guess"
+    # posture control-center's own validateAdvanced (a 400) applies at its
+    # own boundary. Omitted entirely (both flags absent) means no
+    # qualityGates section at all -- same omit-when-unset contract every
+    # other optional TaskContract field here already follows.
+    ap.add_argument("--customer-readiness-required", action="store_true",
+                    help="Contract qualityGates.customerReadinessRequired: this session's "
+                         "DeliveryReview must exist (and, with --minimum-customer-readiness, "
+                         "must meet that bar) or gates.customerReadinessApproved=False blocks VERIFIED.")
+    ap.add_argument("--minimum-customer-readiness", choices=CUSTOMER_READINESS_ORDER, default=None,
+                    help="Contract qualityGates.minimumCustomerReadiness: the DeliveryReview's "
+                         "customerReadiness must be at least this good (V7 §23.10's own ordering, "
+                         "best to worst: " + ", ".join(CUSTOMER_READINESS_ORDER) + ").")
     args = ap.parse_args()
 
     ws = Path(args.workspace).expanduser().resolve()
@@ -5226,6 +6031,15 @@ def main():
     # unset contract just above).
     if args.max_changed_files is not None:
         contract["budgets"] = {"maxChangedFiles": args.max_changed_files}
+    # Task 8.1 (V7 §23.10): qualityGates -- omitted entirely when neither
+    # flag was passed, same convention as budgets/maxTurns above.
+    if args.customer_readiness_required or args.minimum_customer_readiness is not None:
+        quality_gates = {}
+        if args.customer_readiness_required:
+            quality_gates["customerReadinessRequired"] = True
+        if args.minimum_customer_readiness is not None:
+            quality_gates["minimumCustomerReadiness"] = args.minimum_customer_readiness
+        contract["qualityGates"] = quality_gates
 
     # Task 2.1 (V7 §5.5): risk score always computed (even on a run that
     # passes neither --architect-first nor --no-architect) so
@@ -5292,6 +6106,22 @@ def main():
     manifest_path = session / "manifest.json"
 
     def save():
+        # SINGLE-WRITER INVARIANT (8.3 review fix-round, M3, V7 §14/§35):
+        # this is a bare non-atomic write_text of the FULL in-memory
+        # `manifest` dict -- safe ONLY because this process never calls
+        # save() while a glimmer-engineer.py subprocess is running
+        # (invoke_engineer's `for line in p.stdout: ...` loop blocks this
+        # thread for the subprocess's entire lifetime; no save() call site
+        # exists between spawning it and it exiting). glimmer-engineer.py
+        # relies on exactly this gap to patch manifest.json directly
+        # (request_approval_and_wait's status="waiting-for-approval"/
+        # pendingApproval, via its own atomic os.replace) without a
+        # concurrent-writer race. Anyone adding a NEW save() call site
+        # inside that window (a progress heartbeat, a streaming status
+        # update, ...) breaks the approval card silently -- read this
+        # comment first. See _resolve_orphaned_pending_approval below for
+        # the recovery when the engineer subprocess dies mid-wait instead
+        # of resolving it itself.
         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -5345,6 +6175,12 @@ def main():
     # ever runs (e.g. readiness_probe failing below), which would otherwise
     # be a NameError in finally.
     tasks = None
+    # Task 8.2 (V7 §23.15): same NameError-in-finally hazard as `tasks`
+    # above -- the finally block's architect-escalation check reads
+    # architecture_plan on EVERY exit path (it's an escalation input, not
+    # a gate), including a V2Error raised before the real assignment
+    # inside the try (just below `if run_architect:`) ever runs.
+    architecture_plan = None
     # Task 1.2: shared across every evaluate_*_tasks call site below so
     # task_list_completed fires at most once per session (see
     # emit_task_transitions's docstring).
@@ -5593,24 +6429,39 @@ def main():
                                 gates["tasksResolvedBy"] = "human"
                                 for task_id, action in override_resolutions:
                                     emit_event(events_path, "task_override_applied", sid, taskId=task_id, action=action)
+                        # Task 8.1 (V7 §23.10): quality gate, same "no
+                        # bypass" reasoning as tasksResolved just above --
+                        # this no-change path has its OWN real
+                        # DeliveryReview (glimmer-engineer.py's final-answer
+                        # turn runs regardless of whether files changed), so
+                        # a required-but-failing review must block here too,
+                        # not just on the real-diff VERIFIED path below.
+                        gates["customerReadinessApproved"] = compute_customer_readiness_gate(
+                            contract.get("qualityGates"), load_delivery_review(session)
+                        )
                         manifest["gates"] = gates
 
-                        if gates["tasksResolved"] is False:
-                            # Fix round 1 (MODERATE 5): "no bypass" -- a
-                            # required task left unresolved (e.g. a prior
-                            # repair round's task never actually completed)
-                            # must block promotion here exactly like it
-                            # blocks the real-diff VERIFIED path below.
-                            blocked_gates = ["tasksResolved"]
-                            attempt["blockedGates"] = blocked_gates
-                            manifest["blockedGates"] = blocked_gates
+                        no_change_blocked_gates = [
+                            k for k in ("tasksResolved", "customerReadinessApproved")
+                            if gates.get(k) is False
+                        ]
+                        if no_change_blocked_gates:
+                            # Fix round 1 (MODERATE 5) + Task 8.1: "no
+                            # bypass" -- a required task left unresolved
+                            # (e.g. a prior repair round's task never
+                            # actually completed), and/or a required-but-
+                            # unmet customer-readiness gate, must block
+                            # promotion here exactly like they block the
+                            # real-diff VERIFIED path below.
+                            attempt["blockedGates"] = no_change_blocked_gates
+                            manifest["blockedGates"] = no_change_blocked_gates
                             attempt["status"] = "needs-architect-review-consistency-rejected"
                             manifest["attempts"].append(attempt)
                             manifest["status"] = "needs-architect-review-consistency-rejected"
                             manifest["state"] = canonical_session_state(manifest["status"])
                             emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
-                            final_label = "NOT VERIFIED — GATE BLOCKED (tasksResolved)"
-                            print("\n[V2] gates blocked promotion to verified: ['tasksResolved']")
+                            final_label = "NOT VERIFIED — GATE BLOCKED (" + ", ".join(no_change_blocked_gates) + ")"
+                            print(f"\n[V2] gates blocked promotion to verified: {no_change_blocked_gates}")
                             save()
                             break
 
@@ -6069,6 +6920,16 @@ def main():
                         gates["tasksResolvedBy"] = "human"
                         for task_id, action in override_resolutions:
                             emit_event(events_path, "task_override_applied", sid, taskId=task_id, action=action)
+                # Task 8.1 (V7 §23.10): must be set BEFORE gates_block_
+                # verified is consulted below (same C1-lesson ordering as
+                # run_doc_pass/documentationCurrent above) -- otherwise the
+                # gate is decorative. load_delivery_review reads whatever
+                # glimmer-engineer.py's final-answer turn already wrote to
+                # delivery-review.json for this session (real review, or
+                # the reviewFailed fallback -- either way, real evidence).
+                gates["customerReadinessApproved"] = compute_customer_readiness_gate(
+                    contract.get("qualityGates"), load_delivery_review(session)
+                )
                 manifest["gates"] = gates
 
                 if gates_block_verified(gates):
@@ -6183,6 +7044,13 @@ def main():
         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         raise
     finally:
+        # 8.3 review fix-round (M3, V7 §14/§35): first thing in this
+        # unconditional finally, before anything else reads/rewrites
+        # manifest.json -- see that function's own docstring for why this
+        # can only be observed via a fresh disk read, never v2's own
+        # in-memory `manifest` dict.
+        _resolve_orphaned_pending_approval(session)
+
         # I2: every exit path routes through this finally, including the
         # already-handled SIGTERM/KeyboardInterrupt path above (which sets a
         # real terminal status before falling through here) and the sibling
@@ -6226,6 +7094,42 @@ def main():
         manifest["finalDiffHash"] = diff_hash(ws, baseline)
 
         manifest["failure"] = classify_failure(manifest, read_session_events(events_path))
+        # Task 8.1 (V7 §23.11): combined statuses -- computed last, in this
+        # SAME unconditional `finally` block, so every exit path (VERIFIED,
+        # blocked, failed, interrupted) gets an honest statuses object, not
+        # just the two VERIFIED-reaching branches above (those are the only
+        # ones that ever populate gates.architectureApproved/
+        # documentationCurrent/customerReadinessApproved at all -- a session
+        # that never got that far reads back as "not_run" for those three
+        # legs here, which IS the honest fact).
+        manifest["statuses"] = compute_statuses(manifest, session)
+
+        # Task 8.2 (V7 §23.15/§23.16): both read the SAME already-written
+        # delivery-review.json exactly once more here (compute_statuses
+        # above already read it too, internally, for the "delivery" leg --
+        # this second cheap read just avoids threading an extra parameter
+        # through compute_statuses's own signature for one more consumer).
+        _delivery_review_final = load_delivery_review(session)
+        # Round 8 whole-round review (MJ4): run_architect_escalation's own
+        # docstring already promises "never raises" -- fault-injection proved
+        # that promise false (an unguarded write_text inside its own except
+        # handler). Fixed at the root there too, but this call sits in the
+        # unconditional `finally`, strictly BEFORE write_delivery_packet/
+        # save()/session_completed below, so belt-and-braces here as well:
+        # nothing this second-opinion consult (V7 §23.15 -- a second opinion,
+        # never a second gate) can do should be able to take those down with
+        # it.
+        try:
+            if compute_architect_escalation_trigger(_delivery_review_final, run_architect):
+                run_architect_escalation(
+                    engineer, ws, architecture_plan, _delivery_review_final,
+                    session, events_path, sid,
+                )
+        except Exception as exc:  # noqa: BLE001 - escalation must never break session finalization
+            print(f"[V2] WARN: architect escalation failed: {exc}")
+        if write_delivery_packet(manifest, session, _delivery_review_final) is not None:
+            emit_event(events_path, "delivery_packet_created", sid)
+
         save()
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
         # the canonical manifest["state"], not the raw manifest["status"].
@@ -6317,6 +7221,45 @@ def _r6_selfcheck() -> None:
     # I2: "failed-aborted" rides the existing generic "failed-" prefix match
     # in canonical_session_state (no new branch needed there).
     assert canonical_session_state("failed-aborted") == "failed"
+
+    # 8.3 review fix-round (M3): orphaned waiting_for_approval cleanup.
+    assert canonical_session_state("waiting-for-approval") == "waiting_for_approval"
+    with tempfile.TemporaryDirectory() as td:
+        sd = Path(td)
+        # 1. The common case: no pendingApproval at all -- a no-op, no
+        #    approvals.json created, manifest.json untouched.
+        (sd / "manifest.json").write_text(json.dumps({"status": "verified", "state": "verified"}))
+        before = (sd / "manifest.json").read_text()
+        _resolve_orphaned_pending_approval(sd)
+        assert (sd / "manifest.json").read_text() == before
+        assert not (sd / "approvals.json").exists()
+
+        # 2. A genuinely orphaned pending approval: manifest.json restored
+        #    to its pre-approval status/state, pendingApproval cleared,
+        #    and the matching approvals.json record resolved to denied
+        #    with a human-readable, honest provenance -- never silently
+        #    left "pending" forever.
+        (sd / "manifest.json").write_text(json.dumps({
+            "status": "waiting-for-approval", "state": "waiting_for_approval",
+            "_preApprovalStatus": "initialized", "_preApprovalState": "preflight",
+            "pendingApproval": {"approvalId": "s1-appr-1", "action": "modify_dependencies"},
+        }))
+        (sd / "approvals.json").write_text(json.dumps({
+            "s1-appr-1": {"action": "modify_dependencies", "status": "pending"},
+        }))
+        _resolve_orphaned_pending_approval(sd)
+        after = json.loads((sd / "manifest.json").read_text())
+        assert after["status"] == "initialized" and after["state"] == "preflight"
+        assert "pendingApproval" not in after
+        assert "_preApprovalStatus" not in after and "_preApprovalState" not in after
+        approvals_after = json.loads((sd / "approvals.json").read_text())
+        assert approvals_after["s1-appr-1"]["status"] == "denied"
+        assert "orphaned" in approvals_after["s1-appr-1"]["approvedBy"]
+
+        # 3. Missing/malformed manifest.json or approvals.json never raises.
+        _resolve_orphaned_pending_approval(sd / "does-not-exist")
+        (sd / "manifest.json").write_text("not json{{{")
+        _resolve_orphaned_pending_approval(sd)
 
     print("R6 classify_failure self-check: PASS")
 
@@ -8380,6 +9323,9 @@ def _gates_selfcheck() -> None:
         # Task 4.2: tasksResolved joins architectureApproved/scopeApproved's
         # True/False/None contract (see the shared loop just below).
         "tasksResolved": True,
+        # Task 8.1: customerReadinessApproved joins the exact same contract
+        # (see the shared loop just below).
+        "customerReadinessApproved": True,
     }
     assert gates_block_verified(all_true) is False, "V7 §5.11's own worked example must pass"
 
@@ -8389,7 +9335,7 @@ def _gates_selfcheck() -> None:
     assert gates_block_verified({"implementationComplete": True, "verificationPassed": True}) is False
 
     for optional_key in ("architectureApproved", "scopeApproved", "tasksResolved",
-                         "documentationCurrent"):
+                         "documentationCurrent", "customerReadinessApproved"):
         blocked = dict(all_true, **{optional_key: False})
         assert gates_block_verified(blocked) is True, f"{optional_key}=False must block VERIFIED"
         nulled = dict(all_true, **{optional_key: None})
@@ -8429,6 +9375,14 @@ def _gates_selfcheck() -> None:
     assert blocked_gate_names(dict(all_true, tasksResolved=False)) == ["tasksResolved"]
     assert blocked_gate_names(dict(all_true, tasksResolved=None)) == [], (
         "no tasks.json (task graph never ran) must NOT block or appear as a named cause"
+    )
+
+    # Task 8.1: customerReadinessApproved=False is a named blocked gate,
+    # same contract as documentationCurrent/tasksResolved; None (gate never
+    # requested) must NOT block or appear as a named cause.
+    assert blocked_gate_names(dict(all_true, customerReadinessApproved=False)) == ["customerReadinessApproved"]
+    assert blocked_gate_names(dict(all_true, customerReadinessApproved=None)) == [], (
+        "qualityGates.customerReadinessRequired never set must NOT block or appear as a named cause"
     )
     assert blocked_gate_names(
         dict(all_true, architectureApproved=False, scopeApproved=False, tasksResolved=False)
@@ -8508,6 +9462,18 @@ def _gates_selfcheck() -> None:
         "documentationCurrent can never actually block a VERIFIED promotion"
     )
 
+    # 5a-i. Task 8.1: same C1-lesson ordering for the new quality gate --
+    # gates["customerReadinessApproved"] must be computed before
+    # gates_block_verified is consulted on the real-diff VERIFIED path, or
+    # it too would be decorative.
+    real_diff_customer_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(', doc_pass_call_idx
+    )
+    assert doc_pass_call_idx < real_diff_customer_gate_idx < gates_block_idx, (
+        "gates[\"customerReadinessApproved\"] must be computed after the doc pass and before "
+        "gates_block_verified is consulted, or the quality gate can never actually block VERIFIED"
+    )
+
     # 5b. Review round 1 (minor): once flagged, consistency_gate's default
     #     must be None, never True -- a flagged diff with no plan/budget
     #     to review against must read as indeterminate, not clean. Proven
@@ -8545,11 +9511,19 @@ def _gates_selfcheck() -> None:
     tasks_resolved_idx = main_source.index(
         'gates["tasksResolved"] = (', no_change_ok_idx,
     )
-    tasks_resolved_check_idx = main_source.index('if gates["tasksResolved"] is False:', no_change_ok_idx)
-    no_change_verified_label_idx = main_source.index('"no-change-verified"', tasks_resolved_check_idx)
-    assert no_change_if_idx < no_change_ok_idx < impl_null_idx < tasks_resolved_idx < tasks_resolved_check_idx, (
-        "the no-change path must compute implementationComplete=null and tasksResolved, "
-        "in that order, before deciding whether tasksResolved blocks"
+    # Task 8.1: the quality gate is computed after tasksResolved, still
+    # strictly before the combined no_change_blocked_gates check below --
+    # same "must be set before the blocking decision is made" ordering as
+    # every other optional gate in this branch.
+    customer_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(', no_change_ok_idx,
+    )
+    no_change_blocked_idx = main_source.index("no_change_blocked_gates = [", no_change_ok_idx)
+    no_change_verified_label_idx = main_source.index('"no-change-verified"', no_change_blocked_idx)
+    assert (no_change_if_idx < no_change_ok_idx < impl_null_idx < tasks_resolved_idx
+            < customer_gate_idx < no_change_blocked_idx), (
+        "the no-change path must compute implementationComplete=null, tasksResolved, and "
+        "customerReadinessApproved, in that order, before deciding what blocks"
     )
     # Review round 1 (Minor 8a): the anchor above only pins the assignment's
     # `gates["tasksResolved"] = (` prefix (needed once the RHS became a
@@ -8557,11 +9531,11 @@ def _gates_selfcheck() -> None:
     # call, not just that prefix, genuinely sits inside this same span, so
     # a future edit can't hollow out the assignment while leaving the
     # anchor text intact.
-    assert "required_tasks_resolved(" in main_source[tasks_resolved_idx:tasks_resolved_check_idx], (
+    assert "required_tasks_resolved(" in main_source[tasks_resolved_idx:customer_gate_idx], (
         "gates[\"tasksResolved\"] must actually be computed via required_tasks_resolved(...) in this span"
     )
-    assert tasks_resolved_check_idx < no_change_verified_label_idx, (
-        "the tasksResolved==False block must be checked BEFORE the no-change-verified success path -- no bypass"
+    assert no_change_blocked_idx < no_change_verified_label_idx, (
+        "the no_change_blocked_gates check must run BEFORE the no-change-verified success path -- no bypass"
     )
     # This path must NOT reuse gates_block_verified (which would wrongly
     # block on implementationComplete=null, a real property only THIS
@@ -8569,10 +9543,566 @@ def _gates_selfcheck() -> None:
     # branches (this one and the real-diff VERIFIED one below it).
     real_diff_ok_idx = main_source.index("if ok:", no_change_verified_label_idx)
     assert "gates_block_verified(gates)" not in main_source[no_change_ok_idx:real_diff_ok_idx], (
-        "the no-change path must check tasksResolved directly, not via gates_block_verified"
+        "the no-change path must check tasksResolved/customerReadinessApproved directly, "
+        "not via gates_block_verified"
     )
 
     print("gates (Task 2.3, V7 §5.10/§5.11) self-check: PASS")
+
+
+def _quality_gates_selfcheck() -> None:
+    """Task 8.1 (V7 §23.10/§23.11): proves compare_customer_readiness /
+    compute_customer_readiness_gate's comparison vocabulary (including
+    unknown-value rejection) and fail-closed-missing-review behavior, the
+    gates_block_verified/blocked_gate_names blocking matrix for the new
+    customerReadinessApproved key (already extended in _gates_selfcheck --
+    repeated here narrowly so this selfcheck stands on its own), the
+    statuses composition (compute_statuses/compute_overall_status,
+    including worst-of and absent-subsystem honesty), and the source-
+    ordering proof that both branches compute the gate before
+    gates_block_verified is consulted. Run with:
+    python3 glimmer-v2.py --quality-gates-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. compare_customer_readiness: ordering + unknown-value rejection.
+    # ------------------------------------------------------------
+    assert compare_customer_readiness("ready_to_ship", "ready_to_ship") is True
+    assert compare_customer_readiness("ready_to_ship", "not_customer_ready") is True, (
+        "the best value must meet every minimum"
+    )
+    assert compare_customer_readiness("not_customer_ready", "ready_to_ship") is False, (
+        "the worst value must not meet the strictest minimum"
+    )
+    assert compare_customer_readiness("needs_polish", "ready_with_known_limitations") is False
+    assert compare_customer_readiness("ready_with_known_limitations", "needs_polish") is True
+    # Every value meets itself as its own minimum (boundary, not strict >).
+    for value in CUSTOMER_READINESS_ORDER:
+        assert compare_customer_readiness(value, value) is True
+    # Unknown values on either side fail closed, never raise.
+    assert compare_customer_readiness("extremely_ready", "needs_polish") is False
+    assert compare_customer_readiness("ready_to_ship", "extremely_ready") is False
+    assert compare_customer_readiness("bogus", "also_bogus") is False
+
+    # ------------------------------------------------------------
+    # 2. compute_customer_readiness_gate: None/True/False per §23.10.
+    # ------------------------------------------------------------
+    # Gate never requested -- absent qualityGates, or customerReadinessRequired
+    # explicitly False -- is "not applicable", regardless of any review.
+    assert compute_customer_readiness_gate(None, {"customerReadiness": "not_customer_ready"}) is None
+    assert compute_customer_readiness_gate(
+        {"customerReadinessRequired": False}, {"customerReadiness": "ready_to_ship"}
+    ) is None
+    assert compute_customer_readiness_gate({}, {"customerReadiness": "ready_to_ship"}) is None
+
+    # Required but no review at all (engineer never reached a final-answer
+    # turn, or delivery-review.json is missing/unreadable) -- fail closed,
+    # never a fabricated pass.
+    assert compute_customer_readiness_gate({"customerReadinessRequired": True}, None) is False
+    assert compute_customer_readiness_gate({"customerReadinessRequired": True}, {}) is False, (
+        "a review dict with no customerReadiness key at all must fail closed"
+    )
+    assert compute_customer_readiness_gate(
+        {"customerReadinessRequired": True}, {"customerReadiness": "not-a-real-value"}
+    ) is False, "an unrecognized customerReadiness value must fail closed, never fabricate True"
+
+    # Required, real review, no minimum given -- "did the review run" is
+    # the whole ask; True even for the worst real readiness value.
+    assert compute_customer_readiness_gate(
+        {"customerReadinessRequired": True}, {"customerReadiness": "not_customer_ready"}
+    ) is True
+
+    # Required, real review, explicit minimum -- delegates to
+    # compare_customer_readiness.
+    quality_gates = {"customerReadinessRequired": True, "minimumCustomerReadiness": "ready_with_known_limitations"}
+    assert compute_customer_readiness_gate(quality_gates, {"customerReadiness": "ready_to_ship"}) is True
+    assert compute_customer_readiness_gate(
+        quality_gates, {"customerReadiness": "ready_with_known_limitations"}
+    ) is True
+    assert compute_customer_readiness_gate(quality_gates, {"customerReadiness": "needs_polish"}) is False
+    assert compute_customer_readiness_gate(quality_gates, {"customerReadiness": "not_customer_ready"}) is False
+
+    # _fallback_delivery_review's shape (glimmer-engineer.py): reviewFailed
+    # review still carries a real customerReadiness ("not_customer_ready",
+    # the worst value) -- must fail closed against any real minimum, exactly
+    # like a genuinely bad review would, not be treated as "no evidence".
+    fallback_shaped = {"customerReadiness": "not_customer_ready", "reviewFailed": True,
+                       "reviewFailureReason": "model never produced valid JSON"}
+    assert compute_customer_readiness_gate(quality_gates, fallback_shaped) is False
+
+    # ------------------------------------------------------------
+    # 3. gate blocking matrix (gates_block_verified/blocked_gate_names) --
+    #    narrow, self-contained repeat of what _gates_selfcheck already
+    #    covers in full, so this selfcheck proves the wiring on its own.
+    # ------------------------------------------------------------
+    baseline_gates = {
+        "implementationComplete": True, "verificationPassed": True,
+        "architectureApproved": True, "scopeApproved": True,
+        "tasksResolved": True, "documentationCurrent": True,
+        "customerReadinessApproved": True,
+    }
+    assert gates_block_verified(baseline_gates) is False
+    assert gates_block_verified(dict(baseline_gates, customerReadinessApproved=False)) is True
+    assert gates_block_verified(dict(baseline_gates, customerReadinessApproved=None)) is False
+    assert blocked_gate_names(dict(baseline_gates, customerReadinessApproved=False)) == [
+        "customerReadinessApproved"
+    ]
+
+    # ------------------------------------------------------------
+    # 4. load_delivery_review: real file / missing / malformed.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert load_delivery_review(session) is None, "no delivery-review.json at all -> None"
+        (session / "delivery-review.json").write_text("not json {{{", encoding="utf-8")
+        assert load_delivery_review(session) is None, "unparseable JSON -> None, never raises"
+        (session / "delivery-review.json").write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+        assert load_delivery_review(session) is None, "a JSON array (not object) -> None"
+        real_review = {"customerReadiness": "ready_with_known_limitations", "summary": "x",
+                       "confidence": {"level": "high", "reason": "y"}}
+        (session / "delivery-review.json").write_text(json.dumps(real_review), encoding="utf-8")
+        assert load_delivery_review(session) == real_review
+
+    # ------------------------------------------------------------
+    # 5. statuses composition (V7 §23.11): compute_technical_status,
+    #    _gate_to_status_leg, read_visual_status_leg, compute_delivery_
+    #    status_leg, compute_overall_status's worst-of + absent-subsystem
+    #    honesty, and compute_statuses end to end.
+    # ------------------------------------------------------------
+    assert compute_technical_status({"attempts": [], "status": "repo-map-only"}) == "NOT_RUN"
+    assert compute_technical_status(
+        {"attempts": [{"changedFiles": []}], "status": "failed-changed-files-budget-exceeded"}
+    ) == "NOT_RUN", "an attempt that never reached verify() (no verificationResults) is honestly NOT_RUN"
+    assert compute_technical_status(
+        {"attempts": [{"verificationResults": [{"ok": True}]}], "status": "verified"}
+    ) == "VERIFIED"
+    assert compute_technical_status(
+        {"attempts": [{"verificationResults": [{"ok": True}]}], "status": "no-change-verified"}
+    ) == "VERIFIED"
+    assert compute_technical_status(
+        {"attempts": [{"verificationResults": [{"ok": False}]}], "status": "failed-repair-budget-exhausted"}
+    ) == "FAILED"
+    # Round 8 whole-round review (MJ2), reproduced case: a session blocked
+    # purely by a non-technical gate (customerReadinessApproved=False, here
+    # standing in for delivery-readiness) with every verification check
+    # actually passing must read back VERIFIED -- manifest["status"] having
+    # rolled to a gate-rejected terminal must never fabricate a technical
+    # FAILED for checks that all genuinely passed.
+    assert compute_technical_status({
+        "attempts": [{"verificationResults": [{"ok": True}, {"ok": True}]}],
+        "status": "needs-architect-review-consistency-rejected",
+    }) == "VERIFIED", (
+        "a gate-blocked terminal status must never override honestly-passing "
+        "verificationResults -- MJ2"
+    )
+    # The mirror image: a real check failure must still report FAILED even if
+    # manifest["status"] somehow still reads "verified" -- the leg is derived
+    # from the checks alone, in both directions.
+    assert compute_technical_status({
+        "attempts": [{"verificationResults": [{"ok": True}, {"ok": False}]}],
+        "status": "verified",
+    }) == "FAILED", "any required check failing must report FAILED regardless of manifest[\"status\"]"
+
+    assert _gate_to_status_leg(True) == "approved"
+    assert _gate_to_status_leg(False) == "rejected"
+    assert _gate_to_status_leg(None) == "not_run"
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert read_visual_status_leg(session) == "not_run", "no visual/ dir at all -> not_run sentinel"
+        visual_dir = session / "visual"
+        visual_dir.mkdir()
+        assert read_visual_status_leg(session) == "NOT_RUN", (
+            "visual/ exists but findings.json missing -> honest NOT_RUN, never fabricated PASS"
+        )
+        (visual_dir / "findings.json").write_text(json.dumps({"status": "PASS_WITH_WARNINGS"}), encoding="utf-8")
+        assert read_visual_status_leg(session) == "PASS_WITH_WARNINGS"
+        (visual_dir / "findings.json").write_text(json.dumps({"status": "not-a-real-status"}), encoding="utf-8")
+        assert read_visual_status_leg(session) == "NOT_RUN", "unrecognized status value -> NOT_RUN, not fabricated"
+
+    assert compute_delivery_status_leg(None) == "not_run"
+    assert compute_delivery_status_leg({"customerReadiness": "needs_rework"}) == "needs_rework"
+    assert compute_delivery_status_leg({"customerReadiness": "bogus"}) == "not_run"
+
+    # Worst-of: a single bad leg among otherwise-clean legs drives overall.
+    assert compute_overall_status("VERIFIED", "approved", "approved", "PASS", "ready_to_ship") == "ready_to_ship"
+    assert compute_overall_status(
+        "VERIFIED", "approved", "approved", "PASS", "needs_polish"
+    ) == "needs_polish", "V7 §23.11's own worked example: everything else clean, delivery is the worst leg"
+    assert compute_overall_status("FAILED", "approved", "approved", "PASS", "ready_to_ship") == "not_customer_ready", (
+        "a failed technical leg must be the worst-ranked outcome, mapped onto the readiness vocabulary"
+    )
+    assert compute_overall_status(
+        "VERIFIED", "rejected", "approved", "PASS", "ready_with_known_limitations"
+    ) == "not_customer_ready", (
+        "rejected architecture ranks worse than a merely-limited delivery leg -- architecture drives overall here"
+    )
+    assert compute_overall_status(
+        "VERIFIED", "rejected", "approved", "PASS", "ready_to_ship"
+    ) == "not_customer_ready", "rejected architecture alone is the worst leg when delivery itself is clean"
+    # Absent subsystems (not_run/NOT_RUN) never drag overall down.
+    assert compute_overall_status("NOT_RUN", "not_run", "not_run", "not_run", "ready_to_ship") == "ready_to_ship"
+    # Every leg absent -> honestly "not_run", never a fabricated best-case default.
+    assert compute_overall_status("NOT_RUN", "not_run", "not_run", "not_run", "not_run") == "not_run"
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        manifest = {
+            "attempts": [{"verificationResults": [{"ok": True}]}], "status": "verified",
+            "gates": {"architectureApproved": True, "documentationCurrent": None},
+        }
+        assert compute_statuses(manifest, session) == {
+            "technical": "VERIFIED", "architecture": "approved", "documentation": "not_run",
+            "visual": "not_run", "delivery": "not_run", "overall": "ready_to_ship",
+        }, "no visual/ dir and no delivery-review.json -> both honestly not_run; nothing else drags overall down"
+        (session / "delivery-review.json").write_text(
+            json.dumps({"customerReadiness": "needs_rework"}), encoding="utf-8"
+        )
+        assert compute_statuses(manifest, session)["delivery"] == "needs_rework"
+        assert compute_statuses(manifest, session)["overall"] == "needs_rework"
+
+    # ------------------------------------------------------------
+    # 6. Source-ordering proof (both branches): the quality gate must be
+    #    computed before gates_block_verified is consulted -- otherwise it
+    #    is decorative, exactly the C1 lesson documentationCurrent already
+    #    had to learn.
+    # ------------------------------------------------------------
+    import inspect
+    main_source = inspect.getsource(main)
+    gates_block_idx = main_source.index("if gates_block_verified(gates):")
+    real_diff_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(',
+        main_source.index("run_doc_pass(ws, events_path, sid, manifest, tasks, session)"),
+    )
+    assert real_diff_gate_idx < gates_block_idx, (
+        "the real-diff branch must compute customerReadinessApproved before gates_block_verified runs"
+    )
+    no_change_ok_idx = main_source.index("if ok:", main_source.index("if not files:"))
+    no_change_gate_idx = main_source.index(
+        'gates["customerReadinessApproved"] = compute_customer_readiness_gate(', no_change_ok_idx
+    )
+    no_change_blocked_idx = main_source.index("no_change_blocked_gates = [", no_change_ok_idx)
+    assert no_change_gate_idx < no_change_blocked_idx, (
+        "the no-change branch must compute customerReadinessApproved before deciding what blocks"
+    )
+
+    # ------------------------------------------------------------
+    # 7. CLI-level fail-closed rejection: an unrecognized
+    #    --minimum-customer-readiness value must be rejected by argparse
+    #    itself (exit code 2), before any workspace/session validation --
+    #    the "unknown value -> CLI error, fail closed" half of the contract
+    #    validation V7 §23.10 asks for (control-center's validateAdvanced
+    #    is the 400-JSON-response half, tested on that side).
+    # ------------------------------------------------------------
+    result = subprocess.run(
+        [sys.executable, __file__, "--workspace", "/definitely-not-a-real-glimmer-workspace",
+         "--minimum-customer-readiness", "extremely_ready", "--", "task"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2, "argparse must reject an unrecognized minimumCustomerReadiness value"
+    assert "minimum-customer-readiness" in result.stderr
+
+    # ------------------------------------------------------------
+    # 8. Round 8 whole-round review (MJ1): every one of Round 8's four new
+    #    finally-block wirings -- orphan cleanup (8.3), statuses assembly
+    #    (8.1), the architect-escalation trigger/call (8.2), the delivery
+    #    packet (8.2) -- was reachable only via a comment, not a real
+    #    assertion: a mutant that deletes any ONE of the four call sites
+    #    below from main()'s `finally` left ALL 20 selfchecks green
+    #    (reviewer's own 4-mutant proof). Pin both PRESENCE and RELATIVE
+    #    ORDER, chained end-to-end through save()/session_completed, the
+    #    same main_source technique section 6 above already uses for the
+    #    quality gate itself -- so deleting any one of these lines breaks
+    #    THIS single assertion, not just a comment.
+    # ------------------------------------------------------------
+    finally_idx = main_source.index("_resolve_orphaned_pending_approval(session)")
+    statuses_idx = main_source.index('manifest["statuses"] = compute_statuses(manifest, session)')
+    escalation_trigger_idx = main_source.index(
+        "if compute_architect_escalation_trigger(_delivery_review_final, run_architect):"
+    )
+    escalation_call_idx = main_source.index("run_architect_escalation(")
+    packet_idx = main_source.index(
+        "if write_delivery_packet(manifest, session, _delivery_review_final) is not None:"
+    )
+    packet_event_idx = main_source.index('emit_event(events_path, "delivery_packet_created", sid)')
+    save_idx = main_source.rindex("save()")
+    completed_event_idx = main_source.index(
+        'emit_event(events_path, "session_completed", sid, status=manifest["state"])'
+    )
+    assert (finally_idx < statuses_idx < escalation_trigger_idx < escalation_call_idx
+            < packet_idx < packet_event_idx < save_idx < completed_event_idx), (
+        "every Round 8 finally-block wiring (orphan cleanup, statuses, escalation "
+        "trigger+call, delivery packet) must actually run, in this order, before "
+        "save()/session_completed -- deleting any one of these call sites must "
+        "break this assertion, not survive as a comment-only invariant (MJ1)"
+    )
+
+    print("quality gates (Task 8.1, V7 §23.10/§23.11) self-check: PASS")
+
+
+def _delivery_packet_selfcheck() -> None:
+    """Task 8.2 (V7 §23.14-23.16): proves delivery-packet assembly
+    (including absent-artifact honesty and, per the round 8 whole-round
+    review's MN1, the architectEscalation field/summary line), the
+    architect-escalation trigger matrix (disabled architect / no concerns /
+    low-severity-only / a single high or critical concern), and
+    run_architect_escalation's fail-tolerance (spawn failure, "subprocess
+    ran but wrote nothing", an unwritable session dir (MJ4), and a hanging
+    subprocess actually being bounded by invoke_engineer's timeout (MJ4)
+    all degrade to a consultationFailed record or a bounded wait, never
+    raise, session outcome untouched), plus delivery_packet_created's
+    event-vocabulary membership. Run with:
+    python3 glimmer-v2.py --delivery-packet-selfcheck
+    """
+    # ------------------------------------------------------------
+    # 1. compute_delivery_packet: full fixture -- every field traces back
+    #    to a real manifest/delivery_review fact, model-derived fields
+    #    carry "model-output" provenance.
+    # ------------------------------------------------------------
+    manifest = {
+        "task": "add widget",
+        "finalChangedFiles": ["src/widget.ts"],
+        "orchestratorUpdatedFiles": ["docs/graph.json"],
+        "architectPlan": {"used": True, "risk": "low"},
+        "gates": {"architectureApproved": True},
+        "attempts": [{"verificationResults": [{"ok": True}]}],
+        "statuses": {
+            "technical": "VERIFIED", "architecture": "approved", "documentation": "not_run",
+            "visual": "PASS", "delivery": "ready_with_known_limitations", "overall": "ready_with_known_limitations",
+        },
+    }
+    review = {
+        "customerReadiness": "ready_with_known_limitations",
+        "unresolvedItems": ["recovery feedback is subtle"],
+        "intentionallyNotChanged": ["left the legacy adapter alone"],
+        "concerns": [{"severity": "medium", "category": "ux", "description": "x", "evidenceIds": []}],
+        "nextSteps": [{"priority": "recommended_next", "action": "add progress state"}],
+        "confidence": {"level": "high", "reason": "well tested"},
+    }
+    packet = compute_delivery_packet(manifest, review)
+    assert packet["task"] == "add widget"
+    assert packet["planRef"] == {"architectUsed": True, "architectureApproved": True}
+    assert packet["changedFiles"] == ["src/widget.ts"]
+    assert packet["orchestratorUpdatedFiles"] == ["docs/graph.json"]
+    assert packet["verification"] == {"status": "VERIFIED", "results": [{"ok": True}]}
+    assert packet["visual"] == "PASS"
+    assert packet["statuses"] == manifest["statuses"]
+    assert packet["customerReadiness"] == {"value": "ready_with_known_limitations", "provenance": "model-output"}
+    assert packet["limitations"]["unresolvedItems"] == ["recovery feedback is subtle"]
+    assert packet["limitations"]["intentionallyNotChanged"] == ["left the legacy adapter alone"]
+    assert packet["limitations"]["provenance"] == "model-output"
+    assert "reviewFailed" not in packet["limitations"], "a real (non-degraded) review must not be mislabeled"
+    assert packet["forwardPlan"] == {
+        "nextSteps": [{"priority": "recommended_next", "action": "add progress state"}],
+        "provenance": "model-output",
+    }
+    assert packet["confidence"] == {"level": "high", "reason": "well tested", "provenance": "model-output"}
+    assert packet["humanReviewStatus"] == "pending"
+    assert packet["architectEscalation"] is None, "no escalation arg passed -> honest None, never fabricated"
+
+    # MN1 (round 8 whole-round review): a real escalation record passed
+    # through verbatim, plus the same for a degraded/failed one.
+    escalated_packet = compute_delivery_packet(manifest, review, {"question": "q?", "answer": "a."})
+    assert escalated_packet["architectEscalation"] == {"question": "q?", "answer": "a."}
+    failed_escalation_packet = compute_delivery_packet(
+        manifest, review, {"consultationFailed": True, "reason": "model server unreachable"}
+    )
+    assert failed_escalation_packet["architectEscalation"] == {
+        "consultationFailed": True, "reason": "model server unreachable",
+    }
+
+    # ------------------------------------------------------------
+    # 2. Absent-artifact honesty: no architecture plan, no delivery
+    #    review at all -- every derived field is a real None, never a
+    #    fabricated default; changedFiles/orchestratorUpdatedFiles absent
+    #    on manifest degrade to an honest empty list (a real "nothing
+    #    happened" fact, not a missing-artifact case).
+    # ------------------------------------------------------------
+    bare_manifest = {"task": "t", "attempts": [], "statuses": {}}
+    bare_packet = compute_delivery_packet(bare_manifest, None)
+    assert bare_packet["planRef"] is None
+    assert bare_packet["changedFiles"] == []
+    assert bare_packet["orchestratorUpdatedFiles"] == []
+    assert bare_packet["verification"] == {"status": "NOT_RUN", "results": None}
+    assert bare_packet["customerReadiness"] is None
+    assert bare_packet["limitations"] is None
+    assert bare_packet["forwardPlan"] is None
+    assert bare_packet["confidence"] is None
+    assert bare_packet["humanReviewStatus"] == "pending", "always a real fact, never fabricated absence"
+
+    # A reviewFailed (fallback) review is a REAL file, not an absent one --
+    # its fields are present, just labeled.
+    failed_review = {
+        "customerReadiness": "not_customer_ready", "reviewFailed": True,
+        "reviewFailureReason": "model never produced valid JSON",
+        "confidence": {"level": "low", "reason": "delivery review generation failed"},
+    }
+    failed_packet = compute_delivery_packet(bare_manifest, failed_review)
+    assert failed_packet["customerReadiness"] == {
+        "value": "not_customer_ready", "provenance": "model-output", "reviewFailed": True,
+    }
+    assert failed_packet["confidence"]["reviewFailed"] is True
+
+    # ------------------------------------------------------------
+    # 3. render_packet_summary: deterministic, no model call; absent
+    #    sections render "Unavailable", present sections render their
+    #    real values.
+    # ------------------------------------------------------------
+    text = render_packet_summary(packet)
+    assert "Task: add widget" in text
+    assert "Customer readiness: ready_with_known_limitations" in text
+    assert "Confidence: high" in text
+    assert "Architect escalation: not triggered" in text
+    bare_text = render_packet_summary(bare_packet)
+    assert "Customer readiness: Unavailable" in bare_text
+    assert "Known limitations: Unavailable" in bare_text
+    assert "Plan forward: Unavailable" in bare_text
+    assert "Confidence: Unavailable" in bare_text
+    assert "Architecture: not engaged for this session" in bare_text
+
+    # MN1: a real escalation answer, and a failed one, both surface in the
+    # human-handoff summary -- not just the API/UI's separate surface.
+    assert "Architect escalation: a." in render_packet_summary(escalated_packet)
+    assert "Architect escalation: consultation failed (model server unreachable)" in (
+        render_packet_summary(failed_escalation_packet)
+    )
+
+    # ------------------------------------------------------------
+    # 4. compute_architect_escalation_trigger: the full matrix.
+    # ------------------------------------------------------------
+    high_review = {"concerns": [{"severity": "high", "category": "architecture", "description": "x"}]}
+    critical_review = {"concerns": [{"severity": "critical", "category": "architecture", "description": "x"}]}
+    low_review = {"concerns": [{"severity": "low", "category": "ux", "description": "x"}]}
+    no_concerns_review = {"concerns": []}
+
+    assert compute_architect_escalation_trigger(high_review, True) is True
+    assert compute_architect_escalation_trigger(critical_review, True) is True
+    assert compute_architect_escalation_trigger(high_review, False) is False, "disabled architect must never escalate"
+    assert compute_architect_escalation_trigger(low_review, True) is False, "low severity alone must not escalate"
+    assert compute_architect_escalation_trigger(no_concerns_review, True) is False
+    assert compute_architect_escalation_trigger(None, True) is False, "no review at all -> nothing to escalate"
+    assert compute_architect_escalation_trigger({"concerns": "not-a-list"}, True) is False
+
+    question = build_escalation_question(high_review)
+    assert "high/architecture" in question and "x" in question
+
+    # ------------------------------------------------------------
+    # 5. load_architect_escalation: real file / missing / malformed --
+    #    same uniform-None-on-any-degraded-case contract as
+    #    load_delivery_review.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        assert load_architect_escalation(session) is None
+        (session / "architect-escalation.json").write_text("not json {{{", encoding="utf-8")
+        assert load_architect_escalation(session) is None
+        (session / "architect-escalation.json").write_text(
+            json.dumps({"question": "q", "answer": "a"}), encoding="utf-8"
+        )
+        assert load_architect_escalation(session) == {"question": "q", "answer": "a"}
+
+    # ------------------------------------------------------------
+    # 6. run_architect_escalation fail-tolerance: a spawn failure (invoke_
+    #    engineer raises) and a "ran but wrote nothing" degradation both
+    #    produce an honest consultationFailed architect-escalation.json,
+    #    never raise out of this function.
+    # ------------------------------------------------------------
+    real_invoke_engineer = invoke_engineer
+
+    def _raising_invoke_engineer(*args, **kwargs):
+        raise RuntimeError("model server unreachable")
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        globals()["invoke_engineer"] = _raising_invoke_engineer
+        try:
+            run_architect_escalation(
+                Path("/nonexistent/glimmer-engineer.py"), Path(td), None, high_review,
+                session, session / "events.jsonl", "s1",
+            )
+        finally:
+            globals()["invoke_engineer"] = real_invoke_engineer
+        written = load_architect_escalation(session)
+        assert written is not None and written.get("consultationFailed") is True
+        assert "model server unreachable" in written["reason"]
+
+    def _noop_invoke_engineer(*args, **kwargs):
+        return 0  # subprocess "succeeds" but (model down, degraded silently) writes nothing
+
+    with tempfile.TemporaryDirectory() as td:
+        session = Path(td)
+        globals()["invoke_engineer"] = _noop_invoke_engineer
+        try:
+            run_architect_escalation(
+                Path("/nonexistent/glimmer-engineer.py"), Path(td), None, high_review,
+                session, session / "events.jsonl", "s1",
+            )
+        finally:
+            globals()["invoke_engineer"] = real_invoke_engineer
+        written = load_architect_escalation(session)
+        assert written is not None and written.get("consultationFailed") is True, (
+            "a subprocess that exits 0 but writes no architect-escalation.json "
+            "must still be recorded as a failed consultation, never silence"
+        )
+
+    # ------------------------------------------------------------
+    # 6b. Round 8 whole-round review (MJ4), fault-injection-proven: a
+    #     session dir that cannot be written to AT ALL (the reviewer used
+    #     chmod 0555; a nonexistent directory raises the identical OSError
+    #     subclass from write_text, deterministically, with no chmod/root
+    #     dependence) used to raise straight out of this function -- the
+    #     request write fails, falls into the except handler, and THAT
+    #     handler's own escalation-record write ALSO failed, unguarded,
+    #     propagating out of main()'s unconditional `finally` itself. The
+    #     whole point of this case is that it does NOT raise.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        unwritable_session = Path(td) / "does-not-exist"
+        run_architect_escalation(
+            Path("/nonexistent/glimmer-engineer.py"), Path(td), None, high_review,
+            unwritable_session, unwritable_session / "events.jsonl", "s1",
+        )
+        assert not (unwritable_session / "architect-escalation.json").exists(), (
+            "nothing could be written here -- the assertion is that the call above "
+            "returned at all, never raised"
+        )
+
+    # ------------------------------------------------------------
+    # 6c. Round 8 whole-round review (MJ4): invoke_engineer's `timeout`
+    #     actually bounds a real, hanging subprocess -- not just that the
+    #     kwarg is accepted. A tiny shell script that ignores every
+    #     argument and sleeps far longer than the timeout stands in for
+    #     the unresponsive model subprocess the reviewer's "blocks final
+    #     save on an untimed model subprocess" finding described.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        hang_script = Path(td) / "hangs.sh"
+        hang_script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        hang_script.chmod(0o755)
+        started = time.monotonic()
+        rc = invoke_engineer(
+            hang_script, Path(td), "prompt", True, None,
+            Path(td) / "hang.log", Path(td) / "events.jsonl", "s1",
+            timeout=1,
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 15, f"invoke_engineer's timeout must actually bound a hanging subprocess (took {elapsed}s)"
+        assert rc != 0, "a killed subprocess must not report a successful exit code"
+
+    # ------------------------------------------------------------
+    # 7. Event vocabulary: delivery_packet_created is a real, emittable
+    #    event type (glimmer_events.EVENT_TYPES membership + a real
+    #    round-trip through emit_event).
+    # ------------------------------------------------------------
+    import glimmer_events
+    assert "delivery_packet_created" in glimmer_events.EVENT_TYPES
+    with tempfile.TemporaryDirectory() as td:
+        events_path = Path(td) / "events.jsonl"
+        emit_event(str(events_path), "delivery_packet_created", "s1")
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])["type"] == "delivery_packet_created"
+
+    print("delivery packet + architect escalation (Task 8.2, V7 §23.14-23.16) self-check: PASS")
 
 
 def _visual_selfcheck() -> None:
@@ -9848,6 +11378,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--gates-selfcheck"]:
         _gates_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--quality-gates-selfcheck"]:
+        _quality_gates_selfcheck()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--delivery-packet-selfcheck"]:
+        _delivery_packet_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:] == ["--skills-selfcheck"]:
         _skills_selfcheck()

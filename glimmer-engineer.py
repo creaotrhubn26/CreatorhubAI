@@ -1085,43 +1085,79 @@ def _is_typecheck_script(script):
     return script == "typecheck" or script.startswith("typecheck:")
 
 
-def shell_policy(
-    command,
-    workspace,
-    validation_allowlist=None,
-):
+def _structural_shell_guard(command):
+    """8.3 re-review fix (NC1, V7 §14/§35): the composition/substitution/
+    quoting precondition every shell command must pass BEFORE anything
+    else is decided -- factored out of shell_policy so it is the single
+    place this check is ever written, shared by shell_policy itself AND
+    classify_yellow's single entry point (see that function's docstring:
+    NC1 was a migration arm that classified a command as YELLOW-eligible
+    without ever routing it through this check at all, so `npm run
+    migrate ; git push origin main` classified as run_migration and the
+    composed string dispatched verbatim). Returns (tokens, None) for a
+    single, clean, uncomposed command, or (None, reason) otherwise. Never
+    raises."""
     if not isinstance(command, str):
-        return False, "Command must be a string"
+        return None, "Command must be a string"
 
     command = command.strip()
 
     if not command:
-        return False, "Empty command"
+        return None, "Empty command"
 
     # No shell composition / pipes / redirects / substitutions.
     if re.search(
         r"[;&|><\n\r`]",
         command,
     ):
-        return False, (
+        return None, (
             "Shell composition, pipes and redirects "
             "are blocked"
         )
 
     if "$(" in command:
-        return False, (
+        return None, (
             "Command substitution is blocked"
         )
 
     try:
         tokens = shlex.split(command)
     except ValueError as exc:
-        return False, (
+        return None, (
             f"Invalid shell quoting: {exc}"
         )
 
     if not tokens:
-        return False, "Empty command"
+        return None, "Empty command"
+
+    return tokens, None
+
+
+def shell_policy(
+    command,
+    workspace,
+    validation_allowlist=None,
+    *,
+    yellow_relax=frozenset(),
+):
+    """yellow_relax (8.3 review fix-round, V7 §14/§35): a set of npm
+    SUBCOMMAND names (e.g. {"install","i","ci","add"}) this ONE call may
+    treat as not-forbidden -- used exclusively by classify_yellow to
+    probe "would this exact command be allowed if only its dependency-
+    install subcommand were waived", never to actually relax enforcement
+    for a real dispatch. Every real exec_shell_command call site in this
+    file passes the default empty frozenset(), so this parameter is a
+    no-op for real command execution: every check this function already
+    performs -- composition/pipe/redirect/substitution/quoting rejection
+    up top (via _structural_shell_guard), the forbidden-token scan,
+    --prefix containment -- still runs in full and still returns False
+    for anything that isn't a genuinely simple, uncomposed `npm
+    <relaxed-subcommand> ...` command. This is the SAME "BY CONSTRUCTION,
+    not by re-implementing" remedy architect_shell_policy already uses
+    (see its own docstring) applied to a second caller."""
+    tokens, reason = _structural_shell_guard(command)
+    if tokens is None:
+        return False, reason
 
     executable = tokens[0]
 
@@ -1190,10 +1226,36 @@ def shell_policy(
             "exec",
         }
 
-        if any(
+        # yellow_relax (8.3 review fix-round, V7 §14/§35): position-exact
+        # -- only npm's own SUBCOMMAND slot (tokens[1]) may ever be
+        # relaxed, never a package-name/argument token that happens to
+        # collide with a forbidden word elsewhere (the "anywhere in the
+        # tail" scans below stay exactly as strict as before for every
+        # OTHER position -- that looseness in the OLD classify_yellow,
+        # not here, is what let `npm run deploy add` misclassify). Every
+        # real exec_shell_command dispatch passes the default empty
+        # frozenset, so this whole block is a byte-identical no-op for
+        # real enforcement -- only classify_yellow's shell_policy PROBE
+        # (never a real dispatch) ever passes a non-empty relax set.
+        subcommand = lowered[1] if len(lowered) > 1 else ""
+        relaxed = bool(subcommand) and subcommand in yellow_relax
+
+        if not relaxed and any(
             item in forbidden
             for item in lowered[1:]
         ):
+            return False, (
+                "npm dependency/package operations "
+                "are blocked"
+            )
+
+        if relaxed and any(
+            item in forbidden
+            for item in lowered[2:]
+        ):
+            # The relaxed subcommand itself is fine, but some OTHER
+            # forbidden token still appears later in the command -- stays
+            # blocked.
             return False, (
                 "npm dependency/package operations "
                 "are blocked"
@@ -1211,6 +1273,14 @@ def shell_policy(
                 tokens[index + 1],
                 workspace,
             )
+
+        if relaxed:
+            # Dependency-install commands aren't "npm run <script>"
+            # invocations -- every check above (composition/substitution/
+            # quoting at the top of this function, the forbidden-token
+            # scan, and --prefix containment) already ran in full; there
+            # is nothing left to gate for this exact shape.
+            return True, f"yellow-relaxed npm {subcommand}"
 
         if "run" not in tokens:
             return False, (
@@ -1339,6 +1409,390 @@ def shell_policy(
         "Command executable is outside "
         f"the allowlist: {executable}"
     )
+
+
+# ============================================================
+# Task 8.3 (V7 §14/§35): YELLOW approval-boundary classification
+# ============================================================
+#
+# 8.3 review fix-round: the original version of this function was an
+# INDEPENDENT token scan that re-implemented shell_policy's own parsing
+# with none of its preamble (composition/substitution/quoting rejection,
+# --prefix containment, position-exact subcommand extraction) -- exactly
+# the class of hole round 1 forced architect_shell_policy to close "BY
+# CONSTRUCTION -- by delegating to it -- not by re-implementing". Fixed
+# the same way: this function now DELEGATES the actual verdict to
+# shell_policy itself (via its yellow_relax hook, see that function's
+# docstring), never re-derives it. There is exactly one copy of this
+# function now (glimmer-v2.py's former "reference" mirror was removed --
+# it has no shell_policy/workspace to delegate to at all, and a copy that
+# can't be held to the same standard is worse than no copy).
+#
+# Scope-expansion YELLOW (V7 §15 "large expansion -> pause for approval")
+# was dropped in this same fix-round: it had no caller anywhere in either
+# process (glimmer-engineer.py has no structured contract.scope to check
+# it against -- that would need a new spawn-env flag threading it in from
+# glimmer-v2.py, out of scope here) and shipping an unreachable classifier
+# arm is worse than not having one. Tracked as future work, not shipped.
+YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS = frozenset({"install", "i", "ci", "add"})
+YELLOW_MIGRATION_KEYWORDS = ("migrate", "migration", "seed")
+# V7 §35: "commit, push, deploy" (and the rest of shell_policy's own
+# dangerous_fragments set) stay RED even when a migration keyword ALSO
+# appears in the same script name (e.g. "deploy:migrate") -- no
+# escalation offered for those, ever.
+YELLOW_MIGRATION_EXCLUDED_FRAGMENTS = ("deploy", "publish", "release", "production", ":prod", ":live")
+
+
+def _resolve_npm_script_body(workspace, script):
+    """8.3 review fix (C3): resolve the LITERAL command an `npm run
+    <script>` will execute, straight from the workspace's package.json,
+    so a migration-keyword approval shows the operator the real command
+    body -- not just a model-chosen script NAME the model itself could
+    have written moments earlier (package.json is model-writable; only
+    the lockfiles are protected, see check_write_path/PROTECTED_FILES).
+    Returns None (fail closed -- not YELLOW-eligible at all) whenever
+    package.json is missing, unreadable, malformed, has no "scripts"
+    object, or no matching key: an operator must never approve a bare
+    name whose body couldn't be shown to them."""
+    try:
+        data = json.loads((Path(workspace) / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return None
+    body = scripts.get(script)
+    return body if isinstance(body, str) and body.strip() else None
+
+
+def classify_yellow(command, workspace, validation_allowlist=None) -> dict | None:
+    """V7 §14/§35 YELLOW escalation. Called ONLY from execute_tool's
+    exec_shell_command branch, and ONLY after shell_policy has already
+    said no for this exact `command` string. Returns a structured V7 §35
+    approval-request dict -- {"action","reason","proposedChanges","risk"}
+    -- or None, meaning "stays exactly what shell_policy already said"
+    (RED stays RED).
+
+    8.3 re-review fix (NC1): a SINGLE structural precondition, applied
+    HERE at the one entry point before either arm below runs at all --
+    the command must be a single, uncomposed, cleanly-quoted command
+    (the exact same check shell_policy itself always applies first, via
+    the shared _structural_shell_guard -- not a second hand-rolled copy).
+    The install arm ALSO independently re-verifies via a real shell_policy
+    call (belt and suspenders, since it already needs shell_policy for
+    --prefix containment anyway); the migration arm has no shell_policy
+    delegation of its own, which is exactly why this top-level guard has
+    to run for BOTH arms, not be duplicated per-arm -- a composed command
+    like `npm run migrate ; git push origin main` is rejected right here,
+    before `subcommand` is even inspected, regardless of which arm would
+    otherwise have matched.
+    """
+    tokens, _structural_reason = _structural_shell_guard(command)
+    if tokens is None:
+        return None
+    if len(tokens) < 2 or tokens[0] != "npm":
+        return None
+
+    subcommand = tokens[1].lower()
+
+    # --- dependency install ---------------------------------------------
+    if subcommand in YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS:
+        try:
+            allowed, _reason = shell_policy(
+                command, workspace, validation_allowlist,
+                yellow_relax=YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS,
+            )
+        except PermissionError:
+            # e.g. --prefix escaping the workspace -- shell_policy's own
+            # containment check still ran in full (yellow_relax only
+            # skips the forbidden-subcommand short-circuit, nothing
+            # else) and it said no. Fail closed: not eligible.
+            return None
+        if not allowed:
+            return None
+        return {
+            "action": "modify_dependencies",
+            "reason": f"engineer requested a dependency-install command: {command}",
+            "proposedChanges": ["package.json", "package-lock.json"],
+            "risk": "medium",
+        }
+
+    # --- migration-shaped npm run script ---------------------------------
+    if subcommand == "run" and len(tokens) > 2:
+        script = tokens[2]
+        script_lower = script.lower()
+        if not any(k in script_lower for k in YELLOW_MIGRATION_KEYWORDS):
+            return None
+        resolved = _resolve_npm_script_body(workspace, script)
+        if resolved is None:
+            return None
+        # NM1 fix: scan the FULL command (every token, not just tokens[2])
+        # AND the resolved script body for the exclusion fragments --
+        # `npm run migrate --env=production --force` must exclude on
+        # "production" appearing in a trailing arg, and a resolved body
+        # that itself does something deploy/production-shaped must
+        # exclude too. The structural guard above already proved
+        # `command` is a single, uncomposed string, so a plain substring
+        # scan over it is safe (no hidden second command to miss).
+        excluded_haystack = f"{command.lower()} {resolved.lower()}"
+        if any(f in excluded_haystack for f in YELLOW_MIGRATION_EXCLUDED_FRAGMENTS):
+            return None
+        # Re-review-2 minor: `:prod`/`:live` are script-name-shaped, so
+        # argument forms (`--prod`, `--live`, `--env=prod`) slipped past.
+        # Bare `prod`/`live` scan the COMMAND tokens only -- on the body
+        # they'd overmatch ("product", "reproduce"), and overmatching
+        # here is fail-closed anyway (excluded -> not YELLOW-eligible).
+        if any(f in command.lower() for f in ("prod", "live")):
+            return None
+        return {
+            "action": "run_migration",
+            # Disclosure fix: the reason/proposedChanges carry the FULL
+            # literal command (every trailing arg) AND the resolved
+            # script body -- the operator approves everything that will
+            # actually execute, not just a script name.
+            "reason": f"engineer requested: {command!r} -> npm run {script} resolves to: {resolved!r}",
+            "proposedChanges": [command, resolved],
+            "risk": "high",
+        }
+
+    return None
+
+
+# --- approvals.json sidecar (V7 §35 file-based approval) -------------------
+#
+# The gateway spawns glimmer-v2.py (which spawns THIS process) with no
+# stdin at all for a UI-launched run (see invoke_engineer's --yes/
+# --auto-approve handling and the module docstring's cross-reference to
+# the gateway auto-approve deadlock lesson) -- an interactive prompt here
+# would deadlock the session exactly like the parked round-7 repro. File-
+# based polling is the only safe mechanism: this process writes the
+# request, the Control Center gateway (a human clicking Approve/Deny)
+# writes the resolution, both to the SAME sidecar file, same "two
+# processes, one JSON file, each writes only its own half" discipline as
+# task-overrides.json (glimmer-v2.py's load_task_overrides / control-
+# center's writeTaskOverride).
+APPROVAL_POLL_INTERVAL_SECONDS = 2
+DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write-to-temp-then-rename, same discipline control-center's
+    writeTaskOverride uses for task-overrides.json: a crash/kill mid-write
+    must never leave a torn file for a concurrent reader (the gateway, or
+    this process's own next poll) to trip over. os.replace is atomic on
+    the same filesystem, and the temp file lives in the same directory so
+    it always is."""
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _approvals_path(session_dir) -> Path:
+    return Path(session_dir) / "approvals.json"
+
+
+def load_approvals(session_dir) -> dict:
+    """Tolerant read, same uniform-degrade-to-{} contract as glimmer-v2.py's
+    load_task_overrides: missing file, unreadable, malformed JSON, or valid
+    JSON that isn't an object all resolve to {}."""
+    try:
+        data = json.loads(_approvals_path(session_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _bound_action_hash(tool_name, command) -> str:
+    """8.3 review fix (exact-action binding, defense in depth): a compact
+    fingerprint of the tool + exact command string this approval covers.
+    Compared byte-exact at resolution time in request_approval_and_wait --
+    a mismatch (approvals.json hand-edited, or any future refactor that
+    reuses an approval record for a different call) fails closed to
+    POLICY_BLOCK rather than executing something other than what the
+    human actually saw approved."""
+    return hashlib.sha256(
+        json.dumps({"tool": tool_name, "command": command}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _write_approval_request(session_dir, approval_id, action, reason, proposed_changes, risk, tool_name, command) -> dict:
+    """Read-modify-write over the whole file (there is at most one pending
+    approval per session in practice), same pattern as writeTaskOverride.
+    boundTool/boundCommand/boundArgsHash bind this record to the EXACT
+    action it was requested for (see _bound_action_hash)."""
+    existing = load_approvals(session_dir)
+    record = {
+        "action": action,
+        "reason": reason,
+        "proposedChanges": list(proposed_changes or []),
+        "risk": risk,
+        "requestedAt": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+        "boundTool": tool_name,
+        "boundCommand": command,
+        "boundArgsHash": _bound_action_hash(tool_name, command),
+    }
+    existing[approval_id] = record
+    _atomic_write_json(_approvals_path(session_dir), existing)
+    return record
+
+
+def _patch_manifest_approval_state(session_dir, approval_id, pending: dict | None) -> None:
+    """Best-effort direct patch of manifest.json's status/state/
+    pendingApproval fields -- the ONLY way a human watching the Control
+    Center can see "waiting_for_approval" live, since glimmer-v2.py itself
+    is blocked reading this process's stdout for the entire duration of
+    the wait (invoke_engineer's Popen loop) and cannot update manifest.json
+    until this process exits. Safe: manifest.json has exactly one writer
+    at any given moment -- glimmer-v2.py never touches it while blocked on
+    this subprocess, so there is no concurrent-writer race, only a
+    sequential handoff (same assumption architecture-plan.json/tasks.json/
+    every other session-dir artifact this process writes directly already
+    relies on).
+
+    pending is not None: save the CURRENT status/state (so they can be
+    restored exactly) under a private key, then set status/state to the
+    waiting-for-approval raw string glimmer-v2.py's canonical_session_state
+    recognizes, plus the structured pendingApproval envelope.
+
+    pending is None: restore the previously-saved status/state and drop
+    pendingApproval -- called once the wait resolves (approved/denied/
+    timeout), so the session never reports "waiting_for_approval" after
+    it's no longer true.
+
+    Never raises -- a missing/malformed manifest.json (standalone
+    invocation with no v2 parent, or a torn read mid-write) degrades to
+    "no live status update", never to a crashed session. The actual
+    approval gate (execute_tool's caller) does not depend on this
+    succeeding."""
+    path = Path(session_dir) / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(manifest, dict):
+        return
+
+    if pending is not None:
+        manifest["_preApprovalStatus"] = manifest.get("status")
+        manifest["_preApprovalState"] = manifest.get("state")
+        manifest["status"] = "waiting-for-approval"
+        manifest["state"] = "waiting_for_approval"
+        manifest["pendingApproval"] = {"approvalId": approval_id, **pending}
+    else:
+        if "_preApprovalStatus" in manifest:
+            manifest["status"] = manifest.pop("_preApprovalStatus")
+        if "_preApprovalState" in manifest:
+            manifest["state"] = manifest.pop("_preApprovalState")
+        manifest.pop("pendingApproval", None)
+
+    try:
+        _atomic_write_json(path, manifest)
+    except OSError:
+        pass
+
+
+def request_approval_and_wait(
+    action, reason, proposed_changes, risk,
+    *, tool_name, command, timeout_s=None, poll_interval_s=APPROVAL_POLL_INTERVAL_SECONDS,
+) -> tuple:
+    """V7 §35: request human approval for a YELLOW-classified action and
+    block (polling, never an interactive prompt -- see the module note
+    above) until it's approved, denied, or the timeout elapses.
+
+    tool_name/command are the EXACT action this approval is bound to (see
+    _bound_action_hash) -- required, not optional, so a caller can never
+    accidentally request approval for one action and let a different one
+    execute on approval.
+
+    Returns (decision, detail):
+      decision in {"approved", "denied", "timeout", "unavailable"}.
+      "unavailable" -- no GLIMMER_EVENTS_PATH (no session directory to
+      write the sidecar into, e.g. a standalone/test invocation) OR the
+      sidecar write itself failed (unwritable/removed session dir) --
+      fails CLOSED (same as "denied") rather than allowing with nothing
+      for a human to actually approve, and never raises out of this
+      function (M2, 8.3 review fix-round).
+      "denied" also covers a resolved record whose boundTool/boundCommand/
+      boundArgsHash no longer match this exact call (exact-action binding,
+      defense in depth) -- approvals.json hand-tampered, or reused for a
+      different action, is treated as a denial, never as approval.
+      detail is approvedBy (for "approved"/"denied", when the gateway
+      recorded one) or a short human-readable reason otherwise.
+
+    timeout_s defaults to DEFAULT_APPROVAL_TIMEOUT_SECONDS, overridable via
+    GLIMMER_APPROVAL_TIMEOUT_SECONDS (same env-var-configuration convention
+    as the other GLIMMER_* cross-process settings glimmer-v2.py's spawn env
+    already uses) -- never via a new CLI flag threaded through execute_tool
+    and its ~8 call sites. Both timeout_s and poll_interval_s are
+    parameters (not hardcoded reads of the env var/module constant) purely
+    so a selfcheck can pass tiny values and finish in milliseconds, never a
+    real 300-second sleep.
+    """
+    if timeout_s is None:
+        try:
+            timeout_s = int(os.environ.get("GLIMMER_APPROVAL_TIMEOUT_SECONDS", "") or DEFAULT_APPROVAL_TIMEOUT_SECONDS)
+        except ValueError:
+            timeout_s = DEFAULT_APPROVAL_TIMEOUT_SECONDS
+
+    if not GLIMMER_EVENTS_PATH:
+        return "unavailable", "no session directory available for approval sidecar (fail closed)"
+
+    session_dir = Path(GLIMMER_EVENTS_PATH).parent
+    approval_id = f"{GLIMMER_SESSION_ID or 'session'}-appr-{uuid.uuid4().hex[:8]}"
+
+    # M2 (8.3 review fix-round): a write failure here (unwritable/removed
+    # session dir) must fail closed, not raise out of execute_tool and
+    # kill the whole engineer run -- same discipline every other sidecar
+    # writer in this file already follows.
+    try:
+        pending = _write_approval_request(
+            session_dir, approval_id, action, reason, proposed_changes, risk, tool_name, command,
+        )
+    except OSError as exc:
+        return "unavailable", f"could not write approval sidecar (fail closed): {exc}"
+
+    bound_hash = pending["boundArgsHash"]
+    _patch_manifest_approval_state(session_dir, approval_id, pending)
+    _emit("approval_requested", approvalId=approval_id, action=action, reason=reason, risk=risk)
+    _emit("agent_state_changed", state="waiting_for_approval")
+
+    print()
+    print("┌─ YELLOW APPROVAL REQUESTED (V7 §35)")
+    print(f"│ {action}: {reason}")
+    print(f"│ waiting up to {timeout_s}s for a human decision (approvals.json) ...")
+    print("└─")
+
+    deadline = time.monotonic() + timeout_s
+    decision, detail = "timeout", f"no approval decision recorded within {timeout_s}s"
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval_s)
+        record = load_approvals(session_dir).get(approval_id)
+        if isinstance(record, dict) and record.get("status") in ("approved", "denied"):
+            decision = record["status"]
+            detail = record.get("approvedBy") or ""
+            if decision == "approved" and (
+                record.get("boundTool") != tool_name
+                or record.get("boundCommand") != command
+                or record.get("boundArgsHash") != bound_hash
+            ):
+                # Exact-action binding mismatch: the resolved record no
+                # longer describes the SAME action this call requested --
+                # fail closed regardless of what status it carries.
+                decision, detail = "denied", "approval record no longer matches the exact action requested"
+            break
+
+    _patch_manifest_approval_state(session_dir, approval_id, None)
+    # Cosmetic only (see the STATES/waiting_for_approval stepper entry the
+    # Control Center already carries): move the live stepper off
+    # "waiting_for_approval" now that the wait is over. "implementing" is a
+    # reasonable generic "back to work" bucket -- this loop has no record
+    # of whatever more specific phase preceded the request.
+    _emit("agent_state_changed", state="implementing")
+    print(f"\n{'✓ APPROVED' if decision == 'approved' else '✗ ' + decision.upper()}: {action}")
+    return decision, detail
 
 
 def architect_shell_policy(command, workspace):
@@ -3340,6 +3794,37 @@ def execute_tool(
             )
 
         if not allowed:
+            # Task 8.3 (V7 §14/§35): a shell_policy-rejected command may
+            # STILL be a YELLOW case -- dependency install / migration
+            # keyword -- that a human can unlock via the file-based
+            # approval sidecar, rather than a hard RED block. classify_
+            # yellow delegates the actual verdict back to shell_policy
+            # (via yellow_relax), so it never changes what shell_policy
+            # already said for anything it doesn't match (commit/push/
+            # deploy and everything else stay exactly as blocked as
+            # before). Positive allowlist (mode is None, i.e. plain
+            # engineer mode), not a negative one keyed off "architect" --
+            # architect mode has no approval path (C1 scoping) and any
+            # future mode inherits that safe default automatically
+            # instead of silently getting the approval path by omission
+            # (mode defaults to the literal string "engineer" -- there is
+            # no real None value in practice, see execute_tool's own
+            # signature).
+            yellow = classify_yellow(command, workspace, validation_allowlist) if mode == "engineer" else None
+            if yellow is not None:
+                decision, detail = request_approval_and_wait(
+                    yellow["action"], yellow["reason"], yellow["proposedChanges"], yellow["risk"],
+                    tool_name=tool_name, command=command,
+                )
+                if decision == "approved":
+                    allowed = True
+                    reason = f"human-approved YELLOW escalation: {yellow['action']}" + (
+                        f" (approved by {detail})" if detail else ""
+                    )
+                else:
+                    reason = f"{reason} [YELLOW escalation {decision}]"
+
+        if not allowed:
             message = (
                 "ENGINEERING SECURITY BLOCK: "
                 + reason
@@ -4227,11 +4712,13 @@ def _architect_review_selfcheck() -> None:
     assert isinstance(call_kwargs.get("mode"), ast.Constant) and call_kwargs["mode"].value == "architect", (
         "run_architect's one execute_tool call site must pass mode=\"architect\" unconditionally"
     )
-    # main()'s --mode choices must still be exactly engineer/architect —
-    # C2's review capability is a sub-mode of "architect", not a third
-    # --mode value.
-    assert 'choices=("engineer", "architect")' in inspect.getsource(main), (
-        "C2 must not add a new --mode value; review is a sub-mode of architect"
+    # main()'s --mode choices must still treat C2's review capability as
+    # a sub-mode of "architect", not a distinct --mode value of its own —
+    # unlike Task 8.2's later "consult" (a genuinely different, tool-free
+    # one-call mode with no read-only repo-exploration loop at all, so it
+    # earns its own --mode value rather than piggybacking on architect's).
+    assert 'choices=("engineer", "architect", "consult")' in inspect.getsource(main), (
+        "C2 must not add a new --mode value for review; review is a sub-mode of architect"
     )
 
     # ------------------------------------------------------------
@@ -7128,6 +7615,227 @@ def _run_consult_architect(architecture_plan, question):
     return answer, len(question_capped)
 
 
+# ============================================================
+# Task 8.2 (V7 §23.15): architect escalation for a delivery-review high/
+# critical concern. A tiny standalone `--mode consult` subprocess --
+# deliberately NOT the live engineer loop's consult_architect TOOL above
+# (that budget counter lives and dies inside a DIFFERENT subprocess's
+# memory: the engineering run that already finished by the time
+# glimmer-v2.py decides to escalate). Reuses _build_consult_architect_
+# payload -- the exact same request shape the live tool sends -- but
+# talks to chat_with_retry directly rather than through _run_consult_
+# architect, because that function's own fail-open contract swallows a
+# model/network failure into an in-band answer string; this caller needs
+# a REAL success/failure signal so it can write an honest
+# consultationFailed record (V7 §23.15's "model down -> consultation_
+# failed, session outcome unchanged") instead of silently reporting a
+# failure message as if it were the architect's real answer.
+# ============================================================
+
+def _escalation_file_path():
+    """Same session-dir-derivation convention as _delivery_review_file_
+    path -- the parent of GLIMMER_EVENTS_PATH. Returns None when no
+    session dir is available (standalone invocation)."""
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        return None
+    return Path(GLIMMER_EVENTS_PATH).parent / "architect-escalation.json"
+
+
+def _write_escalation_file(output):
+    """Write architect-escalation.json (real consultation or a
+    consultationFailed marker) to the session dir. Never raises. Returns
+    the path written, or None when no session dir is available or the
+    write failed."""
+    path = _escalation_file_path()
+    if path is None:
+        print(
+            "[glimmer-engineer] no session dir available (standalone "
+            "invocation); architect-escalation.json not written."
+        )
+        return None
+    try:
+        path.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Wrote: {path}")
+        return path
+    except OSError as exc:
+        print(f"[glimmer-engineer] failed to write architect-escalation.json: {exc}")
+        return None
+
+
+def _load_consult_request(path):
+    """Load the escalation request glimmer-v2.py writes ({"architecturePlan":
+    plan-or-null, "question": str}) -- same uniform-None-on-any-degraded-
+    case contract as _load_review_request: missing file, unreadable, not
+    valid JSON, or not an object all degrade to None."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_consult_escalation(request_path):
+    """V7 §23.15: the ONE toolless model call behind `--mode consult`.
+    Never raises: any failure (missing/malformed request, model/network
+    error, empty answer) writes a consultationFailed architect-
+    escalation.json instead of raising -- glimmer-v2.py's own caller
+    (run_architect_escalation) treats this subprocess's exit code as
+    advisory only and never depends on it for session outcome.
+    """
+    request = _load_consult_request(request_path) if request_path else None
+    question = str((request or {}).get("question") or "").strip()
+    plan = (request or {}).get("architecturePlan")
+
+    if not question:
+        _write_escalation_file({
+            "consultationFailed": True,
+            "reason": "missing/invalid escalation request (no question)",
+        })
+        return
+
+    payload, question_capped = _build_consult_architect_payload(plan, question)
+    try:
+        response = chat_with_retry(payload, attempts=3, role="consult")
+        answer = response["choices"][0]["message"].get("content") or ""
+        if not answer.strip():
+            raise ValueError("architect returned an empty answer")
+    except Exception as exc:  # noqa: BLE001 - model-down must degrade honestly, never crash
+        print(f"[glimmer-engineer] architect escalation failed: {exc}")
+        _write_escalation_file({
+            "consultationFailed": True,
+            "reason": f"{type(exc).__name__}: {exc}",
+        })
+        return
+
+    print()
+    print("════════════════════════════════════")
+    print("ARCHITECT ESCALATION")
+    print("════════════════════════════════════")
+    print(answer[:1800])
+
+    _write_escalation_file({"question": question_capped, "answer": answer})
+    _emit("architect_consulted", questionChars=len(question_capped), answerChars=len(answer))
+
+
+def _consult_escalation_selfcheck() -> None:
+    """Task 8.2 (V7 §23.15) — proves run_consult_escalation's success,
+    model-down, and empty-answer paths by monkeypatching chat_with_retry
+    (same no-live-llama-server style as _model_provider_selfcheck/
+    _recovery_ladder_selfcheck), plus that `--mode consult` is
+    structurally toolless -- checked against the REAL _build_consult_
+    architect_payload output and the REAL main() dispatch source, not a
+    hand-written re-implementation of what "read-only" should mean
+    (round-7 review lesson: assert against real computation, never a
+    parallel model of it). Run with:
+    python3 glimmer-engineer.py --consult-escalation-selfcheck
+    """
+    import inspect
+    import tempfile
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
+    real_chat_with_retry = chat_with_retry
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-esc"
+            request_path = session_dir / "escalation-request.json"
+            escalation_path = session_dir / "architect-escalation.json"
+
+            request_path.write_text(json.dumps({
+                "architecturePlan": {"objective": "x", "packages": [], "risk": "low"},
+                "question": "Is this architecturally sound?",
+            }))
+
+            # ------------------------------------------------------------
+            # 1. Success: writes the real {"question", "answer"} pair --
+            #    genuine model output, never marked consultationFailed.
+            # ------------------------------------------------------------
+            def fake_ok(payload, attempts=3, role=None):
+                assert role == "consult", "run_consult_escalation must call chat_with_retry with role='consult'"
+                return {"choices": [{"message": {"content": "Approved, proceed as-is."}}]}
+
+            globals()["chat_with_retry"] = fake_ok
+            run_consult_escalation(request_path)
+            written = json.loads(escalation_path.read_text(encoding="utf-8"))
+            assert written == {
+                "question": "Is this architecturally sound?",
+                "answer": "Approved, proceed as-is.",
+            }, written
+            assert "consultationFailed" not in written, "real model output must never be marked failed"
+
+            # ------------------------------------------------------------
+            # 2. Model unreachable: consultationFailed recorded, function
+            #    never raises -- the caller (glimmer-v2.py's own
+            #    run_architect_escalation) only ever reads the exit code/
+            #    file, so session outcome is unaffected either way.
+            # ------------------------------------------------------------
+            def fake_down(payload, attempts=3, role=None):
+                raise ConnectionRefusedError("model server unreachable")
+
+            globals()["chat_with_retry"] = fake_down
+            run_consult_escalation(request_path)  # must not raise
+            written = json.loads(escalation_path.read_text(encoding="utf-8"))
+            assert written.get("consultationFailed") is True
+            assert "model server unreachable" in written["reason"]
+
+            # ------------------------------------------------------------
+            # 3. Empty/whitespace answer: honestly degraded, never
+            #    fabricated as a real consultation.
+            # ------------------------------------------------------------
+            def fake_blank(payload, attempts=3, role=None):
+                return {"choices": [{"message": {"content": "   "}}]}
+
+            globals()["chat_with_retry"] = fake_blank
+            run_consult_escalation(request_path)
+            written = json.loads(escalation_path.read_text(encoding="utf-8"))
+            assert written.get("consultationFailed") is True
+            assert "empty answer" in written["reason"]
+    finally:
+        globals()["chat_with_retry"] = real_chat_with_retry
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+
+    # ------------------------------------------------------------
+    # 4. Structurally toolless: the REAL request-builder never offers
+    #    tools (same discipline _delivery_review_selfcheck already
+    #    proves for _build_delivery_review_payload), and the REAL
+    #    main() dispatch for --mode consult never reaches get_tools/
+    #    execute_tool/run_engineer/run_architect -- read-only by
+    #    construction, not by a re-implemented allow-list.
+    # ------------------------------------------------------------
+    payload, _ = _build_consult_architect_payload(
+        {"objective": "x", "packages": [], "risk": "low"}, "q"
+    )
+    assert "tools" not in payload
+    assert "functions" not in payload
+    assert "tool_choice" not in payload
+    assert "parallel_tool_calls" not in payload
+
+    consult_body = inspect.getsource(run_consult_escalation)
+    for forbidden in ("get_tools(", "execute_tool(", "WRITE_TOOLS", "run_engineer(", "run_architect("):
+        assert forbidden not in consult_body, (
+            f"run_consult_escalation must never reference {forbidden!r} -- it has no tool loop at all"
+        )
+
+    main_source = inspect.getsource(main)
+    consult_dispatch_start = main_source.index('if args.mode == "consult":')
+    consult_dispatch_end = main_source.index('elif args.mode == "architect":', consult_dispatch_start)
+    consult_dispatch = main_source[consult_dispatch_start:consult_dispatch_end]
+    assert "run_consult_escalation(args.consult_request)" in consult_dispatch
+    for forbidden in ("get_tools(", "execute_tool(", "run_engineer(", "run_architect("):
+        assert forbidden not in consult_dispatch, f"--mode consult's dispatch must never reach {forbidden!r}"
+
+    print("consult escalation (Task 8.2, V7 §23.15) self-check: PASS")
+
+
 def _format_advisory_nudge(detail):
     """The one, exact, deterministic nudge wording (no model text) that
     _evaluate_advisory_triggers' callers inject into `messages` on every
@@ -9278,6 +9986,257 @@ def _doc_tools_selfcheck() -> None:
     print("documentation tools (V7 §7.4) self-check: PASS")
 
 
+def _approval_wait_selfcheck() -> None:
+    """Task 8.3 (V7 §14/§35) self-check, extended by the 8.3 review
+    fix-round to reproduce every finding verbatim: classify_yellow now
+    delegates to shell_policy (C1/C2/M1), the migration arm re-excludes
+    deploy/publish/release/production/:prod/:live and requires a
+    resolvable script body (C3), request_approval_and_wait never raises
+    (M2) and binds each approval to the exact tool+command it was
+    requested for (defense in depth). Never sleeps anywhere near the real
+    300s default -- every timeout_s/poll_interval_s below is a tiny
+    override passed explicitly, and the "resolved while waiting" cases
+    use a short-lived background thread standing in for a human clicking
+    Approve/Deny in the Control Center.
+    Run with: python3 glimmer-engineer.py --approval-wait-selfcheck
+    """
+    import ast
+    import inspect
+    import tempfile
+    import threading
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    real_events_path, real_session_id = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    try:
+        with tempfile.TemporaryDirectory() as wd:
+            ws = Path(wd)
+            (ws / "package.json").write_text(json.dumps({
+                "scripts": {
+                    "migrate": "node scripts/migrate.js",
+                    "migrate:prod": "node scripts/migrate.js --env=prod",
+                    "deploy:migrate": "node scripts/deploy-and-migrate.js",
+                    "seed:production": "node scripts/seed.js --env=production",
+                    "migrate:unresolvable": None,  # present but not a string body
+                },
+            }))
+
+            # 1. RED stays RED -- every 8.3-review reproduction command
+            #    returns None (never YELLOW-eligible), because the REAL
+            #    shell_policy verdict (composition, position-exact
+            #    subcommand, dangerous_fragments) is what decides, not a
+            #    hand-rolled scan.
+            for red_command in (
+                "git push",
+                "git commit -m x",
+                "npm install x; git push origin main",   # C1: composition
+                "npm run deploy add",                     # C2: run/deploy, not install-shaped
+                "npm publish --tag add",                  # C2
+                "npm exec -- some-pkg add",                # C2
+                "npm uninstall react add",                # C2
+                "npm update add",
+                "npm --prefix /tmp/elsewhere install",    # M1: not install-shaped at tokens[1]
+                "npm run migrate:prod",                   # C3: migrate + :prod excluded
+                "npm run deploy:migrate",                 # C3: migrate + deploy excluded
+                "npm run seed:production",                 # C3: seed + production excluded
+                "npm run migrate:unresolvable",            # C3: migration keyword, but body isn't a string
+                # NC1 (re-review Critical): the migration arm had NO
+                # structural precondition of its own at all -- a composed
+                # command classified as YELLOW and dispatched verbatim.
+                # Now caught by classify_yellow's single shared entry-
+                # point guard, before either arm even runs.
+                "npm run migrate ; git push origin main",
+                "npm run migrate && git push origin main",
+                "npm run migrate > /tmp/out",
+                "npm run migrate $(whoami)",
+                "npm run migrate `whoami`",
+                # NM1 (re-review Major): the exclusion scan only looked at
+                # tokens[2] (the bare script name) -- a trailing arg
+                # carrying an excluded fragment must still exclude.
+                "npm run migrate --env=production --force",
+            ):
+                assert classify_yellow(red_command, ws) is None, red_command
+
+            # 1b. C3's "script body must be resolvable" requirement,
+            #     isolated from the exclusion-set check: a migration-
+            #     keyword script whose package.json doesn't even exist/
+            #     parse must never be YELLOW-eligible either.
+            with tempfile.TemporaryDirectory() as empty_wd:
+                assert classify_yellow("npm run migrate", Path(empty_wd)) is None
+
+            # 2. GREEN unaffected.
+            assert classify_yellow("npm run typecheck", ws) is None
+            assert classify_yellow("git status", ws) is None
+
+            # 3. YELLOW: plain dependency install, and migration WITH the
+            #    FULL literal command and its resolved script body
+            #    surfaced (re-review disclosure fix) -- not just a bare
+            #    script name.
+            yellow = classify_yellow("npm install left-pad", ws)
+            assert yellow is not None and yellow["action"] == "modify_dependencies"
+            migration = classify_yellow("npm run migrate", ws)
+            assert migration is not None and migration["action"] == "run_migration"
+            assert migration["proposedChanges"] == ["npm run migrate", "node scripts/migrate.js"]
+            assert "npm run migrate" in migration["reason"]
+            assert "node scripts/migrate.js" in migration["reason"]
+
+            # 3b. Structural check (house AST pattern, e.g. C2's
+            #     run_architect execute_tool-call-site assertion): the
+            #     shared structural guard must run BEFORE either arm's
+            #     subcommand-specific logic in classify_yellow's own
+            #     source, so a future third arm can't be added ahead of
+            #     it by accident.
+            body = ast.parse(inspect.getsource(classify_yellow)).body[0].body
+            guard_idx = next(
+                (i for i, stmt in enumerate(body) if "_structural_shell_guard" in ast.dump(stmt)), None,
+            )
+            first_arm_idx = next(
+                (i for i, stmt in enumerate(body)
+                 if "subcommand" in ast.dump(stmt) and "YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS" in ast.dump(stmt)),
+                None,
+            )
+            assert guard_idx is not None, "classify_yellow must call _structural_shell_guard"
+            assert first_arm_idx is not None, "classify_yellow must still dispatch the install arm"
+            assert guard_idx < first_arm_idx, (
+                "the structural guard must run before ANY arm-specific classification"
+            )
+
+            # 4. M1 fix, verified against the real shell_policy call (not
+            #    just classify_yellow's own gate): a workspace-contained
+            #    --prefix DOESN'T qualify either, because --prefix never
+            #    puts "install" at tokens[1].
+            assert classify_yellow(f"npm --prefix {ws} install left-pad", ws) is None
+
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = Path(td)
+            (session_dir / "events.jsonl").write_text("")
+            GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
+            GLIMMER_SESSION_ID = "sess-approval-selfcheck"
+
+            # 5. No manifest.json at all (standalone invocation, no v2
+            #    parent) -- the manifest patch must degrade silently.
+            _patch_manifest_approval_state(
+                session_dir, "appr-x",
+                {"action": "a", "reason": "r", "proposedChanges": [], "risk": "low"},
+            )
+            _patch_manifest_approval_state(session_dir, "appr-x", None)
+
+            manifest_path = session_dir / "manifest.json"
+            manifest_path.write_text(json.dumps({"status": "initialized", "state": "preflight"}))
+
+            # 6. Denied path: a background "human" writes status="denied"
+            #    shortly after the request lands in approvals.json.
+            def _deny_soon():
+                time.sleep(0.03)
+                approvals = load_approvals(session_dir)
+                [approval_id] = approvals.keys()
+                approvals[approval_id]["status"] = "denied"
+                approvals[approval_id]["approvedBy"] = "test-human"
+                _atomic_write_json(_approvals_path(session_dir), approvals)
+
+            threading.Thread(target=_deny_soon, daemon=True).start()
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "install left-pad", ["package.json"], "medium",
+                tool_name="exec_shell_command", command="npm install left-pad",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "denied", decision
+            assert detail == "test-human", detail
+            # manifest restored to its pre-approval status/state, pendingApproval cleared.
+            after = json.loads(manifest_path.read_text())
+            assert after["status"] == "initialized" and after["state"] == "preflight"
+            assert "pendingApproval" not in after
+            assert "_preApprovalStatus" not in after and "_preApprovalState" not in after
+
+            # 7. Approved path.
+            def _approve_soon():
+                time.sleep(0.03)
+                approvals = load_approvals(session_dir)
+                [approval_id] = [k for k, v in approvals.items() if v.get("status") == "pending"]
+                approvals[approval_id]["status"] = "approved"
+                approvals[approval_id]["approvedBy"] = "daniel"
+                _atomic_write_json(_approvals_path(session_dir), approvals)
+
+            threading.Thread(target=_approve_soon, daemon=True).start()
+            decision, detail = request_approval_and_wait(
+                "run_migration", "npm run migrate -> node scripts/migrate.js", [], "high",
+                tool_name="exec_shell_command", command="npm run migrate",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "approved" and detail == "daniel"
+
+            # 8. Exact-action binding mismatch: the record resolves
+            #    "approved", but for a DIFFERENT command than this call
+            #    requested (approvals.json tampered, or reused) -- must
+            #    fail closed to "denied", never execute the original
+            #    command on the strength of an approval for something
+            #    else.
+            def _approve_wrong_command_soon():
+                time.sleep(0.03)
+                approvals = load_approvals(session_dir)
+                [approval_id] = [k for k, v in approvals.items() if v.get("status") == "pending"]
+                approvals[approval_id]["status"] = "approved"
+                approvals[approval_id]["approvedBy"] = "daniel"
+                approvals[approval_id]["boundCommand"] = "npm install totally-different-package"
+                approvals[approval_id]["boundArgsHash"] = "tampered"
+                _atomic_write_json(_approvals_path(session_dir), approvals)
+
+            threading.Thread(target=_approve_wrong_command_soon, daemon=True).start()
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "install left-pad", ["package.json"], "medium",
+                tool_name="exec_shell_command", command="npm install left-pad",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "denied", decision
+            assert "exact action" in detail, detail
+
+            # 9. Timeout path: nobody ever resolves it -> fail closed.
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "npm install x", [], "medium",
+                tool_name="exec_shell_command", command="npm install x",
+                timeout_s=0.05, poll_interval_s=0.01,
+            )
+            assert decision == "timeout", decision
+
+            # 10. Sidecar tolerant of malformed JSON.
+            (session_dir / "approvals.json").write_text("not json{{{")
+            assert load_approvals(session_dir) == {}
+            (session_dir / "approvals.json").write_text(json.dumps(["not", "an", "object"]))
+            assert load_approvals(session_dir) == {}
+
+            # 11. M2: an unwritable session dir must not raise out of
+            #     request_approval_and_wait -- fails closed as
+            #     "unavailable", exactly like the no-session-dir case.
+            real_write = _write_approval_request
+
+            def _raising_write(*args, **kwargs):
+                raise OSError("simulated: session dir removed/unwritable")
+
+            globals()["_write_approval_request"] = _raising_write
+            try:
+                decision, detail = request_approval_and_wait(
+                    "modify_dependencies", "install x", [], "medium",
+                    tool_name="exec_shell_command", command="npm install x",
+                    timeout_s=1, poll_interval_s=0.01,
+                )
+            finally:
+                globals()["_write_approval_request"] = real_write
+            assert decision == "unavailable", decision
+
+            # 12. No session directory at all -> "unavailable", fails
+            #     closed immediately (no wait, no allow-by-default).
+            GLIMMER_EVENTS_PATH = None
+            decision, detail = request_approval_and_wait(
+                "x", "y", [], "low", tool_name="exec_shell_command", command="x",
+                timeout_s=1, poll_interval_s=0.01,
+            )
+            assert decision == "unavailable", decision
+    finally:
+        GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = real_events_path, real_session_id
+
+    print("approval wait loop (V7 §14/§35) self-check: PASS (12/12)")
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -9339,14 +10298,17 @@ def main():
     # that flag explicitly.
     parser.add_argument(
         "--mode",
-        choices=("engineer", "architect"),
+        choices=("engineer", "architect", "consult"),
         default="engineer",
         help=(
             "engineer (default): the existing full read/write "
             "engineering loop, unchanged. "
             "architect: read-only planning mode (V7 §5) — explores the "
             "repository with a read-only tool set and writes "
-            "architecture-plan.json instead of editing files."
+            "architecture-plan.json instead of editing files. "
+            "consult: V7 §23.15 architect escalation -- exactly ONE "
+            "toolless model call (--consult-request required), writing "
+            "architect-escalation.json. No repository access at all."
         ),
     )
 
@@ -9366,6 +10328,18 @@ def main():
     )
 
     parser.add_argument(
+        "--consult-request",
+        type=Path,
+        default=None,
+        help=(
+            "Task 8.2 (V7 §23.15): only meaningful with --mode consult. "
+            "Path to a JSON file written by glimmer-v2.py: "
+            '{"architecturePlan": plan-or-null, "question": str}. Required '
+            "for --mode consult; ignored otherwise."
+        ),
+    )
+
+    parser.add_argument(
         "--architect-consult-enabled",
         action="store_true",
         help=(
@@ -9379,7 +10353,12 @@ def main():
 
     args = parser.parse_args()
 
-    if args.mode == "architect":
+    if args.mode == "consult":
+        # Task 8.2: no workspace access, no tool loop, no turn budget --
+        # exactly one toolless model call. args.prompt/args.workspace are
+        # still required by argparse but unused here.
+        run_consult_escalation(args.consult_request)
+    elif args.mode == "architect":
         max_turns = (
             args.max_turns
             if args.max_turns is not None
@@ -9451,6 +10430,10 @@ if __name__ == "__main__":
         _consult_selfcheck()
         sys.exit(0)
 
+    if sys.argv[1:] == ["--consult-escalation-selfcheck"]:
+        _consult_escalation_selfcheck()
+        sys.exit(0)
+
     if sys.argv[1:] == ["--context-tiers-selfcheck"]:
         _context_tiers_selfcheck()
         sys.exit(0)
@@ -9469,6 +10452,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--doc-tools-selfcheck"]:
         _doc_tools_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--approval-wait-selfcheck"]:
+        _approval_wait_selfcheck()
         sys.exit(0)
 
     try:
