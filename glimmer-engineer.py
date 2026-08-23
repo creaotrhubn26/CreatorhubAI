@@ -1089,7 +1089,24 @@ def shell_policy(
     command,
     workspace,
     validation_allowlist=None,
+    *,
+    yellow_relax=frozenset(),
 ):
+    """yellow_relax (8.3 review fix-round, V7 §14/§35): a set of npm
+    SUBCOMMAND names (e.g. {"install","i","ci","add"}) this ONE call may
+    treat as not-forbidden -- used exclusively by classify_yellow to
+    probe "would this exact command be allowed if only its dependency-
+    install subcommand were waived", never to actually relax enforcement
+    for a real dispatch. Every real exec_shell_command call site in this
+    file passes the default empty frozenset(), so this parameter is a
+    no-op for real command execution: every check this function already
+    performs -- composition/pipe/redirect/substitution/quoting rejection
+    up top, the forbidden-token scan, --prefix containment -- still runs
+    in full and still returns False for anything that isn't a genuinely
+    simple, uncomposed `npm <relaxed-subcommand> ...` command. This is
+    the SAME "BY CONSTRUCTION, not by re-implementing" remedy
+    architect_shell_policy already uses (see its own docstring) applied
+    to a second caller."""
     if not isinstance(command, str):
         return False, "Command must be a string"
 
@@ -1190,10 +1207,36 @@ def shell_policy(
             "exec",
         }
 
-        if any(
+        # yellow_relax (8.3 review fix-round, V7 §14/§35): position-exact
+        # -- only npm's own SUBCOMMAND slot (tokens[1]) may ever be
+        # relaxed, never a package-name/argument token that happens to
+        # collide with a forbidden word elsewhere (the "anywhere in the
+        # tail" scans below stay exactly as strict as before for every
+        # OTHER position -- that looseness in the OLD classify_yellow,
+        # not here, is what let `npm run deploy add` misclassify). Every
+        # real exec_shell_command dispatch passes the default empty
+        # frozenset, so this whole block is a byte-identical no-op for
+        # real enforcement -- only classify_yellow's shell_policy PROBE
+        # (never a real dispatch) ever passes a non-empty relax set.
+        subcommand = lowered[1] if len(lowered) > 1 else ""
+        relaxed = bool(subcommand) and subcommand in yellow_relax
+
+        if not relaxed and any(
             item in forbidden
             for item in lowered[1:]
         ):
+            return False, (
+                "npm dependency/package operations "
+                "are blocked"
+            )
+
+        if relaxed and any(
+            item in forbidden
+            for item in lowered[2:]
+        ):
+            # The relaxed subcommand itself is fine, but some OTHER
+            # forbidden token still appears later in the command -- stays
+            # blocked.
             return False, (
                 "npm dependency/package operations "
                 "are blocked"
@@ -1211,6 +1254,14 @@ def shell_policy(
                 tokens[index + 1],
                 workspace,
             )
+
+        if relaxed:
+            # Dependency-install commands aren't "npm run <script>"
+            # invocations -- every check above (composition/substitution/
+            # quoting at the top of this function, the forbidden-token
+            # scan, and --prefix containment) already ran in full; there
+            # is nothing left to gate for this exact shape.
+            return True, f"yellow-relaxed npm {subcommand}"
 
         if "run" not in tokens:
             return False, (
@@ -1345,73 +1396,127 @@ def shell_policy(
 # Task 8.3 (V7 §14/§35): YELLOW approval-boundary classification
 # ============================================================
 #
-# Mirrors glimmer-v2.py's classify_yellow verbatim -- kept in sync
-# deliberately, same discipline as canonical_session_state/mapManifest
-# Status across the Python/TypeScript boundary. The two orchestrator/
-# engineer processes can't import each other (hyphenated filenames aren't
-# importable Python modules; glimmer_events.py is the one module they
-# genuinely share, and only THIS process ever dispatches a shell command).
-# Any change here must be mirrored in glimmer-v2.py.
+# 8.3 review fix-round: the original version of this function was an
+# INDEPENDENT token scan that re-implemented shell_policy's own parsing
+# with none of its preamble (composition/substitution/quoting rejection,
+# --prefix containment, position-exact subcommand extraction) -- exactly
+# the class of hole round 1 forced architect_shell_policy to close "BY
+# CONSTRUCTION -- by delegating to it -- not by re-implementing". Fixed
+# the same way: this function now DELEGATES the actual verdict to
+# shell_policy itself (via its yellow_relax hook, see that function's
+# docstring), never re-derives it. There is exactly one copy of this
+# function now (glimmer-v2.py's former "reference" mirror was removed --
+# it has no shell_policy/workspace to delegate to at all, and a copy that
+# can't be held to the same standard is worse than no copy).
 #
-# Never widens or replaces shell_policy's own RED enforcement just above --
-# only answers "does this shell_policy-rejected command ALSO qualify for a
-# YELLOW human-approval escalation". None means "stays exactly what
-# shell_policy already said" (RED stays RED).
-YELLOW_DEPENDENCY_INSTALL_TOKENS = frozenset({"install", "i", "ci", "add"})
+# Scope-expansion YELLOW (V7 §15 "large expansion -> pause for approval")
+# was dropped in this same fix-round: it had no caller anywhere in either
+# process (glimmer-engineer.py has no structured contract.scope to check
+# it against -- that would need a new spawn-env flag threading it in from
+# glimmer-v2.py, out of scope here) and shipping an unreachable classifier
+# arm is worse than not having one. Tracked as future work, not shipped.
+YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS = frozenset({"install", "i", "ci", "add"})
 YELLOW_MIGRATION_KEYWORDS = ("migrate", "migration", "seed")
-SCOPE_EXPANSION_YELLOW_THRESHOLD = 3
+# V7 §35: "commit, push, deploy" (and the rest of shell_policy's own
+# dangerous_fragments set) stay RED even when a migration keyword ALSO
+# appears in the same script name (e.g. "deploy:migrate") -- no
+# escalation offered for those, ever.
+YELLOW_MIGRATION_EXCLUDED_FRAGMENTS = ("deploy", "publish", "release", "production", ":prod", ":live")
 
 
-def classify_yellow(action_kind: str, command, contract) -> dict | None:
-    """See glimmer-v2.py's classify_yellow for the full docstring (kept
-    identical here on purpose)."""
-    if action_kind == "shell":
-        if not isinstance(command, str) or not command.strip():
-            return None
+def _resolve_npm_script_body(workspace, script):
+    """8.3 review fix (C3): resolve the LITERAL command an `npm run
+    <script>` will execute, straight from the workspace's package.json,
+    so a migration-keyword approval shows the operator the real command
+    body -- not just a model-chosen script NAME the model itself could
+    have written moments earlier (package.json is model-writable; only
+    the lockfiles are protected, see check_write_path/PROTECTED_FILES).
+    Returns None (fail closed -- not YELLOW-eligible at all) whenever
+    package.json is missing, unreadable, malformed, has no "scripts"
+    object, or no matching key: an operator must never approve a bare
+    name whose body couldn't be shown to them."""
+    try:
+        data = json.loads((Path(workspace) / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return None
+    body = scripts.get(script)
+    return body if isinstance(body, str) and body.strip() else None
+
+
+def classify_yellow(command, workspace, validation_allowlist=None) -> dict | None:
+    """V7 §14/§35 YELLOW escalation. Called ONLY from execute_tool's
+    exec_shell_command branch, and ONLY after shell_policy has already
+    said no for this exact `command` string -- never re-derives that
+    verdict, only asks shell_policy a second, narrower question: "would
+    this be allowed if ONLY its dependency-install subcommand were
+    waived". Returns a structured V7 §35 approval-request dict --
+    {"action","reason","proposedChanges","risk"} -- or None, meaning
+    "stays exactly what shell_policy already said" (RED stays RED).
+
+    The preliminary shlex.split/tokens[0]/tokens[1] check below makes NO
+    security decision by itself -- it only decides whether to bother
+    probing shell_policy at all. shell_policy's own composition/
+    substitution/quoting rejection always runs first and unconditionally
+    on the real `command` string regardless of yellow_relax, so a
+    composed command (e.g. "npm install x; git push origin main") is
+    rejected by that probe just like any other shell_policy call, before
+    ever reaching the relaxed npm branch.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        tokens = shlex.split(command.strip())
+    except ValueError:
+        return None
+    if len(tokens) < 2 or tokens[0] != "npm":
+        return None
+
+    subcommand = tokens[1].lower()
+
+    # --- dependency install ---------------------------------------------
+    if subcommand in YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS:
         try:
-            tokens = shlex.split(command.strip())
-        except ValueError:
+            allowed, _reason = shell_policy(
+                command, workspace, validation_allowlist,
+                yellow_relax=YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS,
+            )
+        except PermissionError:
+            # e.g. --prefix escaping the workspace -- shell_policy's own
+            # containment check still ran in full (yellow_relax only
+            # skips the forbidden-subcommand short-circuit, nothing
+            # else) and it said no. Fail closed: not eligible.
             return None
-        if not tokens:
+        if not allowed:
             return None
+        return {
+            "action": "modify_dependencies",
+            "reason": f"engineer requested a dependency-install command: {command}",
+            "proposedChanges": ["package.json", "package-lock.json"],
+            "risk": "medium",
+        }
 
-        executable = tokens[0]
-        lowered = [t.lower() for t in tokens]
-
-        if executable == "npm":
-            if any(t in YELLOW_DEPENDENCY_INSTALL_TOKENS for t in lowered[1:]):
-                return {
-                    "action": "modify_dependencies",
-                    "reason": f"engineer requested a dependency-install command: {command}",
-                    "proposedChanges": ["package.json", "package-lock.json"],
-                    "risk": "medium",
-                }
-            if "run" in tokens:
-                idx = tokens.index("run")
-                if idx + 1 < len(tokens):
-                    script = tokens[idx + 1]
-                    if any(k in script.lower() for k in YELLOW_MIGRATION_KEYWORDS):
-                        return {
-                            "action": "run_migration",
-                            "reason": f"engineer requested a migration-shaped npm script: {script!r}",
-                            "proposedChanges": [],
-                            "risk": "high",
-                        }
-        return None
-
-    if action_kind == "scope":
-        expanded = (contract or {}).get("expandedFiles") or []
-        if len(expanded) >= SCOPE_EXPANSION_YELLOW_THRESHOLD:
-            return {
-                "action": "scope_expansion",
-                "reason": (
-                    f"{len(expanded)} changed file(s) fall outside the declared/expected "
-                    f"scope: {', '.join(expanded[:5])}"
-                ),
-                "proposedChanges": list(expanded[:20]),
-                "risk": "medium",
-            }
-        return None
+    # --- migration-shaped npm run script ---------------------------------
+    if subcommand == "run" and len(tokens) > 2:
+        script = tokens[2]
+        script_lower = script.lower()
+        if not any(k in script_lower for k in YELLOW_MIGRATION_KEYWORDS):
+            return None
+        if any(f in script_lower for f in YELLOW_MIGRATION_EXCLUDED_FRAGMENTS):
+            return None
+        resolved = _resolve_npm_script_body(workspace, script)
+        if resolved is None:
+            return None
+        return {
+            "action": "run_migration",
+            "reason": f"engineer requested npm run {script} -> {resolved}",
+            "proposedChanges": [resolved],
+            "risk": "high",
+        }
 
     return None
 
@@ -1460,9 +1565,24 @@ def load_approvals(session_dir) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _write_approval_request(session_dir, approval_id, action, reason, proposed_changes, risk) -> dict:
+def _bound_action_hash(tool_name, command) -> str:
+    """8.3 review fix (exact-action binding, defense in depth): a compact
+    fingerprint of the tool + exact command string this approval covers.
+    Compared byte-exact at resolution time in request_approval_and_wait --
+    a mismatch (approvals.json hand-edited, or any future refactor that
+    reuses an approval record for a different call) fails closed to
+    POLICY_BLOCK rather than executing something other than what the
+    human actually saw approved."""
+    return hashlib.sha256(
+        json.dumps({"tool": tool_name, "command": command}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _write_approval_request(session_dir, approval_id, action, reason, proposed_changes, risk, tool_name, command) -> dict:
     """Read-modify-write over the whole file (there is at most one pending
-    approval per session in practice), same pattern as writeTaskOverride."""
+    approval per session in practice), same pattern as writeTaskOverride.
+    boundTool/boundCommand/boundArgsHash bind this record to the EXACT
+    action it was requested for (see _bound_action_hash)."""
     existing = load_approvals(session_dir)
     record = {
         "action": action,
@@ -1471,6 +1591,9 @@ def _write_approval_request(session_dir, approval_id, action, reason, proposed_c
         "risk": risk,
         "requestedAt": datetime.now(timezone.utc).isoformat(),
         "status": "pending",
+        "boundTool": tool_name,
+        "boundCommand": command,
+        "boundArgsHash": _bound_action_hash(tool_name, command),
     }
     existing[approval_id] = record
     _atomic_write_json(_approvals_path(session_dir), existing)
@@ -1534,18 +1657,29 @@ def _patch_manifest_approval_state(session_dir, approval_id, pending: dict | Non
 
 def request_approval_and_wait(
     action, reason, proposed_changes, risk,
-    *, timeout_s=None, poll_interval_s=APPROVAL_POLL_INTERVAL_SECONDS,
+    *, tool_name, command, timeout_s=None, poll_interval_s=APPROVAL_POLL_INTERVAL_SECONDS,
 ) -> tuple:
     """V7 §35: request human approval for a YELLOW-classified action and
     block (polling, never an interactive prompt -- see the module note
     above) until it's approved, denied, or the timeout elapses.
 
+    tool_name/command are the EXACT action this approval is bound to (see
+    _bound_action_hash) -- required, not optional, so a caller can never
+    accidentally request approval for one action and let a different one
+    execute on approval.
+
     Returns (decision, detail):
       decision in {"approved", "denied", "timeout", "unavailable"}.
       "unavailable" -- no GLIMMER_EVENTS_PATH (no session directory to
-      write the sidecar into, e.g. a standalone/test invocation) -- fails
-      CLOSED (same as "denied") rather than allowing with nothing for a
-      human to actually approve.
+      write the sidecar into, e.g. a standalone/test invocation) OR the
+      sidecar write itself failed (unwritable/removed session dir) --
+      fails CLOSED (same as "denied") rather than allowing with nothing
+      for a human to actually approve, and never raises out of this
+      function (M2, 8.3 review fix-round).
+      "denied" also covers a resolved record whose boundTool/boundCommand/
+      boundArgsHash no longer match this exact call (exact-action binding,
+      defense in depth) -- approvals.json hand-tampered, or reused for a
+      different action, is treated as a denial, never as approval.
       detail is approvedBy (for "approved"/"denied", when the gateway
       recorded one) or a short human-readable reason otherwise.
 
@@ -1570,7 +1704,18 @@ def request_approval_and_wait(
     session_dir = Path(GLIMMER_EVENTS_PATH).parent
     approval_id = f"{GLIMMER_SESSION_ID or 'session'}-appr-{uuid.uuid4().hex[:8]}"
 
-    pending = _write_approval_request(session_dir, approval_id, action, reason, proposed_changes, risk)
+    # M2 (8.3 review fix-round): a write failure here (unwritable/removed
+    # session dir) must fail closed, not raise out of execute_tool and
+    # kill the whole engineer run -- same discipline every other sidecar
+    # writer in this file already follows.
+    try:
+        pending = _write_approval_request(
+            session_dir, approval_id, action, reason, proposed_changes, risk, tool_name, command,
+        )
+    except OSError as exc:
+        return "unavailable", f"could not write approval sidecar (fail closed): {exc}"
+
+    bound_hash = pending["boundArgsHash"]
     _patch_manifest_approval_state(session_dir, approval_id, pending)
     _emit("approval_requested", approvalId=approval_id, action=action, reason=reason, risk=risk)
     _emit("agent_state_changed", state="waiting_for_approval")
@@ -1589,6 +1734,15 @@ def request_approval_and_wait(
         if isinstance(record, dict) and record.get("status") in ("approved", "denied"):
             decision = record["status"]
             detail = record.get("approvedBy") or ""
+            if decision == "approved" and (
+                record.get("boundTool") != tool_name
+                or record.get("boundCommand") != command
+                or record.get("boundArgsHash") != bound_hash
+            ):
+                # Exact-action binding mismatch: the resolved record no
+                # longer describes the SAME action this call requested --
+                # fail closed regardless of what status it carries.
+                decision, detail = "denied", "approval record no longer matches the exact action requested"
             break
 
     _patch_manifest_approval_state(session_dir, approval_id, None)
@@ -3604,17 +3758,24 @@ def execute_tool(
             # Task 8.3 (V7 §14/§35): a shell_policy-rejected command may
             # STILL be a YELLOW case -- dependency install / migration
             # keyword -- that a human can unlock via the file-based
-            # approval sidecar, rather than a hard RED block. Never
-            # reached in architect mode (no approval path there -- C1
-            # scoping, see invoke_engineer's docstring) and never changes
-            # what shell_policy/architect_shell_policy actually said for
-            # any command classify_yellow doesn't match (commit/push/
+            # approval sidecar, rather than a hard RED block. classify_
+            # yellow delegates the actual verdict back to shell_policy
+            # (via yellow_relax), so it never changes what shell_policy
+            # already said for anything it doesn't match (commit/push/
             # deploy and everything else stay exactly as blocked as
-            # before).
-            yellow = None if mode == "architect" else classify_yellow("shell", command, {})
+            # before). Positive allowlist (mode is None, i.e. plain
+            # engineer mode), not a negative one keyed off "architect" --
+            # architect mode has no approval path (C1 scoping) and any
+            # future mode inherits that safe default automatically
+            # instead of silently getting the approval path by omission
+            # (mode defaults to the literal string "engineer" -- there is
+            # no real None value in practice, see execute_tool's own
+            # signature).
+            yellow = classify_yellow(command, workspace, validation_allowlist) if mode == "engineer" else None
             if yellow is not None:
                 decision, detail = request_approval_and_wait(
                     yellow["action"], yellow["reason"], yellow["proposedChanges"], yellow["risk"],
+                    tool_name=tool_name, command=command,
                 )
                 if decision == "approved":
                     allowed = True
@@ -9787,15 +9948,17 @@ def _doc_tools_selfcheck() -> None:
 
 
 def _approval_wait_selfcheck() -> None:
-    """Task 8.3 (V7 §14/§35) self-check: classify_yellow (mirrored copy)
-    plus the approvals.json sidecar + request_approval_and_wait's poll
-    loop. Never sleeps anywhere near the real 300s default -- every
-    timeout_s/poll_interval_s below is a tiny override passed explicitly
-    (request_approval_and_wait takes them as parameters for exactly this
-    reason), and the "resolved while waiting" cases use a short-lived
-    background thread standing in for a human clicking Approve/Deny in
-    the Control Center -- no mocked clock needed, the real waits are
-    already millisecond-scale.
+    """Task 8.3 (V7 §14/§35) self-check, extended by the 8.3 review
+    fix-round to reproduce every finding verbatim: classify_yellow now
+    delegates to shell_policy (C1/C2/M1), the migration arm re-excludes
+    deploy/publish/release/production/:prod/:live and requires a
+    resolvable script body (C3), request_approval_and_wait never raises
+    (M2) and binds each approval to the exact tool+command it was
+    requested for (defense in depth). Never sleeps anywhere near the real
+    300s default -- every timeout_s/poll_interval_s below is a tiny
+    override passed explicitly, and the "resolved while waiting" cases
+    use a short-lived background thread standing in for a human clicking
+    Approve/Deny in the Control Center.
     Run with: python3 glimmer-engineer.py --approval-wait-selfcheck
     """
     import tempfile
@@ -9805,17 +9968,65 @@ def _approval_wait_selfcheck() -> None:
     real_events_path, real_session_id = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
 
     try:
-        # 1. classify_yellow parity spot-check -- the full RED/YELLOW/GREEN
-        #    matrix lives in glimmer-v2.py's own --yellow-approval-selfcheck
-        #    (the two copies are kept in sync deliberately); this just
-        #    proves the mirrored copy here agrees on the cases the wait
-        #    loop actually exercises below.
-        assert classify_yellow("shell", "git push", {}) is None
-        assert classify_yellow("shell", "npm run deploy", {}) is None
-        assert classify_yellow("shell", "git commit -m x", {}) is None
-        yellow = classify_yellow("shell", "npm install left-pad", {})
-        assert yellow is not None and yellow["action"] == "modify_dependencies"
-        assert classify_yellow("shell", "npm run db:migrate", {})["action"] == "run_migration"
+        with tempfile.TemporaryDirectory() as wd:
+            ws = Path(wd)
+            (ws / "package.json").write_text(json.dumps({
+                "scripts": {
+                    "migrate": "node scripts/migrate.js",
+                    "migrate:prod": "node scripts/migrate.js --env=prod",
+                    "deploy:migrate": "node scripts/deploy-and-migrate.js",
+                    "seed:production": "node scripts/seed.js --env=production",
+                    "migrate:unresolvable": None,  # present but not a string body
+                },
+            }))
+
+            # 1. RED stays RED -- every 8.3-review reproduction command
+            #    returns None (never YELLOW-eligible), because the REAL
+            #    shell_policy verdict (composition, position-exact
+            #    subcommand, dangerous_fragments) is what decides, not a
+            #    hand-rolled scan.
+            for red_command in (
+                "git push",
+                "git commit -m x",
+                "npm install x; git push origin main",   # C1: composition
+                "npm run deploy add",                     # C2: run/deploy, not install-shaped
+                "npm publish --tag add",                  # C2
+                "npm exec -- some-pkg add",                # C2
+                "npm uninstall react add",                # C2
+                "npm update add",
+                "npm --prefix /tmp/elsewhere install",    # M1: not install-shaped at tokens[1]
+                "npm run migrate:prod",                   # C3: migrate + :prod excluded
+                "npm run deploy:migrate",                 # C3: migrate + deploy excluded
+                "npm run seed:production",                 # C3: seed + production excluded
+                "npm run migrate:unresolvable",            # C3: migration keyword, but body isn't a string
+            ):
+                assert classify_yellow(red_command, ws) is None, red_command
+
+            # 1b. C3's "script body must be resolvable" requirement,
+            #     isolated from the exclusion-set check: a migration-
+            #     keyword script whose package.json doesn't even exist/
+            #     parse must never be YELLOW-eligible either.
+            with tempfile.TemporaryDirectory() as empty_wd:
+                assert classify_yellow("npm run migrate", Path(empty_wd)) is None
+
+            # 2. GREEN unaffected.
+            assert classify_yellow("npm run typecheck", ws) is None
+            assert classify_yellow("git status", ws) is None
+
+            # 3. YELLOW: plain dependency install, and migration WITH its
+            #    resolved script body surfaced (not just the bare name).
+            yellow = classify_yellow("npm install left-pad", ws)
+            assert yellow is not None and yellow["action"] == "modify_dependencies"
+            migration = classify_yellow("npm run migrate", ws)
+            assert migration is not None and migration["action"] == "run_migration"
+            assert migration["proposedChanges"] == ["node scripts/migrate.js"]
+            assert "node scripts/migrate.js" in migration["reason"]
+
+            # 4. M1 fix, verified against the real shell_policy call (not
+            #    just classify_yellow's own gate): a workspace-contained
+            #    --prefix DOESN'T qualify either, because --prefix never
+            #    puts "install" at tokens[1].
+            assert classify_yellow(f"npm --prefix {ws} install left-pad", ws) is None
 
         with tempfile.TemporaryDirectory() as td:
             session_dir = Path(td)
@@ -9823,7 +10034,7 @@ def _approval_wait_selfcheck() -> None:
             GLIMMER_EVENTS_PATH = str(session_dir / "events.jsonl")
             GLIMMER_SESSION_ID = "sess-approval-selfcheck"
 
-            # 2. No manifest.json at all (standalone invocation, no v2
+            # 5. No manifest.json at all (standalone invocation, no v2
             #    parent) -- the manifest patch must degrade silently.
             _patch_manifest_approval_state(
                 session_dir, "appr-x",
@@ -9834,7 +10045,7 @@ def _approval_wait_selfcheck() -> None:
             manifest_path = session_dir / "manifest.json"
             manifest_path.write_text(json.dumps({"status": "initialized", "state": "preflight"}))
 
-            # 3. Denied path: a background "human" writes status="denied"
+            # 6. Denied path: a background "human" writes status="denied"
             #    shortly after the request lands in approvals.json.
             def _deny_soon():
                 time.sleep(0.03)
@@ -9847,6 +10058,7 @@ def _approval_wait_selfcheck() -> None:
             threading.Thread(target=_deny_soon, daemon=True).start()
             decision, detail = request_approval_and_wait(
                 "modify_dependencies", "install left-pad", ["package.json"], "medium",
+                tool_name="exec_shell_command", command="npm install left-pad",
                 timeout_s=2, poll_interval_s=0.01,
             )
             assert decision == "denied", decision
@@ -9857,7 +10069,7 @@ def _approval_wait_selfcheck() -> None:
             assert "pendingApproval" not in after
             assert "_preApprovalStatus" not in after and "_preApprovalState" not in after
 
-            # 4. Approved path.
+            # 7. Approved path.
             def _approve_soon():
                 time.sleep(0.03)
                 approvals = load_approvals(session_dir)
@@ -9868,33 +10080,82 @@ def _approval_wait_selfcheck() -> None:
 
             threading.Thread(target=_approve_soon, daemon=True).start()
             decision, detail = request_approval_and_wait(
-                "run_migration", "npm run db:migrate", [], "high",
+                "run_migration", "npm run migrate -> node scripts/migrate.js", [], "high",
+                tool_name="exec_shell_command", command="npm run migrate",
                 timeout_s=2, poll_interval_s=0.01,
             )
             assert decision == "approved" and detail == "daniel"
 
-            # 5. Timeout path: nobody ever resolves it -> fail closed.
+            # 8. Exact-action binding mismatch: the record resolves
+            #    "approved", but for a DIFFERENT command than this call
+            #    requested (approvals.json tampered, or reused) -- must
+            #    fail closed to "denied", never execute the original
+            #    command on the strength of an approval for something
+            #    else.
+            def _approve_wrong_command_soon():
+                time.sleep(0.03)
+                approvals = load_approvals(session_dir)
+                [approval_id] = [k for k, v in approvals.items() if v.get("status") == "pending"]
+                approvals[approval_id]["status"] = "approved"
+                approvals[approval_id]["approvedBy"] = "daniel"
+                approvals[approval_id]["boundCommand"] = "npm install totally-different-package"
+                approvals[approval_id]["boundArgsHash"] = "tampered"
+                _atomic_write_json(_approvals_path(session_dir), approvals)
+
+            threading.Thread(target=_approve_wrong_command_soon, daemon=True).start()
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "install left-pad", ["package.json"], "medium",
+                tool_name="exec_shell_command", command="npm install left-pad",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "denied", decision
+            assert "exact action" in detail, detail
+
+            # 9. Timeout path: nobody ever resolves it -> fail closed.
             decision, detail = request_approval_and_wait(
                 "modify_dependencies", "npm install x", [], "medium",
+                tool_name="exec_shell_command", command="npm install x",
                 timeout_s=0.05, poll_interval_s=0.01,
             )
             assert decision == "timeout", decision
 
-            # 6. Sidecar tolerant of malformed JSON.
+            # 10. Sidecar tolerant of malformed JSON.
             (session_dir / "approvals.json").write_text("not json{{{")
             assert load_approvals(session_dir) == {}
             (session_dir / "approvals.json").write_text(json.dumps(["not", "an", "object"]))
             assert load_approvals(session_dir) == {}
 
-            # 7. No session directory at all -> "unavailable", fails
-            #    closed immediately (no wait, no allow-by-default).
+            # 11. M2: an unwritable session dir must not raise out of
+            #     request_approval_and_wait -- fails closed as
+            #     "unavailable", exactly like the no-session-dir case.
+            real_write = _write_approval_request
+
+            def _raising_write(*args, **kwargs):
+                raise OSError("simulated: session dir removed/unwritable")
+
+            globals()["_write_approval_request"] = _raising_write
+            try:
+                decision, detail = request_approval_and_wait(
+                    "modify_dependencies", "install x", [], "medium",
+                    tool_name="exec_shell_command", command="npm install x",
+                    timeout_s=1, poll_interval_s=0.01,
+                )
+            finally:
+                globals()["_write_approval_request"] = real_write
+            assert decision == "unavailable", decision
+
+            # 12. No session directory at all -> "unavailable", fails
+            #     closed immediately (no wait, no allow-by-default).
             GLIMMER_EVENTS_PATH = None
-            decision, detail = request_approval_and_wait("x", "y", [], "low", timeout_s=1, poll_interval_s=0.01)
+            decision, detail = request_approval_and_wait(
+                "x", "y", [], "low", tool_name="exec_shell_command", command="x",
+                timeout_s=1, poll_interval_s=0.01,
+            )
             assert decision == "unavailable", decision
     finally:
         GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = real_events_path, real_session_id
 
-    print("approval wait loop (V7 §14/§35) self-check: PASS (7/7)")
+    print("approval wait loop (V7 §14/§35) self-check: PASS (12/12)")
 
 
 # ============================================================

@@ -175,6 +175,78 @@ def canonical_session_state(raw_status: str) -> str:
     return "needs_review"
 
 
+def _resolve_orphaned_pending_approval(session_dir) -> None:
+    """8.3 review fix-round (M3, V7 §14/§35): called ONCE, first thing in
+    main()'s unconditional `finally` block, so a session that ends while a
+    YELLOW approval is still genuinely pending never leaves a stale
+    Approve/Deny card behind. This happens when the glimmer-engineer.py
+    subprocess is killed mid-wait (e.g. a Control Center Cancel/SIGTERM
+    while request_approval_and_wait's poll loop is sleeping) before its
+    own cleanup ever runs -- its manifest.json patch and approvals.json
+    request are both still sitting there as "pending".
+
+    Reads manifest.json FRESH from disk, not v2's own in-memory `manifest`
+    dict -- that dict never carries "pendingApproval" at all (only the
+    engineer subprocess's direct, out-of-band patch does, per save()'s
+    single-writer-invariant comment above), so this is the only place
+    that fact is observable. This function's own manifest.json write is
+    otherwise-redundant-but-harmless (the finally block's later save()
+    call overwrites it again momentarily afterward, from v2's clean
+    in-memory state, with no "pendingApproval" key either way) -- the
+    genuinely non-redundant part is resolving the approvals.json sidecar
+    record itself, which nothing else in this process ever touches.
+
+    Never raises -- every read/write here is best-effort, tolerant of a
+    missing/malformed manifest.json or approvals.json, matching every
+    other session-dir reader/writer in this file."""
+    manifest_path = Path(session_dir) / "manifest.json"
+    try:
+        on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(on_disk, dict):
+        return
+    pending = on_disk.get("pendingApproval")
+    if not isinstance(pending, dict):
+        return  # the common case: nothing was ever left pending
+
+    resolved_by = "system: session ended before a human decided (orphaned)"
+    resolved_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    approval_id = pending.get("approvalId")
+    if approval_id:
+        approvals_path = Path(session_dir) / "approvals.json"
+        try:
+            approvals = json.loads(approvals_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            approvals = {}
+        if not isinstance(approvals, dict):
+            approvals = {}
+        record = approvals.get(approval_id)
+        if isinstance(record, dict) and record.get("status") == "pending":
+            record["status"] = "denied"
+            record["approvedBy"] = resolved_by
+            record["resolvedAt"] = resolved_at
+            approvals[approval_id] = record
+            try:
+                approvals_path.write_text(json.dumps(approvals, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+            print(f"[V2] orphaned YELLOW approval {approval_id!r} resolved: denied ({resolved_by})")
+
+    if "_preApprovalStatus" in on_disk:
+        on_disk["status"] = on_disk.pop("_preApprovalStatus")
+    if "_preApprovalState" in on_disk:
+        on_disk["state"] = on_disk.pop("_preApprovalState")
+    else:
+        on_disk["state"] = canonical_session_state(on_disk.get("status") or "")
+    on_disk.pop("pendingApproval", None)
+    try:
+        manifest_path.write_text(json.dumps(on_disk, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def read_session_events(events_path: Path) -> list:
     """R6: read a session's own events.jsonl back at session end, so
     classify_failure has real event evidence (tool_blocked/scope_expanded/
@@ -492,173 +564,30 @@ def compute_scope_guard(changed: list, contract: dict) -> dict:
     return {"inScope": len(expanded) == 0, "expected": expected, "actual": actual, "expandedFiles": expanded}
 
 
-# ============================================================
-# Task 8.3 (V7 §14/§35): YELLOW approval-boundary classification
-# ============================================================
+# Task 8.3 (V7 §14/§35) YELLOW approval-boundary classification lives ONLY
+# in glimmer-engineer.py now (classify_yellow there), not here. 8.3 review
+# fix-round (C1/C2/C3): the original version of this function -- in BOTH
+# files -- was an independent token scan that re-implemented shell_policy's
+# own parsing with none of its preamble (composition/substitution/quoting
+# rejection, --prefix containment, position-exact subcommand extraction),
+# letting `git push`/`npm run deploy` and friends execute after a card that
+# said "modify_dependencies / medium risk". The fix delegates the real
+# verdict to shell_policy itself (its new yellow_relax hook) -- but
+# shell_policy, and every command it dispatches, lives ONLY in
+# glimmer-engineer.py; this file has no workspace/exec_shell_command
+# concept to delegate through at all. A copy here could therefore never be
+# held to the same standard as the real one and would only invite the two
+# copies drifting apart (exactly the shape of bug that caused this
+# fix-round) -- removed rather than "fixed" a second time. See
+# glimmer-engineer.py's classify_yellow for the real implementation and its
+# --approval-wait-selfcheck for the reproduction-command coverage.
 #
-# Deterministic, pure, no I/O, no model call. Reference implementation --
-# glimmer-engineer.py (the process that actually dispatches shell commands
-# and holds the write-tool loop) carries its own mirrored copy, kept in
-# sync deliberately, same discipline canonical_session_state/mapManifest
-# Status already use across the Python/TypeScript process boundary: the
-# two files can't import each other (glimmer-v2.py/glimmer-engineer.py's
-# hyphenated names aren't importable as Python modules -- glimmer_events.py
-# is the one shared module, and it doesn't need this since only the
-# engineer subprocess ever dispatches a shell command). Any change here
-# must be mirrored there.
-#
-# This function only ever ANSWERS "does this command/fact ALSO qualify for
-# a YELLOW human-approval escalation" -- it never touches, widens, or
-# replaces shell_policy's own RED enforcement (git commit/push/reset/
-# clean/checkout/switch/stash/merge/rebase; npm publish/uninstall/update/
-# exec; any executable outside the {git,npm,python,cargo} allowlist) or
-# its dangerous_fragments block for deploy/publish/release/production/
-# :prod/:live (V7 §35: "commit, push, deploy" stay blocked outright, no
-# escalation offered). None means "not a YELLOW case here" -- RED stays
-# whatever shell_policy already says, GREEN is unaffected.
-YELLOW_DEPENDENCY_INSTALL_TOKENS = frozenset({"install", "i", "ci", "add"})
-YELLOW_MIGRATION_KEYWORDS = ("migrate", "migration", "seed")
-# V7 §15 Scope Guard: "large expansion -> pause for approval". Small/medium
-# expansions stay advisory (existing edit_outside_candidate_files consult
-# nudge in glimmer-engineer.py) -- only a real pile-up of out-of-scope
-# files escalates to an actual human approval gate.
-SCOPE_EXPANSION_YELLOW_THRESHOLD = 3
-
-
-def classify_yellow(action_kind: str, command, contract: dict | None) -> dict | None:
-    """Returns a structured V7 §35 approval-request dict --
-    {"action", "reason", "proposedChanges", "risk"} -- when (action_kind,
-    command, contract) matches a YELLOW trigger, else None.
-
-    action_kind == "shell": `command` is the raw shell command string
-    shell_policy already rejected; `contract` is unused (reserved for
-    future contract-aware shell classification, always safe to pass {}).
-    Detects two V7 §35 triggers: dependency installation (npm install
-    family -- pip is never reachable at all, shell_policy has no pip
-    branch in its executable allowlist, so there is nothing to escalate
-    for it) and database migration (an npm run script whose name contains
-    a migration keyword; deploy/publish/release/production/:prod/:live
-    scripts are deliberately excluded -- those stay RED per V7 §35).
-
-    action_kind == "scope": `command` is unused; `contract` carries an
-    already-computed scope-guard fact, `contract["expandedFiles"]` (see
-    compute_scope_guard's own `expandedFiles`, or glimmer-engineer.py's
-    edit_outside_candidate_files trigger) -- a list of changed-file paths
-    outside the declared/expected scope. SCOPE_EXPANSION_YELLOW_THRESHOLD
-    or more such files is a "large expansion" (V7 §15) that pauses for
-    approval instead of just the existing advisory nudge.
-
-    Any other action_kind, or no match, returns None.
-    """
-    if action_kind == "shell":
-        if not isinstance(command, str) or not command.strip():
-            return None
-        try:
-            tokens = shlex.split(command.strip())
-        except ValueError:
-            return None
-        if not tokens:
-            return None
-
-        executable = tokens[0]
-        lowered = [t.lower() for t in tokens]
-
-        if executable == "npm":
-            if any(t in YELLOW_DEPENDENCY_INSTALL_TOKENS for t in lowered[1:]):
-                return {
-                    "action": "modify_dependencies",
-                    "reason": f"engineer requested a dependency-install command: {command}",
-                    "proposedChanges": ["package.json", "package-lock.json"],
-                    "risk": "medium",
-                }
-            if "run" in tokens:
-                idx = tokens.index("run")
-                if idx + 1 < len(tokens):
-                    script = tokens[idx + 1]
-                    if any(k in script.lower() for k in YELLOW_MIGRATION_KEYWORDS):
-                        return {
-                            "action": "run_migration",
-                            "reason": f"engineer requested a migration-shaped npm script: {script!r}",
-                            "proposedChanges": [],
-                            "risk": "high",
-                        }
-        return None
-
-    if action_kind == "scope":
-        expanded = (contract or {}).get("expandedFiles") or []
-        if len(expanded) >= SCOPE_EXPANSION_YELLOW_THRESHOLD:
-            return {
-                "action": "scope_expansion",
-                "reason": (
-                    f"{len(expanded)} changed file(s) fall outside the declared/expected "
-                    f"scope: {', '.join(expanded[:5])}"
-                ),
-                "proposedChanges": list(expanded[:20]),
-                "risk": "medium",
-            }
-        return None
-
-    return None
-
-
-def _yellow_approval_selfcheck() -> None:
-    """Task 8.3 (V7 §14/§35) self-check. Pure function, no I/O -- run with:
-    python3 glimmer-v2.py --yellow-approval-selfcheck
-    """
-    # 1. RED stays RED: shell_policy's own hard blocks are never touched --
-    #    classify_yellow returns None for every one of them, so the
-    #    existing POLICY_BLOCK path is completely unaffected.
-    for red_command in (
-        "git commit -m x", "git push", "git reset --hard", "git clean -fd",
-        "npm run deploy", "npm run release:prod", "npm publish",
-        "npm uninstall left-pad", "rm -rf /",
-    ):
-        assert classify_yellow("shell", red_command, {}) is None, red_command
-
-    # 2. GREEN unaffected.
-    for green_command in ("git status", "git diff --stat", "npm run typecheck", "npm run test:unit"):
-        assert classify_yellow("shell", green_command, {}) is None, green_command
-
-    # 3. YELLOW: dependency installation.
-    verdict = classify_yellow("shell", "npm install left-pad", {})
-    assert verdict is not None and verdict["action"] == "modify_dependencies"
-    assert verdict["risk"] == "medium"
-    assert classify_yellow("shell", "npm ci", {}) is not None
-    assert classify_yellow("shell", "npm i", {})["action"] == "modify_dependencies"
-
-    # 4. YELLOW: migration keyword (V7 §35's "database migration"), but the
-    #    sibling deploy/production/release scripts above stayed RED (None).
-    verdict = classify_yellow("shell", "npm run db:migrate", {})
-    assert verdict is not None and verdict["action"] == "run_migration"
-    assert verdict["risk"] == "high"
-    assert classify_yellow("shell", "npm run seed:dev", {}) is not None
-
-    # 5. Malformed/edge-case input never raises.
-    assert classify_yellow("shell", "", {}) is None
-    assert classify_yellow("shell", None, {}) is None
-    assert classify_yellow("shell", "unterminated 'quote", {}) is None
-    assert classify_yellow("bogus_action_kind", "npm install x", {}) is None
-
-    # 6. YELLOW: scope expansion, reusing scope-guard facts (contract-
-    #    supplied expandedFiles) -- small expansion stays advisory (None,
-    #    below threshold), large expansion pauses for approval.
-    assert classify_yellow("scope", None, {"expandedFiles": ["a.py", "b.py"]}) is None
-    verdict = classify_yellow("scope", None, {"expandedFiles": ["a.py", "b.py", "c.py", "d.py"]})
-    assert verdict is not None and verdict["action"] == "scope_expansion"
-    assert verdict["risk"] == "medium"
-    assert classify_yellow("scope", None, {}) is None
-    assert classify_yellow("scope", None, None) is None
-
-    # 7. Real compute_scope_guard facts feed classify_yellow end to end.
-    contract = {"scope": {"paths": ["frontend/src/widget/"]}}
-    guard = compute_scope_guard(
-        ["frontend/src/widget/a.ts", "server/x.ts", "server/y.ts", "shared/z.ts"], contract
-    )
-    verdict = classify_yellow("scope", None, guard)
-    assert verdict is not None and verdict["action"] == "scope_expansion"
-    assert "server/x.ts" in verdict["proposedChanges"]
-
-    print("YELLOW approval boundary (V7 §14/§35) self-check: PASS (7/7)")
+# V7 §15 scope-expansion YELLOW ("large expansion -> pause for approval")
+# was dropped in the same fix-round for an unrelated reason (M4): it had no
+# caller in either process -- glimmer-engineer.py has no structured
+# contract.scope to check it against without new spawn-env plumbing, out
+# of scope here -- and shipping an unreachable classifier arm is worse
+# than not having one. Tracked as future work, not shipped.
 
 
 def _scope_guard_selfcheck() -> None:
@@ -6084,6 +6013,22 @@ def main():
     manifest_path = session / "manifest.json"
 
     def save():
+        # SINGLE-WRITER INVARIANT (8.3 review fix-round, M3, V7 §14/§35):
+        # this is a bare non-atomic write_text of the FULL in-memory
+        # `manifest` dict -- safe ONLY because this process never calls
+        # save() while a glimmer-engineer.py subprocess is running
+        # (invoke_engineer's `for line in p.stdout: ...` loop blocks this
+        # thread for the subprocess's entire lifetime; no save() call site
+        # exists between spawning it and it exiting). glimmer-engineer.py
+        # relies on exactly this gap to patch manifest.json directly
+        # (request_approval_and_wait's status="waiting-for-approval"/
+        # pendingApproval, via its own atomic os.replace) without a
+        # concurrent-writer race. Anyone adding a NEW save() call site
+        # inside that window (a progress heartbeat, a streaming status
+        # update, ...) breaks the approval card silently -- read this
+        # comment first. See _resolve_orphaned_pending_approval below for
+        # the recovery when the engineer subprocess dies mid-wait instead
+        # of resolving it itself.
         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -7006,6 +6951,13 @@ def main():
         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         raise
     finally:
+        # 8.3 review fix-round (M3, V7 §14/§35): first thing in this
+        # unconditional finally, before anything else reads/rewrites
+        # manifest.json -- see that function's own docstring for why this
+        # can only be observed via a fresh disk read, never v2's own
+        # in-memory `manifest` dict.
+        _resolve_orphaned_pending_approval(session)
+
         # I2: every exit path routes through this finally, including the
         # already-handled SIGTERM/KeyboardInterrupt path above (which sets a
         # real terminal status before falling through here) and the sibling
@@ -7164,6 +7116,45 @@ def _r6_selfcheck() -> None:
     # I2: "failed-aborted" rides the existing generic "failed-" prefix match
     # in canonical_session_state (no new branch needed there).
     assert canonical_session_state("failed-aborted") == "failed"
+
+    # 8.3 review fix-round (M3): orphaned waiting_for_approval cleanup.
+    assert canonical_session_state("waiting-for-approval") == "waiting_for_approval"
+    with tempfile.TemporaryDirectory() as td:
+        sd = Path(td)
+        # 1. The common case: no pendingApproval at all -- a no-op, no
+        #    approvals.json created, manifest.json untouched.
+        (sd / "manifest.json").write_text(json.dumps({"status": "verified", "state": "verified"}))
+        before = (sd / "manifest.json").read_text()
+        _resolve_orphaned_pending_approval(sd)
+        assert (sd / "manifest.json").read_text() == before
+        assert not (sd / "approvals.json").exists()
+
+        # 2. A genuinely orphaned pending approval: manifest.json restored
+        #    to its pre-approval status/state, pendingApproval cleared,
+        #    and the matching approvals.json record resolved to denied
+        #    with a human-readable, honest provenance -- never silently
+        #    left "pending" forever.
+        (sd / "manifest.json").write_text(json.dumps({
+            "status": "waiting-for-approval", "state": "waiting_for_approval",
+            "_preApprovalStatus": "initialized", "_preApprovalState": "preflight",
+            "pendingApproval": {"approvalId": "s1-appr-1", "action": "modify_dependencies"},
+        }))
+        (sd / "approvals.json").write_text(json.dumps({
+            "s1-appr-1": {"action": "modify_dependencies", "status": "pending"},
+        }))
+        _resolve_orphaned_pending_approval(sd)
+        after = json.loads((sd / "manifest.json").read_text())
+        assert after["status"] == "initialized" and after["state"] == "preflight"
+        assert "pendingApproval" not in after
+        assert "_preApprovalStatus" not in after and "_preApprovalState" not in after
+        approvals_after = json.loads((sd / "approvals.json").read_text())
+        assert approvals_after["s1-appr-1"]["status"] == "denied"
+        assert "orphaned" in approvals_after["s1-appr-1"]["approvedBy"]
+
+        # 3. Missing/malformed manifest.json or approvals.json never raises.
+        _resolve_orphaned_pending_approval(sd / "does-not-exist")
+        (sd / "manifest.json").write_text("not json{{{")
+        _resolve_orphaned_pending_approval(sd)
 
     print("R6 classify_failure self-check: PASS")
 
@@ -11183,9 +11174,6 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if sys.argv[1:] == ["--docs-bootstrap-selfcheck"]:
         _docs_bootstrap_selfcheck()
-        raise SystemExit(0)
-    if sys.argv[1:] == ["--yellow-approval-selfcheck"]:
-        _yellow_approval_selfcheck()
         raise SystemExit(0)
     if sys.argv[1:2] == ["--docs-bootstrap"]:
         # Task 7.4: a standalone CLI mode, not a task run -- takes a bare
