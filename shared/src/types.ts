@@ -988,6 +988,8 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "delivery_review_started", "delivery_review_completed",
   "architect_consult_advised", "architect_consulted",
   "approval_requested", "delivery_packet_created",
+  "documentation_impact_detected", "documentation_stale_detected",
+  "documentation_verified",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {
