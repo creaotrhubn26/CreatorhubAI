@@ -922,6 +922,17 @@ export interface ApprovalRequestedEvent extends GlimmerEventBase {
   risk: ApprovalRequest["risk"];
 }
 
+// Task 8.2 (V7 §23.16): emitted once by glimmer-v2.py's `finally` block,
+// right after delivery-packet.json/packet-summary.txt are written, on
+// every exit path. No fields -- mirrors glimmer_events.py's own
+// unconditional `emit(..., "delivery_packet_created")` call exactly (no
+// payload there either). This was a confirmed gap from the 8.3 review:
+// present in glimmer_events.EVENT_TYPES since 8.2, but absent here, so
+// isGlimmerEvent silently dropped it at the gateway.
+export interface DeliveryPacketCreatedEvent extends GlimmerEventBase {
+  type: "delivery_packet_created";
+}
+
 export type GlimmerEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
@@ -959,7 +970,8 @@ export type GlimmerEvent =
   | DocumentationImpactDetectedEvent
   | DocumentationStaleDetectedEvent
   | DocumentationVerifiedEvent
-  | ApprovalRequestedEvent;
+  | ApprovalRequestedEvent
+  | DeliveryPacketCreatedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -975,7 +987,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",
   "architect_consult_advised", "architect_consulted",
-  "approval_requested",
+  "approval_requested", "delivery_packet_created",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {
