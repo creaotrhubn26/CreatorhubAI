@@ -27,6 +27,24 @@ Usage:
     ./glimmer-eval.py --suite-validate   # schema-check eval-tasks.json, no runs
     ./glimmer-eval.py --selfcheck        # full pipeline against the stub, asserts expectedOutcome
     ./glimmer-eval.py --task <id>        # run a single task by id
+
+Follow-up 3 (V7 §39 live coverage): --live swaps the deterministic stub for
+a REAL model server (GLIMMER_URL env or --model-url; default matches
+glimmer-engineer.py's own API_BASE default, http://127.0.0.1:8080) so the
+model, not a script, decides what tool calls to make. Tasks with "live":
+true in eval-tasks.json (refactor/ambiguous/discovery -- there's no
+deterministic script that could stand in for a live model's disambiguation
+or discovery behavior) are skipped in stub mode and only run under --live.
+--selfcheck stays stub-only by construction (never auto-runs live).
+--live-smoke runs ONE cheap task live end-to-end when a server is reachable
+and reports honestly (NOT_RUN, exit 0, if it isn't -- never a fabricated
+pass). Results are labeled "mode": "live"|"stub"; a --live run also records
+modelId + temperature from the server's /props endpoint when discoverable
+("Unavailable" otherwise -- llama-server does not echo the sampling
+temperature actually used per-request, only its configured default).
+
+    ./glimmer-eval.py --live --task <id> # run one task against the real model
+    ./glimmer-eval.py --live-smoke       # cheap live reachability + 1 task
 """
 import argparse
 import datetime as dt
@@ -40,6 +58,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -49,6 +69,13 @@ DEFAULT_V2 = ROOT / "glimmer-v2.py"
 DEFAULT_ENGINEER = ROOT / "glimmer-engineer.py"
 OUT_DIR = ROOT / "eval-results"
 
+# Follow-up 3: same env var + default + key file glimmer-engineer.py itself
+# uses for its own API_BASE/API_KEY_FILE -- a --live run without --model-url/
+# --model-api-key-file talks to exactly the same real llama-server a normal
+# (non-eval) invocation would.
+DEFAULT_MODEL_URL = os.environ.get("GLIMMER_URL", "http://127.0.0.1:8080")
+DEFAULT_MODEL_API_KEY_FILE = ROOT / "config" / "api-key.txt"
+
 SUITE_VERSION = "1.0.0"
 # Round 9 review (M7): V7 §39 names 11 benchmark categories; these 6 map
 # onto 4 of them fairly directly (create->small-feature-creation,
@@ -56,13 +83,20 @@ SUITE_VERSION = "1.0.0"
 # impossible/security-sensitive-refusal) plus two added this round --
 # typefix (type error) and multifile (multi-file feature, >1 file touched
 # by one task) -- both cheap with the existing stub (no new stub tool/
-# capability needed, just new fixtures + scripted steps). Repository
-# discovery, frontend UI bug, backend API bug, refactor, and ambiguous
-# task are NOT covered: this stub has no real UI/API surface and no live
-# model to exercise ambiguity/discovery against, so faking them would be
-# padding, not coverage -- see eval-tasks.json's top-level "_coverage" note
-# for the recorded decision.
-CATEGORIES = ("create", "modify", "repair", "refuse", "typefix", "multifile")
+# capability needed, just new fixtures + scripted steps).
+#
+# Follow-up 3 (V7 §39 live coverage): refactor, ambiguous, and discovery
+# joined this round via --live mode (see module docstring) -- each has
+# "live": true tasks below with no scripted stub (a script can't stand in
+# for a live model's own disambiguation/discovery behavior). Repository
+# frontend-UI-bug and backend-API-bug remain NOT covered: they need a real
+# UI/API fixture surface this harness still doesn't have, not just a live
+# model -- see eval-tasks.json's top-level "_coverage" note for the
+# recorded decision.
+CATEGORIES = (
+    "create", "modify", "repair", "refuse", "typefix", "multifile",
+    "refactor", "ambiguous", "discovery",
+)
 
 TOOL_DEFS = [
     {"tool": name, "definition": {
@@ -169,29 +203,39 @@ def validate_suite(suite) -> list:
         if not isinstance(task.get("fixtureFiles", {}), dict):
             errors.append(f"{p}.fixtureFiles must be an object (relative path -> content)")
 
+        is_live = task.get("live", False)
+        if "live" in task and not isinstance(is_live, bool):
+            errors.append(f"{p}.live must be a boolean when present")
+
+        # Follow-up 3: a "live": true task has no deterministic stub script
+        # to validate -- it's skipped in stub mode (see run_suite) and run
+        # against a real model under --live instead. `stub` stays required
+        # for every other task (unchanged rules), and is still validated by
+        # the same rules below if a live task happens to carry one anyway.
         stub = task.get("stub")
-        invocations = stub.get("invocations") if isinstance(stub, dict) else None
-        if not isinstance(invocations, list) or not invocations:
-            errors.append(f"{p}.stub.invocations must be a non-empty array")
-        else:
-            for j, inv in enumerate(invocations):
-                if not isinstance(inv, list) or not inv:
-                    errors.append(f"{p}.stub.invocations[{j}] must be a non-empty array of steps")
-                    continue
-                for k, step in enumerate(inv):
-                    sp = f"{p}.stub.invocations[{j}][{k}]"
-                    if not isinstance(step, dict):
-                        errors.append(f"{sp} must be an object")
-                    elif "finish" in step:
-                        if not isinstance(step["finish"], str):
-                            errors.append(f"{sp}.finish must be a string")
-                    elif "tool" in step:
-                        if step.get("tool") not in ("write_file", "edit_file", "exec_shell_command"):
-                            errors.append(f"{sp}.tool unsupported: {step.get('tool')!r}")
-                        if not isinstance(step.get("arguments"), dict):
-                            errors.append(f"{sp}.arguments must be an object")
-                    else:
-                        errors.append(f"{sp} must have a 'tool' or 'finish' key")
+        if stub is not None or not is_live:
+            invocations = stub.get("invocations") if isinstance(stub, dict) else None
+            if not isinstance(invocations, list) or not invocations:
+                errors.append(f"{p}.stub.invocations must be a non-empty array")
+            else:
+                for j, inv in enumerate(invocations):
+                    if not isinstance(inv, list) or not inv:
+                        errors.append(f"{p}.stub.invocations[{j}] must be a non-empty array of steps")
+                        continue
+                    for k, step in enumerate(inv):
+                        sp = f"{p}.stub.invocations[{j}][{k}]"
+                        if not isinstance(step, dict):
+                            errors.append(f"{sp} must be an object")
+                        elif "finish" in step:
+                            if not isinstance(step["finish"], str):
+                                errors.append(f"{sp}.finish must be a string")
+                        elif "tool" in step:
+                            if step.get("tool") not in ("write_file", "edit_file", "exec_shell_command"):
+                                errors.append(f"{sp}.tool unsupported: {step.get('tool')!r}")
+                            if not isinstance(step.get("arguments"), dict):
+                                errors.append(f"{sp}.arguments must be an object")
+                        else:
+                            errors.append(f"{sp} must have a 'tool' or 'finish' key")
 
         if not isinstance(task.get("expected"), dict):
             errors.append(f"{p}.expected must be an object")
@@ -384,6 +428,48 @@ def _free_port() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Live model discovery (Follow-up 3, V7 §39 live coverage)
+# ---------------------------------------------------------------------------
+
+def probe_model_server(model_url: str, api_key_file: Path, timeout: float = 5.0) -> dict:
+    """Best-effort, never-raises discovery of what a real model server is
+    actually serving -- used to both answer "is it reachable" (--live-smoke)
+    and to honestly label results with modelId/temperature (V7 §39: model
+    nondeterminism is the thing being measured, so a report should say what
+    server/config produced it). /health needs no auth (matches the running
+    llama-server); /props does, and carries the model alias/path plus its
+    configured default_generation_settings -- the temperature actually
+    sampled per-request isn't echoed anywhere the client can read, so that
+    field is honestly "Unavailable" whenever /props itself is unavailable,
+    never guessed."""
+    info = {
+        "url": model_url, "reachable": False,
+        "modelId": "Unavailable", "temperature": "Unavailable", "error": None,
+    }
+    try:
+        with urllib.request.urlopen(f"{model_url}/health", timeout=timeout) as resp:
+            resp.read()
+        info["reachable"] = True
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return info
+
+    try:
+        key = api_key_file.read_text(encoding="utf-8").strip()
+        req = urllib.request.Request(
+            f"{model_url}/props", headers={"Authorization": f"Bearer {key}"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            props = json.loads(resp.read().decode("utf-8", errors="replace"))
+        info["modelId"] = props.get("model_alias") or props.get("model_path") or "Unavailable"
+        temp = ((props.get("default_generation_settings") or {}).get("params") or {}).get("temperature")
+        info["temperature"] = temp if temp is not None else "Unavailable"
+    except (OSError, ValueError) as exc:  # noqa: BLE001 - discovery is best-effort, never fatal
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
+# ---------------------------------------------------------------------------
 # Headless run
 # ---------------------------------------------------------------------------
 
@@ -395,20 +481,31 @@ def _find_manifest_path(stdout: str):
 
 
 def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
-             python_exe: str, timeout: int):
-    """Builds the fixture, spins up the stub server, invokes glimmer-v2.py
-    headlessly. Returns (workspace, manifest_dict, events_list, run_error,
-    stub_metrics) -- stub_metrics is {"toolCalls", "turns", "wallSeconds"}
-    (M7, V7 §39 coverage): cheap because the stub already observes every
-    tool call and model turn for free; wallSeconds is just the subprocess's
-    own wall-clock duration."""
+             python_exe: str, timeout: int, live: bool = False, model_url: str | None = None):
+    """Builds the fixture, spins up the stub server (or, under --live,
+    points straight at a real model server -- see module docstring),
+    invokes glimmer-v2.py headlessly. Returns (workspace, manifest_dict,
+    events_list, run_error, stub_metrics) -- stub_metrics is {"toolCalls",
+    "turns", "wallSeconds"} (M7, V7 §39 coverage): cheap because the stub
+    already observes every tool call and model turn for free; wallSeconds
+    is just the subprocess's own wall-clock duration. Under --live there is
+    no stub to instrument, so toolCalls is instead counted from the real
+    session's own events.jsonl and turns is honestly None -- glimmer-
+    engineer.py doesn't emit a distinct per-model-turn event to count
+    (ponytail: add one if a real need for it shows up)."""
     wall_start = time.monotonic()
     ws = build_fixture(tmp_root, task)
-    port = _free_port()
-    state = StubState(ws, task["stub"]["invocations"], task.get("deliveryReadiness", "ready_to_ship"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(state))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+
+    server = thread = state = None
+    if live:
+        resolved_url = model_url or DEFAULT_MODEL_URL
+    else:
+        port = _free_port()
+        state = StubState(ws, task["stub"]["invocations"], task.get("deliveryReadiness", "ready_to_ship"))
+        server = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(state))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        resolved_url = f"http://127.0.0.1:{port}"
 
     cmd = [
         python_exe, str(v2_path), task["objective"],
@@ -430,7 +527,7 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
         cmd += ["--verify", v]
 
     env = os.environ.copy()
-    env["GLIMMER_URL"] = f"http://127.0.0.1:{port}"
+    env["GLIMMER_URL"] = resolved_url
     # Round 9 review (M2): without this, glimmer-v2.py's STATE_ROOT is the
     # real ~/.muse-glimmer/sessions -- every eval task wrote a real synthetic
     # session dir straight into the same corpus glimmer-metrics.py scans by
@@ -461,8 +558,9 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
             pass
         proc.communicate()
     finally:
-        server.shutdown()
-        thread.join(timeout=5)
+        if server is not None:
+            server.shutdown()
+            thread.join(timeout=5)
 
     manifest, events = {}, []
     manifest_path = _find_manifest_path(stdout) if not run_error else None
@@ -484,11 +582,18 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
     elif not run_error:
         run_error = "session manifest not found in glimmer-v2.py output"
 
-    stub_metrics = {
-        "toolCalls": state.tool_calls,
-        "turns": state.total_turns,
-        "wallSeconds": round(time.monotonic() - wall_start, 3),
-    }
+    if state is not None:
+        stub_metrics = {
+            "toolCalls": state.tool_calls,
+            "turns": state.total_turns,
+            "wallSeconds": round(time.monotonic() - wall_start, 3),
+        }
+    else:
+        stub_metrics = {
+            "toolCalls": sum(1 for e in events if e.get("type") == "tool_started"),
+            "turns": None,
+            "wallSeconds": round(time.monotonic() - wall_start, 3),
+        }
     return ws, manifest, events, run_error, stub_metrics
 
 
@@ -570,6 +675,20 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
 
     problems = grade_expected(ws, task.get("expected") or {})
 
+    changed_files = manifest.get("finalChangedFiles") or []
+
+    # Follow-up 3 (V7 §39 live coverage): the deterministic, honest half of
+    # the ambiguous/discovery rubric -- "did not touch files outside X" /
+    # "decoys untouched" -- is just this, generic over any category. Reuses
+    # the same manifest.finalChangedFiles already trusted for budget/scope
+    # elsewhere in this function rather than re-deriving it independently.
+    only_changed = (task.get("expected") or {}).get("onlyChangedFiles")
+    if only_changed is not None:
+        allowed = set(only_changed)
+        strays = [f for f in changed_files if f not in allowed]
+        if strays:
+            problems.append(f"changed files outside allowed set {sorted(allowed)}: {strays}")
+
     if task["category"] == "refuse":
         substr = task.get("expectBlockedSubstring")
         if substr and not any(substr in (e.get("command") or "") for e in _tool_blocked_events(events)):
@@ -580,7 +699,6 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
     task_success = not problems
     false_verified = bool(reported_verified and not task_success)
 
-    changed_files = manifest.get("finalChangedFiles") or []
     max_changed = task.get("maxChangedFiles")
     budget_ok = not (max_changed is not None and len(changed_files) > max_changed)
 
@@ -607,22 +725,34 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
 # ---------------------------------------------------------------------------
 
 def run_suite(suite: dict, *, only_id=None, v2_path: Path, engineer_path: Path,
-              python_exe: str, timeout: int) -> list:
+              python_exe: str, timeout: int, live: bool = False, model_url: str | None = None) -> list:
     tasks = suite["tasks"]
     if only_id:
         tasks = [t for t in tasks if t["id"] == only_id]
         if not tasks:
             raise SystemExit(f"No task with id {only_id!r} in suite")
+        if tasks[0].get("live") and not live:
+            raise SystemExit(
+                f"Task {only_id!r} is live-only (\"live\": true, no deterministic stub) "
+                "-- pass --live to run it"
+            )
+    elif not live:
+        # Follow-up 3: "live": true tasks have no stub script to run in the
+        # default/stub mode -- silently skipped here, not scored as a
+        # failure, exactly the "skipped in stub mode" the schema comment
+        # promises. They only appear in results under --live.
+        tasks = [t for t in tasks if not t.get("live")]
 
     results = []
     with tempfile.TemporaryDirectory(prefix="glimmer-eval-") as tmp:
         tmp_root = Path(tmp)
         for task in tasks:
-            print(f"[glimmer-eval] running {task['id']} ({task['category']}) ...", flush=True)
+            tag = " [live]" if live else ""
+            print(f"[glimmer-eval] running {task['id']} ({task['category']}){tag} ...", flush=True)
             try:
                 ws, manifest, events, run_error, stub_metrics = run_task(
                     task, tmp_root, v2_path=v2_path, engineer_path=engineer_path,
-                    python_exe=python_exe, timeout=timeout,
+                    python_exe=python_exe, timeout=timeout, live=live, model_url=model_url,
                 )
                 r = score_task(task, ws, manifest, events, run_error=run_error, stub_metrics=stub_metrics)
             except Exception as exc:  # noqa: BLE001 - one bad task must not abort the suite
@@ -633,7 +763,15 @@ def run_suite(suite: dict, *, only_id=None, v2_path: Path, engineer_path: Path,
     return results
 
 
-def write_results(results: list, suite_version: str) -> tuple:
+def write_results(results: list, suite_version: str, *, mode: str = "stub", model_info: dict | None = None) -> tuple:
+    """Follow-up 3: `mode` ("live"|"stub") is stamped on every results doc
+    this writes -- one run is always one mode (run_suite never mixes stub
+    and live tasks in a single call), so there is nothing to silently mix;
+    a caller wanting both just gets two separate files/timestamps, which is
+    the "or separate files" half of the requirement. `model_info` (modelId/
+    temperature/url from probe_model_server) is recorded only for live
+    runs, honestly "Unavailable" per-field rather than omitted when the
+    server didn't answer."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     aggregates = {
@@ -650,14 +788,23 @@ def write_results(results: list, suite_version: str) -> tuple:
             for c in CATEGORIES
         },
     }
-    doc = {"suiteVersion": suite_version, "generatedAt": ts, "results": results, "aggregates": aggregates}
+    doc = {"suiteVersion": suite_version, "generatedAt": ts, "mode": mode, "results": results, "aggregates": aggregates}
+    if model_info is not None:
+        doc["model"] = model_info
 
     json_path = OUT_DIR / f"{ts}.json"
     json_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
+    model_line = ""
+    if model_info is not None:
+        model_line = (
+            f"- Model: modelId={model_info.get('modelId')} "
+            f"temperature={model_info.get('temperature')} url={model_info.get('url')}\n"
+        )
     lines = [
         f"# Glimmer eval results ({ts})", "",
-        f"Suite version: {suite_version}", "",
+        f"Suite version: {suite_version} -- mode: {mode}", "",
+        model_line.rstrip("\n"),
         f"- Total tasks: {aggregates['total']}",
         f"- Task success: {aggregates['taskSuccess']}/{aggregates['total']}",
         f"- False-VERIFIED (honesty violation): {aggregates['falseVerified']}",
@@ -684,6 +831,9 @@ def write_results(results: list, suite_version: str) -> tuple:
 # CLI
 # ---------------------------------------------------------------------------
 
+SMOKE_TASK_ID = "create-hello-module"  # cheap, single write_file -- see --live-smoke
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Muse Glimmer evaluation harness (V7 O5/§39)")
     ap.add_argument("--suite", default=str(DEFAULT_SUITE), help="Path to eval-tasks.json")
@@ -691,10 +841,34 @@ def main() -> int:
     ap.add_argument("--v2", default=str(DEFAULT_V2))
     ap.add_argument("--engineer", default=str(DEFAULT_ENGINEER))
     ap.add_argument("--python", default=sys.executable)
-    ap.add_argument("--timeout", type=int, default=90, help="Per-task subprocess wall-clock timeout (s)")
+    ap.add_argument("--timeout", type=int, default=None,
+                     help="Per-task subprocess wall-clock timeout (s); default 90 (stub) / 600 (--live)")
     ap.add_argument("--suite-validate", action="store_true")
-    ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--selfcheck", action="store_true", help="Stub-only deterministic pipeline check; never live")
+    ap.add_argument("--live", action="store_true",
+                     help="Run selected tasks against a real model server instead of the stub")
+    ap.add_argument("--live-smoke", action="store_true",
+                     help="Run ONE cheap task live if a model server is reachable; NOT_RUN (exit 0) if not")
+    ap.add_argument("--model-url", default=None,
+                     help=f"Live model server base URL (default: $GLIMMER_URL or {DEFAULT_MODEL_URL})")
+    ap.add_argument("--model-api-key-file", default=str(DEFAULT_MODEL_API_KEY_FILE))
     args = ap.parse_args()
+
+    live_mode = args.live or args.live_smoke
+    timeout = args.timeout if args.timeout is not None else (600 if live_mode else 90)
+    model_url = args.model_url or DEFAULT_MODEL_URL
+    model_api_key_file = Path(args.model_api_key_file)
+
+    # Item 4: a report must never mix live and stub results silently.
+    # --selfcheck is stub-only by construction (item 3: never auto-run
+    # live in --selfcheck) -- refuse the combination outright rather than
+    # quietly ignoring one flag.
+    if args.selfcheck and live_mode:
+        print("Refusing: --selfcheck is stub-only and must not be combined with --live/--live-smoke.")
+        return 1
+    if args.live and args.live_smoke:
+        print("Pass either --live or --live-smoke, not both.")
+        return 1
 
     suite_path = Path(args.suite)
     suite = json.loads(suite_path.read_text(encoding="utf-8"))
@@ -717,6 +891,30 @@ def main() -> int:
 
     v2_path, engineer_path = Path(args.v2), Path(args.engineer)
 
+    if args.live_smoke:
+        probe = probe_model_server(model_url, model_api_key_file)
+        if not probe["reachable"]:
+            print(f"LIVE-SMOKE NOT_RUN: model server unreachable at {model_url} ({probe['error']})")
+            return 0
+        if not any(t["id"] == SMOKE_TASK_ID for t in suite["tasks"]):
+            print(f"LIVE-SMOKE NOT_RUN: smoke task {SMOKE_TASK_ID!r} not found in suite")
+            return 0
+        print(f"[glimmer-eval] live-smoke: server reachable at {model_url} "
+              f"(modelId={probe['modelId']}, temperature={probe['temperature']})")
+        results = run_suite(suite, only_id=SMOKE_TASK_ID, v2_path=v2_path, engineer_path=engineer_path,
+                             python_exe=args.python, timeout=timeout, live=True, model_url=model_url)
+        json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION),
+                                            mode="live", model_info=probe)
+        print(f"[glimmer-eval] wrote {json_path}")
+        print(f"[glimmer-eval] wrote {md_path}")
+        r = results[0]
+        ok = (r["taskSuccess"] and not r["falseVerified"]
+              and r.get("budgetAdherence", True) and r.get("honestyChecks") != "FAIL")
+        print(f"LIVE-SMOKE {'PASS' if ok else 'FAIL'}: {SMOKE_TASK_ID} taskSuccess={r['taskSuccess']} "
+              f"falseVerified={r['falseVerified']} budgetAdherence={r['budgetAdherence']} "
+              f"honestyChecks={r['honestyChecks']} problems={r.get('problems')}")
+        return 0 if ok else 1
+
     if args.selfcheck:
         # Round 9 review (M2): the real corpus glimmer-metrics.py scans by
         # default is ~/.muse-glimmer/sessions -- before GLIMMER_STATE_ROOT
@@ -728,15 +926,16 @@ def main() -> int:
         before = set(real_sessions_dir.iterdir()) if real_sessions_dir.is_dir() else set()
 
         results = run_suite(suite, v2_path=v2_path, engineer_path=engineer_path,
-                             python_exe=args.python, timeout=args.timeout)
+                             python_exe=args.python, timeout=timeout)
+        tasks_by_id = {t["id"]: t for t in suite["tasks"]}
         ok = True
-        for r, task in zip(results, suite["tasks"]):
-            expected_outcome = task.get("expectedOutcome") or {}
+        for r in results:
+            expected_outcome = tasks_by_id[r["id"]].get("expectedOutcome") or {}
             for key, want in expected_outcome.items():
                 got = r.get(key)
                 if got != want:
                     ok = False
-                    print(f"SELFCHECK MISMATCH [{task['id']}]: {key} expected {want!r}, got {got!r}")
+                    print(f"SELFCHECK MISMATCH [{r['id']}]: {key} expected {want!r}, got {got!r}")
 
         after = set(real_sessions_dir.iterdir()) if real_sessions_dir.is_dir() else set()
         if after != before:
@@ -744,15 +943,25 @@ def main() -> int:
             print(f"SELFCHECK MISMATCH: real corpus {real_sessions_dir} changed during the run "
                   f"({len(after - before)} new dir(s)) -- GLIMMER_STATE_ROOT isolation is broken")
 
-        json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION))
+        json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION), mode="stub")
         print(f"[glimmer-eval] wrote {json_path}")
         print(f"[glimmer-eval] wrote {md_path}")
         print("SELFCHECK " + ("PASS" if ok else "FAIL"))
         return 0 if ok else 1
 
+    model_info = None
+    if args.live:
+        model_info = probe_model_server(model_url, model_api_key_file)
+        if not model_info["reachable"]:
+            print(f"LIVE RUN ABORTED: model server unreachable at {model_url} ({model_info['error']})")
+            return 1
+        print(f"[glimmer-eval] live: server reachable at {model_url} "
+              f"(modelId={model_info['modelId']}, temperature={model_info['temperature']})")
+
     results = run_suite(suite, only_id=args.task, v2_path=v2_path, engineer_path=engineer_path,
-                         python_exe=args.python, timeout=args.timeout)
-    json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION))
+                         python_exe=args.python, timeout=timeout, live=args.live, model_url=model_url)
+    json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION),
+                                        mode="live" if args.live else "stub", model_info=model_info)
     print(f"[glimmer-eval] wrote {json_path}")
     print(f"[glimmer-eval] wrote {md_path}")
     # Exit code covers ALL four score legs -- a CI gate on this exit code
