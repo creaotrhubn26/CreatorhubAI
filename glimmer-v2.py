@@ -6179,6 +6179,19 @@ def main():
         # comment first. See _resolve_orphaned_pending_approval below for
         # the recovery when the engineer subprocess dies mid-wait instead
         # of resolving it itself.
+        # NEW-1 (1+2 re-review): the engineer subprocess writes durable
+        # facts of its own into manifest.json during its run --
+        # approvedActions waivers (request_approval_and_wait). This full
+        # overwrite from the in-memory dict would silently destroy them
+        # (reproduced: waiver present after the engineer round-trip, gone
+        # after the next save()). Merge the engineer-owned key back from
+        # disk before writing; the in-memory dict wins everywhere else.
+        try:
+            on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if "approvedActions" in on_disk and "approvedActions" not in manifest:
+                manifest["approvedActions"] = on_disk["approvedActions"]
+        except (OSError, ValueError):
+            pass
         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -9906,6 +9919,16 @@ def _quality_gates_selfcheck() -> None:
     no_change_blocked_idx = main_source.index("no_change_blocked_gates = [", no_change_ok_idx)
     assert no_change_gate_idx < no_change_blocked_idx, (
         "the no-change branch must compute customerReadinessApproved before deciding what blocks"
+    )
+
+    # NEW-1 (1+2 re-review): save() is a full overwrite of the in-memory
+    # manifest -- it must merge the engineer-written approvedActions
+    # waiver back from disk, or every save() after the engineer returns
+    # silently destroys the waiver record (reproduced by the reviewer).
+    save_body = main_source[main_source.index("def save():"):main_source.index("save()\n")]
+    assert '"approvedActions"' in save_body, (
+        "save() must merge the engineer-written approvedActions waiver from disk "
+        "before its full overwrite -- see NEW-1 in followup-1-2-review.md"
     )
 
     # ------------------------------------------------------------

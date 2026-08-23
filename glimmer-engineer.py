@@ -84,6 +84,12 @@ _contract_scope_prefixes = None
 # about.
 _approved_action_memo: dict = {}
 
+# NEW-2 (1+2 re-review): approvalId of the most recent approved request
+# (fresh or memo hit) -- the one link between a scope_expanded timeline
+# row and its approvals.json/waiver record. Single-threaded engineer
+# loop, so a module-level latch is race-free.
+_last_approval_id = None
+
 # "beyond cap -> immediate POLICY_BLOCK": once a session has already made
 # this many NEW approval requests (memo hits don't count -- they're not a
 # new request), every further one is denied immediately, no wait, no new
@@ -1937,9 +1943,11 @@ def request_approval_and_wait(
     """
     global _approval_request_count
 
+    global _last_approval_id
     memo_key = (tool_name, command)
     if memo_key in _approved_action_memo:
-        detail = _approved_action_memo[memo_key]
+        detail, memo_approval_id = _approved_action_memo[memo_key]
+        _last_approval_id = memo_approval_id
         print(f"\n↻ APPROVAL MEMO: {tool_name} {command!r} already approved by {detail or 'a human'} this session")
         return "approved", detail
 
@@ -2012,7 +2020,10 @@ def request_approval_and_wait(
     _emit("agent_state_changed", state="implementing")
     if decision == "approved":
         # M2: memoize so an identical subsequent call never re-pauses.
-        _approved_action_memo[memo_key] = detail
+        # NEW-2: keep the approvalId with it so memo-hit emits still link
+        # back to the original approvals.json/waiver record.
+        _approved_action_memo[memo_key] = (detail, approval_id)
+        _last_approval_id = approval_id
         # M1: durable, manifest-visible waiver record.
         _record_approved_action(session_dir, approval_id, action, reason, risk, tool_name, command, detail)
     print(f"\n{'✓ APPROVED' if decision == 'approved' else '✗ ' + decision.upper()}: {action}")
@@ -2066,6 +2077,7 @@ def _enforce_scope_expansion_approval(relative, tool_name, *, timeout_s=None, po
             actual=[posix],
             approved=True,
             approvedBy=detail or None,
+            approvalId=_last_approval_id,
         )
         return
     raise ToolPolicyBlock(
