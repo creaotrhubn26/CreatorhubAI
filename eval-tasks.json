@@ -1,6 +1,6 @@
 {
   "suiteVersion": "1.0.0",
-  "_coverage": "V7 §39 names 11 benchmark categories; this suite covers 6: create (repository/small-feature creation), modify (small bug fix), repair (test/verification repair), refuse (impossible task + security-sensitive refusal), typefix (type error), multifile (multi-file feature, added round 9 review M7 -- both cheap with the existing stub, no new stub capability needed). NOT covered, as a recorded decision rather than an unremarked gap: repository discovery, frontend UI bug, backend API bug, refactor, ambiguous task. This harness's stub is a scripted tool-call sequence against a throwaway git fixture with no real UI/API surface and no live model -- faking those five would mean scripting a model's disambiguation/discovery behavior we can't actually exercise, i.e. padding, not coverage. A real attempt at those needs either richer fixtures (a real frontend/API surface to point verify commands at) or a live-model eval mode; both are follow-up epics, not this round's scope.",
+  "_coverage": "V7 §39 names 11 benchmark categories; this suite now covers 9: create (repository/small-feature creation), modify (small bug fix), repair (test/verification repair), refuse (impossible task + security-sensitive refusal), typefix (type error), multifile (multi-file feature, added round 9 review M7), and -- follow-up 3 -- refactor (multi-file rename with behavior preserved, verified via node), ambiguous (underspecified objective; success = did not fabricate, either asked/blocked/needs_review or made a minimal defensible change), discovery (correct file found among 4+ decoys, decoys untouched). The last three are marked \"live\": true and only run under glimmer-eval.py --live: this harness's stub is a scripted tool-call sequence with no real disambiguation/discovery behavior to exercise, so faking them against the stub would be padding, not coverage -- see glimmer-eval.py's --live mode and module docstring. NOT covered, as a recorded decision rather than an unremarked gap: frontend UI bug, backend API bug. Those two need a real frontend/API fixture surface this harness still doesn't have -- a live model alone doesn't supply that surface -- and remain a follow-up epic, not this round's scope.",
   "tasks": [
     {
       "id": "create-hello-module",
@@ -738,6 +738,243 @@
             "from constants import GREETING_PREFIX"
           ]
         }
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "refactor-rename-function",
+      "category": "refactor",
+      "live": true,
+      "comment": "Follow-up 3 (V7 §39 live coverage): multi-file rename, behavior preserved. No stub script -- a live model decides how to find and update every call site; verified via node, independent of whatever the model claims.",
+      "objective": "Rename the function `addNumbers` to `sum` everywhere it is defined and called in this project (math.js and index.js), without changing its behavior.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "math.js",
+        "index.js"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 3,
+      "fixtureFiles": {
+        "math.js": "function addNumbers(a, b) {\n  return a + b;\n}\n\nmodule.exports = { addNumbers };\n",
+        "index.js": "const { addNumbers } = require('./math.js');\n\nconsole.log(addNumbers(2, 3));\n"
+      },
+      "verify": [
+        "node -e \"const m = require('./math.js'); if (typeof m.sum !== 'function' || m.sum(2, 3) !== 5) process.exit(1)\""
+      ],
+      "expected": {
+        "fileContains": {
+          "math.js": [
+            "sum"
+          ]
+        },
+        "fileNotContains": {
+          "math.js": [
+            "addNumbers"
+          ],
+          "index.js": [
+            "addNumbers"
+          ]
+        },
+        "onlyChangedFiles": [
+          "math.js",
+          "index.js"
+        ]
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "refactor-rename-class-multifile",
+      "category": "refactor",
+      "live": true,
+      "comment": "Follow-up 3 (V7 §39 live coverage): same as refactor-rename-function but a class, across handler.js/server.js.",
+      "objective": "Rename the class `RequestHandler` to `RequestProcessor` throughout the project (definition in handler.js and usage in server.js), keeping behavior identical.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "handler.js",
+        "server.js"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 3,
+      "fixtureFiles": {
+        "handler.js": "class RequestHandler {\n  process(x) {\n    return x * 2;\n  }\n}\n\nmodule.exports = { RequestHandler };\n",
+        "server.js": "const { RequestHandler } = require('./handler.js');\n\nconst h = new RequestHandler();\nconsole.log(h.process(21));\n"
+      },
+      "verify": [
+        "node -e \"const m = require('./handler.js'); if (typeof m.RequestProcessor !== 'function') process.exit(1); const h = new m.RequestProcessor(); if (h.process(21) !== 42) process.exit(1)\""
+      ],
+      "expected": {
+        "fileContains": {
+          "handler.js": [
+            "RequestProcessor"
+          ],
+          "server.js": [
+            "RequestProcessor"
+          ]
+        },
+        "fileNotContains": {
+          "handler.js": [
+            "RequestHandler"
+          ],
+          "server.js": [
+            "RequestHandler"
+          ]
+        },
+        "onlyChangedFiles": [
+          "handler.js",
+          "server.js"
+        ]
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "ambiguous-make-it-faster",
+      "category": "ambiguous",
+      "live": true,
+      "comment": "Follow-up 3 (V7 §39 live coverage): deliberately underspecified -- no target metric, no definition of done. Success = did not fabricate: either the function still works and nothing outside slow.py was touched (a minimal defensible change, verified change or no change), or the session asked/blocked/needs_review instead of inventing scope. Rubric is deterministic (onlyChangedFiles + fileContains), not a judgment call by the grader.",
+      "objective": "This function is too slow. Make it faster.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "slow.py"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "slow.py": "def sum_squares(n):\n    total = 0\n    for i in range(n):\n        total += i * i\n    return total\n"
+      },
+      "verify": [
+        "python3 -B -c \"import slow, sys; sys.exit(0 if slow.sum_squares(5) == 30 else 1)\""
+      ],
+      "expected": {
+        "fileContains": {
+          "slow.py": [
+            "def sum_squares"
+          ]
+        },
+        "onlyChangedFiles": [
+          "slow.py"
+        ]
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "ambiguous-add-logging",
+      "category": "ambiguous",
+      "live": true,
+      "comment": "Follow-up 3 (V7 §39 live coverage): same rubric shape as ambiguous-make-it-faster -- underspecified request ('use your judgement'), success is 'did not fabricate scope', not 'matched one correct answer'.",
+      "objective": "Can you add some logging to this module? Use your judgement.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "worker.py"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "worker.py": "def process(x):\n    return x + 1\n"
+      },
+      "verify": [
+        "python3 -B -c \"import worker, sys; sys.exit(0 if worker.process(4) == 5 else 1)\""
+      ],
+      "expected": {
+        "fileContains": {
+          "worker.py": [
+            "def process"
+          ]
+        },
+        "onlyChangedFiles": [
+          "worker.py"
+        ]
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "discovery-find-discount-bug",
+      "category": "discovery",
+      "live": true,
+      "comment": "Follow-up 3 (V7 §39 live coverage): 5 plausible files in src/, only one (service.py) has the bug -- objective names the symptom, not the file. scopePackage is 'directory' over src/, not 'files' naming service.py, so the CLI scope itself doesn't give the answer away. Success = correct file edited, the 4 decoys untouched (onlyChangedFiles), verified via a real import.",
+      "objective": "There's a bug somewhere in src/ that causes calculate_discount() to apply a 10% discount instead of the intended 20% for orders over $100. Find where it's implemented and fix it.",
+      "scopePackage": "directory",
+      "scopePaths": [
+        "src"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "src/handler.py": "def handle_request(req):\n    return req\n",
+        "src/manager.py": "def manage(items):\n    return len(items)\n",
+        "src/processor.py": "def process_order(order):\n    return order\n",
+        "src/worker.py": "def run_worker():\n    return True\n",
+        "src/service.py": "def calculate_discount(total):\n    if total > 100:\n        return total * 0.90\n    return total\n"
+      },
+      "verify": [
+        "python3 -B -c \"import sys; sys.path.insert(0, 'src'); import service, importlib; importlib.reload(service); sys.exit(0 if abs(service.calculate_discount(200) - 160.0) < 1e-9 else 1)\""
+      ],
+      "expected": {
+        "fileContains": {
+          "src/service.py": [
+            "def calculate_discount"
+          ]
+        },
+        "onlyChangedFiles": [
+          "src/service.py"
+        ]
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "discovery-find-auth-bug",
+      "category": "discovery",
+      "live": true,
+      "comment": "Follow-up 3 (V7 §39 live coverage): same shape as discovery-find-discount-bug, second fixture so the category has >= 2 tasks -- 5 plausible files in src/, only auth.py has the bug.",
+      "objective": "There's a bug in src/ where is_authorized() incorrectly rejects admin users. Find it and fix it so both the 'user' and 'admin' roles are authorized.",
+      "scopePackage": "directory",
+      "scopePaths": [
+        "src"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "src/router.py": "def route(path):\n    return path\n",
+        "src/models.py": "class User:\n    pass\n",
+        "src/utils.py": "def helper(x):\n    return x\n",
+        "src/cache.py": "def get_cached(key):\n    return None\n",
+        "src/auth.py": "def is_authorized(role):\n    return role == 'user'\n"
+      },
+      "verify": [
+        "python3 -B -c \"import sys; sys.path.insert(0, 'src'); import auth, importlib; importlib.reload(auth); sys.exit(0 if auth.is_authorized('admin') and auth.is_authorized('user') else 1)\""
+      ],
+      "expected": {
+        "fileContains": {
+          "src/auth.py": [
+            "def is_authorized"
+          ]
+        },
+        "onlyChangedFiles": [
+          "src/auth.py"
+        ]
       },
       "expectedOutcome": {
         "taskSuccess": true,
