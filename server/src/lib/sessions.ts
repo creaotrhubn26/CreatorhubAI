@@ -394,6 +394,11 @@ export async function resolveApproval(
   const real = resolveSessionId(id);
   if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
   const existing = (await readApprovals(real)) ?? {};
+  // Minor (8.3 review): plain `existing[approvalId]` walks the prototype
+  // chain -- "__proto__"/"constructor"/"toString" would otherwise resolve
+  // to an inherited Object.prototype member instead of 404ing like any
+  // other unknown id.
+  if (!Object.prototype.hasOwnProperty.call(existing, approvalId)) return null;
   const record = existing[approvalId];
   if (!record) return null; // no matching pending request -- 404 at the route
   if (record.status !== "pending") return record; // already resolved -- idempotent no-op

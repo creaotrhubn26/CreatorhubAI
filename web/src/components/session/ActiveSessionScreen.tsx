@@ -88,7 +88,20 @@ const RISK_COLOR: Record<string, string> = {
 // both together the moment the wait resolves). Approve/Deny follow the
 // same one-shot, gateway-owned, second-click-is-a-no-op conventions as
 // TasksPanel's task-override buttons.
-function ApprovalCard({ sessionId, approval }: { sessionId: string; approval: NonNullable<GlimmerSession["pendingApproval"]> }) {
+//
+// `stalled` (8.3 review fix-round, M3): the SAME isStalled fact
+// LivenessLine already computes from lastEventAt, just passed down as a
+// prop -- no new staleness machinery. If the process that would actually
+// read an approval decision back (glimmer-engineer.py's poll loop) died
+// without a trace for >=120s, clicking Approve/Deny writes a record
+// nothing will ever read; the buttons are suppressed rather than let a
+// human act on a session that's very likely already gone. v2's own
+// finally-block orphan cleanup (_resolve_orphaned_pending_approval) is
+// the durable fix for the manifest/sidecar state itself -- this is just
+// the UI not inviting a pointless click in the meantime.
+function ApprovalCard({ sessionId, approval, stalled }: {
+  sessionId: string; approval: NonNullable<GlimmerSession["pendingApproval"]>; stalled: boolean;
+}) {
   const queryClient = useQueryClient();
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
   const approveMutation = useMutation({
@@ -121,6 +134,10 @@ function ApprovalCard({ sessionId, approval }: { sessionId: string; approval: No
       {resolved ? (
         <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>
           {approval.status}{approval.approvedBy ? ` by ${approval.approvedBy}` : ""}
+        </p>
+      ) : stalled ? (
+        <p style={{ fontSize: 12, color: "var(--amber)", margin: 0 }}>
+          No recent activity — this session may have ended without resolving this request. Refresh before deciding.
         </p>
       ) : (
         <div style={{ display: "flex", gap: 8 }}>
@@ -189,7 +206,9 @@ export function ActiveSessionScreen() {
       )}
       <h1>{session.task}</h1>
       <LivenessLine isRunning={isRunning} startedAt={startedAtBase} lastEventAt={lastEventAt} />
-      {session.pendingApproval && id && <ApprovalCard sessionId={id} approval={session.pendingApproval} />}
+      {session.pendingApproval && id && (
+        <ApprovalCard sessionId={id} approval={session.pendingApproval} stalled={isStalled(lastEventAt, Date.now())} />
+      )}
       <div className="toolbar">
         <Link to={`/sessions/${id}/diff`}>View diff</Link>
         <Link to={`/sessions/${id}/verification`}>Verification Center</Link>

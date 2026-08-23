@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ActiveSessionScreen } from "./ActiveSessionScreen";
 import * as client from "../../api/client";
 import * as sseHook from "../../api/useSessionEvents";
+import { SessionEventsContext } from "../../api/useSessionEvents";
 
 describe("ActiveSessionScreen", () => {
   it("shows the session's changed-file count and derived state", async () => {
@@ -545,6 +546,34 @@ describe("ActiveSessionScreen", () => {
       );
 
       expect(await screen.findByText(/approved by daniel/i)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^deny$/i })).not.toBeInTheDocument();
+    });
+
+    // 8.3 review fix-round (M3): a session with no SSE activity in >=120s
+    // (isStalled, the SAME fact LivenessLine already computes) suppresses
+    // the buttons instead of inviting a click nothing will ever read back.
+    it("suppresses Approve/Deny (but still shows the card) when the session is stalled", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "waiting_for_approval", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2, pendingApproval,
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <SessionEventsContext.Provider value={{ events: [], lastEventAt: Date.now() - 200_000 }}>
+            <MemoryRouter initialEntries={["/sessions/s1"]}>
+              <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+            </MemoryRouter>
+          </SessionEventsContext.Provider>
+        </QueryClientProvider>
+      );
+
+      expect(await screen.findByText(/modify_dependencies/)).toBeInTheDocument();
+      expect(screen.getByText(/no recent activity/i)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: /^deny$/i })).not.toBeInTheDocument();
     });
