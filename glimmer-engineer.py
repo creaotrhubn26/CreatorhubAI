@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
 import ast
@@ -3024,6 +3025,16 @@ class _PyReferenceVisitor(ast.NodeVisitor):
             self.linenos.add(node.lineno)
         self.generic_visit(node)
 
+    def visit_Import(self, node):
+        # py3.9 compat: ast.alias has no lineno before 3.10 -- stash the
+        # statement's own lineno for visit_alias to fall back on.
+        self._import_lineno = node.lineno
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        self._import_lineno = node.lineno
+        self.generic_visit(node)
+
     def visit_alias(self, node):
         # `import pkg.sub` binds "pkg" locally, so check every dotted
         # component of the imported name, plus the `as` alias if present
@@ -3033,7 +3044,7 @@ class _PyReferenceVisitor(ast.NodeVisitor):
         if node.asname:
             candidates.add(node.asname)
         if self.name in candidates:
-            self.linenos.add(node.lineno)
+            self.linenos.add(getattr(node, "lineno", None) or getattr(self, "_import_lineno", 0))
         self.generic_visit(node)
 
     def visit_arg(self, node):

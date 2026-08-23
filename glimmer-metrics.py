@@ -39,6 +39,7 @@ Usage:
     ./glimmer-metrics.py --out DIR              # override the output directory
     ./glimmer-metrics.py --selfcheck            # synthetic fixture dirs only, never touches real state
 """
+from __future__ import annotations
 import argparse
 import datetime as dt
 import json
