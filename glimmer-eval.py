@@ -15,6 +15,13 @@ fixture workspace and events.jsonl directly, so a session that reports
 "verified" while the harness's own (stricter) expectations aren't met is
 caught as a false-VERIFIED honesty violation, not trusted at face value.
 
+Round 9 review (M2): every task run points glimmer-v2.py's GLIMMER_STATE_ROOT
+env var at this run's own tempdir, so its synthetic session dirs never land
+in the real ~/.muse-glimmer/sessions corpus glimmer-metrics.py scans by
+default -- that corpus is a §41 report a human is meant to act on, and eval
+fixtures were previously dominating its headline numbers (see run_task).
+--selfcheck asserts the real corpus dir is byte-for-byte untouched.
+
 Usage:
     ./glimmer-eval.py                    # run the full suite, write eval-results/<ts>.json + .md
     ./glimmer-eval.py --suite-validate   # schema-check eval-tasks.json, no runs
@@ -32,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,7 +50,19 @@ DEFAULT_ENGINEER = ROOT / "glimmer-engineer.py"
 OUT_DIR = ROOT / "eval-results"
 
 SUITE_VERSION = "1.0.0"
-CATEGORIES = ("create", "modify", "repair", "refuse")
+# Round 9 review (M7): V7 §39 names 11 benchmark categories; these 6 map
+# onto 4 of them fairly directly (create->small-feature-creation,
+# modify->small bug fix, repair->test/verification repair, refuse->
+# impossible/security-sensitive-refusal) plus two added this round --
+# typefix (type error) and multifile (multi-file feature, >1 file touched
+# by one task) -- both cheap with the existing stub (no new stub tool/
+# capability needed, just new fixtures + scripted steps). Repository
+# discovery, frontend UI bug, backend API bug, refactor, and ambiguous
+# task are NOT covered: this stub has no real UI/API surface and no live
+# model to exercise ambiguity/discovery against, so faking them would be
+# padding, not coverage -- see eval-tasks.json's top-level "_coverage" note
+# for the recorded decision.
+CATEGORIES = ("create", "modify", "repair", "refuse", "typefix", "multifile")
 
 TOOL_DEFS = [
     {"tool": name, "definition": {
@@ -235,6 +255,14 @@ class StubState:
         self.invocation_index = -1
         self.turn_index = 0
         self.lock = threading.Lock()
+        # M7 (V7 §39 coverage): cheap-and-free per-session metrics the stub
+        # already observes for free -- every tool call and every model turn
+        # passes through this same process, so counting them costs nothing
+        # beyond incrementing an int. turn_index (above) resets to 0 per
+        # engineer iteration (see do_GET's /tools handler) for the scripted-
+        # step lookup; these two are cumulative across the whole task run.
+        self.total_turns = 0
+        self.tool_calls = 0
 
 
 def _make_handler(state: StubState):
@@ -278,6 +306,8 @@ def _make_handler(state: StubState):
                 self._reply({"error": "not found"}, 404)
 
         def _exec_tool(self, body):
+            with state.lock:
+                state.tool_calls += 1
             tool = body.get("tool")
             params = body.get("params") or {}
             try:
@@ -331,6 +361,7 @@ def _make_handler(state: StubState):
                 inv = state.invocations[max(state.invocation_index, 0)]
                 idx = state.turn_index
                 state.turn_index += 1
+                state.total_turns += 1
             step = inv[idx] if idx < len(inv) else {"finish": "Stub script exhausted; finishing."}
 
             if "finish" in step:
@@ -366,7 +397,12 @@ def _find_manifest_path(stdout: str):
 def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
              python_exe: str, timeout: int):
     """Builds the fixture, spins up the stub server, invokes glimmer-v2.py
-    headlessly. Returns (workspace, manifest_dict, events_list, run_error)."""
+    headlessly. Returns (workspace, manifest_dict, events_list, run_error,
+    stub_metrics) -- stub_metrics is {"toolCalls", "turns", "wallSeconds"}
+    (M7, V7 §39 coverage): cheap because the stub already observes every
+    tool call and model turn for free; wallSeconds is just the subprocess's
+    own wall-clock duration."""
+    wall_start = time.monotonic()
     ws = build_fixture(tmp_root, task)
     port = _free_port()
     state = StubState(ws, task["stub"]["invocations"], task.get("deliveryReadiness", "ready_to_ship"))
@@ -395,6 +431,14 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
 
     env = os.environ.copy()
     env["GLIMMER_URL"] = f"http://127.0.0.1:{port}"
+    # Round 9 review (M2): without this, glimmer-v2.py's STATE_ROOT is the
+    # real ~/.muse-glimmer/sessions -- every eval task wrote a real synthetic
+    # session dir straight into the same corpus glimmer-metrics.py scans by
+    # default, silently dominating §41 headline numbers (measured: 11/12
+    # "repair success rate" sessions were eval fixtures). Point it at this
+    # run's own tempdir instead; glimmer-v2.py's STATE_ROOT reads this same
+    # var control-center already uses for its stateRoot.
+    env["GLIMMER_STATE_ROOT"] = str(tmp_root / "state")
 
     run_error = None
     stdout = ""
@@ -440,7 +484,12 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
     elif not run_error:
         run_error = "session manifest not found in glimmer-v2.py output"
 
-    return ws, manifest, events, run_error
+    stub_metrics = {
+        "toolCalls": state.tool_calls,
+        "turns": state.total_turns,
+        "wallSeconds": round(time.monotonic() - wall_start, 3),
+    }
+    return ws, manifest, events, run_error, stub_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -501,8 +550,13 @@ def honesty_check(manifest: dict, events: list) -> str:
     return "FAIL" if violations else "PASS"
 
 
-def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=None) -> dict:
+def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=None,
+               stub_metrics: dict | None = None) -> dict:
     result = {"id": task["id"], "category": task["category"]}
+    # M7 (V7 §39 coverage): cheap-and-free per-session metrics, recorded
+    # regardless of outcome -- even a run_error/timeout task still ran some
+    # real turns/tool calls worth reporting, not just the happy path.
+    result["metrics"] = dict(stub_metrics or {"toolCalls": None, "turns": None, "wallSeconds": None})
 
     if run_error:
         result.update(
@@ -566,11 +620,11 @@ def run_suite(suite: dict, *, only_id=None, v2_path: Path, engineer_path: Path,
         for task in tasks:
             print(f"[glimmer-eval] running {task['id']} ({task['category']}) ...", flush=True)
             try:
-                ws, manifest, events, run_error = run_task(
+                ws, manifest, events, run_error, stub_metrics = run_task(
                     task, tmp_root, v2_path=v2_path, engineer_path=engineer_path,
                     python_exe=python_exe, timeout=timeout,
                 )
-                r = score_task(task, ws, manifest, events, run_error=run_error)
+                r = score_task(task, ws, manifest, events, run_error=run_error, stub_metrics=stub_metrics)
             except Exception as exc:  # noqa: BLE001 - one bad task must not abort the suite
                 r = score_task(task, tmp_root, {}, [], run_error=f"{type(exc).__name__}: {exc}")
             results.append(r)
@@ -609,14 +663,16 @@ def write_results(results: list, suite_version: str) -> tuple:
         f"- False-VERIFIED (honesty violation): {aggregates['falseVerified']}",
         f"- Budget violations: {aggregates['budgetViolations']}",
         f"- Honesty check failures: {aggregates['honestyFailures']}", "",
-        "| id | category | success | falseVerified | budget | honesty | problems |",
-        "|---|---|---|---|---|---|---|",
+        "| id | category | success | falseVerified | budget | honesty | tool calls | turns | wall (s) | problems |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         problems = "; ".join(r.get("problems") or []) or "-"
+        m = r.get("metrics") or {}
         lines.append(
             f"| {r['id']} | {r['category']} | {r['taskSuccess']} | {r['falseVerified']} | "
-            f"{r['budgetAdherence']} | {r['honestyChecks']} | {problems} |"
+            f"{r['budgetAdherence']} | {r['honestyChecks']} | {m.get('toolCalls')} | "
+            f"{m.get('turns')} | {m.get('wallSeconds')} | {problems} |"
         )
     md_path = OUT_DIR / f"{ts}.md"
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -662,6 +718,15 @@ def main() -> int:
     v2_path, engineer_path = Path(args.v2), Path(args.engineer)
 
     if args.selfcheck:
+        # Round 9 review (M2): the real corpus glimmer-metrics.py scans by
+        # default is ~/.muse-glimmer/sessions -- before GLIMMER_STATE_ROOT
+        # isolation, every task run here wrote a real session dir straight
+        # into it. Snapshot it before/after and assert nothing changed; this
+        # is the honesty check the whole point of the isolation fix hinges
+        # on, not just "run_task passes an env var".
+        real_sessions_dir = Path.home() / ".muse-glimmer" / "sessions"
+        before = set(real_sessions_dir.iterdir()) if real_sessions_dir.is_dir() else set()
+
         results = run_suite(suite, v2_path=v2_path, engineer_path=engineer_path,
                              python_exe=args.python, timeout=args.timeout)
         ok = True
@@ -672,6 +737,13 @@ def main() -> int:
                 if got != want:
                     ok = False
                     print(f"SELFCHECK MISMATCH [{task['id']}]: {key} expected {want!r}, got {got!r}")
+
+        after = set(real_sessions_dir.iterdir()) if real_sessions_dir.is_dir() else set()
+        if after != before:
+            ok = False
+            print(f"SELFCHECK MISMATCH: real corpus {real_sessions_dir} changed during the run "
+                  f"({len(after - before)} new dir(s)) -- GLIMMER_STATE_ROOT isolation is broken")
+
         json_path, md_path = write_results(results, suite.get("suiteVersion", SUITE_VERSION))
         print(f"[glimmer-eval] wrote {json_path}")
         print(f"[glimmer-eval] wrote {md_path}")

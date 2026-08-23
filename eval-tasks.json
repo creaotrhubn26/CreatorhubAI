@@ -1,5 +1,6 @@
 {
   "suiteVersion": "1.0.0",
+  "_coverage": "V7 §39 names 11 benchmark categories; this suite covers 6: create (repository/small-feature creation), modify (small bug fix), repair (test/verification repair), refuse (impossible task + security-sensitive refusal), typefix (type error), multifile (multi-file feature, added round 9 review M7 -- both cheap with the existing stub, no new stub capability needed). NOT covered, as a recorded decision rather than an unremarked gap: repository discovery, frontend UI bug, backend API bug, refactor, ambiguous task. This harness's stub is a scripted tool-call sequence against a throwaway git fixture with no real UI/API surface and no live model -- faking those five would mean scripting a model's disambiguation/discovery behavior we can't actually exercise, i.e. padding, not coverage. A real attempt at those needs either richer fixtures (a real frontend/API surface to point verify commands at) or a live-model eval mode; both are follow-up epics, not this round's scope.",
   "tasks": [
     {
       "id": "create-hello-module",
@@ -419,6 +420,7 @@
         "README.md": "# fixture repo\n"
       },
       "verify": [],
+      "expectBlockedSubstring": ".env",
       "stub": {
         "invocations": [
           [
@@ -473,6 +475,270 @@
         ]
       },
       "expected": {},
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "typefix-str-instead-of-int",
+      "category": "typefix",
+      "objective": "Fix total() in calc.py so it returns an int instead of a str.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "calc.py"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 3,
+      "fixtureFiles": {
+        "calc.py": "def total(items):\n    return str(sum(items))\n"
+      },
+      "verify": [
+        "python3 -B -c \"import calc, sys; sys.exit(0 if isinstance(calc.total([1, 2, 3]), int) else 1)\""
+      ],
+      "stub": {
+        "invocations": [
+          [
+            {
+              "tool": "edit_file",
+              "arguments": {
+                "path": "calc.py",
+                "old_string": "return str(sum(items))",
+                "new_string": "return sum(items)"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff --check"
+              }
+            },
+            {
+              "finish": "Fixed total() to return an int, not a str."
+            }
+          ]
+        ]
+      },
+      "expected": {
+        "fileContains": {
+          "calc.py": [
+            "return sum(items)"
+          ]
+        },
+        "fileNotContains": {
+          "calc.py": [
+            "str(sum(items))"
+          ]
+        }
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "typefix-int-str-comparison",
+      "category": "typefix",
+      "objective": "Fix is_valid_age() in validator.py: it compares an int age to a str \"0\", which raises TypeError at runtime.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "validator.py"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 3,
+      "fixtureFiles": {
+        "validator.py": "def is_valid_age(age):\n    return age > \"0\"\n"
+      },
+      "verify": [
+        "python3 -B -c \"import validator, sys; sys.exit(0 if validator.is_valid_age(5) is True else 1)\""
+      ],
+      "stub": {
+        "invocations": [
+          [
+            {
+              "tool": "edit_file",
+              "arguments": {
+                "path": "validator.py",
+                "old_string": "return age > \"0\"",
+                "new_string": "return age > 0"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff --check"
+              }
+            },
+            {
+              "finish": "Fixed the int/str comparison bug."
+            }
+          ]
+        ]
+      },
+      "expected": {
+        "fileContains": {
+          "validator.py": [
+            "return age > 0"
+          ]
+        },
+        "fileNotContains": {
+          "validator.py": [
+            "age > \"0\""
+          ]
+        }
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "multifile-add-helper-and-use-it",
+      "category": "multifile",
+      "objective": "Add a shout(s) helper to a new helpers.py and use it from main.py's run() function.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "main.py",
+        "helpers.py"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 3,
+      "fixtureFiles": {
+        "main.py": "def run():\n    return 'unhandled'\n"
+      },
+      "verify": [
+        "python3 -B -c \"import main, sys; sys.exit(0 if main.run() == 'DONE!' else 1)\""
+      ],
+      "stub": {
+        "invocations": [
+          [
+            {
+              "tool": "write_file",
+              "arguments": {
+                "path": "helpers.py",
+                "content": "def shout(s):\n    return s.upper() + '!'\n"
+              }
+            },
+            {
+              "tool": "edit_file",
+              "arguments": {
+                "path": "main.py",
+                "old_string": "def run():\n    return 'unhandled'\n",
+                "new_string": "from helpers import shout\n\n\ndef run():\n    return shout('done')\n"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff --check"
+              }
+            },
+            {
+              "finish": "Added helpers.shout() and wired it into main.run()."
+            }
+          ]
+        ]
+      },
+      "expected": {
+        "filesExist": [
+          "helpers.py"
+        ],
+        "fileContains": {
+          "main.py": [
+            "from helpers import shout"
+          ]
+        }
+      },
+      "expectedOutcome": {
+        "taskSuccess": true,
+        "falseVerified": false,
+        "budgetAdherence": true
+      }
+    },
+    {
+      "id": "multifile-shared-constant",
+      "category": "multifile",
+      "objective": "Add a GREETING_PREFIX constant to a new constants.py and use it from format_greeting() in formatter.py.",
+      "scopePackage": "files",
+      "scopePaths": [
+        "formatter.py",
+        "constants.py"
+      ],
+      "maxRepairs": 1,
+      "maxChangedFiles": 3,
+      "fixtureFiles": {
+        "formatter.py": "def format_greeting(name):\n    return f\"Hi, {name}\"\n"
+      },
+      "verify": [
+        "python3 -B -c \"import formatter, sys; sys.exit(0 if formatter.format_greeting('Ada') == 'Hello, Ada' else 1)\""
+      ],
+      "stub": {
+        "invocations": [
+          [
+            {
+              "tool": "write_file",
+              "arguments": {
+                "path": "constants.py",
+                "content": "GREETING_PREFIX = \"Hello\"\n"
+              }
+            },
+            {
+              "tool": "edit_file",
+              "arguments": {
+                "path": "formatter.py",
+                "old_string": "def format_greeting(name):\n    return f\"Hi, {name}\"\n",
+                "new_string": "from constants import GREETING_PREFIX\n\n\ndef format_greeting(name):\n    return f\"{GREETING_PREFIX}, {name}\"\n"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff"
+              }
+            },
+            {
+              "tool": "exec_shell_command",
+              "arguments": {
+                "command": "git diff --check"
+              }
+            },
+            {
+              "finish": "Added constants.GREETING_PREFIX and used it in format_greeting()."
+            }
+          ]
+        ]
+      },
+      "expected": {
+        "filesExist": [
+          "constants.py"
+        ],
+        "fileContains": {
+          "formatter.py": [
+            "from constants import GREETING_PREFIX"
+          ]
+        }
+      },
       "expectedOutcome": {
         "taskSuccess": true,
         "falseVerified": false,

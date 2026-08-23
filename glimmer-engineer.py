@@ -912,6 +912,22 @@ def resolve_workspace_path(
     return resolved
 
 
+class ToolPolicyBlock(PermissionError):
+    """Round 9 review (M5): a real POLICY_BLOCK, raised only by
+    check_write_path below -- distinct from the plain PermissionError
+    secure_tool_arguments' OTHER guards raise (path traversal via
+    resolve_workspace_path, read_file-on-a-directory, write_file-on-an-
+    existing-file, edit_file-on-a-missing-file). Subclasses PermissionError
+    so every existing `except PermissionError` catch site (check_write_path's
+    own unit-test assertions, etc.) still works unchanged; execute_tool
+    catches this SPECIFIC subclass to route it through the same
+    tool_blocked/record_blocked_command/POLICY_BLOCK-envelope audit path
+    shell_policy rejections already use -- deliberately narrower than
+    catching every PermissionError there, so this fix doesn't silently
+    change the (already-tested) propagate-and-let-the-caller-handle-it
+    contract for the OTHER guards, which is out of this finding's scope."""
+
+
 def check_write_path(
     path,
     workspace,
@@ -920,25 +936,25 @@ def check_write_path(
 
     for part in relative.parts:
         if part in PROTECTED_DIRS:
-            raise PermissionError(
+            raise ToolPolicyBlock(
                 "Writing to protected directory "
                 f"is blocked: {relative}"
             )
 
     if path.name.startswith(".env"):
-        raise PermissionError(
+        raise ToolPolicyBlock(
             "Writing environment/secret files "
             f"is blocked: {relative}"
         )
 
     if path.name in PROTECTED_FILES:
-        raise PermissionError(
+        raise ToolPolicyBlock(
             "Lockfile writes are blocked in "
             f"Engineering Mode v1: {relative}"
         )
 
     if path.suffix == ".lock":
-        raise PermissionError(
+        raise ToolPolicyBlock(
             f"Lockfile writes are blocked: {relative}"
         )
 
@@ -949,7 +965,7 @@ def check_write_path(
     # Exact relative-path check, not PROTECTED_FILES (that matches on
     # path.name and would block any graph.json anywhere in the repo).
     if relative.as_posix() == DOC_GRAPH_RELATIVE_PATH:
-        raise PermissionError(
+        raise ToolPolicyBlock(
             "docs/graph.json is orchestrator-owned documentation "
             f"bookkeeping; model writes are blocked: {relative}"
         )
@@ -2675,10 +2691,11 @@ def _symbol_patterns(escaped_name):
 #     symbols in different scopes -- every match, at any nesting depth, is
 #     reported (still strictly more accurate than the regex path, which is
 #     scope-blind in the same way).
-#   - bare `import x` / `from mod import x` naming the symbol is NOT counted
-#     as a reference (ast.alias nodes are not visited) -- a real gap versus
-#     the regex/TS-JS path, which would catch it as a word-boundary text
-#     match. Add an ast.alias visit if this proves to matter in practice.
+#   - a `keyword.arg` name in a call site (`f(target=1)`'s "target") is NOT
+#     counted -- keyword.arg is a plain string field, not a node, so
+#     NodeVisitor never visits it; only the value expression is (already
+#     true of the regex path's blindness to which token is the kwarg name
+#     vs. the value, just the opposite miss).
 #   - no cross-file resolution, no type information -- this remains a
 #     single-file, name-based tool, same as the regex path it upgrades.
 # TS/JS get no equivalent upgrade (no stdlib AST for those languages) and
@@ -2709,10 +2726,16 @@ class _PySymbolDefVisitor(ast.NodeVisitor):
 class _PyReferenceVisitor(ast.NodeVisitor):
     """Collects the line numbers of every real usage of `name`: a bare
     identifier (ast.Name -- a call, a read, an argument, an assignment
-    target, ...) or an attribute access (ast.Attribute, e.g. `self.name`/
-    `obj.name(...)`). Unlike the regex path's word-boundary text match,
-    this cannot false-positive on a comment or string literal that merely
-    mentions the name — ast.parse never turns those into nodes at all."""
+    target, ...), an attribute access (ast.Attribute, e.g. `self.name`/
+    `obj.name(...)`), an import name or alias (ast.alias, e.g. `import name`/
+    `from mod import name`/`import mod as name`), a function/lambda
+    parameter name (ast.arg), or a `global`/`nonlocal name` declaration
+    (ast.Global/ast.Nonlocal). Unlike the regex path's word-boundary text
+    match, this cannot false-positive on a comment or string literal that
+    merely mentions the name — ast.parse never turns those into nodes at
+    all. Round 9 review (M4): imports/params/global/nonlocal were the four
+    reproduced gaps versus the regex path this upgrades; see the ceiling
+    note above this class for what's still deliberately out of scope."""
 
     def __init__(self, name):
         self.name = name
@@ -2727,6 +2750,30 @@ class _PyReferenceVisitor(ast.NodeVisitor):
         if node.attr == self.name:
             self.linenos.add(node.lineno)
         self.generic_visit(node)
+
+    def visit_alias(self, node):
+        # `import pkg.sub` binds "pkg" locally, so check every dotted
+        # component of the imported name, plus the `as` alias if present
+        # (`import target as t` mentions "target" in source even though it
+        # binds "t") -- either matching `name` counts as a real mention.
+        candidates = set(node.name.split(".")) if node.name else set()
+        if node.asname:
+            candidates.add(node.asname)
+        if self.name in candidates:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    def visit_arg(self, node):
+        if node.arg == self.name:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    def visit_Global(self, node):
+        if self.name in node.names:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    visit_Nonlocal = visit_Global
 
 
 def _ast_line_hits(text, linenos):
@@ -2839,20 +2886,26 @@ def find_symbol(name, kind, workspace):
 def find_references(name, workspace):
     """All usages of `name` across the workspace, grouped by file. TS/JS
     (and any .py file that fails to parse): word-boundary lexical match
-    (so searching "foo" will never match inside "foobar"), unchanged —
-    definition lines are NOT excluded from the results, since distinguishing
-    "this line defines X" from "this line merely mentions X" would require
-    real parsing, which this lexical path doesn't do.
+    (so searching "foo" will never match inside "foobar") — definition
+    lines are NOT excluded from the results, since distinguishing "this
+    line defines X" from "this line merely mentions X" would require real
+    parsing, which this lexical path doesn't do.
 
     Python (.py) files that parse successfully (Task 9.3d) use a real
     stdlib `ast` NodeVisitor instead: a reference is an ast.Name(id=name)
-    (a call, a read, an argument, ...) or an ast.Attribute(attr=name)
-    (`self.name`/`obj.name(...)`). This is strictly more precise than the
-    lexical path for those files — a def/class statement's own name is not
-    a Name/Attribute node, so definition lines are correctly excluded, and
-    a comment or string literal merely mentioning the name is never counted
-    (ast.parse doesn't turn those into nodes at all). See the ceiling note
-    on _PyReferenceVisitor above (imports aren't walked). Capped at
+    (a call, a read, an argument, ...), an ast.Attribute(attr=name)
+    (`self.name`/`obj.name(...)`), an import name/alias (ast.alias), a
+    function/lambda parameter name (ast.arg), or a `global`/`nonlocal name`
+    declaration. This is strictly more precise than the lexical path for
+    those files — a def/class statement's own name is not one of those node
+    types, so definition lines are correctly excluded, and a comment or
+    string literal merely mentioning the name is never counted (ast.parse
+    doesn't turn those into nodes at all). See the ceiling note on
+    _PyReferenceVisitor above for what's still out of scope (e.g. a call's
+    keyword-argument name). Per-file results below say which path a given
+    file actually took (Round 9 review M3: the header used to make one
+    blanket "lexical, definitions included" claim even for files the AST
+    path — the opposite on both counts — actually handled). Capped at
     _SEMANTIC_MAX_MATCHES total matches."""
     name = _validate_semantic_name(name)
     pattern = re.compile(r"\b" + re.escape(name) + r"\b")
@@ -2888,24 +2941,28 @@ def find_references(name, workspace):
                         break
 
         if file_matches:
-            by_file[path.relative_to(workspace).as_posix()] = file_matches
+            rel = path.relative_to(workspace).as_posix()
+            by_file[rel] = (file_matches, ast_handled)
         if total >= _SEMANTIC_MAX_MATCHES:
             break
 
     if not by_file:
         return (
-            f"No references to '{name}' found (word-boundary lexical "
-            "search across the workspace)."
+            f"No references to '{name}' found (word-boundary lexical search "
+            "for non-Python files and any .py file that failed to parse; "
+            "real ast parse — definition lines excluded — for .py files "
+            "that parsed)."
         )
 
-    lines = [
-        f"Found {total} reference(s) to '{name}' across {len(by_file)} "
-        "file(s) (word-boundary match; definition lines are included, "
-        "not excluded — see find_symbol to specifically locate "
-        "definitions):"
-    ]
-    for rel, file_matches in by_file.items():
-        lines.append(f"\n{rel}:")
+    lines = [f"Found {total} reference(s) to '{name}' across {len(by_file)} file(s):"]
+    for rel, (file_matches, ast_handled) in by_file.items():
+        mode = (
+            "ast match; definition lines excluded"
+            if ast_handled else
+            "word-boundary lexical match; definition lines included, not "
+            "excluded — see find_symbol to specifically locate definitions"
+        )
+        lines.append(f"\n{rel} ({mode}):")
         lines.extend(f"  {m}" for m in file_matches)
     return "\n".join(lines)
 
@@ -3859,11 +3916,53 @@ def execute_tool(
 
         return _render_tool_envelope_message(envelope), False
 
-    arguments = secure_tool_arguments(
-        tool_name,
-        arguments,
-        workspace,
-    )
+    try:
+        arguments = secure_tool_arguments(
+            tool_name,
+            arguments,
+            workspace,
+        )
+    except ToolPolicyBlock as exc:
+        # Round 9 review (M5): check_write_path raises ToolPolicyBlock for a
+        # real policy block (.env*, PROTECTED_DIRS, lockfiles, docs/
+        # graph.json) -- but nothing here used to emit tool_blocked or
+        # record_blocked_command. The caller's own generic `except
+        # Exception` just stringified it into "TOOL BLOCKED/ERROR: ..." and
+        # printed it: a real write was attempted and blocked, with ZERO
+        # audit trail (no tool_blocked event, no repo-memory record, no
+        # POLICY_BLOCK envelope -- classify_failure's POLICY_BLOCK branch,
+        # glimmer-metrics.py's taxonomy, and CC's event feed never saw it).
+        # Route it through the exact same block-reporting shape the
+        # shell_policy rejection below uses, so every policy-block class
+        # shares one audit path. Deliberately NOT catching plain
+        # PermissionError here -- see ToolPolicyBlock's own docstring for
+        # why the OTHER secure_tool_arguments guards (path traversal,
+        # existing-file write, missing-file edit) must keep propagating
+        # unchanged.
+        reason = str(exc)
+        message = "ENGINEERING SECURITY BLOCK: " + reason
+        blocked_path = str(arguments.get("path", tool_name))[:MAX_EVENT_FIELD]
+
+        print()
+        print(f"✗ BLOCKED: {tool_name} {blocked_path}")
+        print(f"  {reason}")
+
+        _emit(
+            "tool_blocked",
+            command=blocked_path,
+            reason=reason,
+        )
+        record_blocked_command(workspace, blocked_path, reason)
+
+        envelope = _build_tool_envelope(
+            ok=False,
+            tool=tool_name,
+            duration_ms=_duration_ms(),
+            error={"code": "POLICY_BLOCK", "message": message},
+        )
+        _persist_tool_envelope(envelope)
+
+        return _render_tool_envelope_message(envelope), False
 
     cache_key = None
 
@@ -4525,6 +4624,47 @@ def _tool_envelope_selfcheck() -> None:
             assert blocked_env["evidence"] == [], "a blocked call must never carry an evidence id"
             assert blocked_env["changed"] is False
             assert blocked_env["data"] is None
+
+            # ------------------------------------------------------
+            # 3. Round 9 review (M5): a write-path PermissionError
+            #    (check_write_path via secure_tool_arguments -- .env* here)
+            #    must get the SAME audit trail as the shell_policy block
+            #    above: a tool_blocked event, a repo-memory record, and a
+            #    POLICY_BLOCK envelope -- not just a stringified message
+            #    swallowed by the caller's generic except.
+            # ------------------------------------------------------
+            events_before = [json.loads(l) for l in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()]
+
+            env_message, env_changed = execute_tool(
+                "write_file",
+                {"path": ".env", "content": "SECRET=1"},
+                workspace,
+                approval_state,
+                cache,
+                ledger,
+            )
+
+            assert env_changed is False
+            assert "ENGINEERING SECURITY BLOCK" in env_message, env_message
+            assert ".env" in env_message, env_message
+            assert not (workspace / ".env").exists(), (
+                "the blocked write must never actually happen"
+            )
+
+            records = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+            envelopes = [r for r in records if r.get("kind") == "tool_envelope"]
+            env_envelope = envelopes[-1]
+            assert env_envelope["ok"] is False
+            assert env_envelope["tool"] == "write_file"
+            assert env_envelope["error"]["code"] == "POLICY_BLOCK"
+
+            events_after = [json.loads(l) for l in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()]
+            new_events = events_after[len(events_before):]
+            blocked_events = [e for e in new_events if e.get("type") == "tool_blocked"]
+            assert len(blocked_events) == 1, (
+                f"write_file(.env) must emit exactly one tool_blocked event, got: {new_events!r}"
+            )
+            assert ".env" in blocked_events[0].get("command", ""), blocked_events[0]
 
     finally:
         http_json = real_http_json
@@ -8677,6 +8817,44 @@ def _semantic_tools_selfcheck() -> None:
         # broken.py still contributes via the same regex fallback as
         # find_symbol above.
         assert "src/broken.py" in py_refs, py_refs
+
+        # M3: the per-file annotation must say what that file actually
+        # got -- ast for a parsed .py file, lexical for the regex-fallback
+        # broken.py in the SAME result.
+        assert "src/models.py (ast match; definition lines excluded):" in py_refs, py_refs
+        assert "src/broken.py (word-boundary lexical match" in py_refs, py_refs
+
+        # ------------------------------------------------------------
+        # 2c. Round 9 review (M4): the AST reference visitor also collects
+        #     imports (ast.alias), function parameters (ast.arg), and
+        #     global/nonlocal declarations -- four real reference sites
+        #     the regex path found and the AST path used to silently drop.
+        # ------------------------------------------------------------
+        (ws / "src" / "imports_and_params.py").write_text(
+            "from mod import target\n"          # 1: ast.alias (import name)
+            "import target as t\n"               # 2: ast.alias (import name, aliased)
+            "\n"
+            "def f(target=1):\n"                 # 4: ast.arg (parameter name)
+            "    global target\n"                 # 5: ast.Global
+            "    return call(target=target)\n"    # 6: ast.Name (the value only)
+        )
+        target_refs = find_references("target", ws)
+        assert "src/imports_and_params.py (ast match" in target_refs, target_refs
+        assert "1: from mod import target" in target_refs, (
+            f"import name site missed: {target_refs!r}"
+        )
+        assert "2: import target as t" in target_refs, (
+            f"aliased import name site missed: {target_refs!r}"
+        )
+        assert "4: def f(target=1):" in target_refs, (
+            f"parameter name site missed: {target_refs!r}"
+        )
+        assert "5: global target" in target_refs, (
+            f"global declaration site missed: {target_refs!r}"
+        )
+        assert "6: return call(target=target)" in target_refs, (
+            f"the value half of the keyword arg (a real ast.Name) missed: {target_refs!r}"
+        )
 
         # ------------------------------------------------------------
         # 3. find_related_tests: same-basename + content-import match.

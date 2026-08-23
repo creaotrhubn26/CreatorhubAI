@@ -12,9 +12,11 @@ persisted (classify_failure's manifest["failure"], compute_statuses'
 manifest["statuses"], the describe_blocked_gates contract's
 manifest["blockedGates"], and architect_review_completed events):
 
-  - failure taxonomy distribution (manifest["failure"]["class"], plus an
-    honest "SUCCESS" bucket for every session classify_failure recorded no
-    failure for)
+  - failure taxonomy distribution (manifest["failure"]["class"]; SUCCESS
+    only for sessions that actually ended verified; a session with no
+    failure.class that never verified lands in its own honest
+    "unclassified:<status>" bucket -- never silently counted as SUCCESS --
+    with "repo-map-only" split into its own non-failure early-exit bucket)
   - repair success rate (a session with >=2 recorded attempts -- i.e. at
     least one repair iteration ran -- that ended verified)
   - architect-gate outcomes (approved/replan/rejected/revise), read from
@@ -144,13 +146,31 @@ def _session_ended_verified(manifest: dict) -> bool:
 
 
 def compute_failure_taxonomy(sessions) -> dict:
+    """Round 9 review (M1): SUCCESS used to mean only "classify_failure
+    recorded no failure.class", which also swept in every session that
+    never actually reached verified -- blocked-infra_blocked, blocked-
+    no-changes, no-change-unverified, a bare "initialized" that crashed
+    pre-classify, etc. (classify_failure returns None for those too, same
+    as it does for a real success.) Measured 16/60 "SUCCESS" sessions on
+    the real corpus that were never verified -- a 27% inflated headline
+    number for the exact §41 human-review decision this taxonomy exists to
+    support. SUCCESS now requires the same ended-verified check the repair-
+    rate metric already applies; repo-map-only keeps its own honest
+    non-failure bucket (classify_failure treats it as a deliberate early
+    exit, not a success); everything else with no failure.class is an
+    honest "unclassified:<status>" bucket instead of a silent SUCCESS."""
     classes = []
     for s in sessions:
-        failure = s["manifest"].get("failure")
+        manifest = s["manifest"]
+        failure = manifest.get("failure")
         if isinstance(failure, dict) and failure.get("class"):
             classes.append(failure["class"])
-        else:
+        elif _session_ended_verified(manifest):
             classes.append("SUCCESS")
+        elif manifest.get("status") == "repo-map-only":
+            classes.append("EARLY_EXIT:repo-map-only")
+        else:
+            classes.append(f"unclassified:{manifest.get('status')}")
     return _tally(classes)
 
 
@@ -473,17 +493,43 @@ def _selfcheck() -> bool:
             "status": "no-change-verified", "attempts": [{"iteration": 0}],
         }), encoding="utf-8")
 
+        # j) Round 9 review (M1): a session with NO failure.class that never
+        #    ended verified -- classify_failure returns None for this raw
+        #    status (it isn't one of the recognized failure-producing ones),
+        #    the exact real-corpus shape (blocked-infra_blocked, blocked-no-
+        #    changes, no-change-unverified, a crashed "initialized") that
+        #    used to be silently swept into SUCCESS. Must NOT count as
+        #    SUCCESS; must land in its own honest unclassified bucket.
+        infra_blocked = root / "20260101-000009-infra-blocked-no-failure-class"
+        infra_blocked.mkdir()
+        (infra_blocked / "manifest.json").write_text(json.dumps({
+            "status": "blocked-infra_blocked", "attempts": [{"iteration": 0}],
+        }), encoding="utf-8")
+
+        # k) repo-map-only -- classify_failure's deliberate early-exit, no
+        #    failure.class, never verified: its own non-failure bucket, not
+        #    SUCCESS and not lumped in with genuine unclassified failures.
+        repo_map = root / "20260101-000010-repo-map-only"
+        repo_map.mkdir()
+        (repo_map / "manifest.json").write_text(json.dumps({
+            "status": "repo-map-only",
+        }), encoding="utf-8")
+
         sessions = scan_sessions(root)
         # stray (no manifest), corrupt JSON, and wrong-shape (non-dict) must
-        # all be silently skipped -- 6 real sessions survive out of 9 dirs.
-        check("malformed tolerance: 6 valid sessions found", len(sessions) == 6)
+        # all be silently skipped -- 8 real sessions survive out of 11 dirs.
+        check("malformed tolerance: 8 valid sessions found", len(sessions) == 8)
 
         metrics = build_metrics(sessions)
-        check("sessionCount == 6", metrics["sessionCount"] == 6)
+        check("sessionCount == 8", metrics["sessionCount"] == 8)
 
         ft = metrics["failureTaxonomy"]
         check("failure taxonomy: 5 SUCCESS", ft.get("SUCCESS") == 5)
         check("failure taxonomy: 1 CODE_FAIL", ft.get("CODE_FAIL") == 1)
+        check("failure taxonomy: never-verified session is NOT SUCCESS",
+              ft.get("unclassified:blocked-infra_blocked") == 1)
+        check("failure taxonomy: repo-map-only gets its own non-failure bucket",
+              ft.get("EARLY_EXIT:repo-map-only") == 1)
 
         rsr = metrics["repairSuccessRate"]
         check("repair: 2 sessions attempted a repair", rsr["sessionsWithRepairAttempted"] == 2)
@@ -520,7 +566,7 @@ def _selfcheck() -> bool:
         check("metrics.json written", json_path.exists())
         check("metrics-report.md written", md_path.exists())
         round_tripped = json.loads(json_path.read_text(encoding="utf-8"))
-        check("metrics.json round-trips sessionCount", round_tripped["sessionCount"] == 6)
+        check("metrics.json round-trips sessionCount", round_tripped["sessionCount"] == 8)
 
     return ok
 
