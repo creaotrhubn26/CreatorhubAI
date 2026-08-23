@@ -63,7 +63,12 @@ function describe(e: GlimmerEvent): string {
     case "verification_completed": return `VERIFY ${e.check}: ${e.status}`;
     case "agent_state_changed": return `STATE ${e.state}`;
     case "candidate_selected": return `DECISION ${e.file}`;
-    case "scope_expanded": return "SCOPE EXPANSION";
+    // M3 (followup-1-2 review): a human-approved expansion (V7 §15
+    // write-time pause) is a resolved deviation, not an open violation --
+    // say so, and name who approved it when the event carries that.
+    case "scope_expanded": return e.approved
+      ? `SCOPE EXPANSION (approved${e.approvedBy ? ` by ${e.approvedBy}` : ""})`
+      : "SCOPE EXPANSION";
     case "repair_started": return `REPAIR ${e.iteration}`;
     case "parser_recovery": return `PEG retry (attempt ${e.attempt})`;
     case "session_completed": return `SESSION ${e.status}`;
@@ -88,7 +93,12 @@ function iconMeta(row: TimelineRow): { glyph: string; color: string } {
     case "verification_completed": return { glyph: "◎", color: statusColor(e.status) };
     case "agent_state_changed": return { glyph: "▸", color: "var(--text-secondary)" };
     case "candidate_selected": return { glyph: "◆", color: "var(--accent-strong)" };
-    case "scope_expanded": return { glyph: "⚠", color: "var(--red)" };
+    // M3 (followup-1-2 review): approved != unapproved -- same glyph (it
+    // is still an expansion worth flagging) but amber, the codebase's
+    // existing "resolved caution, not a failure" color (see statusColor's
+    // waiting_for_approval/stale/partial), never the red an unapproved/
+    // unreviewed expansion still gets.
+    case "scope_expanded": return { glyph: "⚠", color: e.approved ? "var(--amber)" : "var(--red)" };
     case "repair_started": return { glyph: "↻", color: "var(--amber)" };
     case "parser_recovery": return { glyph: "⟲", color: "var(--gray)" };
     case "session_completed": return { glyph: "■", color: statusColor(e.status) };
@@ -107,7 +117,10 @@ function eventDetails(e: GlimmerEvent): Record<string, unknown> {
     case "verification_completed": return { ...base, check: e.check, status: e.status, baselineAware: e.baselineAware };
     case "agent_state_changed": return { ...base, state: e.state };
     case "candidate_selected": return { ...base, file: e.file, reasons: e.reasons };
-    case "scope_expanded": return { ...base, expected: e.expected, actual: e.actual };
+    case "scope_expanded": return {
+      ...base, expected: e.expected, actual: e.actual,
+      approved: e.approved, approvedBy: e.approvedBy, approvalId: e.approvalId,
+    };
     case "repair_started": return { ...base, iteration: e.iteration };
     case "parser_recovery": return { ...base, attempt: e.attempt, payloadPath: e.payloadPath };
     case "session_completed": return { ...base, status: e.status };

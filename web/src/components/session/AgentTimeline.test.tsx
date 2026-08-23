@@ -52,4 +52,40 @@ describe("AgentTimeline", () => {
     expect(screen.getByText("git push origin main")).toBeInTheDocument();
     expect(screen.getByText("Remote writes are disabled for autonomous sessions.")).toBeInTheDocument();
   });
+
+  // M3 (followup-1-2 review): a scope_expanded event a human explicitly
+  // approved (V7 §15 write-time pause) must not read/look identical to an
+  // unapproved one -- distinct label, distinct icon color, and the
+  // approval provenance must survive into the expanded detail view.
+  it("renders an unapproved scope_expanded event with the plain label and red icon", () => {
+    const unapproved: GlimmerEvent = {
+      id: "e4", sessionId: "s1", timestamp: "t", type: "scope_expanded",
+      expected: ["src/dialog"], actual: ["backend/x.ts"],
+    };
+    const { container } = render(<AgentTimeline events={[unapproved]} />);
+
+    expect(screen.getByText("SCOPE EXPANSION")).toBeInTheDocument();
+    expect(screen.queryByText(/approved/i)).not.toBeInTheDocument();
+    const icon = container.querySelector(".tl-icon") as HTMLElement;
+    expect(icon.style.getPropertyValue("--tl-color")).toBe("var(--red)");
+  });
+
+  it("renders an approved scope_expanded event with a distinct label, amber icon, and approvedBy in the detail view", () => {
+    const approved: GlimmerEvent = {
+      id: "e5", sessionId: "s1", timestamp: "t", type: "scope_expanded",
+      expected: ["src/dialog"], actual: ["backend/x.ts"],
+      approved: true, approvedBy: "daniel", approvalId: "s1-appr-1",
+    };
+    const { container } = render(<AgentTimeline events={[approved]} />);
+
+    const label = screen.getByText("SCOPE EXPANSION (approved by daniel)");
+    expect(label).toBeInTheDocument();
+    const icon = container.querySelector(".tl-icon") as HTMLElement;
+    expect(icon.style.getPropertyValue("--tl-color")).toBe("var(--amber)");
+
+    fireEvent.click(label);
+    const rendered = screen.getByText(/"approvedBy"/).textContent ?? "";
+    expect(rendered).toContain("daniel");
+    expect(rendered).toContain("s1-appr-1");
+  });
 });

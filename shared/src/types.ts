@@ -725,6 +725,17 @@ export interface ScopeExpandedEvent extends GlimmerEventBase {
   type: "scope_expanded";
   expected: string[];
   actual: string[];
+  // followup-1-2 review (M3): V7 §15 write-time scope-expansion approval
+  // (glimmer-engineer.py's _enforce_scope_expansion_approval) emits this
+  // SAME event type for an out-of-scope write a human explicitly approved
+  // -- additive/optional so an older emitter (or v2.py's own unrelated
+  // post-hoc scope_expanded, which never sets these) keeps working
+  // unchanged. approved is only ever present+true on a human-authorized
+  // expansion; absent means "not approved" (either denied/timed out, or
+  // this is the pre-existing unapproved-expansion event shape).
+  approved?: boolean;
+  approvedBy?: string;
+  approvalId?: string;
 }
 export interface RepairStartedEvent extends GlimmerEventBase {
   type: "repair_started";
