@@ -1085,6 +1085,54 @@ def _is_typecheck_script(script):
     return script == "typecheck" or script.startswith("typecheck:")
 
 
+def _structural_shell_guard(command):
+    """8.3 re-review fix (NC1, V7 §14/§35): the composition/substitution/
+    quoting precondition every shell command must pass BEFORE anything
+    else is decided -- factored out of shell_policy so it is the single
+    place this check is ever written, shared by shell_policy itself AND
+    classify_yellow's single entry point (see that function's docstring:
+    NC1 was a migration arm that classified a command as YELLOW-eligible
+    without ever routing it through this check at all, so `npm run
+    migrate ; git push origin main` classified as run_migration and the
+    composed string dispatched verbatim). Returns (tokens, None) for a
+    single, clean, uncomposed command, or (None, reason) otherwise. Never
+    raises."""
+    if not isinstance(command, str):
+        return None, "Command must be a string"
+
+    command = command.strip()
+
+    if not command:
+        return None, "Empty command"
+
+    # No shell composition / pipes / redirects / substitutions.
+    if re.search(
+        r"[;&|><\n\r`]",
+        command,
+    ):
+        return None, (
+            "Shell composition, pipes and redirects "
+            "are blocked"
+        )
+
+    if "$(" in command:
+        return None, (
+            "Command substitution is blocked"
+        )
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        return None, (
+            f"Invalid shell quoting: {exc}"
+        )
+
+    if not tokens:
+        return None, "Empty command"
+
+    return tokens, None
+
+
 def shell_policy(
     command,
     workspace,
@@ -1101,44 +1149,15 @@ def shell_policy(
     file passes the default empty frozenset(), so this parameter is a
     no-op for real command execution: every check this function already
     performs -- composition/pipe/redirect/substitution/quoting rejection
-    up top, the forbidden-token scan, --prefix containment -- still runs
-    in full and still returns False for anything that isn't a genuinely
-    simple, uncomposed `npm <relaxed-subcommand> ...` command. This is
-    the SAME "BY CONSTRUCTION, not by re-implementing" remedy
-    architect_shell_policy already uses (see its own docstring) applied
-    to a second caller."""
-    if not isinstance(command, str):
-        return False, "Command must be a string"
-
-    command = command.strip()
-
-    if not command:
-        return False, "Empty command"
-
-    # No shell composition / pipes / redirects / substitutions.
-    if re.search(
-        r"[;&|><\n\r`]",
-        command,
-    ):
-        return False, (
-            "Shell composition, pipes and redirects "
-            "are blocked"
-        )
-
-    if "$(" in command:
-        return False, (
-            "Command substitution is blocked"
-        )
-
-    try:
-        tokens = shlex.split(command)
-    except ValueError as exc:
-        return False, (
-            f"Invalid shell quoting: {exc}"
-        )
-
-    if not tokens:
-        return False, "Empty command"
+    up top (via _structural_shell_guard), the forbidden-token scan,
+    --prefix containment -- still runs in full and still returns False
+    for anything that isn't a genuinely simple, uncomposed `npm
+    <relaxed-subcommand> ...` command. This is the SAME "BY CONSTRUCTION,
+    not by re-implementing" remedy architect_shell_policy already uses
+    (see its own docstring) applied to a second caller."""
+    tokens, reason = _structural_shell_guard(command)
+    if tokens is None:
+        return False, reason
 
     executable = tokens[0]
 
@@ -1451,27 +1470,27 @@ def _resolve_npm_script_body(workspace, script):
 def classify_yellow(command, workspace, validation_allowlist=None) -> dict | None:
     """V7 §14/§35 YELLOW escalation. Called ONLY from execute_tool's
     exec_shell_command branch, and ONLY after shell_policy has already
-    said no for this exact `command` string -- never re-derives that
-    verdict, only asks shell_policy a second, narrower question: "would
-    this be allowed if ONLY its dependency-install subcommand were
-    waived". Returns a structured V7 §35 approval-request dict --
-    {"action","reason","proposedChanges","risk"} -- or None, meaning
-    "stays exactly what shell_policy already said" (RED stays RED).
+    said no for this exact `command` string. Returns a structured V7 §35
+    approval-request dict -- {"action","reason","proposedChanges","risk"}
+    -- or None, meaning "stays exactly what shell_policy already said"
+    (RED stays RED).
 
-    The preliminary shlex.split/tokens[0]/tokens[1] check below makes NO
-    security decision by itself -- it only decides whether to bother
-    probing shell_policy at all. shell_policy's own composition/
-    substitution/quoting rejection always runs first and unconditionally
-    on the real `command` string regardless of yellow_relax, so a
-    composed command (e.g. "npm install x; git push origin main") is
-    rejected by that probe just like any other shell_policy call, before
-    ever reaching the relaxed npm branch.
+    8.3 re-review fix (NC1): a SINGLE structural precondition, applied
+    HERE at the one entry point before either arm below runs at all --
+    the command must be a single, uncomposed, cleanly-quoted command
+    (the exact same check shell_policy itself always applies first, via
+    the shared _structural_shell_guard -- not a second hand-rolled copy).
+    The install arm ALSO independently re-verifies via a real shell_policy
+    call (belt and suspenders, since it already needs shell_policy for
+    --prefix containment anyway); the migration arm has no shell_policy
+    delegation of its own, which is exactly why this top-level guard has
+    to run for BOTH arms, not be duplicated per-arm -- a composed command
+    like `npm run migrate ; git push origin main` is rejected right here,
+    before `subcommand` is even inspected, regardless of which arm would
+    otherwise have matched.
     """
-    if not isinstance(command, str) or not command.strip():
-        return None
-    try:
-        tokens = shlex.split(command.strip())
-    except ValueError:
+    tokens, _structural_reason = _structural_shell_guard(command)
+    if tokens is None:
         return None
     if len(tokens) < 2 or tokens[0] != "npm":
         return None
@@ -1506,15 +1525,28 @@ def classify_yellow(command, workspace, validation_allowlist=None) -> dict | Non
         script_lower = script.lower()
         if not any(k in script_lower for k in YELLOW_MIGRATION_KEYWORDS):
             return None
-        if any(f in script_lower for f in YELLOW_MIGRATION_EXCLUDED_FRAGMENTS):
-            return None
         resolved = _resolve_npm_script_body(workspace, script)
         if resolved is None:
             return None
+        # NM1 fix: scan the FULL command (every token, not just tokens[2])
+        # AND the resolved script body for the exclusion fragments --
+        # `npm run migrate --env=production --force` must exclude on
+        # "production" appearing in a trailing arg, and a resolved body
+        # that itself does something deploy/production-shaped must
+        # exclude too. The structural guard above already proved
+        # `command` is a single, uncomposed string, so a plain substring
+        # scan over it is safe (no hidden second command to miss).
+        excluded_haystack = f"{command.lower()} {resolved.lower()}"
+        if any(f in excluded_haystack for f in YELLOW_MIGRATION_EXCLUDED_FRAGMENTS):
+            return None
         return {
             "action": "run_migration",
-            "reason": f"engineer requested npm run {script} -> {resolved}",
-            "proposedChanges": [resolved],
+            # Disclosure fix: the reason/proposedChanges carry the FULL
+            # literal command (every trailing arg) AND the resolved
+            # script body -- the operator approves everything that will
+            # actually execute, not just a script name.
+            "reason": f"engineer requested: {command!r} -> npm run {script} resolves to: {resolved!r}",
+            "proposedChanges": [command, resolved],
             "risk": "high",
         }
 
@@ -9961,6 +9993,8 @@ def _approval_wait_selfcheck() -> None:
     Approve/Deny in the Control Center.
     Run with: python3 glimmer-engineer.py --approval-wait-selfcheck
     """
+    import ast
+    import inspect
     import tempfile
     import threading
 
@@ -9999,6 +10033,20 @@ def _approval_wait_selfcheck() -> None:
                 "npm run deploy:migrate",                 # C3: migrate + deploy excluded
                 "npm run seed:production",                 # C3: seed + production excluded
                 "npm run migrate:unresolvable",            # C3: migration keyword, but body isn't a string
+                # NC1 (re-review Critical): the migration arm had NO
+                # structural precondition of its own at all -- a composed
+                # command classified as YELLOW and dispatched verbatim.
+                # Now caught by classify_yellow's single shared entry-
+                # point guard, before either arm even runs.
+                "npm run migrate ; git push origin main",
+                "npm run migrate && git push origin main",
+                "npm run migrate > /tmp/out",
+                "npm run migrate $(whoami)",
+                "npm run migrate `whoami`",
+                # NM1 (re-review Major): the exclusion scan only looked at
+                # tokens[2] (the bare script name) -- a trailing arg
+                # carrying an excluded fragment must still exclude.
+                "npm run migrate --env=production --force",
             ):
                 assert classify_yellow(red_command, ws) is None, red_command
 
@@ -10013,14 +10061,38 @@ def _approval_wait_selfcheck() -> None:
             assert classify_yellow("npm run typecheck", ws) is None
             assert classify_yellow("git status", ws) is None
 
-            # 3. YELLOW: plain dependency install, and migration WITH its
-            #    resolved script body surfaced (not just the bare name).
+            # 3. YELLOW: plain dependency install, and migration WITH the
+            #    FULL literal command and its resolved script body
+            #    surfaced (re-review disclosure fix) -- not just a bare
+            #    script name.
             yellow = classify_yellow("npm install left-pad", ws)
             assert yellow is not None and yellow["action"] == "modify_dependencies"
             migration = classify_yellow("npm run migrate", ws)
             assert migration is not None and migration["action"] == "run_migration"
-            assert migration["proposedChanges"] == ["node scripts/migrate.js"]
+            assert migration["proposedChanges"] == ["npm run migrate", "node scripts/migrate.js"]
+            assert "npm run migrate" in migration["reason"]
             assert "node scripts/migrate.js" in migration["reason"]
+
+            # 3b. Structural check (house AST pattern, e.g. C2's
+            #     run_architect execute_tool-call-site assertion): the
+            #     shared structural guard must run BEFORE either arm's
+            #     subcommand-specific logic in classify_yellow's own
+            #     source, so a future third arm can't be added ahead of
+            #     it by accident.
+            body = ast.parse(inspect.getsource(classify_yellow)).body[0].body
+            guard_idx = next(
+                (i for i, stmt in enumerate(body) if "_structural_shell_guard" in ast.dump(stmt)), None,
+            )
+            first_arm_idx = next(
+                (i for i, stmt in enumerate(body)
+                 if "subcommand" in ast.dump(stmt) and "YELLOW_DEPENDENCY_INSTALL_SUBCOMMANDS" in ast.dump(stmt)),
+                None,
+            )
+            assert guard_idx is not None, "classify_yellow must call _structural_shell_guard"
+            assert first_arm_idx is not None, "classify_yellow must still dispatch the install arm"
+            assert guard_idx < first_arm_idx, (
+                "the structural guard must run before ANY arm-specific classification"
+            )
 
             # 4. M1 fix, verified against the real shell_policy call (not
             #    just classify_yellow's own gate): a workspace-contained
