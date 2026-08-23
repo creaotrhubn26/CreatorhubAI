@@ -905,7 +905,11 @@ def resolve_workspace_path(
     try:
         resolved.relative_to(workspace)
     except ValueError:
-        raise PermissionError(
+        # ToolPolicyBlock, not plain PermissionError (round-9 re-review
+        # NEW-1): a traversal attempt is a security-boundary violation and
+        # must reach the audit trail (tool_blocked + POLICY_BLOCK), same
+        # as check_write_path's blocks.
+        raise ToolPolicyBlock(
             f"Path escapes repository: {value}"
         )
 
@@ -3936,9 +3940,11 @@ def execute_tool(
         # shell_policy rejection below uses, so every policy-block class
         # shares one audit path. Deliberately NOT catching plain
         # PermissionError here -- see ToolPolicyBlock's own docstring for
-        # why the OTHER secure_tool_arguments guards (path traversal,
-        # existing-file write, missing-file edit) must keep propagating
-        # unchanged.
+        # why the usage-error guards (existing-file write, missing-file
+        # edit, read-dir) must keep propagating unchanged. Path traversal
+        # ("Path escapes repository") is a ToolPolicyBlock too (round-9
+        # re-review NEW-1): a security-boundary violation belongs on this
+        # audit path, not in the generic stringifier.
         reason = str(exc)
         message = "ENGINEERING SECURITY BLOCK: " + reason
         blocked_path = str(arguments.get("path", tool_name))[:MAX_EVENT_FIELD]
@@ -8904,18 +8910,20 @@ def _semantic_tools_selfcheck() -> None:
         # since find_related_tests is in PATH_TOOLS) — exercised through
         # execute_tool, the real dispatch entry point, not a hand-rolled
         # check.
-        try:
-            execute_tool(
-                "find_related_tests",
-                {"path": "../../../etc/passwd"},
-                ws,
-                {"approve_all": True},
-                {},
-                [],
-            )
-            raise AssertionError("path escaping the workspace must be rejected")
-        except PermissionError as exc:
-            assert "escapes repository" in str(exc), str(exc)
+        # NEW-1 (round-9 re-review): traversal is now a ToolPolicyBlock,
+        # so execute_tool returns a POLICY_BLOCK envelope (with audit
+        # trail) instead of raising -- assert the blocked result shape.
+        result, changed = execute_tool(
+            "find_related_tests",
+            {"path": "../../../etc/passwd"},
+            ws,
+            {"approve_all": True},
+            {},
+            [],
+        )
+        assert changed is False
+        assert "escapes repository" in result, result
+        assert "ENGINEERING SECURITY BLOCK" in result, result
 
         # ------------------------------------------------------------
         # 5. Normal dispatch path: cache hit + evidence persistence.
