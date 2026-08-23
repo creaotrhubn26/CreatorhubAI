@@ -36,6 +36,69 @@ export function suggestVerification(pkg: RepoPackage | null): string[] {
   return suggestions;
 }
 
+// Task 9.3b (V7 §5.5/§46): TS port of glimmer-v2.py's compute_architect_risk
+// -- same table, same scoring, kept in sync deliberately (not imported: the
+// two processes never share Python/TS code, same discipline as every other
+// mirrored pure function in this codebase, e.g. mapManifestStatus/
+// canonical_session_state). Pure/deterministic: no I/O, no model call.
+export interface ArchitectRiskHints {
+  mode?: string;
+  objective?: string;
+  verificationLevel?: string;
+  candidateCount?: number;
+}
+
+const ARCHITECT_RISK_CANDIDATE_THRESHOLD = 5;
+export const ARCHITECT_RISK_THRESHOLD = 5;
+
+// Same plain-word, exact-token style as glimmer-v2.py's _PROTECTED_AREA_WORDS.
+const PROTECTED_AREA_WORDS = new Set([
+  "auth", "authentication", "payment", "payments", "migration", "migrations", "schema", "security",
+]);
+
+export function computeArchitectRiskScore(
+  scopePackage: string,
+  hints: ArchitectRiskHints
+): { score: number; signals: string[] } {
+  let score = 0;
+  const signals: string[] = [];
+
+  if (hints.mode === "refactor") {
+    score += 3;
+    signals.push("mode_refactor");
+  }
+  if (scopePackage === "repository") {
+    score += 2;
+    signals.push("multi_package_scope");
+  }
+  if (typeof hints.candidateCount === "number" && hints.candidateCount > ARCHITECT_RISK_CANDIDATE_THRESHOLD) {
+    score += 2;
+    signals.push("candidate_count_high");
+  }
+  const objectiveWords = (hints.objective ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (objectiveWords.some((w) => PROTECTED_AREA_WORDS.has(w))) {
+    score += 3;
+    signals.push("protected_area_keyword");
+  }
+  if (hints.verificationLevel === "full") {
+    score += 2;
+    signals.push("verification_full");
+  }
+
+  return { score, signals };
+}
+
+// Deterministic score -> RiskLevel mapping (V7 §46 ArchitecturePlan.risk
+// vocabulary, upper-cased). Anchored on ARCHITECT_RISK_THRESHOLD (5 -- the
+// same score glimmer-v2.py auto-triggers architect-first at): below it is
+// at most MEDIUM, at or above it is at least HIGH.
+export function riskScoreToLevel(score: number): RiskLevel {
+  if (score <= 0) return "LOW";
+  if (score < ARCHITECT_RISK_THRESHOLD) return "MEDIUM";
+  if (score < ARCHITECT_RISK_THRESHOLD + 3) return "HIGH"; // 5-7
+  return "CRITICAL"; // 8+
+}
+
 const LOCKFILE_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/;
 const MIGRATION_RE = /migrat/i;
 const AUTH_RE = /\b(auth|permission|security|credential)/i;

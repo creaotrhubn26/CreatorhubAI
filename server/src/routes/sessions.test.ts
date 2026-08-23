@@ -720,6 +720,65 @@ describe("GET /api/sessions/:id/evidence", () => {
   });
 });
 
+// Task 9.3c (V7 §7 Context Engine): context-selection facts from
+// context_selected events + evidence-index.json's own entry count.
+describe("GET /api/sessions/:id/context", () => {
+  it("returns context_selected events plus the evidence-index.json entry count", async () => {
+    const id = "20260823-000001-glimmer-context-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const events = [
+      {
+        id: "evt_1", sessionId: id, timestamp: "2026-08-23T00:00:00.000Z",
+        type: "context_selected", tier0Chars: 1000, tier1Chars: 0, tier2Refs: 0, tier3Note: "cold: n/a",
+      },
+      {
+        id: "evt_2", sessionId: id, timestamp: "2026-08-23T00:00:01.000Z",
+        type: "tool_started", tool: "read_file", args: { path: "a.ts" },
+      },
+      {
+        id: "evt_3", sessionId: id, timestamp: "2026-08-23T00:00:02.000Z",
+        type: "context_selected", tier0Chars: 1000, tier1Chars: 400, tier2Refs: 1, tier3Note: "cold: n/a",
+      },
+    ];
+    await fs.writeFile(dir + "/events.jsonl", events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    await fs.writeFile(
+      path.join(dir, "evidence-index.json"),
+      JSON.stringify([{ id: "e1", kind: "file", path: "a.ts", toolCall: "read_file" }])
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/context`);
+    expect(res.status).toBe(200);
+    expect(res.body.selections).toHaveLength(2);
+    expect(res.body.selections.every((e: any) => e.type === "context_selected")).toBe(true);
+    expect(res.body.evidenceCount).toBe(1);
+  });
+
+  it("honestly returns empty facts (not 404) for a well-formed session with nothing recorded yet", async () => {
+    const id = "20260823-000002-glimmer-context-empty";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/context`);
+    expect(res.status).toBe(200);
+    expect(res.body.selections).toEqual([]);
+    expect(res.body.evidenceCount).toBeNull();
+  });
+
+  it("404s for an unsafe/invalid session id", async () => {
+    const res = await request(app).get(`/api/sessions/${encodeURIComponent("../../etc")}/context`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const fileId = "20260823-000003-context-not-a-directory";
+    await fs.writeFile(path.join(stateRoot, "sessions", fileId), "not a session dir");
+
+    const res = await request(app).get(`/api/sessions/${fileId}/context`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
+});
+
 describe("GET /api/sessions/:id/tasks", () => {
   const tasks = [
     { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },

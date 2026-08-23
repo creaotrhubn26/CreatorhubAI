@@ -189,6 +189,7 @@ describe("mapManifestStatus", () => {
   // Ground truth: glimmer-v2.py's manifest["status"] assignment sites.
   it.each([
     ["initialized", "preflight"],
+    ["understanding", "understanding"],
     ["repo-map-only", "cancelled"],
     ["verified", "verified"],
     ["no-change-verified", "verified"],
