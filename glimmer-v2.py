@@ -24,7 +24,14 @@ import urllib.request
 from glimmer_events import emit as emit_event
 
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
-STATE_ROOT = Path.home() / ".muse-glimmer/sessions"
+# Round 9 review (M2): GLIMMER_STATE_ROOT is the same env var control-center's
+# server/src/config.ts already reads for its stateRoot (parent of "sessions")
+# -- additive here, default unchanged. Lets glimmer-eval.py point a run's
+# sessions at a per-run tempdir instead of writing synthetic fixture sessions
+# into the real ~/.muse-glimmer/sessions corpus glimmer-metrics.py scans by
+# default (that corpus pollution was silently inflating the §41 repair-rate
+# headline with eval fixtures -- see glimmer-eval.py's use of this var).
+STATE_ROOT = Path(os.environ.get("GLIMMER_STATE_ROOT") or (Path.home() / ".muse-glimmer")) / "sessions"
 # O1 (glimmer-v7 reconciliation doc, OPTIONAL tier -- "a directory of
 # markdown selected by area is enough; don't build a registry service").
 # User-space, NOT this repo: install a starter skill by copying one of
@@ -130,6 +137,12 @@ PASS_STATUSES = {"PASS", "PASS_BASELINE"}
 def canonical_session_state(raw_status: str) -> str:
     if raw_status == "initialized":
         return "preflight"
+    # Task 9.3a (V7 §46): identity mapping -- main() writes this raw string
+    # verbatim as manifest["status"] right after readiness/before the
+    # architect-first step or the first engineer invocation (see that call
+    # site's comment). Kept in sync with control-center's mapManifestStatus.
+    if raw_status == "understanding":
+        return "understanding"
     if raw_status in ("verified", "no-change-verified"):
         return "verified"
     if raw_status == "no-change-unverified":
@@ -275,6 +288,13 @@ def read_session_events(events_path: Path) -> list:
 
 
 PARSER_FAILURE_THRESHOLD = 2  # R6: one recovered parse is transient; repeated recoveries in one terminal session point at a structural parser problem
+
+# Round 9 review (C1): every manifest["status"] value main() can still be
+# sitting on when an exception/interrupt reaches the `finally` block's
+# catch-all, i.e. every pre-discovery status set BEFORE any real terminal
+# status can be written. A set (not a bare string) so a future pre-discovery
+# status only needs adding here, not re-derived at the one call site.
+NON_TERMINAL_STATUSES = {"initialized", "understanding"}
 
 
 def classify_failure(manifest: dict, events: list) -> dict | None:
@@ -6214,6 +6234,22 @@ def main():
             manifest["modelReadiness"] = {"status": "SKIPPED"}
             save()
 
+        # Task 9.3a (V7 §46 SessionState / §4 Task Intelligence): "understanding"
+        # is the real canonical state between preflight (readiness confirmed
+        # above) and discovery (the first engineer subprocess's own
+        # "discovering" phase marker, emitted from inside invoke_engineer
+        # once the iteration loop below actually spawns it) -- this process
+        # building/consulting the task's own understanding of the work
+        # (architect-first, if triggered, then the first prompt) before any
+        # repository exploration tool call happens. Additive: a session that
+        # crashes before reaching here (e.g. readiness_probe's raise just
+        # above) never emits or persists this state, exactly like every
+        # other manifest["status"] transition in this function.
+        manifest["status"] = "understanding"
+        manifest["state"] = canonical_session_state(manifest["status"])
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+        save()
+
         # C1 (glimmer-v7) + Task 2.1 (V7 §5.5): runs once before iteration 0
         # whenever run_architect is True -- manual force-on (--architect-
         # first) or risk-based auto-trigger (architect_trigger_mode ==
@@ -7061,7 +7097,18 @@ def main():
         # still stuck at its initial "initialized" value forever. If nothing
         # else set a real terminal status by the time we get here, record one
         # now, before state is recomputed/saved below.
-        if manifest["status"] == "initialized":
+        #
+        # Round 9 review (C1): "understanding" (Task 9.3a, set just above the
+        # main loop) is ALSO a non-terminal pre-discovery status -- a session
+        # that crashes/raises anywhere between that write and the first real
+        # terminal status (readiness_probe already excepted, invoke_engineer
+        # raising, the model server dying mid-session, etc.) used to leave
+        # "initialized" and hit this guard; it now leaves "understanding" and
+        # silently skipped it, reporting as perpetually live/in-flight
+        # (Control Center's IN_FLIGHT_STATUSES) and misclassifying as UNKNOWN
+        # instead of ORCHESTRATION_ABORTED. Both are non-terminal statuses
+        # this catch-all must abort out of.
+        if manifest["status"] in NON_TERMINAL_STATUSES:
             manifest["status"] = "failed-aborted"
             manifest["state"] = canonical_session_state(manifest["status"])
             emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
@@ -7217,6 +7264,19 @@ def _r6_selfcheck() -> None:
 
     # R6's new raw status maps to the same "cancelled" canonical bucket
     # repo-map-only already uses.
+    # Task 9.3a (V7 §46): the "understanding" pre-discovery status main()
+    # now writes right after readiness -- identity-mapped, same as
+    # "waiting-for-approval" below.
+    assert canonical_session_state("understanding") == "understanding"
+    # Round 9 review (C1): the `finally` block's abort catch-all normalizes
+    # every status in NON_TERMINAL_STATUSES to "failed-aborted" -- this was
+    # keyed on "initialized" alone, so a session that crashed after main()
+    # wrote "understanding" (Task 9.3a, above) silently skipped it and
+    # reported as perpetually live, classifying UNKNOWN forever instead of
+    # ORCHESTRATION_ABORTED. Assert both the membership and, end to end,
+    # that classify_failure resolves what the guard produces.
+    assert "initialized" in NON_TERMINAL_STATUSES and "understanding" in NON_TERMINAL_STATUSES
+    assert classify_failure({"status": "failed-aborted"}, [])["class"] == "ORCHESTRATION_ABORTED"
     assert canonical_session_state("cancelled-sigterm") == "cancelled"
     # I2: "failed-aborted" rides the existing generic "failed-" prefix match
     # in canonical_session_state (no new branch needed there).

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import ast
 import atexit
 import functools
 import hashlib
@@ -904,11 +905,31 @@ def resolve_workspace_path(
     try:
         resolved.relative_to(workspace)
     except ValueError:
-        raise PermissionError(
+        # ToolPolicyBlock, not plain PermissionError (round-9 re-review
+        # NEW-1): a traversal attempt is a security-boundary violation and
+        # must reach the audit trail (tool_blocked + POLICY_BLOCK), same
+        # as check_write_path's blocks.
+        raise ToolPolicyBlock(
             f"Path escapes repository: {value}"
         )
 
     return resolved
+
+
+class ToolPolicyBlock(PermissionError):
+    """Round 9 review (M5): a real POLICY_BLOCK, raised only by
+    check_write_path below -- distinct from the plain PermissionError
+    secure_tool_arguments' OTHER guards raise (path traversal via
+    resolve_workspace_path, read_file-on-a-directory, write_file-on-an-
+    existing-file, edit_file-on-a-missing-file). Subclasses PermissionError
+    so every existing `except PermissionError` catch site (check_write_path's
+    own unit-test assertions, etc.) still works unchanged; execute_tool
+    catches this SPECIFIC subclass to route it through the same
+    tool_blocked/record_blocked_command/POLICY_BLOCK-envelope audit path
+    shell_policy rejections already use -- deliberately narrower than
+    catching every PermissionError there, so this fix doesn't silently
+    change the (already-tested) propagate-and-let-the-caller-handle-it
+    contract for the OTHER guards, which is out of this finding's scope."""
 
 
 def check_write_path(
@@ -919,25 +940,25 @@ def check_write_path(
 
     for part in relative.parts:
         if part in PROTECTED_DIRS:
-            raise PermissionError(
+            raise ToolPolicyBlock(
                 "Writing to protected directory "
                 f"is blocked: {relative}"
             )
 
     if path.name.startswith(".env"):
-        raise PermissionError(
+        raise ToolPolicyBlock(
             "Writing environment/secret files "
             f"is blocked: {relative}"
         )
 
     if path.name in PROTECTED_FILES:
-        raise PermissionError(
+        raise ToolPolicyBlock(
             "Lockfile writes are blocked in "
             f"Engineering Mode v1: {relative}"
         )
 
     if path.suffix == ".lock":
-        raise PermissionError(
+        raise ToolPolicyBlock(
             f"Lockfile writes are blocked: {relative}"
         )
 
@@ -948,7 +969,7 @@ def check_write_path(
     # Exact relative-path check, not PROTECTED_FILES (that matches on
     # path.name and would block any graph.json anywhere in the repo).
     if relative.as_posix() == DOC_GRAPH_RELATIVE_PATH:
-        raise PermissionError(
+        raise ToolPolicyBlock(
             "docs/graph.json is orchestrator-owned documentation "
             f"bookkeeping; model writes are blocked: {relative}"
         )
@@ -2665,13 +2686,146 @@ def _symbol_patterns(escaped_name):
     }
 
 
+# Task 9.3d (V7 §28 semantic code intelligence, O4): .py targets get a real
+# parse instead of the per-line lexical scan every other extension uses.
+# stdlib `ast` only (no new dependency) -- ast.NodeVisitor subclasses below,
+# one for definitions (find_symbol) and one for references (find_references).
+# Ceiling, spelled out here once rather than repeated at every call site:
+#   - module/class/function SCOPE is not used to disambiguate two same-named
+#     symbols in different scopes -- every match, at any nesting depth, is
+#     reported (still strictly more accurate than the regex path, which is
+#     scope-blind in the same way).
+#   - a `keyword.arg` name in a call site (`f(target=1)`'s "target") is NOT
+#     counted -- keyword.arg is a plain string field, not a node, so
+#     NodeVisitor never visits it; only the value expression is (already
+#     true of the regex path's blindness to which token is the kwarg name
+#     vs. the value, just the opposite miss).
+#   - no cross-file resolution, no type information -- this remains a
+#     single-file, name-based tool, same as the regex path it upgrades.
+# TS/JS get no equivalent upgrade (no stdlib AST for those languages) and
+# stay exactly the lexical/regex scan documented above.
+class _PySymbolDefVisitor(ast.NodeVisitor):
+    """Collects the line numbers of every FunctionDef/AsyncFunctionDef/
+    ClassDef node named `name`, restricted to `wanted_kinds` (a subset of
+    {"def", "class"})."""
+
+    def __init__(self, name, wanted_kinds):
+        self.name = name
+        self.wanted_kinds = wanted_kinds
+        self.linenos = []
+
+    def visit_FunctionDef(self, node):
+        if "def" in self.wanted_kinds and node.name == self.name:
+            self.linenos.append(node.lineno)
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        if "class" in self.wanted_kinds and node.name == self.name:
+            self.linenos.append(node.lineno)
+        self.generic_visit(node)
+
+
+class _PyReferenceVisitor(ast.NodeVisitor):
+    """Collects the line numbers of every real usage of `name`: a bare
+    identifier (ast.Name -- a call, a read, an argument, an assignment
+    target, ...), an attribute access (ast.Attribute, e.g. `self.name`/
+    `obj.name(...)`), an import name or alias (ast.alias, e.g. `import name`/
+    `from mod import name`/`import mod as name`), a function/lambda
+    parameter name (ast.arg), or a `global`/`nonlocal name` declaration
+    (ast.Global/ast.Nonlocal). Unlike the regex path's word-boundary text
+    match, this cannot false-positive on a comment or string literal that
+    merely mentions the name — ast.parse never turns those into nodes at
+    all. Round 9 review (M4): imports/params/global/nonlocal were the four
+    reproduced gaps versus the regex path this upgrades; see the ceiling
+    note above this class for what's still deliberately out of scope."""
+
+    def __init__(self, name):
+        self.name = name
+        self.linenos = set()
+
+    def visit_Name(self, node):
+        if node.id == self.name:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        if node.attr == self.name:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    def visit_alias(self, node):
+        # `import pkg.sub` binds "pkg" locally, so check every dotted
+        # component of the imported name, plus the `as` alias if present
+        # (`import target as t` mentions "target" in source even though it
+        # binds "t") -- either matching `name` counts as a real mention.
+        candidates = set(node.name.split(".")) if node.name else set()
+        if node.asname:
+            candidates.add(node.asname)
+        if self.name in candidates:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    def visit_arg(self, node):
+        if node.arg == self.name:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    def visit_Global(self, node):
+        if self.name in node.names:
+            self.linenos.add(node.lineno)
+        self.generic_visit(node)
+
+    visit_Nonlocal = visit_Global
+
+
+def _ast_line_hits(text, linenos):
+    """Shared tail: sorted (lineno, stripped source line) pairs for a set/
+    list of line numbers already collected by one of the visitors above."""
+    lines = text.splitlines()
+    return sorted(
+        (lineno, lines[lineno - 1].strip() if 0 < lineno <= len(lines) else "")
+        for lineno in set(linenos)
+    )
+
+
+def _ast_symbol_matches_py(text, name, wanted_kinds):
+    """AST-based definition finder for one Python file's source text.
+    Raises SyntaxError (propagated) on invalid Python -- the caller
+    catches this and falls back to the same lexical regex scan used for
+    every other extension, for this one file only."""
+    tree = ast.parse(text)
+    visitor = _PySymbolDefVisitor(name, wanted_kinds)
+    visitor.visit(tree)
+    return _ast_line_hits(text, visitor.linenos)
+
+
+def _ast_reference_lines_py(text, name):
+    """AST-based reference finder for one Python file's source text.
+    Raises SyntaxError (propagated) on invalid Python -- same per-file
+    regex fallback contract as _ast_symbol_matches_py above."""
+    tree = ast.parse(text)
+    visitor = _PyReferenceVisitor(name)
+    visitor.visit(tree)
+    return _ast_line_hits(text, visitor.linenos)
+
+
 def find_symbol(name, kind, workspace):
     """Locate definition(s) of `name` across the workspace. TS/JS:
-    function/const/class/interface/type declarations. Python: def/class.
-    `kind` optionally narrows to one of those (kind="function" also
-    matches Python `def`, since callers rarely distinguish the two).
-    Capped at _SEMANTIC_MAX_MATCHES; returns "file:line: <matched line>"
-    per hit."""
+    function/const/class/interface/type declarations, lexical/regex-based
+    (unchanged). Python: def/class/method, via a real stdlib `ast` parse
+    (Task 9.3d) — finds definitions at any nesting depth (a method inside a
+    class, a function nested inside another function) and never
+    false-positives on a comment or string literal that merely mentions the
+    name, unlike a per-line regex scan. Falls back to the same lexical
+    regex scan TS/JS uses for a .py file that fails to parse (a real
+    SyntaxError — e.g. a work-in-progress edit) — for that one file only;
+    every other .py file still gets the AST treatment. See the ceiling note
+    on _PySymbolDefVisitor above. `kind` optionally narrows to one of
+    function/const/class/interface/type/def (kind="function" also matches
+    Python `def`, since callers rarely distinguish the two). Capped at
+    _SEMANTIC_MAX_MATCHES; returns "file:line: <matched line>" per hit."""
     name = _validate_semantic_name(name)
     patterns = _symbol_patterns(re.escape(name))
 
@@ -2697,6 +2851,21 @@ def find_symbol(name, kind, workspace):
             continue
 
         rel = path.relative_to(workspace).as_posix()
+
+        if ext in _PY_EXTS:
+            try:
+                ast_hits = _ast_symbol_matches_py(text, name, set(active.keys()))
+            except SyntaxError:
+                ast_hits = None
+            if ast_hits is not None:
+                for lineno, line_text in ast_hits:
+                    matches.append(f"{rel}:{lineno}: {line_text}")
+                    if len(matches) >= _SEMANTIC_MAX_MATCHES:
+                        break
+                if len(matches) >= _SEMANTIC_MAX_MATCHES:
+                    break
+                continue  # AST path handled this file; skip the regex scan below
+
         for lineno, line in enumerate(text.splitlines(), start=1):
             if any(pat.search(line) for pat in active.values()):
                 matches.append(f"{rel}:{lineno}: {line.strip()}")
@@ -2719,14 +2888,29 @@ def find_symbol(name, kind, workspace):
 
 
 def find_references(name, workspace):
-    """All usages of `name` across the workspace, word-boundary matched
-    (so searching "foo" will never match inside "foobar") and grouped by
-    file. Definition lines are NOT excluded from the results — they
-    contain the bare word too, so they will appear here as well as in
-    find_symbol's output. This is a deliberate honesty-over-cleverness
-    choice: distinguishing "this line defines X" from "this line merely
-    mentions X" would require real parsing, which this lexical tool does
-    not do. Capped at _SEMANTIC_MAX_MATCHES total matches."""
+    """All usages of `name` across the workspace, grouped by file. TS/JS
+    (and any .py file that fails to parse): word-boundary lexical match
+    (so searching "foo" will never match inside "foobar") — definition
+    lines are NOT excluded from the results, since distinguishing "this
+    line defines X" from "this line merely mentions X" would require real
+    parsing, which this lexical path doesn't do.
+
+    Python (.py) files that parse successfully (Task 9.3d) use a real
+    stdlib `ast` NodeVisitor instead: a reference is an ast.Name(id=name)
+    (a call, a read, an argument, ...), an ast.Attribute(attr=name)
+    (`self.name`/`obj.name(...)`), an import name/alias (ast.alias), a
+    function/lambda parameter name (ast.arg), or a `global`/`nonlocal name`
+    declaration. This is strictly more precise than the lexical path for
+    those files — a def/class statement's own name is not one of those node
+    types, so definition lines are correctly excluded, and a comment or
+    string literal merely mentioning the name is never counted (ast.parse
+    doesn't turn those into nodes at all). See the ceiling note on
+    _PyReferenceVisitor above for what's still out of scope (e.g. a call's
+    keyword-argument name). Per-file results below say which path a given
+    file actually took (Round 9 review M3: the header used to make one
+    blanket "lexical, definitions included" claim even for files the AST
+    path — the opposite on both counts — actually handled). Capped at
+    _SEMANTIC_MAX_MATCHES total matches."""
     name = _validate_semantic_name(name)
     pattern = re.compile(r"\b" + re.escape(name) + r"\b")
 
@@ -2738,32 +2922,51 @@ def find_references(name, workspace):
             continue
 
         file_matches = []
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if pattern.search(line):
-                file_matches.append(f"{lineno}: {line.strip()}")
-                total += 1
-                if total >= _SEMANTIC_MAX_MATCHES:
-                    break
+        ast_handled = False
+        if path.suffix in _PY_EXTS:
+            try:
+                ast_hits = _ast_reference_lines_py(text, name)
+                ast_handled = True
+            except SyntaxError:
+                ast_hits = None
+            if ast_handled:
+                for lineno, line_text in ast_hits:
+                    file_matches.append(f"{lineno}: {line_text}")
+                    total += 1
+                    if total >= _SEMANTIC_MAX_MATCHES:
+                        break
+
+        if not ast_handled:
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if pattern.search(line):
+                    file_matches.append(f"{lineno}: {line.strip()}")
+                    total += 1
+                    if total >= _SEMANTIC_MAX_MATCHES:
+                        break
 
         if file_matches:
-            by_file[path.relative_to(workspace).as_posix()] = file_matches
+            rel = path.relative_to(workspace).as_posix()
+            by_file[rel] = (file_matches, ast_handled)
         if total >= _SEMANTIC_MAX_MATCHES:
             break
 
     if not by_file:
         return (
-            f"No references to '{name}' found (word-boundary lexical "
-            "search across the workspace)."
+            f"No references to '{name}' found (word-boundary lexical search "
+            "for non-Python files and any .py file that failed to parse; "
+            "real ast parse — definition lines excluded — for .py files "
+            "that parsed)."
         )
 
-    lines = [
-        f"Found {total} reference(s) to '{name}' across {len(by_file)} "
-        "file(s) (word-boundary match; definition lines are included, "
-        "not excluded — see find_symbol to specifically locate "
-        "definitions):"
-    ]
-    for rel, file_matches in by_file.items():
-        lines.append(f"\n{rel}:")
+    lines = [f"Found {total} reference(s) to '{name}' across {len(by_file)} file(s):"]
+    for rel, (file_matches, ast_handled) in by_file.items():
+        mode = (
+            "ast match; definition lines excluded"
+            if ast_handled else
+            "word-boundary lexical match; definition lines included, not "
+            "excluded — see find_symbol to specifically locate definitions"
+        )
+        lines.append(f"\n{rel} ({mode}):")
         lines.extend(f"  {m}" for m in file_matches)
     return "\n".join(lines)
 
@@ -2939,10 +3142,13 @@ SEMANTIC_TOOL_DEFINITIONS = [
                     "Prefer this over grep_search when you know a "
                     "symbol's name and want its definition site(s), not "
                     "every mention — use find_references for that. "
-                    "Lexical/regex-based (function X / const X = / "
-                    "class X / interface X / type X = in TS/JS; def X / "
-                    "class X in Python) — not a real language server; "
-                    "unusual declaration syntax may be missed."
+                    "TS/JS: lexical/regex-based (function X / const X = / "
+                    "class X / interface X / type X =) — not a real "
+                    "language server; unusual declaration syntax may be "
+                    "missed. Python: a real stdlib `ast` parse (def X / "
+                    "class X, including methods nested inside a class), "
+                    "falling back to the same lexical scan only on a file "
+                    "with a real syntax error."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2976,15 +3182,20 @@ SEMANTIC_TOOL_DEFINITIONS = [
                 "name": "find_references",
                 "description": (
                     "Find all usages of an identifier across the "
-                    "workspace (word-boundary match, grouped by file). "
-                    "Prefer this over grep_search for 'where is X used' "
-                    "questions — unlike a plain grep, it will not match "
-                    "the name as a substring of a longer identifier (e.g. "
-                    "searching 'foo' will not match 'foobar'). Lexical, "
-                    "not a real language server: the definition line(s) "
-                    "are NOT excluded from the results (they contain the "
-                    "bare word too), so this tool's output may overlap "
-                    "with find_symbol's."
+                    "workspace (grouped by file). Prefer this over "
+                    "grep_search for 'where is X used' questions. TS/JS: "
+                    "lexical word-boundary match — will not match the "
+                    "name as a substring of a longer identifier (e.g. "
+                    "'foo' will not match 'foobar'), but the definition "
+                    "line(s) are NOT excluded (they contain the bare word "
+                    "too), so this tool's output may overlap with "
+                    "find_symbol's. Python: a real stdlib `ast` parse — "
+                    "only real usage sites (calls, reads, `self.x`-style "
+                    "attribute access) are reported, definition lines are "
+                    "correctly excluded, and a comment/string merely "
+                    "mentioning the name is never a false match; falls "
+                    "back to the same lexical scan on a file with a real "
+                    "syntax error."
                 ),
                 "parameters": {
                     "type": "object",
@@ -3709,11 +3920,55 @@ def execute_tool(
 
         return _render_tool_envelope_message(envelope), False
 
-    arguments = secure_tool_arguments(
-        tool_name,
-        arguments,
-        workspace,
-    )
+    try:
+        arguments = secure_tool_arguments(
+            tool_name,
+            arguments,
+            workspace,
+        )
+    except ToolPolicyBlock as exc:
+        # Round 9 review (M5): check_write_path raises ToolPolicyBlock for a
+        # real policy block (.env*, PROTECTED_DIRS, lockfiles, docs/
+        # graph.json) -- but nothing here used to emit tool_blocked or
+        # record_blocked_command. The caller's own generic `except
+        # Exception` just stringified it into "TOOL BLOCKED/ERROR: ..." and
+        # printed it: a real write was attempted and blocked, with ZERO
+        # audit trail (no tool_blocked event, no repo-memory record, no
+        # POLICY_BLOCK envelope -- classify_failure's POLICY_BLOCK branch,
+        # glimmer-metrics.py's taxonomy, and CC's event feed never saw it).
+        # Route it through the exact same block-reporting shape the
+        # shell_policy rejection below uses, so every policy-block class
+        # shares one audit path. Deliberately NOT catching plain
+        # PermissionError here -- see ToolPolicyBlock's own docstring for
+        # why the usage-error guards (existing-file write, missing-file
+        # edit, read-dir) must keep propagating unchanged. Path traversal
+        # ("Path escapes repository") is a ToolPolicyBlock too (round-9
+        # re-review NEW-1): a security-boundary violation belongs on this
+        # audit path, not in the generic stringifier.
+        reason = str(exc)
+        message = "ENGINEERING SECURITY BLOCK: " + reason
+        blocked_path = str(arguments.get("path", tool_name))[:MAX_EVENT_FIELD]
+
+        print()
+        print(f"✗ BLOCKED: {tool_name} {blocked_path}")
+        print(f"  {reason}")
+
+        _emit(
+            "tool_blocked",
+            command=blocked_path,
+            reason=reason,
+        )
+        record_blocked_command(workspace, blocked_path, reason)
+
+        envelope = _build_tool_envelope(
+            ok=False,
+            tool=tool_name,
+            duration_ms=_duration_ms(),
+            error={"code": "POLICY_BLOCK", "message": message},
+        )
+        _persist_tool_envelope(envelope)
+
+        return _render_tool_envelope_message(envelope), False
 
     cache_key = None
 
@@ -4375,6 +4630,47 @@ def _tool_envelope_selfcheck() -> None:
             assert blocked_env["evidence"] == [], "a blocked call must never carry an evidence id"
             assert blocked_env["changed"] is False
             assert blocked_env["data"] is None
+
+            # ------------------------------------------------------
+            # 3. Round 9 review (M5): a write-path PermissionError
+            #    (check_write_path via secure_tool_arguments -- .env* here)
+            #    must get the SAME audit trail as the shell_policy block
+            #    above: a tool_blocked event, a repo-memory record, and a
+            #    POLICY_BLOCK envelope -- not just a stringified message
+            #    swallowed by the caller's generic except.
+            # ------------------------------------------------------
+            events_before = [json.loads(l) for l in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()]
+
+            env_message, env_changed = execute_tool(
+                "write_file",
+                {"path": ".env", "content": "SECRET=1"},
+                workspace,
+                approval_state,
+                cache,
+                ledger,
+            )
+
+            assert env_changed is False
+            assert "ENGINEERING SECURITY BLOCK" in env_message, env_message
+            assert ".env" in env_message, env_message
+            assert not (workspace / ".env").exists(), (
+                "the blocked write must never actually happen"
+            )
+
+            records = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+            envelopes = [r for r in records if r.get("kind") == "tool_envelope"]
+            env_envelope = envelopes[-1]
+            assert env_envelope["ok"] is False
+            assert env_envelope["tool"] == "write_file"
+            assert env_envelope["error"]["code"] == "POLICY_BLOCK"
+
+            events_after = [json.loads(l) for l in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()]
+            new_events = events_after[len(events_before):]
+            blocked_events = [e for e in new_events if e.get("type") == "tool_blocked"]
+            assert len(blocked_events) == 1, (
+                f"write_file(.env) must emit exactly one tool_blocked event, got: {new_events!r}"
+            )
+            assert ".env" in blocked_events[0].get("command", ""), blocked_events[0]
 
     finally:
         http_json = real_http_json
@@ -8344,8 +8640,16 @@ def _semantic_tools_selfcheck() -> None:
     llama-server needed — these tools never call http_json at all) and
     proves:
       1. find_symbol finds a planted TS function and a planted Python class.
+      1b. Task 9.3d: find_symbol on .py targets uses real `ast` parsing --
+          finds a method nested inside a class, does not false-positive on
+          a comment merely mentioning the name, and falls back to the same
+          regex scan on a syntactically-broken .py file.
       2. find_references is word-boundary correct (name "foo" does not
          match a line whose only occurrence is "foobar").
+      2b. Task 9.3d: find_references on .py targets uses real `ast` too --
+          finds a real attribute-access usage, excludes the definition's
+          own name, ignores a comment mention, and falls back to regex on
+          a syntactically-broken file.
       3. find_related_tests finds both a same-basename X.test.ts and an
          indirectly-related file that imports the basename.
       4. Hostile inputs: regex metacharacters are escaped (name=".*" finds
@@ -8379,7 +8683,19 @@ def _semantic_tools_selfcheck() -> None:
         )
         (ws / "src" / "models.py").write_text(
             "class UserModel:\n"
-            "    pass\n"
+            "    # not a real definition: def get_name would be a false regex hit here\n"
+            "    def get_name(self):\n"
+            "        return self.name\n"
+            "\n"
+            "def make_user():\n"
+            "    return UserModel().get_name()\n"
+        )
+        # Task 9.3d: syntactically invalid Python -- ast.parse must raise
+        # SyntaxError on this, so find_symbol/find_references fall back to
+        # the same lexical regex scan TS/JS always uses, for this file only.
+        (ws / "src" / "broken.py").write_text(
+            "def get_name(:\n"
+            "    return None\n"
         )
         (ws / "src" / "widget.test.ts").write_text(
             'import { createWidget } from "./widget";\n'
@@ -8439,6 +8755,29 @@ def _semantic_tools_selfcheck() -> None:
         no_such_kind = find_symbol("UserModel", "function", ws)
         assert "No definitions" in no_such_kind, no_such_kind
 
+        # ------------------------------------------------------------
+        # 1b. Task 9.3d: Python find_symbol uses real `ast`, not a
+        #     per-line regex scan, for .py files that parse successfully.
+        # ------------------------------------------------------------
+        method_result = find_symbol("get_name", "function", ws)
+        # Real definition (a method nested inside a class) IS found, at
+        # its real line (3) -- proves NodeVisitor walks into class bodies.
+        assert "src/models.py:3:" in method_result, method_result
+        # The comment on line 2 merely CONTAINS the text "def get_name" --
+        # a per-line regex would have matched it; real AST parsing never
+        # turns a comment into a node, so it must not appear here.
+        assert "src/models.py:2:" not in method_result, (
+            "a comment merely mentioning 'def get_name' as text must not "
+            f"be reported as a definition: {method_result!r}"
+        )
+        # broken.py can't be ast.parse'd (SyntaxError) -- must still be
+        # found via the same regex fallback TS/JS always uses, not
+        # silently dropped.
+        assert "src/broken.py:1:" in method_result, (
+            f"a syntactically-broken .py file must fall back to the regex "
+            f"scan, not be silently skipped: {method_result!r}"
+        )
+
         # Binary file skipped outright: _semantic_read_text must return
         # None (never a garbage-decoded string via errors="ignore").
         assert _semantic_read_text(ws / "src" / "binary.bin") is None, (
@@ -8463,6 +8802,65 @@ def _semantic_tools_selfcheck() -> None:
             "'foo' must not match inside 'foobar' (word-boundary correctness)"
         )
         assert "return foobar;" not in refs_result
+
+        # ------------------------------------------------------------
+        # 2b. Task 9.3d: Python find_references uses real `ast` for .py
+        #     files that parse -- finds the real attribute-access usage in
+        #     make_user, excludes the def statement's own name, and never
+        #     false-positives on the comment merely mentioning the name.
+        # ------------------------------------------------------------
+        py_refs = find_references("get_name", ws)
+        assert "src/models.py" in py_refs, py_refs
+        assert "return UserModel().get_name()" in py_refs, py_refs
+        assert "not a real definition" not in py_refs, (
+            "a comment merely mentioning the name as text must not count "
+            f"as a real reference: {py_refs!r}"
+        )
+        assert "def get_name(self):" not in py_refs, (
+            "the def statement's own name is not an ast.Name/Attribute "
+            f"node and must not be reported as a reference: {py_refs!r}"
+        )
+        # broken.py still contributes via the same regex fallback as
+        # find_symbol above.
+        assert "src/broken.py" in py_refs, py_refs
+
+        # M3: the per-file annotation must say what that file actually
+        # got -- ast for a parsed .py file, lexical for the regex-fallback
+        # broken.py in the SAME result.
+        assert "src/models.py (ast match; definition lines excluded):" in py_refs, py_refs
+        assert "src/broken.py (word-boundary lexical match" in py_refs, py_refs
+
+        # ------------------------------------------------------------
+        # 2c. Round 9 review (M4): the AST reference visitor also collects
+        #     imports (ast.alias), function parameters (ast.arg), and
+        #     global/nonlocal declarations -- four real reference sites
+        #     the regex path found and the AST path used to silently drop.
+        # ------------------------------------------------------------
+        (ws / "src" / "imports_and_params.py").write_text(
+            "from mod import target\n"          # 1: ast.alias (import name)
+            "import target as t\n"               # 2: ast.alias (import name, aliased)
+            "\n"
+            "def f(target=1):\n"                 # 4: ast.arg (parameter name)
+            "    global target\n"                 # 5: ast.Global
+            "    return call(target=target)\n"    # 6: ast.Name (the value only)
+        )
+        target_refs = find_references("target", ws)
+        assert "src/imports_and_params.py (ast match" in target_refs, target_refs
+        assert "1: from mod import target" in target_refs, (
+            f"import name site missed: {target_refs!r}"
+        )
+        assert "2: import target as t" in target_refs, (
+            f"aliased import name site missed: {target_refs!r}"
+        )
+        assert "4: def f(target=1):" in target_refs, (
+            f"parameter name site missed: {target_refs!r}"
+        )
+        assert "5: global target" in target_refs, (
+            f"global declaration site missed: {target_refs!r}"
+        )
+        assert "6: return call(target=target)" in target_refs, (
+            f"the value half of the keyword arg (a real ast.Name) missed: {target_refs!r}"
+        )
 
         # ------------------------------------------------------------
         # 3. find_related_tests: same-basename + content-import match.
@@ -8512,18 +8910,20 @@ def _semantic_tools_selfcheck() -> None:
         # since find_related_tests is in PATH_TOOLS) — exercised through
         # execute_tool, the real dispatch entry point, not a hand-rolled
         # check.
-        try:
-            execute_tool(
-                "find_related_tests",
-                {"path": "../../../etc/passwd"},
-                ws,
-                {"approve_all": True},
-                {},
-                [],
-            )
-            raise AssertionError("path escaping the workspace must be rejected")
-        except PermissionError as exc:
-            assert "escapes repository" in str(exc), str(exc)
+        # NEW-1 (round-9 re-review): traversal is now a ToolPolicyBlock,
+        # so execute_tool returns a POLICY_BLOCK envelope (with audit
+        # trail) instead of raising -- assert the blocked result shape.
+        result, changed = execute_tool(
+            "find_related_tests",
+            {"path": "../../../etc/passwd"},
+            ws,
+            {"approve_all": True},
+            {},
+            [],
+        )
+        assert changed is False
+        assert "escapes repository" in result, result
+        assert "ENGINEERING SECURITY BLOCK" in result, result
 
         # ------------------------------------------------------------
         # 5. Normal dispatch path: cache hit + evidence persistence.
