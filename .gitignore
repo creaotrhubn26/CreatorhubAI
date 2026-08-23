@@ -15,6 +15,9 @@ backups/
 # Disposable throwaway repos used for live smoke-test checkpoints
 .smoke-test-repo/
 
+# glimmer-eval.py output -- runs, not source (V7 O5/§39)
+eval-results/
+
 # Superpowers SDD/fix workflow scratch (ledgers, briefs, review packages) — git history is the record
 .superpowers/
 
