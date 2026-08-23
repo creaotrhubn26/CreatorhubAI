@@ -110,6 +110,30 @@ describe("parseManifest", () => {
     expect(session.failure).toBeUndefined();
   });
 
+  // Task 8.1 (V7 §23.11): manifest["statuses"], same optional-pass-through
+  // discipline as gates/architectPlan/failure above.
+  it("passes through statuses when the manifest carries them", () => {
+    const session = parseManifest(
+      {
+        ...REAL_MANIFEST,
+        statuses: {
+          technical: "VERIFIED", architecture: "approved", documentation: "not_run",
+          visual: "not_run", delivery: "needs_polish", overall: "needs_polish",
+        },
+      },
+      "sid-statuses-1"
+    );
+    expect(session.statuses).toEqual({
+      technical: "VERIFIED", architecture: "approved", documentation: "not_run",
+      visual: "not_run", delivery: "needs_polish", overall: "needs_polish",
+    });
+  });
+
+  it("leaves statuses undefined for a manifest predating Task 8.1", () => {
+    const session = parseManifest(REAL_MANIFEST, "sid-statuses-2");
+    expect(session.statuses).toBeUndefined();
+  });
+
   it("passes through a real failure object", () => {
     const session = parseManifest(
       { ...REAL_MANIFEST, failure: { class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] } },
@@ -371,6 +395,54 @@ describe("opt-in orchestrator artifact reads", () => {
     const id = "20260817-000034-glimmer-no-delivery-review";
     await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
     expect(await sessionsIsolated.readDeliveryReview(id)).toBeNull();
+  });
+
+  // Task 8.2 (V7 §23.15): architect-escalation.json is merged onto the
+  // DeliveryReview response at read time, not served as its own route.
+  it("readDeliveryReview merges architect-escalation.json onto the review when present", async () => {
+    const id = "20260821-000001-glimmer-escalation";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(REAL_DELIVERY_REVIEW));
+    await fs.writeFile(
+      path.join(dir, "architect-escalation.json"),
+      JSON.stringify({ question: "Is this sound?", answer: "Yes, proceed." })
+    );
+    expect(await sessionsIsolated.readDeliveryReview(id)).toEqual({
+      ...REAL_DELIVERY_REVIEW,
+      architectEscalation: { question: "Is this sound?", answer: "Yes, proceed." },
+    });
+  });
+
+  it("readDeliveryReview omits architectEscalation when no escalation ran for this session", async () => {
+    const id = "20260821-000002-glimmer-no-escalation";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(REAL_DELIVERY_REVIEW));
+    expect(await sessionsIsolated.readDeliveryReview(id)).toEqual(REAL_DELIVERY_REVIEW);
+  });
+
+  // Task 8.2 (V7 §23.16): delivery-packet.json, same opt-in-artifact
+  // convention as every other session-dir read above.
+  it("readDeliveryPacket returns the parsed packet when present", async () => {
+    const id = "20260821-000003-glimmer-packet";
+    const dir = path.join(contractStateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const packet = {
+      task: "add widget", planRef: null, changedFiles: ["a.ts"], orchestratorUpdatedFiles: [],
+      verification: { status: "VERIFIED", results: null }, visual: "not_run",
+      statuses: { technical: "VERIFIED", architecture: "not_run", documentation: "not_run", visual: "not_run", delivery: "not_run", overall: "not_run" },
+      customerReadiness: null, limitations: null, forwardPlan: null, confidence: null,
+      humanReviewStatus: "pending",
+    };
+    await fs.writeFile(path.join(dir, "delivery-packet.json"), JSON.stringify(packet));
+    expect(await sessionsIsolated.readDeliveryPacket(id)).toEqual(packet);
+  });
+
+  it("readDeliveryPacket returns null when absent (normal, opt-in)", async () => {
+    const id = "20260821-000004-glimmer-no-packet";
+    await fs.mkdir(path.join(contractStateRoot, "sessions", id), { recursive: true });
+    expect(await sessionsIsolated.readDeliveryPacket(id)).toBeNull();
   });
 
   it("readSessionTasks returns the parsed task list when present", async () => {

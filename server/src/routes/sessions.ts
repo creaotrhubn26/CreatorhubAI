@@ -6,10 +6,10 @@ import { CONFIG, sessionsDir } from "../config.js";
 import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
-  readArchitecturePlan, readArchitectReviews, readDeliveryReview, readSessionTasks,
+  readArchitecturePlan, readArchitectReviews, readDeliveryReview, readDeliveryPacket, readSessionTasks,
   writeHumanAcceptance, readVisualManifest, readVisualFindings,
   readTaskOverrides, writeTaskOverride, applyTaskOverrides,
-  readEvidenceIndex, readEvidenceEntry,
+  readEvidenceIndex, readEvidenceEntry, resolveApproval,
 } from "../lib/sessions.js";
 import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
@@ -294,6 +294,19 @@ sessionsRouter.get("/sessions/:id/delivery-review", async (req, res) => {
   }
 });
 
+// Task 8.2 (V7 §23.16) -- delivery-packet.json, assembled once by
+// glimmer-v2.py at session close-out. Same opt-in-artifact-absence
+// convention as /delivery-review, /plan, etc.
+sessionsRouter.get("/sessions/:id/delivery-packet", async (req, res) => {
+  try {
+    const packet = await readDeliveryPacket(req.params.id);
+    if (!packet) return res.status(404).json({ error: "not found" });
+    res.json(packet);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Task 5.2 (V7 §26/§46): evidence-index.json + per-entry lookup behind
 // one endpoint, distinguished by the ?id= query param -- a single
 // GET route (rather than a second path segment) since both read from
@@ -355,6 +368,35 @@ async function handleTaskOverride(req: Request, res: Response, action: "skip" | 
 
 sessionsRouter.post("/sessions/:id/tasks/:taskId/skip", (req, res) => handleTaskOverride(req, res, "skip"));
 sessionsRouter.post("/sessions/:id/tasks/:taskId/approve", (req, res) => handleTaskOverride(req, res, "approve"));
+
+// Task 8.3 (V7 §14/§35): human approve/deny for a YELLOW-classified action
+// glimmer-engineer.py is currently blocked waiting on (approvals.json) --
+// gateway-owned resolution, exactly like the task-override routes above.
+// 404s on an unknown session OR an unknown/never-requested approvalId;
+// never validates session status (mirrors handleTaskOverride's own
+// reasoning: this just records the human's decision honestly). Idempotent:
+// a second approve/deny call on an already-resolved approvalId returns the
+// SAME stored record rather than erroring or re-resolving it (see
+// resolveApproval).
+async function handleApprovalResolution(req: Request, res: Response, action: "approve" | "deny") {
+  try {
+    // No real auth/user-account system in this local single-operator tool
+    // (same reality HumanAcceptance's {accepted, acceptedAt} already
+    // reflects, with no actor field at all) -- approvedBy is whatever the
+    // client sends, defaulting to a generic label when omitted, purely so
+    // the sidecar's human-provenance field is never left blank.
+    const approvedBy = typeof req.body?.approvedBy === "string" && req.body.approvedBy.trim()
+      ? req.body.approvedBy.trim() : "control-center-operator";
+    const record = await resolveApproval(req.params.id, req.params.approvalId, action, approvedBy);
+    if (!record) return res.status(404).json({ error: "not found" });
+    res.json({ approvalId: req.params.approvalId, ...record });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+sessionsRouter.post("/sessions/:id/approvals/:approvalId/approve", (req, res) => handleApprovalResolution(req, res, "approve"));
+sessionsRouter.post("/sessions/:id/approvals/:approvalId/deny", (req, res) => handleApprovalResolution(req, res, "deny"));
 
 // V7 §22.14/§22.16 visual evidence store -- static serving of a session's
 // visual/ artifacts. Same opt-in-artifact-absence convention as /plan,

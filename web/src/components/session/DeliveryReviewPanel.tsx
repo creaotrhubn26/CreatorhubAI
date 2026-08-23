@@ -1,9 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import type { DeliveryReviewCustomerReadiness, NextStepPriority } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
 
-const READINESS_COLOR: Record<DeliveryReviewCustomerReadiness, string> = {
+// Exported for StatusesRow (Task 8.1, V7 §23.11) -- the delivery/overall
+// legs there use this exact same 5-level vocabulary, one color map instead
+// of two independently-drifting ones.
+export const READINESS_COLOR: Record<DeliveryReviewCustomerReadiness, string> = {
   ready_to_ship: "var(--green)",
   ready_with_known_limitations: "var(--amber)",
   needs_polish: "var(--amber)",
@@ -19,6 +23,7 @@ const PRIORITY_LABEL: Record<NextStepPriority, string> = {
 };
 
 export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
+  const navigate = useNavigate();
   // Written once at session close-out — fetch once, not a poll target.
   const { data: review } = useQuery({
     queryKey: ["delivery-review", sessionId],
@@ -59,6 +64,12 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
           <dd>{review.confidence.level} — {review.confidence.reason}</dd>
         </div>
       </dl>
+      {!!review.approachRationale?.length && (
+        <>
+          <h3>Approach rationale</h3>
+          <ul>{review.approachRationale.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </>
+      )}
       {!!review.strengths?.length && (
         <>
           <h3>Strengths</h3>
@@ -75,6 +86,18 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
           </ul>
         </>
       )}
+      {!!review.unresolvedItems?.length && (
+        <>
+          <h3>Unresolved items</h3>
+          <ul>{review.unresolvedItems.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </>
+      )}
+      {!!review.intentionallyNotChanged?.length && (
+        <>
+          <h3>Intentionally not changed</h3>
+          <ul>{review.intentionallyNotChanged.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </>
+      )}
       {!!review.nextSteps?.length && (
         <>
           <h3>Next steps</h3>
@@ -82,10 +105,40 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
             <div key={p}>
               <strong>{PRIORITY_LABEL[p]}</strong>
               <ul>
-                {review.nextSteps!.filter((s) => s.priority === p).map((s, i) => <li key={i}>{s.action}</li>)}
+                {review.nextSteps!.filter((s) => s.priority === p).map((s, i) => (
+                  <li key={i} style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                    <span>{s.action}</span>
+                    <button
+                      type="button"
+                      style={{ fontSize: 12 }}
+                      title="Convert this next step into a new task (opens the composer, prefilled — nothing runs automatically)"
+                      onClick={() => navigate("/tasks/new", { state: { objective: s.action } })}
+                    >
+                      Convert to task
+                    </button>
+                  </li>
+                ))}
               </ul>
             </div>
           ))}
+        </>
+      )}
+      {review.architectEscalation && (
+        <>
+          <h3>Architect escalation</h3>
+          <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            V7 §23.15 — a high/critical concern above triggered a second architect opinion
+          </p>
+          {review.architectEscalation.consultationFailed ? (
+            <p>
+              Consultation failed{review.architectEscalation.reason ? `: ${review.architectEscalation.reason}` : "."}
+            </p>
+          ) : (
+            <>
+              {review.architectEscalation.question && <p><strong>Question:</strong> {review.architectEscalation.question}</p>}
+              {review.architectEscalation.answer && <p>{review.architectEscalation.answer}</p>}
+            </>
+          )}
         </>
       )}
     </CollapsibleSection>

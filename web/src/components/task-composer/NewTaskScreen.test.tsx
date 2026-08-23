@@ -9,11 +9,11 @@ import * as client from "../../api/client";
 // which requires a Router context to render. MemoryRouter is added here (matching
 // the pattern already used in AppShell.test.tsx) purely as test scaffolding — it
 // does not change what is asserted.
-function withQuery(ui: React.ReactElement) {
+function withQuery(ui: React.ReactElement, initialEntries: Array<string | { pathname: string; state?: unknown }> = ["/"]) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={qc}>
-      <MemoryRouter>{ui}</MemoryRouter>
+      <MemoryRouter initialEntries={initialEntries}>{ui}</MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -56,6 +56,24 @@ describe("NewTaskScreen", () => {
     expect(box.checked).toBe(false);
     fireEvent.click(box);
     expect(box.checked).toBe(true);
+  });
+
+  // Task 8.2 (V7 §23.14): DeliveryReviewPanel's "convert next step to task"
+  // action navigates here with router state { objective } — a DRAFT prefill
+  // only. Nothing runs automatically: the objective field is pre-filled,
+  // every other field keeps its normal default, and RUN GLIMMER still
+  // requires an explicit click.
+  it("prefills the objective from router state when arriving via 'convert to task'", () => {
+    render(
+      withQuery(<NewTaskScreen />, [{ pathname: "/tasks/new", state: { objective: "Add restoration progress state" } }])
+    );
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("Add restoration progress state");
+    expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
+  });
+
+  it("defaults the objective to empty when arriving with no router state", () => {
+    render(withQuery(<NewTaskScreen />));
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("");
   });
 
   // F5: "directory"/"files" scope previously had no way to enter a concrete

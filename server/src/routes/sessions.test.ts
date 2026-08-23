@@ -542,6 +542,66 @@ describe("GET /api/sessions/:id/delivery-review", () => {
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
   });
+
+  // Task 8.2 (V7 §23.15): a session that triggered architect escalation
+  // gets it merged onto the SAME response, not a separate route.
+  it("merges architect-escalation.json onto the response when present", async () => {
+    const id = "20260821-000010-glimmer-delivery-escalated";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(deliveryReview));
+    await fs.writeFile(
+      path.join(dir, "architect-escalation.json"),
+      JSON.stringify({ consultationFailed: true, reason: "architect model unreachable" })
+    );
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ...deliveryReview,
+      architectEscalation: { consultationFailed: true, reason: "architect model unreachable" },
+    });
+  });
+});
+
+describe("GET /api/sessions/:id/delivery-packet", () => {
+  const packet = {
+    task: "add widget", planRef: null, changedFiles: ["src/widget.ts"], orchestratorUpdatedFiles: [],
+    verification: { status: "VERIFIED", results: null }, visual: "not_run",
+    statuses: { technical: "VERIFIED", architecture: "not_run", documentation: "not_run", visual: "not_run", delivery: "not_run", overall: "not_run" },
+    customerReadiness: null, limitations: null, forwardPlan: null, confidence: null,
+    humanReviewStatus: "pending",
+  };
+
+  it("returns the parsed delivery-packet.json when present", async () => {
+    const id = "20260821-000011-glimmer-packet-found";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "delivery-packet.json"), JSON.stringify(packet));
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-packet`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(packet);
+  });
+
+  it("returns 404 when no packet was ever written (opt-in artifact)", async () => {
+    const id = "20260821-000012-glimmer-packet-missing";
+    await fs.mkdir(path.join(stateRoot, "sessions", id), { recursive: true });
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-packet`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 500, not a crash, on a real fs read error", async () => {
+    const id = "20260821-000013-glimmer-packet-fserror";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(path.join(dir, "delivery-packet.json"));
+
+    const res = await request(app).get(`/api/sessions/${id}/delivery-packet`);
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty("error");
+  });
 });
 
 describe("GET /api/sessions/:id/evidence", () => {
@@ -825,6 +885,96 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
   });
 });
 
+// Task 8.3 (V7 §14/§35): human approve/deny for a YELLOW-classified action
+// glimmer-engineer.py is currently blocked on (approvals.json). Gateway-
+// owned resolution, exactly like the task-override routes above.
+describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () => {
+  const pendingApproval = {
+    action: "modify_dependencies",
+    reason: "engineer requested a dependency-install command: npm install left-pad",
+    proposedChanges: ["package.json", "package-lock.json"],
+    risk: "medium",
+    requestedAt: "2026-08-22T00:00:00.000Z",
+    status: "pending",
+  };
+
+  it("writes approvals.json on approve and reflects it on a re-read", async () => {
+    const id = "20260823-000001-glimmer-approval-approve";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+
+    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "daniel" });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ approvalId: "appr-1", status: "approved", approvedBy: "daniel" });
+    expect(typeof res.body.resolvedAt).toBe("string");
+
+    const onDisk = JSON.parse(await fs.readFile(path.join(dir, "approvals.json"), "utf-8"));
+    expect(onDisk["appr-1"]).toMatchObject({ status: "approved", approvedBy: "daniel" });
+  });
+
+  it("writes approvals.json on deny, defaulting approvedBy when omitted", async () => {
+    const id = "20260823-000002-glimmer-approval-deny";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-2": pendingApproval }));
+
+    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-2/deny`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ approvalId: "appr-2", status: "denied" });
+    expect(typeof res.body.approvedBy).toBe("string");
+    expect(res.body.approvedBy.length).toBeGreaterThan(0);
+  });
+
+  it("404s for an unknown session id", async () => {
+    const res = await request(app).post("/api/sessions/does-not-exist/approvals/appr-1/approve");
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for an approvalId that was never requested", async () => {
+    const id = "20260823-000003-glimmer-approval-bad-id";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+
+    const res = await request(app).post(`/api/sessions/${id}/approvals/does-not-exist/approve`);
+    expect(res.status).toBe(404);
+  });
+
+  it("double-approve is idempotent: the second call returns the same record, not a re-resolved one", async () => {
+    const id = "20260823-000004-glimmer-approval-double";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+
+    const first = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "daniel" });
+    expect(first.status).toBe(200);
+    const second = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "someone-else" });
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body); // unchanged -- not re-resolved to "someone-else"/a new timestamp
+
+    // A denial after an approval is already recorded is equally a no-op.
+    const third = await request(app).post(`/api/sessions/${id}/approvals/appr-1/deny`);
+    expect(third.body).toEqual(first.body);
+  });
+
+  it("GET /api/sessions/:id exposes pendingApproval + status waiting_for_approval from manifest.json", async () => {
+    const id = "20260823-000005-glimmer-approval-session";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      status: "waiting-for-approval", workspace: "/tmp/ws", branch: "main", baseline: "abc123",
+      task: "add widget", attempts: [], updatedAt: "2026-08-23T00:00:00.000Z",
+      pendingApproval: { approvalId: "appr-1", ...pendingApproval },
+    }));
+
+    const res = await request(app).get(`/api/sessions/${id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("waiting_for_approval");
+    expect(res.body.pendingApproval).toMatchObject({ approvalId: "appr-1", action: "modify_dependencies" });
+  });
+});
+
 describe("GET /api/sessions/:id/visual/manifest", () => {
   const manifest = {
     route: "http://localhost:5183/role-room",
@@ -941,7 +1091,7 @@ describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
 });
 
 describe("opt-in artifact routes reject path-traversal ids", () => {
-  it.each(["plan", "architect-reviews", "delivery-review", "tasks", "evidence"])(
+  it.each(["plan", "architect-reviews", "delivery-review", "delivery-packet", "tasks", "evidence"])(
     "GET /api/sessions/:id/%s returns 404 for a traversal id",
     async (routeName) => {
       const res = await request(app).get(`/api/sessions/..%2F..%2Fevil/${routeName}`);

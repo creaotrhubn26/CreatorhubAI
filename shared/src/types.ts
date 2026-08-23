@@ -134,6 +134,18 @@ export interface TaskContract {
     modelReadinessUrl?: string;
     architectFirst?: boolean;
   };
+  // Task 8.1 (V7 §23.10): "would I send this to a customer?" quality gate.
+  // Omitted entirely (or customerReadinessRequired omitted/false) means the
+  // gate is never applicable for this task -- same omit-when-unset contract
+  // as budgets/advanced above. minimumCustomerReadiness is meaningful only
+  // alongside customerReadinessRequired: true; DeliveryReviewCustomerReadiness
+  // is the same ordered vocabulary glimmer-v2.py's CUSTOMER_READINESS_ORDER
+  // compares against (best to worst: ready_to_ship, ready_with_known_
+  // limitations, needs_polish, needs_rework, not_customer_ready).
+  qualityGates?: {
+    customerReadinessRequired?: boolean;
+    minimumCustomerReadiness?: DeliveryReviewCustomerReadiness;
+  };
 }
 
 // V7 §18: manifest.verificationPlan, command strings (not results) for the
@@ -199,6 +211,32 @@ export interface GlimmerSession {
     // on real evidence alone -- a human decision must stay visibly
     // distinct from evidence, never blended into a plain "✓".
     tasksResolvedBy?: "human";
+    // Task 8.1 (V7 §23.10): compute_customer_readiness_gate's result --
+    // same True/False/None contract as the other optional gates above.
+    // null when contract.qualityGates.customerReadinessRequired was never
+    // set (gate not requested — not applicable); false when required but
+    // the session's DeliveryReview is missing, unparseable, or doesn't meet
+    // qualityGates.minimumCustomerReadiness.
+    customerReadinessApproved?: boolean | null;
+  };
+  // Task 8.1 (V7 §23.11): combined statuses, written once by glimmer-v2.py's
+  // `finally` block (every exit path, not just VERIFIED-reaching ones) —
+  // mirrored from manifest["statuses"] verbatim, same "additive, optional,
+  // absent on sessions predating this task" convention as gates/
+  // architectPlan/failure above. Distinct from this type's own finalStatus
+  // (V7 §22.17, composed at READ time by control-center itself) — this one
+  // is the orchestrator's own self-report. technical/architecture/
+  // documentation/visual/delivery each keep their own natural vocabulary
+  // (see glimmer-v2.py's compute_statuses docstring); overall is expressed
+  // in DeliveryReviewCustomerReadiness's 5-level vocabulary (plus "not_run"),
+  // the only one granular enough to rank every other leg against.
+  statuses?: {
+    technical: "VERIFIED" | "FAILED" | "NOT_RUN";
+    architecture: "approved" | "rejected" | "not_run";
+    documentation: "approved" | "rejected" | "not_run";
+    visual: VisualFindingsStatus | "not_run";
+    delivery: DeliveryReviewCustomerReadiness | "not_run";
+    overall: DeliveryReviewCustomerReadiness | "not_run";
   };
   architectPlan?: { used: boolean; risk: string | null };
   // Task 2.1 (V7 §5.5): how architect mode was decided for this run —
@@ -235,11 +273,38 @@ export interface GlimmerSession {
   // time from facts already on this object plus an opt-in visual/ dir read
   // -- see FinalStatus's own field comments for the exact per-field mapping).
   finalStatus: FinalStatus;
+  // Task 8.3 (V7 §14/§35): mirrored from manifest.json's own transient
+  // "pendingApproval" field -- present ONLY while glimmer-engineer.py is
+  // actually blocked polling approvals.json for a YELLOW action (status is
+  // "waiting_for_approval" at the same time). Cleared the moment the wait
+  // resolves (approved/denied/timeout), when the engineer process patches
+  // manifest.json back to its prior status/state.
+  pendingApproval?: ApprovalRequest & { approvalId: string };
 }
 
 export interface HumanAcceptance {
   accepted: boolean;
   acceptedAt: string;
+}
+
+// Task 8.3 (V7 §14/§35) -- YELLOW human-approval boundary. Written by
+// glimmer-engineer.py (request_approval_and_wait) the moment a YELLOW-
+// classified action (classify_yellow: dependency install, migration
+// keyword, large scope expansion) needs a human decision -- status starts
+// "pending". Resolved by the gateway's own POST /sessions/:id/approvals/
+// :approvalId/approve|deny (adds status/resolvedAt/approvedBy), same "two
+// processes, one sidecar file, each writes only its own half" discipline
+// as task-overrides.json/TaskOverride. proposedChanges/risk/reason are
+// deterministic fields only -- no chain-of-thought, no model text.
+export interface ApprovalRequest {
+  action: string;
+  reason: string;
+  proposedChanges: string[];
+  risk: "low" | "medium" | "high" | "critical";
+  requestedAt: string;
+  status: "pending" | "approved" | "denied";
+  resolvedAt?: string;
+  approvedBy?: string;
 }
 
 // V7 §5.3 ArchitecturePlan — opt-in architect-mode output, written to
@@ -346,6 +411,23 @@ export interface DeliveryNextStep {
   action: string;
 }
 
+// Task 8.2 (V7 §23.15) -- architect-escalation.json, written by
+// glimmer-engineer.py's `--mode consult` ONLY when glimmer-v2.py's
+// deterministic trigger fires (a high/critical DeliveryConcern AND
+// architect mode enabled for the session). Merged onto DeliveryReview at
+// read time (see server/src/lib/sessions.ts readDeliveryReview) rather
+// than served as its own route -- it is always read alongside the review
+// it escalates, never independently. consultationFailed marks a
+// model-down/spawn-failure degrade path (same convention as
+// DeliveryReview.reviewFailed) -- the session outcome is never affected
+// either way (§23.15: a second opinion, not a second gate).
+export interface ArchitectEscalation {
+  question?: string;
+  answer?: string;
+  consultationFailed?: true;
+  reason?: string;
+}
+
 export interface DeliveryReview {
   summary: string;
   approachRationale?: string[];
@@ -358,6 +440,47 @@ export interface DeliveryReview {
   confidence: { level: "low" | "medium" | "high"; reason: string };
   reviewFailed?: true;
   reviewFailureReason?: string;
+  architectEscalation?: ArchitectEscalation;
+}
+
+// V7 §23.16 -- delivery-packet.json, assembled once by glimmer-v2.py at
+// session close-out (main()'s unconditional `finally` block, right after
+// manifest.statuses). Deliberately NOT a duplicate of every full artifact
+// (architecture-plan.json/delivery-review.json/visual findings remain
+// their own routes) -- this is the concise handoff summary V7 §23.16
+// asks for. Fields derived from the session's own DeliveryReview
+// (customerReadiness/limitations/forwardPlan/confidence) carry an
+// explicit provenance tag (same DataProvenance union every other
+// model-derived API field already uses) and are null whenever no
+// delivery-review.json exists for the session at all -- never
+// fabricated. planRef is null whenever architect mode was never engaged
+// for this session.
+export interface DeliveryPacket {
+  task: string | null;
+  planRef: { architectUsed: boolean; architectureApproved: boolean | null } | null;
+  changedFiles: string[];
+  orchestratorUpdatedFiles: string[];
+  verification: { status: "VERIFIED" | "FAILED" | "NOT_RUN"; results: unknown };
+  visual: VisualFindingsStatus | "not_run";
+  statuses: GlimmerSession["statuses"];
+  customerReadiness: { value: DeliveryReviewCustomerReadiness | null; provenance: DataProvenance; reviewFailed?: true } | null;
+  limitations: {
+    unresolvedItems: string[];
+    intentionallyNotChanged: string[];
+    concerns: DeliveryConcern[];
+    provenance: DataProvenance;
+    reviewFailed?: true;
+  } | null;
+  forwardPlan: { nextSteps: DeliveryNextStep[]; provenance: DataProvenance; reviewFailed?: true } | null;
+  confidence: { level: "low" | "medium" | "high"; reason: string; provenance: DataProvenance; reviewFailed?: true } | null;
+  humanReviewStatus: string;
+  // Round-8 re-review NEW-MN2/NEW-MN1: written by glimmer-v2.py since
+  // MJ4/MN1 fixes -- optional so pre-fix packets still parse.
+  blockedGates?: string[];
+  architectEscalation?:
+    | { question: string; answer: string }
+    | { consultationFailed: true; reason: string }
+    | null;
 }
 
 // V7 §22.14 visual evidence store — these mirror glimmer-visual.py's real
@@ -795,6 +918,28 @@ export interface DocumentationVerifiedEvent extends GlimmerEventBase {
   status: string;
 }
 
+// Task 8.3 (V7 §14/§35): emitted by glimmer-engineer.py's
+// request_approval_and_wait, once per approval request, right before the
+// poll loop over approvals.json starts. Deterministic fields only.
+export interface ApprovalRequestedEvent extends GlimmerEventBase {
+  type: "approval_requested";
+  approvalId: string;
+  action: string;
+  reason: string;
+  risk: ApprovalRequest["risk"];
+}
+
+// Task 8.2 (V7 §23.16): emitted once by glimmer-v2.py's `finally` block,
+// right after delivery-packet.json/packet-summary.txt are written, on
+// every exit path. No fields -- mirrors glimmer_events.py's own
+// unconditional `emit(..., "delivery_packet_created")` call exactly (no
+// payload there either). This was a confirmed gap from the 8.3 review:
+// present in glimmer_events.EVENT_TYPES since 8.2, but absent here, so
+// isGlimmerEvent silently dropped it at the gateway.
+export interface DeliveryPacketCreatedEvent extends GlimmerEventBase {
+  type: "delivery_packet_created";
+}
+
 export type GlimmerEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
@@ -831,7 +976,9 @@ export type GlimmerEvent =
   | ArchitectConsultedEvent
   | DocumentationImpactDetectedEvent
   | DocumentationStaleDetectedEvent
-  | DocumentationVerifiedEvent;
+  | DocumentationVerifiedEvent
+  | ApprovalRequestedEvent
+  | DeliveryPacketCreatedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -847,6 +994,9 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "visual_verification_completed",
   "delivery_review_started", "delivery_review_completed",
   "architect_consult_advised", "architect_consulted",
+  "approval_requested", "delivery_packet_created",
+  "documentation_impact_detected", "documentation_stale_detected",
+  "documentation_verified",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {

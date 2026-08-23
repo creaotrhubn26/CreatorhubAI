@@ -18,6 +18,8 @@ const GATE_LABELS: Array<[ValueGateKey, string]> = [
   ["scopeApproved", "Scope"],
   ["documentationCurrent", "Docs"],
   ["tasksResolved", "Tasks"],
+  // Task 8.1 (V7 §23.10): "would I send this to a customer?" quality gate.
+  ["customerReadinessApproved", "Delivery"],
 ];
 
 function gateSymbol(value: boolean | null | undefined): string {

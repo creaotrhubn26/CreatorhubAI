@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ActiveSessionScreen } from "./ActiveSessionScreen";
 import * as client from "../../api/client";
 import * as sseHook from "../../api/useSessionEvents";
+import { SessionEventsContext } from "../../api/useSessionEvents";
 
 describe("ActiveSessionScreen", () => {
   it("shows the session's changed-file count and derived state", async () => {
@@ -423,5 +424,158 @@ describe("ActiveSessionScreen", () => {
     expect(screen.queryByText(/Architect Reviews/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Tasks$/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Delivery Review/)).not.toBeInTheDocument();
+  });
+
+  // Task 8.3 (V7 §14/§35): the YELLOW human-approval boundary card.
+  describe("approval card", () => {
+    const pendingApproval = {
+      approvalId: "s1-appr-1", action: "modify_dependencies",
+      reason: "engineer requested a dependency-install command: npm install left-pad",
+      proposedChanges: ["package.json", "package-lock.json"],
+      risk: "medium" as const, requestedAt: "2026-08-23T00:00:00.000Z", status: "pending" as const,
+    };
+
+    it("renders nothing when pendingApproval is absent", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2,
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      await waitFor(() => expect(screen.getByText(/Changed files/)).toBeInTheDocument());
+      expect(screen.queryByRole("button", { name: /approve/i })).not.toBeInTheDocument();
+    });
+
+    it("renders the action/reason/risk/proposedChanges and Approve/Deny buttons for a pending approval", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "waiting_for_approval", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2, pendingApproval,
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      expect(await screen.findByText("modify_dependencies")).toBeInTheDocument();
+      expect(screen.getByText(/npm install left-pad/)).toBeInTheDocument();
+      expect(screen.getByText(/medium risk/)).toBeInTheDocument();
+      expect(screen.getByText(/package.json, package-lock.json/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^approve$/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^deny$/i })).toBeInTheDocument();
+    });
+
+    it("clicking Approve calls approveApproval with the session and approval ids", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "waiting_for_approval", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2, pendingApproval,
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+      const approveSpy = vi.spyOn(client.glimmerApi, "approveApproval")
+        .mockResolvedValue({ ...pendingApproval, status: "approved", approvedBy: "daniel", resolvedAt: "x" } as any);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      fireEvent.click(await screen.findByRole("button", { name: /^approve$/i }));
+      await waitFor(() => expect(approveSpy).toHaveBeenCalledWith("s1", "s1-appr-1"));
+    });
+
+    it("clicking Deny calls denyApproval with the session and approval ids", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "waiting_for_approval", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2, pendingApproval,
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+      const denySpy = vi.spyOn(client.glimmerApi, "denyApproval")
+        .mockResolvedValue({ ...pendingApproval, status: "denied", approvedBy: "daniel", resolvedAt: "x" } as any);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      fireEvent.click(await screen.findByRole("button", { name: /^deny$/i }));
+      await waitFor(() => expect(denySpy).toHaveBeenCalledWith("s1", "s1-appr-1"));
+    });
+
+    it("shows the resolved decision instead of buttons once status is no longer pending", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2,
+        pendingApproval: { ...pendingApproval, status: "approved", approvedBy: "daniel", resolvedAt: "x" },
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/sessions/s1"]}>
+            <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      expect(await screen.findByText(/approved by daniel/i)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^deny$/i })).not.toBeInTheDocument();
+    });
+
+    // 8.3 review fix-round (M3): a session with no SSE activity in >=120s
+    // (isStalled, the SAME fact LivenessLine already computes) suppresses
+    // the buttons instead of inviting a click nothing will ever read back.
+    it("suppresses Approve/Deny (but still shows the card) when the session is stalled", async () => {
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+        id: "s1", task: "Fix dialog parser", status: "waiting_for_approval", workspace: "/ws", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2, pendingApproval,
+      } as any);
+      vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <SessionEventsContext.Provider value={{ events: [], lastEventAt: Date.now() - 200_000 }}>
+            <MemoryRouter initialEntries={["/sessions/s1"]}>
+              <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+            </MemoryRouter>
+          </SessionEventsContext.Provider>
+        </QueryClientProvider>
+      );
+
+      expect(await screen.findByText(/modify_dependencies/)).toBeInTheDocument();
+      expect(screen.getByText(/no recent activity/i)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^approve$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^deny$/i })).not.toBeInTheDocument();
+    });
   });
 });

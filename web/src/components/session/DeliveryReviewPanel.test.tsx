@@ -1,14 +1,31 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 import * as client from "../../api/client";
 
 afterEach(() => vi.restoreAllMocks());
 
+// DeliveryReviewPanel's "convert to task" action calls useNavigate(), which
+// requires a Router context -- MemoryRouter is test scaffolding, matching
+// AppShell.test.tsx's LocationProbe pattern, so the navigation target/state
+// can be asserted without a real /tasks/new route tree.
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-probe">{location.pathname}::{JSON.stringify(location.state)}</div>;
+}
+
 function withQuery(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return <QueryClientProvider client={qc}>{ui}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={qc}>
+      <MemoryRouter>
+        {ui}
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
 }
 
 describe("DeliveryReviewPanel", () => {
@@ -72,6 +89,80 @@ describe("DeliveryReviewPanel", () => {
     const { container } = render(withQuery(<DeliveryReviewPanel sessionId="s1" />));
 
     await waitFor(() => expect(client.glimmerApi.getDeliveryReview).toHaveBeenCalled());
-    expect(container).toBeEmptyDOMElement();
+    // container also holds the test-only LocationProbe sibling (see
+    // withQuery above), so "renders nothing" is checked against the
+    // panel's own root element (a CollapsibleSection <section>), not the
+    // whole container.
+    expect(container.querySelector("section")).toBeNull();
+  });
+
+  it("renders approachRationale, unresolvedItems, and intentionallyNotChanged when present", async () => {
+    vi.spyOn(client.glimmerApi, "getDeliveryReview").mockResolvedValue({
+      summary: "s", customerReadiness: "ready_to_ship", confidence: { level: "high", reason: "r" },
+      approachRationale: ["Reused the existing adapter instead of a new one"],
+      unresolvedItems: ["recovery feedback is subtle"],
+      intentionallyNotChanged: ["left the legacy formatter alone"],
+    } as any);
+    render(withQuery(<DeliveryReviewPanel sessionId="s1" />));
+
+    await waitFor(() => expect(screen.getByText(/Reused the existing adapter/)).toBeInTheDocument());
+    expect(screen.getByText("recovery feedback is subtle")).toBeInTheDocument();
+    expect(screen.getByText("left the legacy formatter alone")).toBeInTheDocument();
+  });
+
+  it("omits approachRationale/unresolvedItems/intentionallyNotChanged sections honestly when absent", async () => {
+    vi.spyOn(client.glimmerApi, "getDeliveryReview").mockResolvedValue({
+      summary: "s", customerReadiness: "ready_to_ship", confidence: { level: "high", reason: "r" },
+    } as any);
+    render(withQuery(<DeliveryReviewPanel sessionId="s1" />));
+
+    await waitFor(() => expect(screen.getByText("s")).toBeInTheDocument());
+    expect(screen.queryByText("Approach rationale")).not.toBeInTheDocument();
+    expect(screen.queryByText("Unresolved items")).not.toBeInTheDocument();
+    expect(screen.queryByText("Intentionally not changed")).not.toBeInTheDocument();
+  });
+
+  it("'convert to task' navigates to /tasks/new with a DRAFT objective and runs nothing", async () => {
+    vi.spyOn(client.glimmerApi, "getDeliveryReview").mockResolvedValue({
+      summary: "s", customerReadiness: "ready_to_ship", confidence: { level: "high", reason: "r" },
+      nextSteps: [{ priority: "recommended_next", action: "Add restoration progress state" }],
+    } as any);
+    render(withQuery(<DeliveryReviewPanel sessionId="s1" />));
+
+    await waitFor(() => expect(screen.getByText("Add restoration progress state")).toBeInTheDocument());
+    // The section body is collapsed by default (CollapsibleSection's native
+    // `hidden` attribute) -- getByText still finds it (unlike getByRole,
+    // which excludes hidden-from-accessibility-tree elements), and
+    // fireEvent.click on it bubbles up correctly regardless of visibility.
+    fireEvent.click(screen.getByText("Convert to task"));
+
+    const probe = screen.getByTestId("location-probe");
+    expect(probe.textContent).toBe(
+      `/tasks/new::${JSON.stringify({ objective: "Add restoration progress state" })}`
+    );
+  });
+
+  it("renders the architect escalation section when present", async () => {
+    vi.spyOn(client.glimmerApi, "getDeliveryReview").mockResolvedValue({
+      summary: "s", customerReadiness: "needs_polish", confidence: { level: "medium", reason: "r" },
+      concerns: [{ severity: "high", category: "architecture", description: "data ownership duplicated", evidenceIds: [] }],
+      architectEscalation: { question: "Is this sound?", answer: "Approved, proceed as-is." },
+    } as any);
+    render(withQuery(<DeliveryReviewPanel sessionId="s1" />));
+
+    await waitFor(() => expect(screen.getByText("Architect escalation")).toBeInTheDocument());
+    expect(screen.getByText(/Is this sound\?/)).toBeInTheDocument();
+    expect(screen.getByText("Approved, proceed as-is.")).toBeInTheDocument();
+  });
+
+  it("renders a failed-consultation line when architect escalation could not run", async () => {
+    vi.spyOn(client.glimmerApi, "getDeliveryReview").mockResolvedValue({
+      summary: "s", customerReadiness: "needs_polish", confidence: { level: "medium", reason: "r" },
+      architectEscalation: { consultationFailed: true, reason: "architect model unreachable" },
+    } as any);
+    render(withQuery(<DeliveryReviewPanel sessionId="s1" />));
+
+    await waitFor(() => expect(screen.getByText("Architect escalation")).toBeInTheDocument());
+    expect(screen.getByText(/Consultation failed: architect model unreachable/)).toBeInTheDocument();
   });
 });
