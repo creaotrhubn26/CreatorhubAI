@@ -5,13 +5,16 @@
 //! built web UI and talks to the gateway over `http://127.0.0.1:4317` exactly
 //! as it does when run outside Tauri.
 //!
-//! Gateway location: resolved from the `GLIMMER_GATEWAY_DIR` env var, falling
-//! back to `<repo>/server` (baked in at compile time via `CARGO_MANIFEST_DIR`,
-//! since `src-tauri/` lives at the repo root) — so a bundled .app still
-//! needs the repo checkout with a built server (`npm --prefix server run
-//! build`). Node itself is bundled: `node_binary()` prefers the sidecar
-//! shipped via `bundle.externalBin` (see scripts/prepare-sidecar.sh),
-//! falling back to `node` on PATH in dev.
+//! Gateway location: resolved from the `GLIMMER_GATEWAY_DIR` env var first;
+//! otherwise the bundled resource dir (`resources/gateway`, a self-contained
+//! copy of `server/dist` + `@glimmer/shared` + prod node_modules produced by
+//! `scripts/prepare-gateway.sh` and shipped via `bundle.resources`) if
+//! present there; otherwise, in debug builds only, the compile-time repo
+//! path (`CARGO_MANIFEST_DIR/../server`) so `cargo run`/`tauri dev` works
+//! straight from a checkout without running the prepare script first. Node
+//! itself is bundled: `node_binary()` prefers the sidecar shipped via
+//! `bundle.externalBin` (see scripts/prepare-sidecar.sh), falling back to
+//! `node` on PATH in dev.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -29,12 +32,34 @@ const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// has already been reaped.
 struct GatewayChild(Mutex<Option<Child>>);
 
-fn gateway_dir() -> PathBuf {
+fn gateway_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(dir) = std::env::var("GLIMMER_GATEWAY_DIR") {
         return PathBuf::from(dir);
     }
-    // src-tauri/ sits at the repo root, so the server dir is a sibling.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server")
+
+    // Bundled resource, produced by scripts/prepare-gateway.sh (see
+    // tauri.conf.json's bundle.resources). Present in release bundles, and
+    // in debug builds too once the script has been run — tauri-build copies
+    // `bundle.resources` at compile time (build.rs), not just at `tauri
+    // build` time, so this also works under plain `cargo run`/`tauri dev`.
+    if let Ok(resource_dir) = app.path().resolve("resources/gateway", tauri::path::BaseDirectory::Resource) {
+        if resource_dir.join("dist/index.js").exists() {
+            return resource_dir;
+        }
+    }
+
+    // Dev fallback: compile-time repo path, only meaningful for a debug
+    // build run from a checkout that hasn't produced the bundled resource
+    // yet. A release build shipped to another machine has no such repo, so
+    // this branch is compiled out there.
+    #[cfg(debug_assertions)]
+    {
+        return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server");
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        PathBuf::from("")
+    }
 }
 
 fn port_in_use(port: u16) -> bool {
@@ -47,7 +72,7 @@ fn port_in_use(port: u16) -> bool {
 /// `npm --prefix server run dev` is usually already running). Never panics —
 /// a missing checkout or missing `node` is logged, not fatal, since the web
 /// UI already degrades honestly ("Unavailable") when the API is unreachable.
-fn spawn_gateway() -> Option<Child> {
+fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
     if port_in_use(GATEWAY_PORT) {
         println!(
             "[glimmer] port {GATEWAY_PORT} already in use — assuming the gateway is already running, not spawning another."
@@ -55,7 +80,7 @@ fn spawn_gateway() -> Option<Child> {
         return None;
     }
 
-    let dir = gateway_dir();
+    let dir = gateway_dir(app);
     let entry = dir.join("dist/index.js");
     if !entry.exists() {
         eprintln!(
@@ -132,7 +157,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![notify])
         .setup(|app| {
-            app.manage(GatewayChild(Mutex::new(spawn_gateway())));
+            let handle = app.handle().clone();
+            app.manage(GatewayChild(Mutex::new(spawn_gateway(&handle))));
             Ok(())
         })
         .on_window_event(|window, event| {

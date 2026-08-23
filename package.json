@@ -12,7 +12,7 @@
     "dev:server": "npm run dev -w server",
     "dev:web": "npm run dev -w web",
     "tauri:dev": "npx @tauri-apps/cli dev",
-    "tauri:build": "src-tauri/scripts/prepare-sidecar.sh && npx @tauri-apps/cli build"
+    "tauri:build": "src-tauri/scripts/prepare-sidecar.sh && src-tauri/scripts/prepare-gateway.sh && npx @tauri-apps/cli build"
   },
   "devDependencies": {
     "typescript": "^5.5.4"

@@ -14,8 +14,8 @@ export const CONFIG = {
   // §27/§4.1 workspace creation: the real source repo new worktrees are cut
   // from, where new worktrees/branches live, and the ref they're based on.
   // Mirrors new-glimmer-task.sh's REPO/WORKTREE_ROOT/BASE exactly.
-  sourceRepo: process.env.GLIMMER_SOURCE_REPO ?? "/Users/danielqazi/Creatorhubn-monorepo",
-  worktreeRoot: process.env.GLIMMER_WORKTREE_ROOT ?? "/Users/danielqazi",
+  sourceRepo: process.env.GLIMMER_SOURCE_REPO ?? path.join(os.homedir(), "Creatorhubn-monorepo"),
+  worktreeRoot: process.env.GLIMMER_WORKTREE_ROOT ?? os.homedir(),
   worktreeBase: process.env.GLIMMER_WORKTREE_BASE ?? "origin/main",
 } as const;
 
