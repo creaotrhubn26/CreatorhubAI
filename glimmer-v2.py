@@ -411,7 +411,18 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "POLICY_BLOCK", "detail": blocked[-1].get("reason") or "shell command blocked by policy",
                 "evidenceIds": [e["id"] for e in blocked if "id" in e]}
 
-    scope_events = [e for e in events if e.get("type") == "scope_expanded"]
+    # m5 (followup-1-2 review): a scope_expanded event a human explicitly
+    # APPROVED (glimmer-engineer.py's V7 §15 write-time pause, see its own
+    # module comment -- carries approved: True) is a resolved deviation,
+    # not a failure; only an un-approved expansion (every event from
+    # before this follow-up, and any denied/timed-out one, neither of
+    # which carries "approved") should still fall through to
+    # SCOPE_FAILURE here. This is unrelated to gates.scopeApproved (still
+    # computed independently by compute_scope_guard against the final
+    # diff, and still False for an approved-but-still-out-of-scope file --
+    # see that function's own docstring) -- this only narrows what counts
+    # as a FAILURE in this fallback taxonomy.
+    scope_events = [e for e in events if e.get("type") == "scope_expanded" and not e.get("approved")]
     if scope_events:
         return {"class": "SCOPE_FAILURE", "detail": "changed files exceeded the task contract's declared scope",
                 "evidenceIds": [e["id"] for e in scope_events if "id" in e]}
@@ -2432,10 +2443,27 @@ def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None,
         banned.append("push")
     if constraints.get("noDeploy"):
         banned.append("deploy")
-    if constraints.get("noDependencyInstall"):
-        banned.append("install packages")
     if banned:
         constraint_lines.append(f"Do not {', '.join(banned)}, change Git configuration.")
+    # M1 (followup-1-2 review): noDependencyInstall does NOT mean "never
+    # attempt" any more -- glimmer-engineer.py's own system prompt (V7
+    # §14/§35) tells the model dependency installs/migrations pause for a
+    # real human-approval decision instead of running immediately. The old
+    # prose folded "install packages" into the same "Do not ..." sentence
+    # as commit/push/deploy, which stay genuinely flat-forbidden with no
+    # approval path at all -- a direct contradiction, in the same context
+    # window, with the engineer's own operating instructions. Describe
+    # what actually happens instead; the raw noDependencyInstall flag
+    # itself is left unchanged (still read by CC/gates permissions
+    # mirrors elsewhere) -- only this human-readable prose changes.
+    if constraints.get("noDependencyInstall"):
+        constraint_lines.append(
+            "Dependency installation and migration scripts pause for "
+            "human approval instead of running immediately (V7 §35) -- "
+            "attempt them if the task requires it and wait for the "
+            "decision; commit, push, deploy and Git configuration "
+            "changes stay forbidden with no approval path."
+        )
     constraint_text = "\n".join(f"    - {line}" for line in constraint_lines)
 
     # Fix round 1 (Minor 5): gate on `failure is not None`, not `iteration`
@@ -7273,6 +7301,17 @@ def _r6_selfcheck() -> None:
     scope_evt = {"id": "e2", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/x.ts"]}
     r = classify_failure({"status": "no-change-unverified"}, [scope_evt])
     assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2"]
+
+    # m5 (followup-1-2 review): the SAME shape, but a human explicitly
+    # approved this expansion (glimmer-engineer.py's V7 §15 write-time
+    # pause) -- must NOT be classified as a failure, even alongside an
+    # unrelated, genuinely unapproved one, which must still be caught.
+    approved_scope_evt = {**scope_evt, "id": "e2b", "approved": True, "approvedBy": "daniel"}
+    r = classify_failure({"status": "no-change-unverified"}, [approved_scope_evt])
+    assert r is None or r["class"] != "SCOPE_FAILURE", r
+    unapproved_scope_evt = {"id": "e2c", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/y.ts"]}
+    r = classify_failure({"status": "no-change-unverified"}, [approved_scope_evt, unapproved_scope_evt])
+    assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2c"], r
 
     parser_evts = [{"id": f"p{i}", "type": "parser_recovery", "attempt": i} for i in range(1, 3)]
     r = classify_failure({"status": "no-change-unverified"}, parser_evts)
