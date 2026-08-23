@@ -1539,6 +1539,13 @@ def classify_yellow(command, workspace, validation_allowlist=None) -> dict | Non
         excluded_haystack = f"{command.lower()} {resolved.lower()}"
         if any(f in excluded_haystack for f in YELLOW_MIGRATION_EXCLUDED_FRAGMENTS):
             return None
+        # Re-review-2 minor: `:prod`/`:live` are script-name-shaped, so
+        # argument forms (`--prod`, `--live`, `--env=prod`) slipped past.
+        # Bare `prod`/`live` scan the COMMAND tokens only -- on the body
+        # they'd overmatch ("product", "reproduce"), and overmatching
+        # here is fail-closed anyway (excluded -> not YELLOW-eligible).
+        if any(f in command.lower() for f in ("prod", "live")):
+            return None
         return {
             "action": "run_migration",
             # Disclosure fix: the reason/proposedChanges carry the FULL
