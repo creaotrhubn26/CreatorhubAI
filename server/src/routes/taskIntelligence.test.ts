@@ -78,4 +78,49 @@ describe("GET /api/task-intelligence", () => {
     expect(res.body.likelyArea).toBeNull();
     expect(res.body.likelyPackage).toBeNull();
   });
+
+  // Task 9.3b (V7 §5.5/§46): estimatedRisk ported from glimmer-v2.py's
+  // compute_architect_risk -- opt-in only, so a caller that sends none of
+  // the risk hints (the three tests above) keeps the exact honest null it
+  // always got.
+  it("stays null when no risk hint query params are given, even with scopePackage=repository", async () => {
+    const res = await request(app).get("/api/task-intelligence?scopePackage=repository");
+    expect(res.status).toBe(200);
+    expect(res.body.estimatedRisk).toBeNull();
+  });
+
+  it("scores mode=refactor + scopePackage=repository as HIGH (score 5, at the auto-trigger threshold)", async () => {
+    const res = await request(app).get("/api/task-intelligence?scopePackage=repository&mode=refactor");
+    expect(res.status).toBe(200);
+    expect(res.body.estimatedRisk).toBe("HIGH");
+  });
+
+  it("scores a plain frontend/implement/minimal request as LOW (zero signals)", async () => {
+    const res = await request(app).get(
+      "/api/task-intelligence?scopePackage=frontend&mode=implement&verificationLevel=minimal"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.estimatedRisk).toBe("LOW");
+  });
+
+  it("stacks every signal to CRITICAL (mode=refactor + repository + protected keyword + full verification + high candidate count)", async () => {
+    const res = await request(app).get(
+      "/api/task-intelligence?scopePackage=repository&mode=refactor&objective=" +
+        encodeURIComponent("rotate the auth secrets") +
+        "&verificationLevel=full&candidateCount=9"
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.estimatedRisk).toBe("CRITICAL");
+  });
+
+  it("only counts a candidateCount strictly above the threshold (5)", async () => {
+    const atThreshold = await request(app).get(
+      "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=5"
+    );
+    expect(atThreshold.body.estimatedRisk).toBe("LOW");
+    const aboveThreshold = await request(app).get(
+      "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=6"
+    );
+    expect(aboveThreshold.body.estimatedRisk).toBe("MEDIUM");
+  });
 });

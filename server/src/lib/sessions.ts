@@ -25,6 +25,11 @@ const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
 // cancelled-sigterm, failed-aborted, needs-architect-review(-rejected|-budget-exhausted).
 export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   if (raw === "initialized") return "preflight";
+  // Task 9.3a (V7 §46): glimmer-v2.py writes this raw string verbatim right
+  // after readiness/before architect-first or the first engineer invocation
+  // -- identity mapping, kept in sync with glimmer-v2.py's own
+  // canonical_session_state.
+  if (raw === "understanding") return "understanding";
   if (raw === "verified" || raw === "no-change-verified") return "verified";
   if (raw === "no-change-unverified") return "needs_review";
   // Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string

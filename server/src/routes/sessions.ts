@@ -331,6 +331,31 @@ sessionsRouter.get("/sessions/:id/evidence", async (req, res) => {
   }
 });
 
+// Task 9.3c (V7 §7 Context Engine): context-selection facts for the panel --
+// every context_selected event this session emitted (glimmer-engineer.py's
+// Tier0/1/2/3 sizing, re-emitted each time compaction moves something to
+// Tier2) plus how many entries evidence-index.json holds (Tier2's own
+// retrievable store, same file /evidence above already serves). Same
+// existence check as /sessions/:id/events (isValidSessionId only, not
+// "does a directory exist on disk") -- a well-formed but never-created
+// session id honestly gets back empty facts (selections: [], evidenceCount:
+// null), not a 404, exactly like /events already returns [] rather than
+// 404ing in that case. An invalid/unsafe id is the only real 404 here.
+sessionsRouter.get("/sessions/:id/context", async (req, res) => {
+  if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
+  try {
+    const events = await readSessionEventsBatch(req.params.id);
+    const selections = events.filter((e) => e.type === "context_selected");
+    const evidenceIndex = await readEvidenceIndex(req.params.id);
+    res.json({
+      selections,
+      evidenceCount: evidenceIndex ? evidenceIndex.length : null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 sessionsRouter.get("/sessions/:id/tasks", async (req, res) => {
   try {
     const tasks = await readSessionTasks(req.params.id);
