@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -2569,7 +2570,7 @@ a genuine fix may still require another file if the evidence supports it.
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
                      plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
-                     consult_request=None):
+                     consult_request=None, timeout=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -2620,13 +2621,37 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     if plan_candidate_count > 0:
         env["GLIMMER_PLAN_CANDIDATES"] = str(plan_candidate_count)
     with log_path.open("w", encoding="utf-8") as log:
+        # Round 8 whole-round review (MJ4): `start_new_session` only when a
+        # `timeout` is actually set (only run_architect_escalation ever
+        # passes one -- every other caller is unaffected) -- puts this
+        # subprocess in its own process group so a timeout kill can reach
+        # any grandchildren it spawns too. Confirmed necessary, not just
+        # defensive: killing only the direct child left a still-running
+        # grandchild holding the stdout pipe open, so `for line in
+        # p.stdout` below never saw EOF and the "timeout" silently waited
+        # out the full hang anyway.
         p = subprocess.Popen(cmd, cwd=str(ws), text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, env=env, bufsize=1)
+                             stderr=subprocess.STDOUT, env=env, bufsize=1,
+                             start_new_session=bool(timeout))
         assert p.stdout is not None
-        for line in p.stdout:
-            sys.stdout.write(line)
-            log.write(line)
-        return p.wait()
+
+        def _kill_on_timeout():
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                p.kill()
+
+        timer = threading.Timer(timeout, _kill_on_timeout) if timeout else None
+        if timer is not None:
+            timer.start()
+        try:
+            for line in p.stdout:
+                sys.stdout.write(line)
+                log.write(line)
+            return p.wait()
+        finally:
+            if timer is not None:
+                timer.cancel()
 
 
 # ============================================================
@@ -4760,9 +4785,20 @@ def compute_technical_status(manifest: dict) -> str:
     reached a real verificationResults list (no attempts at all -- e.g.
     --repo-map-only -- or the one attempt recorded exited before verify()
     ever ran, e.g. a changed-files-budget-exceeded break); otherwise
-    "VERIFIED" when manifest["status"] reached one of the two VERIFIED
-    terminals, "FAILED" for every other outcome that DID reach a real
-    verification attempt.
+    "VERIFIED" when every recorded check's own ok is True, "FAILED" when
+    any required check's own ok is False.
+
+    Round 8 whole-round review (MJ2): derived ONLY from this attempt's own
+    verificationResults, never from manifest["status"] -- a session can
+    reach a terminal "needs-architect-review-consistency-rejected" (or any
+    other non-VERIFIED-non-FAILED-terminal) status purely because a
+    non-technical gate (delivery-readiness, architecture, consistency)
+    blocked promotion, with every verification check having actually
+    passed; reading manifest["status"] there reported a fabricated FAILED
+    for a session with zero technical failures, poisoning statuses.overall
+    with it. This mirrors control-center's own overallFromManifest
+    (server/src/lib/sessions.ts) at the same 3-state ceiling this leg has
+    always deliberately kept -- see the ceiling note below.
 
     Deliberately a coarser 3-state mirror of control-center's own
     VerificationOverall (which also distinguishes PARTIAL/BLOCKED/
@@ -4778,9 +4814,10 @@ def compute_technical_status(manifest: dict) -> str:
     if not attempts:
         return "NOT_RUN"
     last = attempts[-1] if isinstance(attempts[-1], dict) else {}
-    if not last.get("verificationResults"):
+    results = last.get("verificationResults")
+    if not results:
         return "NOT_RUN"
-    return "VERIFIED" if manifest.get("status") in ("verified", "no-change-verified") else "FAILED"
+    return "VERIFIED" if all(isinstance(r, dict) and r.get("ok") for r in results) else "FAILED"
 
 
 def _gate_to_status_leg(value) -> str:
@@ -4906,6 +4943,14 @@ ESCALATION_SEVERITIES = {"high", "critical"}
 # question -- keeps the prompt small and focused, same reasoning as
 # ARCHITECT_REVIEW_DIFF_MAX_CHARS capping the review diff above.
 ESCALATION_MAX_CONCERNS = 3
+# Round 8 whole-round review (MJ4): invoke_engineer's Popen has no timeout
+# anywhere else in this file (the main engineering run is bounded by
+# --max-turns/the approval-wait poll loop instead) -- but this escalation
+# runs inside main()'s unconditional `finally`, strictly before the final
+# save(), so an unresponsive model subprocess here must not block session
+# finalization indefinitely. Conservative fixed budget for a single-
+# question consult call (V7 §23.15: a second opinion, not a second gate).
+ARCHITECT_ESCALATION_TIMEOUT_SECONDS = 300
 
 
 def compute_architect_escalation_trigger(delivery_review, architect_enabled) -> bool:
@@ -4985,6 +5030,16 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
     own run_consult_escalation's job to record honestly; this function's
     own except/no-output guard below only covers failures that happen
     OUTSIDE that subprocess (or before it can write anything).
+
+    Round 8 whole-round review (MJ4): the invoke_engineer call is capped by
+    ARCHITECT_ESCALATION_TIMEOUT_SECONDS -- an unresponsive model subprocess
+    here must not hang main()'s `finally` before the final save(). Both
+    escalation_path.write_text calls below are ALSO individually guarded
+    against OSError (fault-injection proved they weren't before: a session
+    dir that can't be written to -- e.g. chmod 0555 -- made the FIRST one
+    raise straight out of this function's own except handler, which then
+    propagated out of the unconditional `finally` itself). This function
+    now genuinely never raises, matching the promise above.
     """
     print("\n" + "=" * 72)
     print(" [V2] Architect escalation: high/critical delivery-review concern")
@@ -4993,6 +5048,13 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
     request_path = session / "escalation-request.json"
     escalation_path = session / "architect-escalation.json"
     rc = None
+
+    def _write_escalation_record(record) -> None:
+        try:
+            escalation_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        except OSError as write_exc:
+            print(f"[V2] WARN: failed to write architect-escalation.json: {write_exc}")
+
     try:
         request_path.write_text(
             json.dumps({
@@ -5008,17 +5070,15 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
             None,  # consult mode makes exactly one model call; no turn budget to set
             session / "architect-escalation.log",
             events_path, sid, mode="consult", consult_request=request_path,
+            timeout=ARCHITECT_ESCALATION_TIMEOUT_SECONDS,
         )
         print(f"[V2] Architect escalation subprocess exited with code {rc}")
     except Exception as exc:  # noqa: BLE001 - escalation must never affect session outcome
         print(f"[V2] WARN: architect escalation subprocess failed to run: {exc}")
-        escalation_path.write_text(
-            json.dumps({
-                "consultationFailed": True,
-                "reason": f"{type(exc).__name__}: {exc}",
-            }, indent=2),
-            encoding="utf-8",
-        )
+        _write_escalation_record({
+            "consultationFailed": True,
+            "reason": f"{type(exc).__name__}: {exc}",
+        })
         return
 
     if not escalation_path.exists():
@@ -5027,13 +5087,10 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
         # exists yet. Recorded honestly (never silent) so a session that
         # triggered escalation always ends up with SOME architect-
         # escalation.json, even a failed one.
-        escalation_path.write_text(
-            json.dumps({
-                "consultationFailed": True,
-                "reason": f"architect escalation subprocess (exit {rc}) produced no output",
-            }, indent=2),
-            encoding="utf-8",
-        )
+        _write_escalation_record({
+            "consultationFailed": True,
+            "reason": f"architect escalation subprocess (exit {rc}) produced no output",
+        })
 
 
 # ============================================================
@@ -5051,13 +5108,16 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
 # a real null, not an invented default.
 # ============================================================
 
-def compute_delivery_packet(manifest: dict, delivery_review) -> dict:
+def compute_delivery_packet(manifest: dict, delivery_review, escalation=None) -> dict:
     """Pure function of already-computed facts -- manifest (which by the
     finally-block call site already carries statuses/gates/attempts/
     finalChangedFiles/orchestratorUpdatedFiles/architectPlan) plus the
-    DeliveryReview dict already loaded by the caller (or None). Same
-    "called by both main() and its own selfcheck" discipline as
-    compute_statuses."""
+    DeliveryReview dict already loaded by the caller (or None), plus
+    (MN1, round 8 whole-round review) the architect-escalation.json record
+    the SAME finally block writes strictly before this packet is assembled
+    (see the quality-gates selfcheck's MJ1 ordering assertion) -- None when
+    escalation never triggered for this session. Same "called by both
+    main() and its own selfcheck" discipline as compute_statuses."""
     statuses = manifest.get("statuses") or {}
     gates = manifest.get("gates") or {}
     architect_plan_record = manifest.get("architectPlan")
@@ -5123,6 +5183,12 @@ def compute_delivery_packet(manifest: dict, delivery_review) -> dict:
         # reviewed it. "pending" is therefore the one honest constant
         # here, never a fabricated guess at a future human decision.
         "humanReviewStatus": "pending",
+        # MN1 (round 8 whole-round review): passed through verbatim -- a
+        # real {"question", "answer"} record, a {"consultationFailed": True,
+        # "reason"} degrade record, or None (escalation never triggered).
+        # Never fabricated: this packet does not re-derive whether an
+        # escalation happened, it only reports what's already on disk.
+        "architectEscalation": escalation,
     }
 
 
@@ -5184,6 +5250,18 @@ def render_packet_summary(packet: dict) -> str:
 
     lines.append(f"Human review status: {packet.get('humanReviewStatus') or 'Unavailable'}")
 
+    # MN1 (round 8 whole-round review): packet-summary.txt is §23.16's
+    # human-handoff artifact -- a second architect opinion on a concern this
+    # SAME summary's "Known limitations" line just named must be visible
+    # here too, not only via the API/UI's separate DeliveryReview surface.
+    escalation = packet.get("architectEscalation")
+    if not isinstance(escalation, dict):
+        lines.append("Architect escalation: not triggered")
+    elif escalation.get("consultationFailed"):
+        lines.append(f"Architect escalation: consultation failed ({escalation.get('reason', 'unknown reason')})")
+    else:
+        lines.append(f"Architect escalation: {escalation.get('answer', '(see architect-escalation.json)')}")
+
     return "\n".join(lines) + "\n"
 
 
@@ -5195,8 +5273,12 @@ def write_delivery_packet(manifest, session_dir, delivery_review):
     assembled packet dict on success, None when the write failed -- so
     the caller can gate delivery_packet_created on the artifact actually
     existing (an event claiming a packet that isn't there would be a
-    fabrication)."""
-    packet = compute_delivery_packet(manifest, delivery_review)
+    fabrication). MN1 (round 8 whole-round review): also reads
+    architect-escalation.json for this session -- main()'s finally block
+    already runs the escalation strictly before this call (see the
+    quality-gates selfcheck's MJ1 ordering assertion), so the record, if
+    any, is already on disk by the time this reads it."""
+    packet = compute_delivery_packet(manifest, delivery_review, load_architect_escalation(session_dir))
     try:
         (Path(session_dir) / "delivery-packet.json").write_text(
             json.dumps(packet, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -7017,11 +7099,23 @@ def main():
         # this second cheap read just avoids threading an extra parameter
         # through compute_statuses's own signature for one more consumer).
         _delivery_review_final = load_delivery_review(session)
-        if compute_architect_escalation_trigger(_delivery_review_final, run_architect):
-            run_architect_escalation(
-                engineer, ws, architecture_plan, _delivery_review_final,
-                session, events_path, sid,
-            )
+        # Round 8 whole-round review (MJ4): run_architect_escalation's own
+        # docstring already promises "never raises" -- fault-injection proved
+        # that promise false (an unguarded write_text inside its own except
+        # handler). Fixed at the root there too, but this call sits in the
+        # unconditional `finally`, strictly BEFORE write_delivery_packet/
+        # save()/session_completed below, so belt-and-braces here as well:
+        # nothing this second-opinion consult (V7 §23.15 -- a second opinion,
+        # never a second gate) can do should be able to take those down with
+        # it.
+        try:
+            if compute_architect_escalation_trigger(_delivery_review_final, run_architect):
+                run_architect_escalation(
+                    engineer, ws, architecture_plan, _delivery_review_final,
+                    session, events_path, sid,
+                )
+        except Exception as exc:  # noqa: BLE001 - escalation must never break session finalization
+            print(f"[V2] WARN: architect escalation failed: {exc}")
         if write_delivery_packet(manifest, session, _delivery_review_final) is not None:
             emit_event(events_path, "delivery_packet_created", sid)
 
@@ -9576,6 +9670,26 @@ def _quality_gates_selfcheck() -> None:
     assert compute_technical_status(
         {"attempts": [{"verificationResults": [{"ok": False}]}], "status": "failed-repair-budget-exhausted"}
     ) == "FAILED"
+    # Round 8 whole-round review (MJ2), reproduced case: a session blocked
+    # purely by a non-technical gate (customerReadinessApproved=False, here
+    # standing in for delivery-readiness) with every verification check
+    # actually passing must read back VERIFIED -- manifest["status"] having
+    # rolled to a gate-rejected terminal must never fabricate a technical
+    # FAILED for checks that all genuinely passed.
+    assert compute_technical_status({
+        "attempts": [{"verificationResults": [{"ok": True}, {"ok": True}]}],
+        "status": "needs-architect-review-consistency-rejected",
+    }) == "VERIFIED", (
+        "a gate-blocked terminal status must never override honestly-passing "
+        "verificationResults -- MJ2"
+    )
+    # The mirror image: a real check failure must still report FAILED even if
+    # manifest["status"] somehow still reads "verified" -- the leg is derived
+    # from the checks alone, in both directions.
+    assert compute_technical_status({
+        "attempts": [{"verificationResults": [{"ok": True}, {"ok": False}]}],
+        "status": "verified",
+    }) == "FAILED", "any required check failing must report FAILED regardless of manifest[\"status\"]"
 
     assert _gate_to_status_leg(True) == "approved"
     assert _gate_to_status_leg(False) == "rejected"
@@ -9676,18 +9790,57 @@ def _quality_gates_selfcheck() -> None:
     assert result.returncode == 2, "argparse must reject an unrecognized minimumCustomerReadiness value"
     assert "minimum-customer-readiness" in result.stderr
 
+    # ------------------------------------------------------------
+    # 8. Round 8 whole-round review (MJ1): every one of Round 8's four new
+    #    finally-block wirings -- orphan cleanup (8.3), statuses assembly
+    #    (8.1), the architect-escalation trigger/call (8.2), the delivery
+    #    packet (8.2) -- was reachable only via a comment, not a real
+    #    assertion: a mutant that deletes any ONE of the four call sites
+    #    below from main()'s `finally` left ALL 20 selfchecks green
+    #    (reviewer's own 4-mutant proof). Pin both PRESENCE and RELATIVE
+    #    ORDER, chained end-to-end through save()/session_completed, the
+    #    same main_source technique section 6 above already uses for the
+    #    quality gate itself -- so deleting any one of these lines breaks
+    #    THIS single assertion, not just a comment.
+    # ------------------------------------------------------------
+    finally_idx = main_source.index("_resolve_orphaned_pending_approval(session)")
+    statuses_idx = main_source.index('manifest["statuses"] = compute_statuses(manifest, session)')
+    escalation_trigger_idx = main_source.index(
+        "if compute_architect_escalation_trigger(_delivery_review_final, run_architect):"
+    )
+    escalation_call_idx = main_source.index("run_architect_escalation(")
+    packet_idx = main_source.index(
+        "if write_delivery_packet(manifest, session, _delivery_review_final) is not None:"
+    )
+    packet_event_idx = main_source.index('emit_event(events_path, "delivery_packet_created", sid)')
+    save_idx = main_source.rindex("save()")
+    completed_event_idx = main_source.index(
+        'emit_event(events_path, "session_completed", sid, status=manifest["state"])'
+    )
+    assert (finally_idx < statuses_idx < escalation_trigger_idx < escalation_call_idx
+            < packet_idx < packet_event_idx < save_idx < completed_event_idx), (
+        "every Round 8 finally-block wiring (orphan cleanup, statuses, escalation "
+        "trigger+call, delivery packet) must actually run, in this order, before "
+        "save()/session_completed -- deleting any one of these call sites must "
+        "break this assertion, not survive as a comment-only invariant (MJ1)"
+    )
+
     print("quality gates (Task 8.1, V7 §23.10/§23.11) self-check: PASS")
 
 
 def _delivery_packet_selfcheck() -> None:
     """Task 8.2 (V7 §23.14-23.16): proves delivery-packet assembly
-    (including absent-artifact honesty), the architect-escalation trigger
-    matrix (disabled architect / no concerns / low-severity-only / a
-    single high or critical concern), and run_architect_escalation's
-    fail-tolerance (spawn failure and "subprocess ran but wrote nothing"
-    both degrade to a consultationFailed record, never raise, session
-    outcome untouched), plus delivery_packet_created's event-vocabulary
-    membership. Run with: python3 glimmer-v2.py --delivery-packet-selfcheck
+    (including absent-artifact honesty and, per the round 8 whole-round
+    review's MN1, the architectEscalation field/summary line), the
+    architect-escalation trigger matrix (disabled architect / no concerns /
+    low-severity-only / a single high or critical concern), and
+    run_architect_escalation's fail-tolerance (spawn failure, "subprocess
+    ran but wrote nothing", an unwritable session dir (MJ4), and a hanging
+    subprocess actually being bounded by invoke_engineer's timeout (MJ4)
+    all degrade to a consultationFailed record or a bounded wait, never
+    raise, session outcome untouched), plus delivery_packet_created's
+    event-vocabulary membership. Run with:
+    python3 glimmer-v2.py --delivery-packet-selfcheck
     """
     # ------------------------------------------------------------
     # 1. compute_delivery_packet: full fixture -- every field traces back
@@ -9733,6 +9886,18 @@ def _delivery_packet_selfcheck() -> None:
     }
     assert packet["confidence"] == {"level": "high", "reason": "well tested", "provenance": "model-output"}
     assert packet["humanReviewStatus"] == "pending"
+    assert packet["architectEscalation"] is None, "no escalation arg passed -> honest None, never fabricated"
+
+    # MN1 (round 8 whole-round review): a real escalation record passed
+    # through verbatim, plus the same for a degraded/failed one.
+    escalated_packet = compute_delivery_packet(manifest, review, {"question": "q?", "answer": "a."})
+    assert escalated_packet["architectEscalation"] == {"question": "q?", "answer": "a."}
+    failed_escalation_packet = compute_delivery_packet(
+        manifest, review, {"consultationFailed": True, "reason": "model server unreachable"}
+    )
+    assert failed_escalation_packet["architectEscalation"] == {
+        "consultationFailed": True, "reason": "model server unreachable",
+    }
 
     # ------------------------------------------------------------
     # 2. Absent-artifact honesty: no architecture plan, no delivery
@@ -9775,12 +9940,20 @@ def _delivery_packet_selfcheck() -> None:
     assert "Task: add widget" in text
     assert "Customer readiness: ready_with_known_limitations" in text
     assert "Confidence: high" in text
+    assert "Architect escalation: not triggered" in text
     bare_text = render_packet_summary(bare_packet)
     assert "Customer readiness: Unavailable" in bare_text
     assert "Known limitations: Unavailable" in bare_text
     assert "Plan forward: Unavailable" in bare_text
     assert "Confidence: Unavailable" in bare_text
     assert "Architecture: not engaged for this session" in bare_text
+
+    # MN1: a real escalation answer, and a failed one, both surface in the
+    # human-handoff summary -- not just the API/UI's separate surface.
+    assert "Architect escalation: a." in render_packet_summary(escalated_packet)
+    assert "Architect escalation: consultation failed (model server unreachable)" in (
+        render_packet_summary(failed_escalation_packet)
+    )
 
     # ------------------------------------------------------------
     # 4. compute_architect_escalation_trigger: the full matrix.
@@ -9859,6 +10032,50 @@ def _delivery_packet_selfcheck() -> None:
             "a subprocess that exits 0 but writes no architect-escalation.json "
             "must still be recorded as a failed consultation, never silence"
         )
+
+    # ------------------------------------------------------------
+    # 6b. Round 8 whole-round review (MJ4), fault-injection-proven: a
+    #     session dir that cannot be written to AT ALL (the reviewer used
+    #     chmod 0555; a nonexistent directory raises the identical OSError
+    #     subclass from write_text, deterministically, with no chmod/root
+    #     dependence) used to raise straight out of this function -- the
+    #     request write fails, falls into the except handler, and THAT
+    #     handler's own escalation-record write ALSO failed, unguarded,
+    #     propagating out of main()'s unconditional `finally` itself. The
+    #     whole point of this case is that it does NOT raise.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        unwritable_session = Path(td) / "does-not-exist"
+        run_architect_escalation(
+            Path("/nonexistent/glimmer-engineer.py"), Path(td), None, high_review,
+            unwritable_session, unwritable_session / "events.jsonl", "s1",
+        )
+        assert not (unwritable_session / "architect-escalation.json").exists(), (
+            "nothing could be written here -- the assertion is that the call above "
+            "returned at all, never raised"
+        )
+
+    # ------------------------------------------------------------
+    # 6c. Round 8 whole-round review (MJ4): invoke_engineer's `timeout`
+    #     actually bounds a real, hanging subprocess -- not just that the
+    #     kwarg is accepted. A tiny shell script that ignores every
+    #     argument and sleeps far longer than the timeout stands in for
+    #     the unresponsive model subprocess the reviewer's "blocks final
+    #     save on an untimed model subprocess" finding described.
+    # ------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        hang_script = Path(td) / "hangs.sh"
+        hang_script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        hang_script.chmod(0o755)
+        started = time.monotonic()
+        rc = invoke_engineer(
+            hang_script, Path(td), "prompt", True, None,
+            Path(td) / "hang.log", Path(td) / "events.jsonl", "s1",
+            timeout=1,
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 15, f"invoke_engineer's timeout must actually bound a hanging subprocess (took {elapsed}s)"
+        assert rc != 0, "a killed subprocess must not report a successful exit code"
 
     # ------------------------------------------------------------
     # 7. Event vocabulary: delivery_packet_created is a real, emittable
