@@ -130,6 +130,12 @@ PASS_STATUSES = {"PASS", "PASS_BASELINE"}
 def canonical_session_state(raw_status: str) -> str:
     if raw_status == "initialized":
         return "preflight"
+    # Task 9.3a (V7 §46): identity mapping -- main() writes this raw string
+    # verbatim as manifest["status"] right after readiness/before the
+    # architect-first step or the first engineer invocation (see that call
+    # site's comment). Kept in sync with control-center's mapManifestStatus.
+    if raw_status == "understanding":
+        return "understanding"
     if raw_status in ("verified", "no-change-verified"):
         return "verified"
     if raw_status == "no-change-unverified":
@@ -6214,6 +6220,22 @@ def main():
             manifest["modelReadiness"] = {"status": "SKIPPED"}
             save()
 
+        # Task 9.3a (V7 §46 SessionState / §4 Task Intelligence): "understanding"
+        # is the real canonical state between preflight (readiness confirmed
+        # above) and discovery (the first engineer subprocess's own
+        # "discovering" phase marker, emitted from inside invoke_engineer
+        # once the iteration loop below actually spawns it) -- this process
+        # building/consulting the task's own understanding of the work
+        # (architect-first, if triggered, then the first prompt) before any
+        # repository exploration tool call happens. Additive: a session that
+        # crashes before reaching here (e.g. readiness_probe's raise just
+        # above) never emits or persists this state, exactly like every
+        # other manifest["status"] transition in this function.
+        manifest["status"] = "understanding"
+        manifest["state"] = canonical_session_state(manifest["status"])
+        emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+        save()
+
         # C1 (glimmer-v7) + Task 2.1 (V7 §5.5): runs once before iteration 0
         # whenever run_architect is True -- manual force-on (--architect-
         # first) or risk-based auto-trigger (architect_trigger_mode ==
@@ -7217,6 +7239,10 @@ def _r6_selfcheck() -> None:
 
     # R6's new raw status maps to the same "cancelled" canonical bucket
     # repo-map-only already uses.
+    # Task 9.3a (V7 §46): the "understanding" pre-discovery status main()
+    # now writes right after readiness -- identity-mapped, same as
+    # "waiting-for-approval" below.
+    assert canonical_session_state("understanding") == "understanding"
     assert canonical_session_state("cancelled-sigterm") == "cancelled"
     # I2: "failed-aborted" rides the existing generic "failed-" prefix match
     # in canonical_session_state (no new branch needed there).
