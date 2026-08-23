@@ -18,7 +18,14 @@ function summarizeEvidence(session: GlimmerSession, events: GlimmerEvent[]): str
   for (const e of events) {
     if (e.type === "tool_blocked") lines.push(`Blocked: ${e.command} — ${e.reason}`);
     if (e.type === "candidate_selected") lines.push(`Selected ${e.file}: ${e.reasons.join(", ")}`);
-    if (e.type === "scope_expanded") lines.push(`Scope expanded — expected ${e.expected.join(", ")}, actual ${e.actual.join(", ")}`);
+    // M3 (followup-1-2 review): don't summarize a human-approved
+    // expansion identically to an unreviewed one -- the assistant's
+    // evidence text feeds a model, so an honest distinction here matters
+    // exactly the same way it does in AgentTimeline's own rendering.
+    if (e.type === "scope_expanded") {
+      const approval = e.approved ? ` (human-approved${e.approvedBy ? ` by ${e.approvedBy}` : ""})` : "";
+      lines.push(`Scope expanded${approval} — expected ${e.expected.join(", ")}, actual ${e.actual.join(", ")}`);
+    }
   }
   return lines.join("\n");
 }
