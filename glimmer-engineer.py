@@ -55,6 +55,50 @@ _architect_consult_enabled = False
 # instead of a new threaded-through parameter.
 _loaded_doc_graph = None
 
+# V7 §15 follow-up ("large expansion -> pause for approval"): the
+# contract's declared scope, as a flat list of boundary-safe path
+# prefixes -- set once at run_engineer startup from GLIMMER_CONTRACT_SCOPE
+# (see _load_contract_scope_prefixes below), None whenever glimmer-v2.py
+# didn't set that env var at all (no bounded scope, or this process was
+# invoked standalone / in a mode other than plain engineer). None is the
+# ONLY value that disables the check in check_write_path -- absent env is
+# byte-identical to pre-follow-up behavior (no per-write scope check at
+# all; glimmer-v2.py's own post-hoc compute_scope_guard/scopeApproved gate
+# computation is completely unaffected either way, see its own module
+# comment in glimmer-v2.py).
+_contract_scope_prefixes = None
+
+# M2 (followup-1-2 review): request_approval_and_wait is the single shared
+# entry point for every YELLOW approval (install/migration/scope-expansion)
+# -- both a session-scoped memo and a request cap live here so no caller
+# needs its own bookkeeping. Both are plain module globals: this process is
+# exactly one engineering session, so "per session" == "per process", reset
+# automatically on every fresh invocation with no explicit reset needed.
+#
+# ponytail: exact-match memo keyed on (tool_name, command) -- an approval
+# for `write_file backend/x.ts` covers only THAT literal path/command
+# again, forever, for the rest of this session; it does not notice the
+# file being deleted and recreated, or re-verify anything about it. Known
+# ceiling, not a bug: upgrade to path-existence/mtime invalidation if a
+# session ever needs to re-pause on a path it already got a human decision
+# about.
+_approved_action_memo: dict = {}
+
+# NEW-2 (1+2 re-review): approvalId of the most recent approved request
+# (fresh or memo hit) -- the one link between a scope_expanded timeline
+# row and its approvals.json/waiver record. Single-threaded engineer
+# loop, so a module-level latch is race-free.
+_last_approval_id = None
+
+# "beyond cap -> immediate POLICY_BLOCK": once a session has already made
+# this many NEW approval requests (memo hits don't count -- they're not a
+# new request), every further one is denied immediately, no wait, no new
+# approvals.json entry -- caps the worst case (a narrow declared scope
+# fighting a legitimately broad task) at N * DEFAULT_APPROVAL_TIMEOUT_SECONDS
+# instead of an unbounded serial string of 300s stalls.
+MAX_APPROVAL_REQUESTS_PER_SESSION = 5
+_approval_request_count = 0
+
 
 def _emit(event_type: str, **fields) -> None:
     # No-op when the events file isn't configured (e.g. direct standalone
@@ -932,9 +976,65 @@ class ToolPolicyBlock(PermissionError):
     contract for the OTHER guards, which is out of this finding's scope."""
 
 
+def _load_contract_scope_prefixes():
+    """V7 §15 follow-up: parses GLIMMER_CONTRACT_SCOPE (a JSON list of
+    boundary-safe path-prefix strings -- see glimmer-v2.py's
+    _expected_prefixes/invoke_engineer, the ONLY writer of this env var)
+    into the list check_write_path guards writes against.
+
+    Returns None on ANY malformed/absent input -- a missing env var, a
+    parse failure, or a value that isn't a non-empty list of non-empty
+    strings all collapse to the SAME "no scope guard active" state as a
+    contract with no bounded scope at all (compute_scope_guard's own
+    `expected` can be legitimately empty for a "repository" scope). Never
+    raises: a broken env var must degrade to today's behavior, not fail
+    closed by accident on a parse error.
+    """
+    raw = os.environ.get("GLIMMER_CONTRACT_SCOPE")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, list) or not data or not all(
+        isinstance(p, str) and p for p in data
+    ):
+        return None
+    return data
+
+
+def _path_in_scope(relative, prefixes) -> bool:
+    """Boundary-safe prefix match -- deliberately mirrors glimmer-v2.py's
+    compute_scope_guard/_expected_prefixes rule (a path is in scope only
+    if it equals a declared prefix exactly, or starts with `prefix + "/"`,
+    after stripping any trailing slash from the prefix) so a file that is
+    reported in-scope by the orchestrator's post-hoc gate can never be
+    reported out-of-scope by this live, per-write check, or vice versa.
+    No shared module between the two processes (existing convention --
+    see classify_yellow's own module comment), so this is a deliberate,
+    cross-linked mirror, not a new scheme."""
+    posix = relative.as_posix()
+    return any(
+        posix == p.rstrip("/") or posix.startswith(p.rstrip("/") + "/")
+        for p in prefixes
+    )
+
+
 def check_write_path(
     path,
     workspace,
+    tool_name=None,
+    *,
+    # Test-only override hooks (never passed by secure_tool_arguments'
+    # real call site below): let the selfcheck exercise a real, resolved
+    # approve/deny/timeout round-trip through request_approval_and_wait in
+    # milliseconds instead of the real 300s/2s production defaults, the
+    # same way _approval_wait_selfcheck already does for classify_yellow's
+    # own approval calls. None means "use request_approval_and_wait's own
+    # defaults" -- production behavior is completely unaffected.
+    approval_timeout_s=None,
+    approval_poll_interval_s=None,
 ):
     relative = path.relative_to(workspace)
 
@@ -974,6 +1074,26 @@ def check_write_path(
             f"bookkeeping; model writes are blocked: {relative}"
         )
 
+    # V7 §15 follow-up ("large expansion -> pause for approval"): only
+    # active when glimmer-v2.py declared a real bounded scope for this
+    # session (_contract_scope_prefixes is not None) -- absent env, this
+    # is a no-op and every check above already ran unchanged, so a
+    # session with no GLIMMER_CONTRACT_SCOPE is byte-identical to before
+    # this follow-up. check_write_path is the single choke point both
+    # write_file and edit_file dispatch through (secure_tool_arguments
+    # below), so this can't be bypassed per-tool by construction -- the
+    # same discipline classify_yellow's own docstring credits to routing
+    # every YELLOW arm through one shared entry point, applied here to
+    # the write path instead of the shell-command path.
+    if (
+        _contract_scope_prefixes is not None
+        and not _path_in_scope(relative, _contract_scope_prefixes)
+    ):
+        _enforce_scope_expansion_approval(
+            relative, tool_name,
+            timeout_s=approval_timeout_s, poll_interval_s=approval_poll_interval_s,
+        )
+
 
 def secure_tool_arguments(
     tool_name,
@@ -1005,6 +1125,7 @@ def secure_tool_arguments(
         check_write_path(
             resolved,
             workspace,
+            tool_name,
         )
 
     if tool_name == "write_file":
@@ -1535,9 +1656,19 @@ def classify_yellow(command, workspace, validation_allowlist=None) -> dict | Non
             return None
         return {
             "action": "modify_dependencies",
-            "reason": f"engineer requested a dependency-install command: {command}",
+            # M4 (followup-1-2 review): an install runs the package's own
+            # lifecycle scripts (preinstall/postinstall/etc) as the invoking
+            # user -- arbitrary code execution, not just a file-content
+            # change. The card must say so; a reviewer approving "medium /
+            # two files change" is approving something they weren't told.
+            "reason": (
+                f"engineer requested a dependency-install command: {command} "
+                "-- installed packages can run arbitrary lifecycle scripts "
+                "(preinstall/postinstall/etc) as this user, not just change "
+                "package.json/package-lock.json"
+            ),
             "proposedChanges": ["package.json", "package-lock.json"],
-            "risk": "medium",
+            "risk": "high",
         }
 
     # --- migration-shaped npm run script ---------------------------------
@@ -1715,6 +1846,48 @@ def _patch_manifest_approval_state(session_dir, approval_id, pending: dict | Non
         pass
 
 
+def _record_approved_action(session_dir, approval_id, action, reason, risk, tool_name, command, approved_by) -> None:
+    """M1 (followup-1-2 review): a human approving a YELLOW action (most
+    visibly, an install/migration the task contract's own prose calls
+    forbidden -- see make_prompt's constraint text) is a deviation from
+    the contract's declared constraints. That deviation lived ONLY in the
+    approvals.json sidecar before this -- auditable if you knew to look,
+    invisible everywhere else. Appends one entry to manifest.json's
+    additive "approvedActions" list so it is visible wherever the manifest
+    already is (Control Center, delivery packet, any future reader) --
+    same best-effort, never-raises, read-modify-write-then-atomic-replace
+    discipline as _patch_manifest_approval_state right above, and the same
+    "manifest.json has exactly one writer at a time" assumption."""
+    path = Path(session_dir) / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(manifest, dict):
+        return
+
+    entry = {
+        "approvalId": approval_id,
+        "action": action,
+        "reason": reason,
+        "risk": risk,
+        "tool": tool_name,
+        "command": command,
+        "approvedBy": approved_by,
+        "approvedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    approved_actions = manifest.get("approvedActions")
+    if not isinstance(approved_actions, list):
+        approved_actions = []
+    approved_actions.append(entry)
+    manifest["approvedActions"] = approved_actions
+
+    try:
+        _atomic_write_json(path, manifest)
+    except OSError:
+        pass
+
+
 def request_approval_and_wait(
     action, reason, proposed_changes, risk,
     *, tool_name, command, timeout_s=None, poll_interval_s=APPROVAL_POLL_INTERVAL_SECONDS,
@@ -1726,10 +1899,14 @@ def request_approval_and_wait(
     tool_name/command are the EXACT action this approval is bound to (see
     _bound_action_hash) -- required, not optional, so a caller can never
     accidentally request approval for one action and let a different one
-    execute on approval.
+    execute on approval. The SAME (tool_name, command) pair is also this
+    function's memo key (M2, followup-1-2 review): a call that exactly
+    matches a PRIOR approval this session resolves instantly to
+    ("approved", <original approver>) with no new sidecar entry, no wait,
+    and no cap consumption -- see _approved_action_memo's module comment.
 
     Returns (decision, detail):
-      decision in {"approved", "denied", "timeout", "unavailable"}.
+      decision in {"approved", "denied", "timeout", "unavailable", "capped"}.
       "unavailable" -- no GLIMMER_EVENTS_PATH (no session directory to
       write the sidecar into, e.g. a standalone/test invocation) OR the
       sidecar write itself failed (unwritable/removed session dir) --
@@ -1740,8 +1917,20 @@ def request_approval_and_wait(
       boundArgsHash no longer match this exact call (exact-action binding,
       defense in depth) -- approvals.json hand-tampered, or reused for a
       different action, is treated as a denial, never as approval.
+      "capped" (M2, followup-1-2 review) -- this session already made
+      MAX_APPROVAL_REQUESTS_PER_SESSION genuinely NEW requests (memo hits
+      don't count); every caller already treats any non-"approved"
+      decision as a failure to route through the same POLICY_BLOCK path
+      (see classify_yellow's caller / _enforce_scope_expansion_approval),
+      so this needed no new branch anywhere else.
       detail is approvedBy (for "approved"/"denied", when the gateway
       recorded one) or a short human-readable reason otherwise.
+
+    An "approved" resolution is ALSO recorded as a durable
+    manifest.json["approvedActions"] entry (M1, followup-1-2 review) --
+    see _record_approved_action -- so a human overriding a declared
+    contract constraint (e.g. noDependencyInstall) is auditable in the
+    manifest itself, not only in the approvals.json sidecar.
 
     timeout_s defaults to DEFAULT_APPROVAL_TIMEOUT_SECONDS, overridable via
     GLIMMER_APPROVAL_TIMEOUT_SECONDS (same env-var-configuration convention
@@ -1752,6 +1941,16 @@ def request_approval_and_wait(
     so a selfcheck can pass tiny values and finish in milliseconds, never a
     real 300-second sleep.
     """
+    global _approval_request_count
+
+    global _last_approval_id
+    memo_key = (tool_name, command)
+    if memo_key in _approved_action_memo:
+        detail, memo_approval_id = _approved_action_memo[memo_key]
+        _last_approval_id = memo_approval_id
+        print(f"\n↻ APPROVAL MEMO: {tool_name} {command!r} already approved by {detail or 'a human'} this session")
+        return "approved", detail
+
     if timeout_s is None:
         try:
             timeout_s = int(os.environ.get("GLIMMER_APPROVAL_TIMEOUT_SECONDS", "") or DEFAULT_APPROVAL_TIMEOUT_SECONDS)
@@ -1760,6 +1959,13 @@ def request_approval_and_wait(
 
     if not GLIMMER_EVENTS_PATH:
         return "unavailable", "no session directory available for approval sidecar (fail closed)"
+
+    if _approval_request_count >= MAX_APPROVAL_REQUESTS_PER_SESSION:
+        return "capped", (
+            f"approval request cap ({MAX_APPROVAL_REQUESTS_PER_SESSION}/session) reached; "
+            "denying further out-of-policy requests to avoid an unbounded string of pauses"
+        )
+    _approval_request_count += 1
 
     session_dir = Path(GLIMMER_EVENTS_PATH).parent
     approval_id = f"{GLIMMER_SESSION_ID or 'session'}-appr-{uuid.uuid4().hex[:8]}"
@@ -1812,8 +2018,71 @@ def request_approval_and_wait(
     # reasonable generic "back to work" bucket -- this loop has no record
     # of whatever more specific phase preceded the request.
     _emit("agent_state_changed", state="implementing")
+    if decision == "approved":
+        # M2: memoize so an identical subsequent call never re-pauses.
+        # NEW-2: keep the approvalId with it so memo-hit emits still link
+        # back to the original approvals.json/waiver record.
+        _approved_action_memo[memo_key] = (detail, approval_id)
+        _last_approval_id = approval_id
+        # M1: durable, manifest-visible waiver record.
+        _record_approved_action(session_dir, approval_id, action, reason, risk, tool_name, command, detail)
     print(f"\n{'✓ APPROVED' if decision == 'approved' else '✗ ' + decision.upper()}: {action}")
     return decision, detail
+
+
+def _enforce_scope_expansion_approval(relative, tool_name, *, timeout_s=None, poll_interval_s=None) -> None:
+    """V7 §15 follow-up: called only from check_write_path, only when
+    _contract_scope_prefixes is set AND `relative` falls outside it --
+    the write-path equivalent of classify_yellow's YELLOW escalation,
+    reusing the exact same request_approval_and_wait sidecar (V7 §35).
+
+    Approved: returns normally (the write proceeds) and emits a
+    scope_expanded event of its own, carrying who approved it. This does
+    NOT retroactively make the write "in scope" -- glimmer-v2.py's own
+    post-hoc compute_scope_guard/gates.scopeApproved computation, run
+    after this session exits, is completely untouched by this function
+    and still reports the same file as expanded; approval only decides
+    whether the write itself was allowed to happen, with its own honest,
+    separately-provenanced record of why.
+
+    Denied/timeout/unavailable: raises ToolPolicyBlock -- fails closed,
+    same as every other check_write_path rejection (tool_blocked +
+    record_blocked_command + a POLICY_BLOCK envelope, via execute_tool's
+    existing ToolPolicyBlock catch).
+
+    timeout_s/poll_interval_s: test-only overrides forwarded verbatim from
+    check_write_path's own same-named kwargs (see that function's
+    docstring) -- omitted entirely (not passed at all) unless a caller
+    explicitly set one, so request_approval_and_wait's own real defaults
+    apply for every production call, unchanged."""
+    posix = relative.as_posix()
+    kwargs = {}
+    if timeout_s is not None:
+        kwargs["timeout_s"] = timeout_s
+    if poll_interval_s is not None:
+        kwargs["poll_interval_s"] = poll_interval_s
+    decision, detail = request_approval_and_wait(
+        "scope_expansion",
+        f"write outside declared task scope: {posix}",
+        [posix],
+        "medium",
+        tool_name=tool_name or "write_file",
+        command=posix,
+        **kwargs,
+    )
+    if decision == "approved":
+        _emit(
+            "scope_expanded",
+            expected=list(_contract_scope_prefixes or []),
+            actual=[posix],
+            approved=True,
+            approvedBy=detail or None,
+            approvalId=_last_approval_id,
+        )
+        return
+    raise ToolPolicyBlock(
+        f"out-of-scope write requires human approval [{decision}]: {posix}"
+    )
 
 
 def architect_shell_policy(command, workspace):
@@ -3946,7 +4215,14 @@ def execute_tool(
         # re-review NEW-1): a security-boundary violation belongs on this
         # audit path, not in the generic stringifier.
         reason = str(exc)
-        message = "ENGINEERING SECURITY BLOCK: " + reason
+        # m4 (followup-1-2 review): a human declining a scope expansion is
+        # not "you tried to write a secret" -- same ToolPolicyBlock/
+        # POLICY_BLOCK plumbing (right, keeps one audit path), distinct
+        # label (see _enforce_scope_expansion_approval's own raise text).
+        if reason.startswith("out-of-scope write requires human approval"):
+            message = "SCOPE EXPANSION DECLINED: " + reason
+        else:
+            message = "ENGINEERING SECURITY BLOCK: " + reason
         blocked_path = str(arguments.get("path", tool_name))[:MAX_EVENT_FIELD]
 
         print()
@@ -9189,10 +9465,15 @@ def run_engineer(
     # doesn't change mid-session. Drives both the deterministic advisory
     # triggers (regardless of architect_consult_enabled) and, gated by
     # that flag too, whether consult_architect is offered at all.
-    global _loaded_architecture_plan, _architect_consult_enabled
+    global _loaded_architecture_plan, _architect_consult_enabled, _contract_scope_prefixes
     _loaded_architecture_plan = _load_architecture_plan_for_engineer()
     architecture_plan = _loaded_architecture_plan
     _architect_consult_enabled = architect_consult_enabled
+
+    # V7 §15 follow-up: load once per session, same convention as the
+    # architecture plan just above -- GLIMMER_CONTRACT_SCOPE doesn't
+    # change mid-session either.
+    _contract_scope_prefixes = _load_contract_scope_prefixes()
 
     _augment_tools_with_consult_architect(
         metadata, tools, architecture_plan, architect_consult_enabled,
@@ -9321,11 +9602,29 @@ def run_engineer(
         "Use edit_file for existing files. "
         "Use write_file only for genuinely new files. "
 
-        "Never attempt dependency installation, "
-        "git commit, git push, git reset, git clean, "
-        "git checkout, git switch, git stash, "
-        "git merge, git rebase, database migrations, "
-        "production commands, releases or deployment. "
+        "Never attempt git commit, git push, git reset, "
+        "git clean, git checkout, git switch, git stash, "
+        "git merge, git rebase, production commands, "
+        "releases or deployment -- these are always blocked. "
+
+        "Dependency installation (npm install/i/ci/add) and "
+        "npm run migration/seed scripts are different: they "
+        "are not flat-blocked. When the task genuinely "
+        "requires one, attempt it as a normal command -- it "
+        "will pause for a human approval decision (V7 §35) "
+        "instead of running immediately, so wait for that "
+        "decision. This only applies to a single, plain npm "
+        "command (no chaining, pipes, redirects or "
+        "substitution) -- a composed command, or any other "
+        "migration tool (alembic, prisma, django manage.py, "
+        "etc), is still blocked outright. No one may be "
+        "watching this session: an unanswered request times "
+        "out after a few minutes, and a session only gets a "
+        "handful of these pauses before further ones are "
+        "blocked immediately too -- either way, treat a "
+        "denied, timed-out, or blocked result like any other "
+        "policy block and continue honestly without the "
+        "action, noting it as a remaining risk. "
 
         "Never edit secrets or environment files. "
 
@@ -10406,7 +10705,10 @@ def _approval_wait_selfcheck() -> None:
     import threading
 
     global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    global _approved_action_memo, _approval_request_count
     real_events_path, real_session_id = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    real_memo, real_count = _approved_action_memo, _approval_request_count
+    _approved_action_memo, _approval_request_count = {}, 0
 
     try:
         with tempfile.TemporaryDirectory() as wd:
@@ -10474,6 +10776,11 @@ def _approval_wait_selfcheck() -> None:
             #    script name.
             yellow = classify_yellow("npm install left-pad", ws)
             assert yellow is not None and yellow["action"] == "modify_dependencies"
+            # M4 (followup-1-2 review): install runs arbitrary lifecycle
+            # scripts -- risk must be "high" (matching the migration arm
+            # below), and the card must say so explicitly.
+            assert yellow["risk"] == "high", yellow
+            assert "lifecycle script" in yellow["reason"], yellow
             migration = classify_yellow("npm run migrate", ws)
             assert migration is not None and migration["action"] == "run_migration"
             assert migration["proposedChanges"] == ["npm run migrate", "node scripts/migrate.js"]
@@ -10565,6 +10872,33 @@ def _approval_wait_selfcheck() -> None:
             )
             assert decision == "approved" and detail == "daniel"
 
+            # 7b. M1 (followup-1-2 review): the approval is recorded as a
+            #     durable, manifest-visible waiver -- not only in the
+            #     approvals.json sidecar.
+            approved_actions = json.loads(manifest_path.read_text())["approvedActions"]
+            assert len(approved_actions) == 1, approved_actions
+            waiver = approved_actions[0]
+            assert waiver["action"] == "run_migration", waiver
+            assert waiver["tool"] == "exec_shell_command", waiver
+            assert waiver["command"] == "npm run migrate", waiver
+            assert waiver["approvedBy"] == "daniel", waiver
+
+            # 7c. M2 (followup-1-2 review): the IDENTICAL request again --
+            #     resolves instantly from the memo (no background thread
+            #     to resolve it, no wait) and does not consume the cap or
+            #     write a second approvedActions entry.
+            count_before_memo_hit = _approval_request_count
+            decision, detail = request_approval_and_wait(
+                "run_migration", "npm run migrate -> node scripts/migrate.js", [], "high",
+                tool_name="exec_shell_command", command="npm run migrate",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "approved" and detail == "daniel"
+            assert _approval_request_count == count_before_memo_hit, "a memo hit must not consume a new request"
+            assert len(json.loads(manifest_path.read_text())["approvedActions"]) == 1, (
+                "a memo hit must not add a second waiver entry"
+            )
+
             # 8. Exact-action binding mismatch: the record resolves
             #    "approved", but for a DIFFERENT command than this call
             #    requested (approvals.json tampered, or reused) -- must
@@ -10623,6 +10957,22 @@ def _approval_wait_selfcheck() -> None:
                 globals()["_write_approval_request"] = real_write
             assert decision == "unavailable", decision
 
+            # 11b. M2 (followup-1-2 review): once the session hits the
+            #      request cap, a brand-new command (never seen before, so
+            #      no memo hit) is denied immediately -- no wait, no new
+            #      approvals.json entry.
+            _approval_request_count = MAX_APPROVAL_REQUESTS_PER_SESSION
+            approvals_before_cap = load_approvals(session_dir)
+            started = time.monotonic()
+            decision, detail = request_approval_and_wait(
+                "modify_dependencies", "install something-else", [], "medium",
+                tool_name="exec_shell_command", command="npm install something-else",
+                timeout_s=2, poll_interval_s=0.01,
+            )
+            assert decision == "capped", decision
+            assert time.monotonic() - started < 1, "a capped request must never wait"
+            assert load_approvals(session_dir) == approvals_before_cap
+
             # 12. No session directory at all -> "unavailable", fails
             #     closed immediately (no wait, no allow-by-default).
             GLIMMER_EVENTS_PATH = None
@@ -10633,8 +10983,217 @@ def _approval_wait_selfcheck() -> None:
             assert decision == "unavailable", decision
     finally:
         GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = real_events_path, real_session_id
+        _approved_action_memo, _approval_request_count = real_memo, real_count
 
     print("approval wait loop (V7 §14/§35) self-check: PASS (12/12)")
+
+
+def _scope_expansion_selfcheck() -> None:
+    """V7 §15 follow-up ("large expansion -> pause for approval") self-
+    check. Same tiny-timeout/no-real-sleep discipline as
+    _approval_wait_selfcheck: every approval round-trip below resolves in
+    milliseconds via check_write_path's test-only approval_timeout_s/
+    approval_poll_interval_s overrides, never the real 300s/2s production
+    defaults.
+
+    Run with: python3 glimmer-engineer.py --scope-approval-selfcheck
+    """
+    import tempfile
+    import threading
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID, _contract_scope_prefixes
+    global _approved_action_memo, _approval_request_count
+    real_events_path, real_session_id = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    real_scope_prefixes = _contract_scope_prefixes
+    real_memo, real_count = _approved_action_memo, _approval_request_count
+    _approved_action_memo, _approval_request_count = {}, 0
+
+    try:
+        with tempfile.TemporaryDirectory() as wd:
+            ws = Path(wd)
+            (ws / "src" / "dialog").mkdir(parents=True)
+            (ws / "backend").mkdir()
+            in_scope = ws / "src" / "dialog" / "file.ts"
+            out_of_scope = ws / "backend" / "x.ts"
+            out_of_scope_deny = ws / "backend" / "y.ts"
+            out_of_scope_timeout = ws / "backend" / "z.ts"
+
+            # 1. Absent env, no session dir at all: legacy behavior byte-
+            #    identical -- an out-of-scope-shaped write is never
+            #    blocked or paused. If this accidentally DID try to
+            #    request approval, request_approval_and_wait would fail
+            #    closed to "unavailable" (no GLIMMER_EVENTS_PATH) and this
+            #    would raise instead of returning -- so this also proves
+            #    the check is a true no-op, not silently swallowed.
+            _contract_scope_prefixes = None
+            GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = None, None
+            check_write_path(out_of_scope, ws, "write_file")  # must NOT raise
+
+            with tempfile.TemporaryDirectory() as td:
+                session_dir = Path(td)
+                events_path = session_dir / "events.jsonl"
+                events_path.write_text("")
+                GLIMMER_EVENTS_PATH = str(events_path)
+                GLIMMER_SESSION_ID = "sess-scope-selfcheck"
+
+                # 2. A real session dir now exists, but GLIMMER_CONTRACT_
+                #    SCOPE was never set (_contract_scope_prefixes stays
+                #    None) -- still a complete no-op: no approval request,
+                #    no scope_expanded event, write proceeds.
+                check_write_path(out_of_scope, ws, "write_file")  # must NOT raise
+                assert load_approvals(session_dir) == {}
+                assert events_path.read_text() == ""
+
+                # 3. Explicit scope declared: an IN-scope write is
+                #    completely untouched -- no approval requested.
+                _contract_scope_prefixes = ["src/dialog"]
+                check_write_path(in_scope, ws, "write_file")  # must NOT raise
+                assert load_approvals(session_dir) == {}
+
+                # 4. Out-of-scope + explicit scope + approved: bound to
+                #    the exact relative path, write proceeds, and a
+                #    scope_expanded event carries approval provenance.
+                #    v2.py's own post-hoc scopeApproved gate computation is
+                #    untouched by any of this (a separate process/file);
+                #    this only asserts what THIS process's write-time
+                #    check does.
+                def _approve_soon():
+                    time.sleep(0.03)
+                    approvals = load_approvals(session_dir)
+                    [approval_id] = approvals.keys()
+                    record = approvals[approval_id]
+                    assert record["boundTool"] == "write_file", record
+                    assert record["boundCommand"] == "backend/x.ts", record
+                    record["status"] = "approved"
+                    record["approvedBy"] = "daniel"
+                    _atomic_write_json(_approvals_path(session_dir), approvals)
+
+                threading.Thread(target=_approve_soon, daemon=True).start()
+                check_write_path(
+                    out_of_scope, ws, "write_file",
+                    approval_timeout_s=2, approval_poll_interval_s=0.01,
+                )  # must NOT raise
+                scope_events = [
+                    json.loads(line) for line in events_path.read_text().splitlines()
+                    if json.loads(line).get("type") == "scope_expanded"
+                ]
+                assert len(scope_events) == 1, scope_events
+                assert scope_events[0]["expected"] == ["src/dialog"]
+                assert scope_events[0]["actual"] == ["backend/x.ts"]
+                assert scope_events[0]["approved"] is True
+                assert scope_events[0]["approvedBy"] == "daniel"
+                approvals_after_first = load_approvals(session_dir)
+                assert len(approvals_after_first) == 1
+                assert _approval_request_count == 1
+
+                # 4b. M2 memo: an IDENTICAL subsequent call (same tool_name
+                #     + same exact path) never re-pauses -- resolves
+                #     "approved" from the in-process memo with NO new
+                #     approvals.json entry and NO cap consumption, but it
+                #     still emits its own scope_expanded event (the write
+                #     is still honestly reported as an expansion every
+                #     time, only the human wait is skipped). No background
+                #     thread/timeout override needed -- this must return
+                #     instantly with nobody resolving anything.
+                check_write_path(out_of_scope, ws, "write_file")  # must NOT raise, must NOT hang
+                assert load_approvals(session_dir) == approvals_after_first, (
+                    "a memoized approval must not create a second approvals.json entry"
+                )
+                assert _approval_request_count == 1, "a memo hit must not consume a new approval request"
+                scope_events = [
+                    json.loads(line) for line in events_path.read_text().splitlines()
+                    if json.loads(line).get("type") == "scope_expanded"
+                ]
+                assert len(scope_events) == 2, scope_events
+                assert scope_events[1]["approvedBy"] == "daniel"
+
+                # 5. Out-of-scope + explicit scope + denied (a FRESH path --
+                #    out_of_scope is already memoized as approved above, so
+                #    reusing it here would just hit the memo): fails closed
+                #    (ToolPolicyBlock -- the same exception class every
+                #    other check_write_path rejection raises, so
+                #    execute_tool's existing catch routes it through the
+                #    normal tool_blocked/POLICY_BLOCK audit path with no
+                #    new plumbing).
+                def _deny_soon():
+                    time.sleep(0.03)
+                    approvals = load_approvals(session_dir)
+                    pending = [k for k, v in approvals.items() if v.get("status") == "pending"]
+                    [approval_id] = pending
+                    approvals[approval_id]["status"] = "denied"
+                    approvals[approval_id]["approvedBy"] = "daniel"
+                    _atomic_write_json(_approvals_path(session_dir), approvals)
+
+                threading.Thread(target=_deny_soon, daemon=True).start()
+                try:
+                    check_write_path(
+                        out_of_scope_deny, ws, "write_file",
+                        approval_timeout_s=2, approval_poll_interval_s=0.01,
+                    )
+                    raise AssertionError("a denied scope expansion must raise ToolPolicyBlock")
+                except ToolPolicyBlock as exc:
+                    assert "denied" in str(exc), exc
+                assert _approval_request_count == 2, "a real denied request must still consume the cap"
+                # A denial must never memoize as "approved" -- only an
+                # actual "approved" resolution is ever stored.
+                assert ("write_file", "backend/y.ts") not in _approved_action_memo
+
+                # 6. Out-of-scope + explicit scope + nobody ever decides
+                #    (a THIRD fresh path): timeout also fails closed.
+                try:
+                    check_write_path(
+                        out_of_scope_timeout, ws, "write_file",
+                        approval_timeout_s=0.05, approval_poll_interval_s=0.01,
+                    )
+                    raise AssertionError("an unresolved scope expansion must time out closed")
+                except ToolPolicyBlock as exc:
+                    assert "timeout" in str(exc), exc
+                assert _approval_request_count == 3, "a real timed-out request must still consume the cap"
+
+                # 7. M2 cap: once the session has made
+                #    MAX_APPROVAL_REQUESTS_PER_SESSION genuinely NEW
+                #    requests, a further out-of-scope write on a path
+                #    that was NEVER seen before (no memo entry to hit) is
+                #    denied immediately -- no sidecar entry, no wait.
+                _approval_request_count = MAX_APPROVAL_REQUESTS_PER_SESSION
+                before_cap = load_approvals(session_dir)
+                capped_path = ws / "backend" / "capped.ts"
+                started = time.monotonic()
+                try:
+                    check_write_path(
+                        capped_path, ws, "write_file",
+                        approval_timeout_s=2, approval_poll_interval_s=0.01,
+                    )
+                    raise AssertionError("a request past the cap must raise ToolPolicyBlock")
+                except ToolPolicyBlock as exc:
+                    assert "cap" in str(exc), exc
+                assert time.monotonic() - started < 1, "a capped request must never wait at all"
+                assert load_approvals(session_dir) == before_cap, (
+                    "a capped request must never create a new approvals.json entry"
+                )
+
+                # 8. Composition/traversal can't sneak past this check:
+                #    resolve_workspace_path's containment guard runs
+                #    BEFORE check_write_path even sees a path (secure_
+                #    tool_arguments' existing call order), so a traversal
+                #    attempt never reaches the scope check at all -- no
+                #    approval request, no scope_expanded event, just the
+                #    pre-existing "escapes repository" block.
+                before = load_approvals(session_dir)
+                try:
+                    secure_tool_arguments("write_file", {"path": "../outside.txt"}, ws)
+                    raise AssertionError("a path escaping the workspace must still be blocked")
+                except ToolPolicyBlock as exc:
+                    assert "escapes repository" in str(exc), exc
+                assert load_approvals(session_dir) == before, (
+                    "a blocked traversal attempt must never reach the scope-expansion check"
+                )
+    finally:
+        GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = real_events_path, real_session_id
+        _contract_scope_prefixes = real_scope_prefixes
+        _approved_action_memo, _approval_request_count = real_memo, real_count
+
+    print("scope-expansion approval (V7 §15 follow-up) self-check: PASS (9/9)")
 
 
 # ============================================================
@@ -10856,6 +11415,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--approval-wait-selfcheck"]:
         _approval_wait_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--scope-approval-selfcheck"]:
+        _scope_expansion_selfcheck()
         sys.exit(0)
 
     try:

@@ -411,7 +411,18 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "POLICY_BLOCK", "detail": blocked[-1].get("reason") or "shell command blocked by policy",
                 "evidenceIds": [e["id"] for e in blocked if "id" in e]}
 
-    scope_events = [e for e in events if e.get("type") == "scope_expanded"]
+    # m5 (followup-1-2 review): a scope_expanded event a human explicitly
+    # APPROVED (glimmer-engineer.py's V7 §15 write-time pause, see its own
+    # module comment -- carries approved: True) is a resolved deviation,
+    # not a failure; only an un-approved expansion (every event from
+    # before this follow-up, and any denied/timed-out one, neither of
+    # which carries "approved") should still fall through to
+    # SCOPE_FAILURE here. This is unrelated to gates.scopeApproved (still
+    # computed independently by compute_scope_guard against the final
+    # diff, and still False for an approved-but-still-out-of-scope file --
+    # see that function's own docstring) -- this only narrows what counts
+    # as a FAILURE in this fallback taxonomy.
+    scope_events = [e for e in events if e.get("type") == "scope_expanded" and not e.get("approved")]
     if scope_events:
         return {"class": "SCOPE_FAILURE", "detail": "changed files exceeded the task contract's declared scope",
                 "evidenceIds": [e["id"] for e in scope_events if "id" in e]}
@@ -2432,10 +2443,27 @@ def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None,
         banned.append("push")
     if constraints.get("noDeploy"):
         banned.append("deploy")
-    if constraints.get("noDependencyInstall"):
-        banned.append("install packages")
     if banned:
         constraint_lines.append(f"Do not {', '.join(banned)}, change Git configuration.")
+    # M1 (followup-1-2 review): noDependencyInstall does NOT mean "never
+    # attempt" any more -- glimmer-engineer.py's own system prompt (V7
+    # §14/§35) tells the model dependency installs/migrations pause for a
+    # real human-approval decision instead of running immediately. The old
+    # prose folded "install packages" into the same "Do not ..." sentence
+    # as commit/push/deploy, which stay genuinely flat-forbidden with no
+    # approval path at all -- a direct contradiction, in the same context
+    # window, with the engineer's own operating instructions. Describe
+    # what actually happens instead; the raw noDependencyInstall flag
+    # itself is left unchanged (still read by CC/gates permissions
+    # mirrors elsewhere) -- only this human-readable prose changes.
+    if constraints.get("noDependencyInstall"):
+        constraint_lines.append(
+            "Dependency installation and migration scripts pause for "
+            "human approval instead of running immediately (V7 §35) -- "
+            "attempt them if the task requires it and wait for the "
+            "decision; commit, push, deploy and Git configuration "
+            "changes stay forbidden with no approval path."
+        )
     constraint_text = "\n".join(f"    - {line}" for line in constraint_lines)
 
     # Fix round 1 (Minor 5): gate on `failure is not None`, not `iteration`
@@ -2590,7 +2618,7 @@ a genuine fix may still require another file if the evidence supports it.
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
                      plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
-                     consult_request=None, timeout=None):
+                     consult_request=None, timeout=None, scope_prefixes=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -2640,6 +2668,15 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     # its own budget/turns are untouched (C1 task scoping).
     if plan_candidate_count > 0:
         env["GLIMMER_PLAN_CANDIDATES"] = str(plan_candidate_count)
+    # V7 §15 follow-up ("large expansion -> pause for approval"): same
+    # spawn-env plumbing again -- only ever set when the caller resolved a
+    # real, non-empty list of expected prefixes (see _expected_prefixes),
+    # i.e. only for the real engineer run (mode is None); architect/
+    # consult/review calls never pass this. Additive and opt-in: no
+    # scope_prefixes means no env var at all, which is exactly today's
+    # behavior in glimmer-engineer.py (see _contract_scope_prefixes there).
+    if scope_prefixes:
+        env["GLIMMER_CONTRACT_SCOPE"] = json.dumps(list(scope_prefixes))
     with log_path.open("w", encoding="utf-8") as log:
         # Round 8 whole-round review (MJ4): `start_new_session` only when a
         # `timeout` is actually set (only run_architect_escalation ever
@@ -5879,6 +5916,24 @@ def required_tasks_resolved(tasks, overrides: dict | None = None) -> bool:
     return True
 
 
+def _merge_engineer_owned_keys(manifest: dict, manifest_path) -> None:
+    """NEW-1/NEW-3 (1+2 re-review): save() is a full overwrite of the
+    in-memory manifest, but the engineer subprocess writes durable facts
+    of its own into manifest.json (approvedActions waivers). For those
+    engineer-owned keys, DISK always wins -- v2 never authors them in
+    memory, and a stale in-memory copy captured after engineer #1 must
+    not shadow what engineer #2 added (NEW-3: second waiver silently
+    destroyed across sequential invoke_engineer calls). Tolerant of
+    absent/malformed disk state; named module-level function so the
+    selfcheck exercises the REAL merge, not a re-implementation."""
+    try:
+        on_disk = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if "approvedActions" in on_disk:
+        manifest["approvedActions"] = on_disk["approvedActions"]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
     ap.add_argument("task", nargs="+")
@@ -6142,6 +6197,15 @@ def main():
         # comment first. See _resolve_orphaned_pending_approval below for
         # the recovery when the engineer subprocess dies mid-wait instead
         # of resolving it itself.
+        # NEW-1/NEW-3 (1+2 re-review): the engineer subprocess writes
+        # durable facts of its own into manifest.json during its run --
+        # approvedActions waivers (request_approval_and_wait). This full
+        # overwrite from the in-memory dict would silently destroy them.
+        # Disk ALWAYS wins for that one engineer-owned key (v2 never
+        # authors it in memory; a stale in-memory copy from engineer #1
+        # must not shadow engineer #2's additions -- NEW-3, reproduced
+        # across sequential invoke_engineer calls).
+        _merge_engineer_owned_keys(manifest, manifest_path)
         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -6315,6 +6379,19 @@ def main():
                                source=t.get("source"), priority=t.get("priority"))
             save()
 
+        # V7 §15 follow-up ("large expansion -> pause for approval"):
+        # computed once, deterministically, from the fixed task contract --
+        # not re-derived per repair iteration, same convention as
+        # candidate_evidence above. `or None` collapses an empty list
+        # (contract has no bounded scope -- e.g. scope.package ==
+        # "repository") to the same "don't set the env var at all" state
+        # invoke_engineer's own `if scope_prefixes:` guard already treats
+        # identically -- absent env is glimmer-engineer.py's one and only
+        # "no scope guard active" signal (see _contract_scope_prefixes
+        # there), so this must never pass an empty list as if it meant
+        # something.
+        engineer_scope_prefixes = _expected_prefixes(contract.get("scope") or {}) or None
+
         for iteration in range(args.max_repairs + 1):
             if iteration > 0:
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
@@ -6332,7 +6409,8 @@ def main():
             rc = invoke_engineer(engineer, ws, prompt, args.auto_approve, args.max_turns,
                                  session / f"engineer-{iteration:02d}.log", events_path, sid,
                                  plan_candidate_count=len(candidate_evidence),
-                                 architect_consult_enabled=architecture_plan is not None)
+                                 architect_consult_enabled=architecture_plan is not None,
+                                 scope_prefixes=engineer_scope_prefixes)
             # Task 2.3 (V7 §5.11): gates.implementationComplete tracks the
             # MOST RECENT engineer invocation this iteration -- a revise
             # round below reassigns this to revise_rc, exactly mirroring
@@ -6723,6 +6801,7 @@ def main():
                         session / f"architect-revise-{iteration:02d}-{review_round:02d}.log",
                         events_path, sid, plan_candidate_count=len(candidate_evidence),
                         architect_consult_enabled=architecture_plan is not None,
+                        scope_prefixes=engineer_scope_prefixes,
                     )
                     last_engineer_rc = revise_rc
                     files = changed_files(ws, baseline)
@@ -7249,6 +7328,17 @@ def _r6_selfcheck() -> None:
     scope_evt = {"id": "e2", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/x.ts"]}
     r = classify_failure({"status": "no-change-unverified"}, [scope_evt])
     assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2"]
+
+    # m5 (followup-1-2 review): the SAME shape, but a human explicitly
+    # approved this expansion (glimmer-engineer.py's V7 §15 write-time
+    # pause) -- must NOT be classified as a failure, even alongside an
+    # unrelated, genuinely unapproved one, which must still be caught.
+    approved_scope_evt = {**scope_evt, "id": "e2b", "approved": True, "approvedBy": "daniel"}
+    r = classify_failure({"status": "no-change-unverified"}, [approved_scope_evt])
+    assert r is None or r["class"] != "SCOPE_FAILURE", r
+    unapproved_scope_evt = {"id": "e2c", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/y.ts"]}
+    r = classify_failure({"status": "no-change-unverified"}, [approved_scope_evt, unapproved_scope_evt])
+    assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2c"], r
 
     parser_evts = [{"id": f"p{i}", "type": "parser_recovery", "attempt": i} for i in range(1, 3)]
     r = classify_failure({"status": "no-change-unverified"}, parser_evts)
@@ -9844,6 +9934,34 @@ def _quality_gates_selfcheck() -> None:
     assert no_change_gate_idx < no_change_blocked_idx, (
         "the no-change branch must compute customerReadinessApproved before deciding what blocks"
     )
+
+    # NEW-1/NEW-3 (1+2 re-review): save() must merge the engineer-written
+    # approvedActions waiver from disk, and disk must ALWAYS win for that
+    # key -- a one-shot merge guarded on the in-memory dict shadowed
+    # engineer #2's additions with engineer #1's stale copy (NEW-3).
+    # Behavioral check against the REAL merge function, both the call-site
+    # wiring and the two-run shadowing repro.
+    save_body = main_source[main_source.index("def save():"):main_source.index("save()\n")]
+    assert "_merge_engineer_owned_keys(manifest, manifest_path)" in save_body, (
+        "save() must call _merge_engineer_owned_keys before its full overwrite"
+    )
+    with tempfile.TemporaryDirectory() as _td:
+        _mp = Path(_td) / "manifest.json"
+        # engineer #1's waiver on disk, v2 memory without it -> merged in
+        _mp.write_text(json.dumps({"approvedActions": [{"approvalId": "a1"}]}))
+        _mem = {"status": "x"}
+        _merge_engineer_owned_keys(_mem, _mp)
+        assert _mem["approvedActions"] == [{"approvalId": "a1"}]
+        # engineer #2 appended on disk; stale in-memory copy must NOT win
+        _mp.write_text(json.dumps({"approvedActions": [{"approvalId": "a1"}, {"approvalId": "a2"}]}))
+        _merge_engineer_owned_keys(_mem, _mp)
+        assert [w["approvalId"] for w in _mem["approvedActions"]] == ["a1", "a2"], (
+            "disk must always win for approvedActions (NEW-3 shadowing)"
+        )
+        # malformed/absent disk -> tolerant no-op
+        _mp.write_text("not json{{{")
+        _merge_engineer_owned_keys(_mem, _mp)
+        assert [w["approvalId"] for w in _mem["approvedActions"]] == ["a1", "a2"]
 
     # ------------------------------------------------------------
     # 7. CLI-level fail-closed rejection: an unrecognized
