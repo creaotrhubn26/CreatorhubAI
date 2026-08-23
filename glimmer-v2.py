@@ -5172,6 +5172,9 @@ def compute_delivery_packet(manifest: dict, delivery_review, escalation=None) ->
         },
         "visual": statuses.get("visual", "not_run"),
         "statuses": statuses,
+        # NEW-MN1 (round-8 re-review): a gate-blocked session's summary
+        # must say so -- technical VERIFIED alone would read as shippable.
+        "blockedGates": manifest.get("blockedGates") or [],
         "customerReadiness": customer_readiness,
         "limitations": limitations,
         "forwardPlan": forward_plan,
@@ -5221,6 +5224,14 @@ def render_packet_summary(packet: dict) -> str:
     verification = packet.get("verification") or {}
     lines.append(f"Verification: {verification.get('status', 'NOT_RUN')}")
     lines.append(f"Visual: {packet.get('visual', 'not_run')}")
+
+    # NEW-MN1: overall + blocked gates in the summary -- "Verification:
+    # VERIFIED" on a gate-blocked session must not read as shippable.
+    statuses = packet.get("statuses") or {}
+    lines.append(f"Overall: {statuses.get('overall', 'not_run')}")
+    blocked = packet.get("blockedGates") or []
+    if blocked:
+        lines.append(f"Blocked gates: {', '.join(blocked)}")
 
     readiness = packet.get("customerReadiness")
     lines.append(f"Customer readiness: {readiness['value'] if readiness else 'Unavailable'}")

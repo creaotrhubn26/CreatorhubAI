@@ -36,6 +36,11 @@ EVENT_TYPES = {
     # ARCHITECT_RISK_THRESHOLD and --no-architect was not passed.
     "architect_autotriggered",
     "task_created", "task_status_changed", "task_list_completed",
+    # Round-8 re-review NEW-MJ1: emitted by glimmer-v2.py when a HUMAN
+    # task-override (task-overrides.json sidecar) is applied -- was in the
+    # CC union/Set but missing here, so emit() silently dropped the very
+    # event that records a human overriding a gate.
+    "task_override_applied",
     "visual_verification_started", "visual_finding_detected",
     "visual_verification_completed",
     "delivery_review_started", "delivery_review_completed",
@@ -159,6 +164,7 @@ def _selfcheck() -> None:
             ("architect_consult_advised", {"trigger": "turns_high_no_writes", "detail": "turn 7/10 (over 60% of the turn budget) with no repository write yet"}),
             ("architect_consulted", {"questionChars": 42, "answerChars": 210}),
             ("delivery_packet_created", {}),
+            ("task_override_applied", {"taskId": "t1", "override": "approve", "tasksResolvedBy": "human"}),
             ("approval_requested", {"approvalId": "s2-appr-abc123", "action": "modify_dependencies",
                                      "reason": "engineer requested a dependency-install command: npm install left-pad",
                                      "risk": "medium"}),
@@ -173,7 +179,29 @@ def _selfcheck() -> None:
             for k, v in fields.items():
                 assert rec[k] == v, f"{t}: field {k!r} mismatch"
 
-        print("glimmer_events self-check: PASS (4/4)")
+        # 5. Emitter parity (round-8 re-review NEW-MJ1 root cause: three
+        # separate incidents of an emitted type missing from EVENT_TYPES,
+        # each silently dropping real events). Scan the sibling emitter
+        # sources for every string literal passed as emit/emit_event's
+        # type argument and assert each is registered here. Source scan,
+        # not import -- the hyphenated filenames can't be imported.
+        import re as _re
+        here = os.path.dirname(os.path.abspath(__file__))
+        emitted = set()
+        for fname in ("glimmer-v2.py", "glimmer-engineer.py", "glimmer-visual.py"):
+            fpath = os.path.join(here, fname)
+            if not os.path.isfile(fpath):
+                continue
+            with open(fpath, encoding="utf-8") as f:
+                src = f.read()
+            emitted |= set(_re.findall(r'emit(?:_event)?\(\s*[^,)]+,\s*"([a-z_]+)"', src))
+        unregistered = emitted - EVENT_TYPES
+        assert not unregistered, (
+            f"emitted event types missing from EVENT_TYPES (would be "
+            f"silently dropped): {sorted(unregistered)}"
+        )
+
+        print("glimmer_events self-check: PASS (5/5)")
 
 
 if __name__ == "__main__":
