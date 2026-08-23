@@ -5916,6 +5916,24 @@ def required_tasks_resolved(tasks, overrides: dict | None = None) -> bool:
     return True
 
 
+def _merge_engineer_owned_keys(manifest: dict, manifest_path) -> None:
+    """NEW-1/NEW-3 (1+2 re-review): save() is a full overwrite of the
+    in-memory manifest, but the engineer subprocess writes durable facts
+    of its own into manifest.json (approvedActions waivers). For those
+    engineer-owned keys, DISK always wins -- v2 never authors them in
+    memory, and a stale in-memory copy captured after engineer #1 must
+    not shadow what engineer #2 added (NEW-3: second waiver silently
+    destroyed across sequential invoke_engineer calls). Tolerant of
+    absent/malformed disk state; named module-level function so the
+    selfcheck exercises the REAL merge, not a re-implementation."""
+    try:
+        on_disk = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if "approvedActions" in on_disk:
+        manifest["approvedActions"] = on_disk["approvedActions"]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
     ap.add_argument("task", nargs="+")
@@ -6179,19 +6197,15 @@ def main():
         # comment first. See _resolve_orphaned_pending_approval below for
         # the recovery when the engineer subprocess dies mid-wait instead
         # of resolving it itself.
-        # NEW-1 (1+2 re-review): the engineer subprocess writes durable
-        # facts of its own into manifest.json during its run --
+        # NEW-1/NEW-3 (1+2 re-review): the engineer subprocess writes
+        # durable facts of its own into manifest.json during its run --
         # approvedActions waivers (request_approval_and_wait). This full
-        # overwrite from the in-memory dict would silently destroy them
-        # (reproduced: waiver present after the engineer round-trip, gone
-        # after the next save()). Merge the engineer-owned key back from
-        # disk before writing; the in-memory dict wins everywhere else.
-        try:
-            on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if "approvedActions" in on_disk and "approvedActions" not in manifest:
-                manifest["approvedActions"] = on_disk["approvedActions"]
-        except (OSError, ValueError):
-            pass
+        # overwrite from the in-memory dict would silently destroy them.
+        # Disk ALWAYS wins for that one engineer-owned key (v2 never
+        # authors it in memory; a stale in-memory copy from engineer #1
+        # must not shadow engineer #2's additions -- NEW-3, reproduced
+        # across sequential invoke_engineer calls).
+        _merge_engineer_owned_keys(manifest, manifest_path)
         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -9921,15 +9935,33 @@ def _quality_gates_selfcheck() -> None:
         "the no-change branch must compute customerReadinessApproved before deciding what blocks"
     )
 
-    # NEW-1 (1+2 re-review): save() is a full overwrite of the in-memory
-    # manifest -- it must merge the engineer-written approvedActions
-    # waiver back from disk, or every save() after the engineer returns
-    # silently destroys the waiver record (reproduced by the reviewer).
+    # NEW-1/NEW-3 (1+2 re-review): save() must merge the engineer-written
+    # approvedActions waiver from disk, and disk must ALWAYS win for that
+    # key -- a one-shot merge guarded on the in-memory dict shadowed
+    # engineer #2's additions with engineer #1's stale copy (NEW-3).
+    # Behavioral check against the REAL merge function, both the call-site
+    # wiring and the two-run shadowing repro.
     save_body = main_source[main_source.index("def save():"):main_source.index("save()\n")]
-    assert '"approvedActions"' in save_body, (
-        "save() must merge the engineer-written approvedActions waiver from disk "
-        "before its full overwrite -- see NEW-1 in followup-1-2-review.md"
+    assert "_merge_engineer_owned_keys(manifest, manifest_path)" in save_body, (
+        "save() must call _merge_engineer_owned_keys before its full overwrite"
     )
+    with tempfile.TemporaryDirectory() as _td:
+        _mp = Path(_td) / "manifest.json"
+        # engineer #1's waiver on disk, v2 memory without it -> merged in
+        _mp.write_text(json.dumps({"approvedActions": [{"approvalId": "a1"}]}))
+        _mem = {"status": "x"}
+        _merge_engineer_owned_keys(_mem, _mp)
+        assert _mem["approvedActions"] == [{"approvalId": "a1"}]
+        # engineer #2 appended on disk; stale in-memory copy must NOT win
+        _mp.write_text(json.dumps({"approvedActions": [{"approvalId": "a1"}, {"approvalId": "a2"}]}))
+        _merge_engineer_owned_keys(_mem, _mp)
+        assert [w["approvalId"] for w in _mem["approvedActions"]] == ["a1", "a2"], (
+            "disk must always win for approvedActions (NEW-3 shadowing)"
+        )
+        # malformed/absent disk -> tolerant no-op
+        _mp.write_text("not json{{{")
+        _merge_engineer_owned_keys(_mem, _mp)
+        assert [w["approvalId"] for w in _mem["approvedActions"]] == ["a1", "a2"]
 
     # ------------------------------------------------------------
     # 7. CLI-level fail-closed rejection: an unrecognized
