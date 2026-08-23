@@ -17,16 +17,31 @@ repo checkout to find `dist/index.js` or `node_modules`.
 src-tauri/scripts/prepare-gateway.sh
 ```
 
-- Builds `shared` and `server` (`tsc`), then assembles
-  `src-tauri/resources/gateway/` as an isolated copy: `dist/` from
-  `server/dist`, `node_modules/@glimmer/shared` vendored directly from
-  `shared/dist` (not installed — it isn't published to a registry), and a
-  generated `package.json` (server's `dependencies` minus `@glimmer/shared`)
-  installed with `npm install --omit=dev` so only the gateway's actual
-  runtime deps (express, cors, transitively ~70 packages, ~4.3MB) land
-  there — not the whole hoisted monorepo `node_modules`.
-- Gitignored, regenerated fresh each build, same convention as
-  `binaries/glimmer-node-*`.
+- Builds `shared` and `server` (`tsc` — `server/tsconfig.json` excludes
+  `src/**/*.test.ts`, mirroring `shared/tsconfig.json`, so no compiled test
+  files land in `dist/` or the shipped bundle), then assembles
+  `src-tauri/resources/gateway/` as an isolated copy: a generated
+  `package.json` (server's `dependencies` minus `@glimmer/shared`)
+  installed with `npm ci --omit=dev` against a **committed** lockfile
+  (`src-tauri/scripts/gateway-package-lock.json`) so the ~70 transitive
+  packages (express, cors, ~4.2MB) resolve identically across machines and
+  time; falls back to `npm install` (and re-commits the lockfile) if the
+  lockfile no longer matches the generated `package.json` — e.g. after a
+  server dependency bump. `node_modules/@glimmer/shared` is then vendored
+  by hand from `shared/dist` (it isn't published to a registry, so it's
+  never a declared dependency) **after** the install/`ci` step, never
+  before — npm prunes anything not declared in `package.json` on every
+  install, so copying it in first got it silently deleted as "extraneous",
+  which crashed the gateway with `ERR_MODULE_NOT_FOUND` on any machine
+  without the repo checkout to invisibly fall back on (caught in review:
+  both live tests in the original version of this work ran the bundled
+  gateway from *inside* the git checkout, where it silently succeeded via
+  the workspace's hoisted `node_modules/@glimmer/shared` symlink instead of
+  the vendored copy — the exact failure mode this bundling exists to
+  prevent).
+- `resources/gateway/` itself is gitignored, regenerated fresh each build
+  (like `binaries/glimmer-node-*`); the lockfile next to the script is
+  committed.
 - **Required before `cargo build`/`tauri build`** if you want the bundled
   path exercised — `tauri-build` copies `bundle.resources` into
   `target/<profile>/resources/` at *compile* time (`build.rs`), so this
@@ -40,11 +55,19 @@ src-tauri/scripts/prepare-gateway.sh
   compile-time repo path (`CARGO_MANIFEST_DIR/../server`) so a checkout
   that hasn't run the prepare script yet still works in dev. That last
   branch is compiled out of release builds.
-- **Verified live**: with `server/dist` renamed out of the way (so the dev
-  repo-path fallback would 404 if it were ever hit), running the debug
-  binary spawned the gateway from
-  `target/debug/resources/gateway` via the bundled `glimmer-node` sidecar
-  and served real data on `GET /api/status`.
+- **Verified live, off-repo**: copied the built `resources/gateway/` to
+  `/tmp` (no ancestor `node_modules` reachable at all — the actual failure
+  mode the earlier in-repo test masked) and ran it there with the bundled
+  `glimmer-node` sidecar binary directly: served real data on
+  `GET /api/status` with no `ERR_MODULE_NOT_FOUND`. Also re-ran the
+  original in-repo checks (debug binary with `server/dist` renamed away,
+  and the actual built `.app`/`.dmg` via `npm run tauri:build`, quit via
+  the app's Quit menu) — all still pass.
+- **Stale-vendor caveat**: `prepare-gateway.sh` is only re-run by the
+  blessed `tauri:build` entry point. Editing `server/src` and running
+  `cargo build`/`cargo check` directly (without re-running the script)
+  ships a stale `dist/` — there's no mtime/hash guard against this, just
+  this documented invariant.
 
 ### What's still NOT bundled — external requirement, by design
 `CONFIG.glimmerV2Path` / `CONFIG.engineerPath` (see `server/src/config.ts`)
