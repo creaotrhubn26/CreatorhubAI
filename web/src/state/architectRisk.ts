@@ -25,6 +25,14 @@ function segmentTokens(text: string): string[] {
   return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 }
 
+// The exact derivation server/src/lib/runner.ts's buildArgs uses for
+// --verification-level. Exported so the composer's task-intelligence request
+// (Task 4c(a)) sends the same value the orchestrator will actually run with,
+// rather than a second guess at it.
+export function deriveVerificationLevel(contract: TaskContract): string {
+  return contract.verification.length === 0 ? "minimal" : "standard";
+}
+
 export interface ArchitectRisk {
   score: number;
   signals: string[];
@@ -69,7 +77,7 @@ export function computeArchitectRisk(contract: TaskContract): ArchitectRisk {
   // currently unreachable) branch instead of a TS2367 compile error --
   // "full" is a legitimate value of this same field on the Python side,
   // just not one today's composer/runner derivation ever produces.
-  const verificationLevel: string = contract.verification.length === 0 ? "minimal" : "standard";
+  const verificationLevel: string = deriveVerificationLevel(contract);
   if (verificationLevel === "full") {
     score += 2;
     signals.push("verification_full");

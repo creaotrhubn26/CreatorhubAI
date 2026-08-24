@@ -10,6 +10,7 @@
   "dependencies": {
     "@glimmer/shared": "*",
     "@tanstack/react-query": "^5.51.1",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.25.1"

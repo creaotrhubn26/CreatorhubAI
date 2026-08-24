@@ -15,5 +15,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
+# Task 4c(2/3): native Finder directory/file chooser for the task composer's
+# workspace and scope-path fields (browser builds fall back to the gateway's
+# read-only GET /api/fs/dirs browser).
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -32,12 +32,52 @@ describe("glimmerApi", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ likelyArea: "frontend", likelyPackage: "x", suggestedVerification: [], estimatedRisk: null, provenance: "git-derived" }), { status: 200 })
     );
-    const result = await glimmerApi.getTaskIntelligence("frontend", "frontend/client/src/dialog");
+    const result = await glimmerApi.getTaskIntelligence({
+      scopePackage: "frontend",
+      scopeArea: "frontend/client/src/dialog",
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       `${API_BASE}/api/task-intelligence?scopePackage=frontend&scopeArea=${encodeURIComponent("frontend/client/src/dialog")}`,
       expect.anything()
     );
     expect(result.likelyArea).toBe("frontend");
+  });
+
+  // Task 4c(a): the composer's live state is what makes the endpoint able to
+  // score risk and pick the right repo map — assert those hints actually reach
+  // the wire, and that unset ones are omitted rather than sent as blanks.
+  it("getTaskIntelligence forwards workspace and risk hints, omitting the ones not given", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: "HIGH", provenance: "deterministic-backend", repoMapStatus: "unmatched-workspace" }), { status: 200 })
+    );
+    await glimmerApi.getTaskIntelligence({
+      scopePackage: "repository",
+      workspace: "/tmp/ws",
+      mode: "refactor",
+      objective: "rotate the auth secrets",
+      verificationLevel: "standard",
+    });
+    const url = fetchMock.mock.calls[0][0] as string;
+    const query = new URLSearchParams(url.split("?")[1]);
+    expect(query.get("workspace")).toBe("/tmp/ws");
+    expect(query.get("mode")).toBe("refactor");
+    expect(query.get("objective")).toBe("rotate the auth secrets");
+    expect(query.get("verificationLevel")).toBe("standard");
+    expect(query.has("candidateCount")).toBe(false);
+    expect(query.has("scopeArea")).toBe(false);
+  });
+
+  it("listDirectory calls GET /api/fs/dirs with path/root/includeFiles", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ root: "/ws", path: "/ws", parent: null, entries: [], truncated: false }), { status: 200 })
+    );
+    await glimmerApi.listDirectory({ path: "/ws/src", root: "/ws", includeFiles: true });
+    const url = fetchMock.mock.calls[0][0] as string;
+    const query = new URLSearchParams(url.split("?")[1]);
+    expect(url.startsWith(`${API_BASE}/api/fs/dirs?`)).toBe(true);
+    expect(query.get("path")).toBe("/ws/src");
+    expect(query.get("root")).toBe("/ws");
+    expect(query.get("includeFiles")).toBe("1");
   });
 
   it("getSessionAnalysis calls GET /api/sessions/:id/analysis", async () => {

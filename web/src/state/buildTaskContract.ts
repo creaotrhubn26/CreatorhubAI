@@ -24,6 +24,19 @@ export interface TaskComposerFormState {
   architectFirst?: boolean;
 }
 
+// Task 4c(3): "files" scope is a LIST — the picker can select several, and the
+// backend's scope guard (server/src/lib/repoAnalysis.ts expectedPrefixes)
+// checks every entry of scope.paths, while scope.area is a single prefix. So a
+// multi-file selection goes into paths; everything else keeps using area
+// exactly as before. Paths are workspace-relative, the same form the guard
+// compares changed-file paths in.
+function scopePaths(form: TaskComposerFormState): { area?: string; paths?: string[] } {
+  const raw = form.scopeArea?.trim();
+  if (form.scopePackage !== "files" || !raw) return { area: form.scopeArea };
+  const paths = raw.split(/[,\n]/).map((p) => p.trim()).filter(Boolean);
+  return paths.length > 0 ? { paths } : { area: form.scopeArea };
+}
+
 export function buildTaskContract(form: TaskComposerFormState): TaskContract {
   const advanced: NonNullable<TaskContract["advanced"]> = {};
   if (form.timeoutSeconds !== undefined) advanced.timeoutSeconds = form.timeoutSeconds;
@@ -35,7 +48,7 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
 
   return {
     objective: form.objective,
-    scope: { package: form.scopePackage, area: form.scopeArea },
+    scope: { package: form.scopePackage, ...scopePaths(form) },
     mode: form.mode,
     constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
     verification: form.verification,

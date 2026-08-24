@@ -3,7 +3,7 @@ import type {
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, DeliveryPacket, GlimmerTask, HumanAcceptance,
   CreateWorkspaceResult,
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
-  ApprovalRequest,
+  ApprovalRequest, FsListing,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -219,9 +219,35 @@ export const glimmerApi = {
   // shape as a success, so the caller never has to invent one.
   startModelServer: () => modelControl("start"),
   stopModelServer: () => modelControl("stop"),
-  getTaskIntelligence: (scopePackage: string, scopeArea?: string) => {
-    const params = new URLSearchParams({ scopePackage });
-    if (scopeArea) params.set("scopeArea", scopeArea);
-    return request<TaskIntelligence>(`/api/task-intelligence?${params.toString()}`);
+  // Task 4c(a): the composer passes its live mode/objective/verificationLevel
+  // (the risk hints the endpoint requires before it will score anything) and
+  // the workspace being composed against, so the panel stops rendering a
+  // permanently-null risk and a possibly-unrelated repo's areas.
+  getTaskIntelligence: (params: {
+    scopePackage: string;
+    scopeArea?: string;
+    workspace?: string;
+    mode?: string;
+    objective?: string;
+    verificationLevel?: string;
+    candidateCount?: number;
+  }) => {
+    const query = new URLSearchParams({ scopePackage: params.scopePackage });
+    if (params.scopeArea) query.set("scopeArea", params.scopeArea);
+    if (params.workspace) query.set("workspace", params.workspace);
+    if (params.mode) query.set("mode", params.mode);
+    if (params.objective) query.set("objective", params.objective);
+    if (params.verificationLevel) query.set("verificationLevel", params.verificationLevel);
+    if (params.candidateCount !== undefined) query.set("candidateCount", String(params.candidateCount));
+    return request<TaskIntelligence>(`/api/task-intelligence?${query.toString()}`);
+  },
+  // Task 4c(2/3): read-only directory listing for the composer's path pickers
+  // (browser/dev fallback — the Tauri app uses the native Finder dialog).
+  listDirectory: (params: { path?: string; root?: string; includeFiles?: boolean }) => {
+    const query = new URLSearchParams();
+    if (params.path) query.set("path", params.path);
+    if (params.root) query.set("root", params.root);
+    if (params.includeFiles) query.set("includeFiles", "1");
+    return request<FsListing>(`/api/fs/dirs?${query.toString()}`);
   },
 };

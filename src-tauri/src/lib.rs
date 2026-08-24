@@ -279,6 +279,8 @@ fn kill_gateway(state: &GatewayChild) {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        // Task 4c(2/3): native directory/file chooser for the task composer.
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![notify])
         .setup(|app| {
             let handle = app.handle().clone();
