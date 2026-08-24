@@ -9,8 +9,10 @@ import { StatusBadge } from "../common/StatusBadge";
 const RUN_STATE_NOTE: Record<ModelRunState, string> = {
   OFFLINE: "Not running.",
   STARTING: "Start script launched — the port isn't accepting connections yet.",
-  LOADING: "Port is up, /health hasn't returned 200 yet — the model is loading (1–2 min).",
-  ONLINE: "/health returned 200.",
+  LOADING:
+    "Port is up, /health hasn't returned 200 yet — the model is loading (1–2 min). It keeps running after you quit the app; press Stop to free the memory (~20 GB).",
+  ONLINE:
+    "/health returned 200. It keeps running after you quit the app; press Stop to free the memory (~20 GB).",
   FAILED: "The process we started exited before the server came up.",
 };
 
@@ -60,8 +62,13 @@ export function ModelStatusScreen() {
         <button onClick={() => stopMutation.mutate()} disabled={pending || runState === "OFFLINE"}>
           Stop server
         </button>
+        <p>Stop targets whatever holds the model port — including a llama-server you started in a terminal.</p>
         {failure && <p className="error">{String(failure)}</p>}
-        {noOp && lastResult && <p>No change: the server was already {lastResult.runState ?? "Unavailable"}.</p>}
+        {/* A stop that didn't stop anything says why. Never a silent click. */}
+        {lastResult?.detail && <p className="error">Nothing was stopped: {lastResult.detail}.</p>}
+        {noOp && lastResult && !lastResult.detail && (
+          <p>No change: the server was already {lastResult.runState ?? "Unavailable"}.</p>
+        )}
         {lastResult?.error && <p className="error">{lastResult.error}</p>}
         {runState === "FAILED" && (
           <>

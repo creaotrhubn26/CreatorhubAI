@@ -74,6 +74,20 @@ describe("ModelStatusScreen", () => {
     expect(screen.getByRole("button", { name: "Start server" })).toBeEnabled();
   });
 
+  it("says why nothing was stopped when the target survived the stop attempt", async () => {
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
+      status: "ONLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "ONLINE",
+    });
+    vi.spyOn(client.glimmerApi, "stopModelServer").mockResolvedValue({
+      stopped: false, detail: "something is still listening on the model port (ONLINE)",
+      status: "ONLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "ONLINE",
+    });
+    render(withQuery(<ModelStatusScreen />));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Stop server" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Stop server" }));
+    await waitFor(() => expect(screen.getByText(/Nothing was stopped: something is still listening/)).toBeInTheDocument());
+  });
+
   it("reports an already-running server as a no-op rather than a successful start", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
       status: "OFFLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "OFFLINE",

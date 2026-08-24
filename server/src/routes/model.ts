@@ -51,11 +51,21 @@ modelRouter.post("/model/stop", async (_req, res) => {
   }
 
   const result = await stopModelServer();
-  if (result.error) {
-    return res.status(500).json({ stopped: false, error: result.error, ...probe, ...run });
-  }
-  // Re-probe: the stop script SIGTERMs by port, and the honest answer is
-  // whatever the port says now, not what we intended to happen.
+  // Re-probe: the honest answer is what the port and the pid say now, never
+  // the stop script's exit code (it exits 0 when it refuses to kill a
+  // non-llama-server process, and it cannot see a process that hasn't bound
+  // yet). `stopped` is derived from that evidence, so a target that survived
+  // is reported as survived — never as a stop that did not happen.
   const after = await probeModel(CONFIG.modelBaseUrl);
-  res.json({ stopped: true, ...after, ...(await describeRunState(after)) });
+  const afterRun = await describeRunState(after);
+  const stopped = !result.pidStillAlive && afterRun.runState === "OFFLINE";
+  const detail = stopped
+    ? undefined
+    : result.pidStillAlive
+      ? "the process we started is still running after the stop attempt"
+      : `something is still listening on the model port (${afterRun.runState})`;
+  if (result.error) {
+    return res.status(500).json({ stopped, error: result.error, detail, ...after, ...afterRun });
+  }
+  res.json({ stopped, ...(detail ? { detail } : {}), ...after, ...afterRun });
 });

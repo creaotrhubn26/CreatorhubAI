@@ -25,13 +25,44 @@ let spawned: Spawned | null = null;
 
 const logPath = () => path.join(CONFIG.stateRoot, "model-server.log");
 
-async function readLogTail(maxChars = 2000): Promise<string | undefined> {
+// Read only the tail off the end of the file. The log is opened "a" and never
+// rotated — it accumulates every llama-server run — and the status route polls
+// this every few seconds while FAILED, so slurping the whole file would grow
+// without bound.
+async function readLogTail(maxBytes = 2000): Promise<string | undefined> {
+  let handle;
   try {
-    const text = await fs.readFile(logPath(), "utf8");
-    return text.length > maxChars ? text.slice(-maxChars) : text;
+    handle = await fs.open(logPath(), "r");
+    const { size } = await handle.stat();
+    const length = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(length);
+    await handle.read(buf, 0, length, Math.max(0, size - length));
+    return buf.toString("utf8");
   } catch {
     return undefined; // no log yet — absent, never invented
+  } finally {
+    await handle?.close().catch(() => {});
   }
+}
+
+/// Does this pid still exist? EPERM means it exists but isn't ours — still
+/// alive, which is what the caller is asking.
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function waitGone(pid: number, timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return !processAlive(pid);
 }
 
 async function executable(script: string): Promise<boolean> {
@@ -43,7 +74,24 @@ async function executable(script: string): Promise<boolean> {
   }
 }
 
-export async function startModelServer(): Promise<{ pid: number } | { error: string }> {
+// Serialised: the route's "is it already running?" check is a read-then-act
+// with awaits in between, so N concurrent POSTs used to reach the spawn
+// together and start N servers — and the last one to spawn overwrote the
+// single `spawned` handle, so the gateway could report a loser's FAILED exit
+// while the winner was loading. One in-flight start at a time, all callers
+// share its result.
+let inFlight: Promise<{ pid: number } | { error: string }> | null = null;
+
+export function startModelServer(): Promise<{ pid: number } | { error: string }> {
+  return (inFlight ??= doStart().finally(() => {
+    inFlight = null;
+  }));
+}
+
+async function doStart(): Promise<{ pid: number } | { error: string }> {
+  // Second line of defence behind the serialisation: never abandon a process
+  // we already own by overwriting its handle.
+  if (spawned?.alive && processAlive(spawned.pid)) return { pid: spawned.pid };
   const script = CONFIG.modelStartScript;
   if (!(await executable(script))) {
     return { error: `model start script not found or not executable: ${script}` };
@@ -77,19 +125,50 @@ export async function startModelServer(): Promise<{ pid: number } | { error: str
   }
 }
 
-export async function stopModelServer(): Promise<{ error?: string }> {
+/// Runs the stop script and then establishes, from evidence, whether anything
+/// is actually gone. `pidStillAlive` is the honest answer for the process we
+/// started; the caller re-probes the port for the other half.
+///
+/// Two things the script alone cannot tell us, both found live:
+///  - it finds its target with `lsof -tiTCP:$PORT`, so a process that hasn't
+///    bound yet (the STARTING window) is invisible to it and survives;
+///  - it exits 0 when it deliberately refuses to kill a non-llama-server
+///    process on the port.
+/// So its exit code is never treated as proof, and `spawned` is cleared only
+/// once the pid is really gone — a failed stop must not lose the handle to a
+/// process that is definitely still running.
+export async function stopModelServer(): Promise<{ error?: string; pidStillAlive: boolean }> {
   const script = CONFIG.modelStopScript;
+  const pid = spawned && processAlive(spawned.pid) ? spawned.pid : null;
   if (!(await executable(script))) {
-    return { error: `model stop script not found or not executable: ${script}` };
+    return { error: `model stop script not found or not executable: ${script}`, pidStillAlive: pid !== null };
   }
+
+  let error: string | undefined;
   try {
     await exec(script, [], { timeout: 15_000 });
   } catch (err) {
-    return { error: `stop script failed: ${String(err)}` };
-  } finally {
-    spawned = null;
+    error = `stop script failed: ${String(err)}`;
   }
-  return {};
+
+  if (pid && processAlive(pid)) {
+    // The child was spawned detached, so it leads its own process group —
+    // signal the group so an exec'd llama-server goes with it.
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        /* already gone between the check and the signal */
+      }
+    }
+    await waitGone(pid);
+  }
+
+  const pidStillAlive = pid !== null && processAlive(pid);
+  if (!pidStillAlive) spawned = null;
+  return { error, pidStillAlive };
 }
 
 /// Forget the process we started without running anything — used when there

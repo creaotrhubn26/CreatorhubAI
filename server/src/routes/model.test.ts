@@ -6,6 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import type { Express } from "express";
 
+// Writes require an allowed Origin (app.ts localOnlyGuard): a browser always
+// sends one on a state-changing request, so the tests speak the same way.
+const UI_ORIGIN = "http://127.0.0.1:5183";
+
 // Process control (POST /model/start|stop) must never actually launch a
 // 30B llama-server, so child_process is mocked for this whole file. execFile
 // is mocked too because it must stay a function: lib/git.ts promisifies it at
@@ -145,7 +149,7 @@ describe("POST /api/model/start", () => {
     const { createApp } = await import("../app.js");
     const app: Express = createApp();
 
-    const res = await request(app).post("/api/model/start");
+    const res = await request(app).post("/api/model/start").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(409);
     expect(res.body.started).toBe(false);
     expect(res.body.runState).toBe("ONLINE");
@@ -157,7 +161,7 @@ describe("POST /api/model/start", () => {
     const { createApp } = await import("../app.js");
     const app: Express = createApp();
 
-    const res = await request(app).post("/api/model/start");
+    const res = await request(app).post("/api/model/start").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(202);
     expect(res.body.started).toBe(true);
     expect(res.body.pid).toBe(4242);
@@ -180,7 +184,7 @@ describe("POST /api/model/start", () => {
     const { createApp } = await import("../app.js");
     const app: Express = createApp();
 
-    const res = await request(app).post("/api/model/start");
+    const res = await request(app).post("/api/model/start").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(500);
     expect(res.body.started).toBe(false);
     expect(res.body.error).toContain("does-not-exist.sh");
@@ -193,7 +197,7 @@ describe("POST /api/model/start", () => {
     const { createApp } = await import("../app.js");
     const app: Express = createApp();
 
-    await request(app).post("/api/model/start");
+    await request(app).post("/api/model/start").set("Origin", UI_ORIGIN);
     await fs.writeFile(path.join(stateRoot, "model-server.log"), "error: failed to load model\n");
     child.emit("exit", 1);
 
@@ -209,7 +213,7 @@ describe("POST /api/model/stop", () => {
     const { createApp } = await import("../app.js");
     const app: Express = createApp();
 
-    const res = await request(app).post("/api/model/stop");
+    const res = await request(app).post("/api/model/stop").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body.stopped).toBe(false);
     expect(res.body.runState).toBe("OFFLINE");
@@ -229,7 +233,7 @@ describe("POST /api/model/stop", () => {
     const { createApp } = await import("../app.js");
     const app: Express = createApp();
 
-    const res = await request(app).post("/api/model/stop");
+    const res = await request(app).post("/api/model/stop").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body.stopped).toBe(true);
     expect(res.body.runState).toBe("OFFLINE");
@@ -237,5 +241,64 @@ describe("POST /api/model/stop", () => {
     const [cmd, args] = execFileMock.mock.calls[0];
     expect(cmd).toBe(stopScript);
     expect(args).toEqual([]);
+  });
+
+  it("kills the process we started even in the STARTING window, where the port-keyed script cannot see it", async () => {
+    // A real, detached child of our own so the process-group kill has
+    // something true to act on (the port-keyed stop script finds nothing —
+    // this process never binds, exactly like llama-server before it binds).
+    const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawn;
+    const victim = realSpawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+    victim.unref();
+    spawnMock.mockReturnValue(fakeChild(victim.pid!));
+    const { createApp } = await import("../app.js");
+    const app: Express = createApp();
+
+    await request(app).post("/api/model/start").set("Origin", UI_ORIGIN);
+    const res = await request(app).post("/api/model/stop").set("Origin", UI_ORIGIN);
+
+    expect(res.status).toBe(200);
+    expect(res.body.stopped).toBe(true);
+    // Evidence, not the script's exit code: the process is actually gone.
+    expect(() => process.kill(victim.pid!, 0)).toThrow();
+  });
+
+  it("never claims a stop that did not happen: a surviving target is reported as still running", async () => {
+    // The port stays up after the script runs — a slow SIGTERM, or the script
+    // refusing to kill a non-llama-server process (it exits 0 either way).
+    await listen((req, res) => {
+      if (req.url === "/health") return res.writeHead(200).end("ok");
+      res.writeHead(404).end();
+    });
+    const { createApp } = await import("../app.js");
+    const app: Express = createApp();
+
+    const res = await request(app).post("/api/model/stop").set("Origin", UI_ORIGIN);
+    expect(res.status).toBe(200);
+    expect(res.body.stopped).toBe(false);
+    expect(res.body.runState).toBe("ONLINE");
+    expect(res.body.detail).toContain("still listening");
+  });
+});
+
+describe("POST /api/model/start concurrency", () => {
+  it("spawns at most one process for parallel starts, and keeps that one's handle", async () => {
+    spawnMock.mockImplementation(() => fakeChild(4242));
+    const { createApp } = await import("../app.js");
+    const app: Express = createApp();
+
+    const results = await Promise.all(
+      [1, 2, 3, 4, 5].map(() => request(app).post("/api/model/start").set("Origin", UI_ORIGIN))
+    );
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    // Nobody is told a process started that didn't, and nobody is told
+    // "already running" about a process that was never spawned.
+    for (const res of results) {
+      expect([202, 409]).toContain(res.status);
+      if (res.status === 202) expect(res.body.pid).toBe(4242);
+    }
+    const status = await request(app).get("/api/model/status");
+    expect(status.body.runState).toBe("STARTING");
   });
 });

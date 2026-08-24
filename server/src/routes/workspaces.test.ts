@@ -7,6 +7,10 @@ import os from "node:os";
 import path from "node:path";
 import type { Express } from "express";
 
+// Writes require an allowed Origin (app.ts localOnlyGuard): a browser always
+// sends one on a state-changing request, so the tests speak the same way.
+const UI_ORIGIN = "http://127.0.0.1:5183";
+
 const exec = promisify(execFile);
 
 // Same isolation convention as routes.test.ts: point every CONFIG-relevant
@@ -65,25 +69,25 @@ describe("GET /api/workspaces (untouched)", () => {
 
 describe("POST /api/workspaces — validation", () => {
   it("400s when taskName is missing", async () => {
-    const res = await request(app).post("/api/workspaces").send({});
+    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({});
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/taskname/i);
   });
 
   it("400s when taskName is not a string", async () => {
-    const res = await request(app).post("/api/workspaces").send({ taskName: 42 });
+    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: 42 });
     expect(res.status).toBe(400);
   });
 
   it("400s when taskName sanitizes to an empty slug", async () => {
-    const res = await request(app).post("/api/workspaces").send({ taskName: "!!!///???" });
+    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "!!!///???" });
     expect(res.status).toBe(400);
   });
 });
 
 describe("POST /api/workspaces — success", () => {
   it("creates a real branch+worktree and returns {workspace, branch, baselineSha}", async () => {
-    const res = await request(app).post("/api/workspaces").send({ taskName: "route level task" });
+    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "route level task" });
     expect(res.status).toBe(200);
     expect(res.body.branch).toMatch(/^glimmer\/route-level-task-\d{8}-\d{6}$/);
     expect(typeof res.body.baselineSha).toBe("string");
@@ -97,8 +101,8 @@ describe("POST /api/workspaces — success", () => {
 describe("POST /api/workspaces — concurrency", () => {
   it("returns 409 for a second request fired while the first is still in flight", async () => {
     const [r1, r2] = await Promise.all([
-      request(app).post("/api/workspaces").send({ taskName: "concurrent-route-a" }),
-      request(app).post("/api/workspaces").send({ taskName: "concurrent-route-b" }),
+      request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "concurrent-route-a" }),
+      request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "concurrent-route-b" }),
     ]);
     const statuses = [r1.status, r2.status].sort();
     expect(statuses).toEqual([200, 409]);

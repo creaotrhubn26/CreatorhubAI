@@ -80,7 +80,23 @@ fn find_in_path(path: &str, program: &str) -> Option<PathBuf> {
     path.split(':')
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable(candidate))
+}
+
+/// A *runnable* file, not just a file: a non-executable `node` earlier in PATH
+/// would otherwise be picked and fail at spawn with a confusing error.
+fn is_executable(path: &PathBuf) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Asks the user's login shell for its PATH, exactly as a Terminal session

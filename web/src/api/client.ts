@@ -22,6 +22,9 @@ export type ModelControlResult = ModelStatus & {
   stopped?: boolean;
   pid?: number;
   error?: string;
+  // Why a stop reported `stopped: false` — nothing was running, or the target
+  // survived the attempt. Present only in that case.
+  detail?: string;
 };
 
 async function modelControl(action: "start" | "stop"): Promise<ModelControlResult> {
