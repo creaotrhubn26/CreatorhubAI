@@ -113,6 +113,73 @@ describe("GET /api/task-intelligence", () => {
     expect(res.body.estimatedRisk).toBe("CRITICAL");
   });
 
+  // Task 4c(b): findRepoMap() returns the first repo map found across ALL
+  // sessions — for the composer, which is always composing against one
+  // workspace, that can be an entirely unrelated repository presented as the
+  // user's own. These cases pin the workspace-scoped resolution and, above
+  // all, that a workspace with no repo map gets nulls rather than someone
+  // else's data.
+  describe("workspace-scoped repo map", () => {
+    let workspace: string;
+    let otherWorkspace: string;
+    const wsSessionId = "20260818-000000-glimmer-ws";
+
+    beforeAll(async () => {
+      workspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-ti-ws-"));
+      otherWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-ti-other-ws-"));
+      const dir = path.join(stateRoot, "sessions", wsSessionId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        path.join(dir, "manifest.json"),
+        JSON.stringify({ task: "t", status: "initialized", workspace, branch: "main", baseline: null, attempts: [] })
+      );
+      await fs.writeFile(path.join(dir, "repo-map.json"), JSON.stringify({ ...REPO_MAP, workspace }));
+    });
+
+    afterAll(async () => {
+      await fs.rm(path.join(stateRoot, "sessions", wsSessionId), { recursive: true, force: true });
+      await fs.rm(workspace, { recursive: true, force: true });
+      await fs.rm(otherWorkspace, { recursive: true, force: true });
+    });
+
+    it("resolves the repo map belonging to the workspace the caller named", async () => {
+      const res = await request(app).get(
+        `/api/task-intelligence?scopePackage=frontend&workspace=${encodeURIComponent(workspace)}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.likelyArea).toBe("frontend");
+      expect(res.body.likelyPackage).toBe("creatorhub-frontend");
+      expect(res.body.repoMapStatus).toBe("workspace-matched");
+      expect(res.body.provenance).toBe("git-derived");
+    });
+
+    it("returns nulls — never another repository's map — for a workspace no session has run in", async () => {
+      const res = await request(app).get(
+        `/api/task-intelligence?scopePackage=frontend&workspace=${encodeURIComponent(otherWorkspace)}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.likelyArea).toBeNull();
+      expect(res.body.likelyPackage).toBeNull();
+      expect(res.body.suggestedVerification).toEqual([]);
+      expect(res.body.repoMapStatus).toBe("unmatched-workspace");
+      expect(res.body.provenance).toBe("deterministic-backend");
+    });
+
+    it("labels a request that names no workspace as first-found rather than implying it is the caller's repo", async () => {
+      const res = await request(app).get("/api/task-intelligence?scopePackage=frontend");
+      expect(res.status).toBe(200);
+      expect(res.body.repoMapStatus).toBe("first-found");
+    });
+
+    it("still scores risk for an unmatched workspace — risk needs no repo map", async () => {
+      const res = await request(app).get(
+        `/api/task-intelligence?scopePackage=repository&mode=refactor&workspace=${encodeURIComponent(otherWorkspace)}`
+      );
+      expect(res.body.estimatedRisk).toBe("HIGH");
+      expect(res.body.repoMapStatus).toBe("unmatched-workspace");
+    });
+  });
+
   it("only counts a candidateCount strictly above the threshold (5)", async () => {
     const atThreshold = await request(app).get(
       "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=5"

@@ -1,7 +1,7 @@
 import { Router } from "express";
-import { findRepoMap } from "./repository.js";
+import { findRepoMap, findRepoMapForWorkspace } from "./repository.js";
 import { inferArea, suggestVerification, computeArchitectRiskScore, riskScoreToLevel } from "../lib/repoAnalysis.js";
-import type { TaskIntelligence, TaskContract } from "@glimmer/shared";
+import type { TaskIntelligence, TaskContract, RepoMap } from "@glimmer/shared";
 
 export const taskIntelligenceRouter = Router();
 
@@ -13,7 +13,23 @@ taskIntelligenceRouter.get("/task-intelligence", async (req, res) => {
     const scopePackage = (VALID_SCOPE_PACKAGES.has(rawScope) ? rawScope : "repository") as TaskContract["scope"]["package"];
     const scopeArea = typeof req.query.scopeArea === "string" ? req.query.scopeArea : undefined;
 
-    const repoMap = await findRepoMap();
+    // Task 4c(b): the composer is always composing against ONE workspace, so
+    // when it names one, the repo map must be that workspace's or nothing --
+    // findRepoMap()'s "first session that has a map wins" answer can be an
+    // entirely unrelated repository. Absent the param, behavior is unchanged.
+    const workspace = typeof req.query.workspace === "string" && req.query.workspace.trim()
+      ? req.query.workspace.trim()
+      : undefined;
+    let repoMap: RepoMap | null;
+    let repoMapStatus: TaskIntelligence["repoMapStatus"];
+    if (workspace) {
+      const found = await findRepoMapForWorkspace(workspace);
+      repoMap = found?.map ?? null;
+      repoMapStatus = found ? "workspace-matched" : "unmatched-workspace";
+    } else {
+      repoMap = await findRepoMap();
+      repoMapStatus = repoMap ? "first-found" : "none";
+    }
     const { area, package: pkg } = inferArea({ package: scopePackage, area: scopeArea }, repoMap);
 
     // Task 9.3b (V7 §5.5/§46): populated from the same deterministic
@@ -40,6 +56,7 @@ taskIntelligenceRouter.get("/task-intelligence", async (req, res) => {
         ? riskScoreToLevel(computeArchitectRiskScore(scopePackage, { mode, objective, verificationLevel, candidateCount }).score)
         : null,
       provenance: repoMap ? "git-derived" : "deterministic-backend",
+      repoMapStatus,
     };
     res.json(result);
   } catch (err: any) {

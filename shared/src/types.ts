@@ -1124,6 +1124,20 @@ export interface ModelStatus {
   logTail?: string;
 }
 
+// Task 4c(2/3): one page of the gateway's read-only directory browser
+// (GET /api/fs/dirs). Names only — no file contents, sizes, or permissions.
+// `root` and `path` are the REALPATH-resolved absolute paths the server
+// actually listed (not the caller's spelling), `parent` is null at the root
+// so the UI can never navigate above it, and `truncated` is true only when
+// entries were genuinely dropped by the result cap.
+export interface FsListing {
+  root: string;
+  path: string;
+  parent: string | null;
+  entries: { name: string; isDir: boolean }[];
+  truncated: boolean;
+}
+
 export interface WorkspaceInfo {
   path: string;
   branch: string;
@@ -1147,6 +1161,22 @@ export interface TaskIntelligence {
   suggestedVerification: string[];
   estimatedRisk: RiskLevel | null;
   provenance: DataProvenance;
+  // Task 4c(b): which repo map the fields above were (or were not) derived
+  // from -- a null likelyArea means something different in each case, and the
+  // UI must be able to say which:
+  //   workspace-matched   the caller named a workspace and a session for THAT
+  //                       workspace had a repo-map.json (the only case where
+  //                       the fields describe the user's own repository)
+  //   unmatched-workspace the caller named a workspace and no session for it
+  //                       has a repo map yet -- fields are null because
+  //                       nothing is known, never because a different repo's
+  //                       map was substituted
+  //   first-found         no workspace was named, so the first repo map found
+  //                       across all sessions was used (the pre-existing
+  //                       repository-screen behavior) -- it may belong to a
+  //                       different repo, so it is labeled, never implied
+  //   none                no workspace named and no repo map exists anywhere
+  repoMapStatus: "workspace-matched" | "unmatched-workspace" | "first-found" | "none";
 }
 
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
