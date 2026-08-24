@@ -67,6 +67,105 @@ describe("GET /api/workspaces (untouched)", () => {
   });
 });
 
+// Task 4c(2/3): the composer's path pickers in a plain browser. Read-only,
+// names only, and contained — these cases exist mostly to pin the containment
+// rules, since this is the gateway's only filesystem-listing endpoint.
+describe("GET /api/fs/dirs", () => {
+  let browseRoot: string;
+  let outside: string;
+
+  beforeAll(async () => {
+    // realpath: macOS tmpdir is a symlink (/var -> /private/var) and the route
+    // compares resolved paths, so the fixture must be expressed the same way.
+    browseRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-root-")));
+    outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-outside-")));
+    process.env.GLIMMER_BROWSE_ROOT = browseRoot;
+
+    await fs.mkdir(path.join(browseRoot, "project", "src"), { recursive: true });
+    await fs.writeFile(path.join(browseRoot, "project", "README.md"), "hi");
+    await fs.writeFile(path.join(browseRoot, "project", ".hidden"), "x");
+    await fs.writeFile(path.join(outside, "secret.txt"), "top secret");
+    await fs.symlink(outside, path.join(browseRoot, "escape-hatch"));
+  });
+
+  afterAll(async () => {
+    delete process.env.GLIMMER_BROWSE_ROOT;
+    await fs.rm(browseRoot, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  });
+
+  it("lists subdirectory names only, hiding files and dotfiles by default", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}`);
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toEqual([{ name: "src", isDir: true }]);
+    expect(res.body.path).toBe(path.join(browseRoot, "project"));
+    expect(res.body.truncated).toBe(false);
+  });
+
+  it("includes file names (never contents) when includeFiles=1", async () => {
+    const res = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}&includeFiles=1`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toEqual([
+      { name: "README.md", isDir: false },
+      { name: "src", isDir: true },
+    ]);
+    expect(JSON.stringify(res.body)).not.toContain("hi");
+  });
+
+  it("reports no parent at the root, so the UI can never walk above it", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.parent).toBeNull();
+  });
+
+  it("rejects ../ traversal out of the browse root", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "..", ".."))}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects an absolute path outside the browse root", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(outside)}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a symlink that escapes the root, even though it lives inside it", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "escape-hatch"))}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a caller-supplied root outside the browse root (scope picker can't widen the boundary)", async () => {
+    const res = await request(app).get(
+      `/api/fs/dirs?root=${encodeURIComponent(outside)}&path=${encodeURIComponent(outside)}`
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("confines the listing to a caller-supplied root inside the boundary", async () => {
+    const root = path.join(browseRoot, "project");
+    const inside = await request(app).get(
+      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path.join(root, "src"))}`
+    );
+    expect(inside.status).toBe(200);
+    expect(inside.body.parent).toBe(root);
+
+    const above = await request(app).get(
+      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(browseRoot)}`
+    );
+    expect(above.status).toBe(403);
+  });
+
+  it("404s for a path that does not exist, and 400s for a file", async () => {
+    const missing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "nope"))}`);
+    expect(missing.status).toBe(404);
+    const file = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", "README.md"))}`
+    );
+    expect(file.status).toBe(400);
+  });
+});
+
 describe("POST /api/workspaces — validation", () => {
   it("400s when taskName is missing", async () => {
     const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({});
