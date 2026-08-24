@@ -189,6 +189,61 @@ describe("budgets.maxChangedFiles", () => {
 });
 
 // Review round 1 fix: TaskContract.mode was never forwarded at all.
+// Review MJ4: buildArgs emitted no --scope-* flag at all, so every
+// gateway-launched run reached glimmer-v2.py with its argparse default
+// (scope.package = "repository", no area, no paths) — the composer's picked
+// files never bounded the run, and GLIMMER_CONTRACT_SCOPE (the engineer's §15
+// expansion pause) was never set.
+describe("scope passthrough", () => {
+  it("forwards scope.package and scope.area", () => {
+    const args = buildArgs(CONTRACT, "/tmp/ws");
+    expect(args[args.indexOf("--scope-package") + 1]).toBe("frontend");
+    expect(args[args.indexOf("--scope-area") + 1]).toBe("role-room");
+  });
+
+  it("repeats --scope-paths once per path (glimmer-v2.py's --scope-paths is action=append)", () => {
+    const args = buildArgs(
+      { ...CONTRACT, scope: { package: "files" as const, paths: ["src/a.ts", "src/b.ts"] } },
+      "/tmp/ws"
+    );
+    expect(args[args.indexOf("--scope-package") + 1]).toBe("files");
+    const pathFlags = args.reduce<string[]>((acc, a, i) => (a === "--scope-paths" ? [...acc, args[i + 1]] : acc), []);
+    expect(pathFlags).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(args).not.toContain("--scope-area");
+  });
+
+  it("forwards a repository scope as such, with no area or paths", () => {
+    const args = buildArgs({ ...CONTRACT, scope: { package: "repository" as const } }, "/tmp/ws");
+    expect(args[args.indexOf("--scope-package") + 1]).toBe("repository");
+    expect(args).not.toContain("--scope-area");
+    expect(args).not.toContain("--scope-paths");
+  });
+
+  it("drops a blank area/path instead of guarding against an empty prefix", () => {
+    const args = buildArgs(
+      { ...CONTRACT, scope: { package: "directory" as const, area: "   ", paths: ["", "  "] } },
+      "/tmp/ws"
+    );
+    expect(args).not.toContain("--scope-area");
+    expect(args).not.toContain("--scope-paths");
+  });
+
+  it("drops a scope.package outside the closed set (defense in depth beyond route validation)", () => {
+    const args = buildArgs({ ...CONTRACT, scope: { package: "--engineer=evil" as any } }, "/tmp/ws");
+    expect(args).not.toContain("--scope-package");
+    expect(args.some((a) => a.includes("--engineer"))).toBe(false);
+  });
+
+  it("keeps the objective last, after --, with every scope flag set", () => {
+    const args = buildArgs(
+      { ...CONTRACT, scope: { package: "files" as const, area: "src", paths: ["src/a.ts"] } },
+      "/tmp/ws"
+    );
+    expect(args[args.length - 2]).toBe("--");
+    expect(args[args.length - 1]).toBe(CONTRACT.objective);
+  });
+});
+
 describe("mode passthrough", () => {
   it("forwards contract.mode as --mode", () => {
     const args = buildArgs({ ...CONTRACT, mode: "debug" }, "/tmp/ws");

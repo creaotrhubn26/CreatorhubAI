@@ -44,7 +44,11 @@ taskIntelligenceRouter.get("/task-intelligence", async (req, res) => {
     const mode = typeof req.query.mode === "string" ? req.query.mode : undefined;
     const objective = typeof req.query.objective === "string" ? req.query.objective : undefined;
     const verificationLevel = typeof req.query.verificationLevel === "string" ? req.query.verificationLevel : undefined;
-    const rawCandidateCount = typeof req.query.candidateCount === "string" ? Number(req.query.candidateCount) : undefined;
+    // Review MN7: `Number("")` is 0, which is finite -- an empty
+    // `candidateCount=` used to fabricate a zero hint (and flip hasRiskHint on).
+    const rawCandidateCount = typeof req.query.candidateCount === "string" && req.query.candidateCount.trim()
+      ? Number(req.query.candidateCount)
+      : undefined;
     const candidateCount = Number.isFinite(rawCandidateCount) ? rawCandidateCount : undefined;
     const hasRiskHint = mode !== undefined || objective !== undefined || verificationLevel !== undefined || candidateCount !== undefined;
 

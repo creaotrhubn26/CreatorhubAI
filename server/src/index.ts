@@ -13,4 +13,8 @@ app.listen(CONFIG.port, "127.0.0.1", () => {
   // is indistinguishable from a real failure once it reaches a session log —
   // so state it here, at boot, where it can be checked.
   console.log(`[gateway] PATH=${process.env.PATH ?? "(unset)"}`);
+  // Review MN2: GLIMMER_BROWSE_ROOT widens what GET /api/fs/dirs will list.
+  // Same trust level as the other env knobs, but it must not be INVISIBLE —
+  // a widened boundary should be checkable at boot, like PATH above.
+  console.log(`[gateway] fs browse root=${process.env.GLIMMER_BROWSE_ROOT ?? "(default: home)"}`);
 });

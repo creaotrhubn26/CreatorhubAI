@@ -31,10 +31,16 @@ const NO_REPO_MAP = "No repository map for this workspace yet";
 function honestField(
   value: string | null,
   data: TaskIntelligence,
-  scopePackage: string
+  // Review MN5: "not applicable for repository-wide scope" is true of AREA and
+  // PACKAGE (there is no single one, by construction) and false of suggested
+  // verification — verification applies perfectly well to a repository-wide
+  // task, it is merely unknown without a package to read scripts from. So the
+  // caller says whether the short-circuit applies rather than the field
+  // inferring it from scopePackage.
+  repositoryScopeMakesItMoot: boolean
 ): { text: string; state: "value" | "not-applicable" | "unknown" } {
   if (value) return { text: value, state: "value" };
-  if (scopePackage === "repository") return { text: NOT_APPLICABLE, state: "not-applicable" };
+  if (repositoryScopeMakesItMoot) return { text: NOT_APPLICABLE, state: "not-applicable" };
   if (data.repoMapStatus === "unmatched-workspace" || data.repoMapStatus === "none") {
     return { text: NO_REPO_MAP, state: "unknown" };
   }
@@ -69,7 +75,7 @@ export function TaskIntelligencePanel({
   candidateCount?: number;
 }) {
   const debouncedObjective = useDebounced(objective ?? "", OBJECTIVE_DEBOUNCE_MS);
-  const { data } = useQuery({
+  const { data, error } = useQuery({
     queryKey: [
       "task-intelligence", scopePackage, scopeArea, workspace, mode, debouncedObjective, verificationLevel, candidateCount,
     ],
@@ -85,14 +91,27 @@ export function TaskIntelligencePanel({
       }),
   });
 
+  // Review MN6: the panel used to vanish whenever the request failed (a very
+  // long objective makes the GET exceed Node's header limit and the gateway
+  // answers 431) — the same silent-disappearance the honest empty states exist
+  // to prevent. Say what happened instead.
+  if (error) {
+    return (
+      <fieldset>
+        <legend>Task Intelligence</legend>
+        <p role="alert">Could not reach the gateway: {(error as Error).message}</p>
+      </fieldset>
+    );
+  }
   if (!data) return null;
 
-  const area = honestField(data.likelyArea, data, scopePackage);
-  const pkg = honestField(data.likelyPackage, data, scopePackage);
+  const repositoryWide = scopePackage === "repository";
+  const area = honestField(data.likelyArea, data, repositoryWide);
+  const pkg = honestField(data.likelyPackage, data, repositoryWide);
   const verification = honestField(
     data.suggestedVerification.length ? data.suggestedVerification.join(", ") : null,
     data,
-    scopePackage
+    false // review MN5: verification is unknown without a package, never "not applicable"
   );
 
   return (

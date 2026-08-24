@@ -42,9 +42,12 @@ describe("TaskIntelligencePanel", () => {
         provenance: "git-derived", repoMapStatus: "workspace-matched",
       });
       render(withQuery(<TaskIntelligencePanel scopePackage="repository" mode="implement" />));
-      await waitFor(() => expect(screen.getAllByText(/not applicable/i).length).toBe(3));
-      expect(screen.queryByText("Unavailable")).not.toBeInTheDocument();
+      // Review MN5: area and package genuinely have no single value for a
+      // repository-wide scope — suggested verification does not get the same
+      // excuse, it is simply unknown without a package to read scripts from.
+      await waitFor(() => expect(screen.getAllByText(/not applicable/i).length).toBe(2));
       expect(screen.getByText("MEDIUM")).toBeInTheDocument();
+      expect(screen.getAllByText("Unavailable").length).toBe(1); // suggested verification
     });
 
     it("says no repository map exists yet when the chosen workspace has never been run", async () => {
@@ -74,6 +77,18 @@ describe("TaskIntelligencePanel", () => {
       render(withQuery(<TaskIntelligencePanel scopePackage="frontend" />));
       await waitFor(() => expect(screen.getByText(/first one found across all sessions/i)).toBeInTheDocument());
     });
+  });
+
+  // Review MN6: the panel used to render null on any query error, so it
+  // silently vanished (e.g. a 431 from a very long objective) — the same
+  // disappearing-data problem the honest empty states exist to prevent.
+  it("says the request failed instead of silently disappearing", async () => {
+    vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockRejectedValue(
+      new Error("GET /api/task-intelligence failed: 431")
+    );
+    render(withQuery(<TaskIntelligencePanel scopePackage="frontend" mode="implement" />));
+    expect(await screen.findByRole("alert")).toHaveTextContent("431");
+    expect(screen.getByText("Task Intelligence")).toBeInTheDocument();
   });
 
   // Task 4c(a): risk only exists when the hints are sent, so the panel must

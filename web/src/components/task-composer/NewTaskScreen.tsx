@@ -55,7 +55,12 @@ function buildArchitectRiskLine(form: TaskComposerFormState): string | null {
 export function toWorkspaceRelative(workspace: string, absolute: string): string | null {
   const base = workspace.trim().replace(/\/+$/, "");
   if (!base) return null;
-  if (absolute === base) return ".";
+  // Review MN4: the workspace root itself has no usable relative form — "."
+  // matches no changed-file path, so computeScopeGuard reported every file in
+  // the run out of scope. Empty instead, which the scopePathMissing guard then
+  // reports honestly ("a path is required"); whole-workspace work is what the
+  // "Entire repository" scope is for.
+  if (absolute === base) return "";
   return absolute.startsWith(base + "/") ? absolute.slice(base.length + 1) : null;
 }
 

@@ -23,6 +23,17 @@ const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
 // TOOLCHAIN_MODES -- an out-of-range string from a raw API client is
 // dropped, never forwarded.
 const MODES = new Set(["inspect", "plan", "implement", "debug", "test", "review", "refactor"] as const);
+// Review MJ4: TaskContract.scope was never forwarded either -- buildArgs
+// emitted no --scope-* flag at all, so glimmer-v2.py's argparse default
+// (scope-package=repository, no area, no paths) applied to EVERY
+// gateway-launched run. Consequences on that side: _expected_prefixes returns
+// [] -> compute_scope_guard has no boundary; GLIMMER_CONTRACT_SCOPE is never
+// set -> the engineer's §15 scope-expansion approval pause is dead code;
+// _contract_scope_text tells the engineer "package=repository" so the files
+// the user picked are never named in its prompt. Same closed-set posture as
+// MODES/TOOLCHAIN_MODES -- mirrors glimmer-v2.py's own --scope-package
+// choices, and a value outside it is dropped rather than forwarded.
+const SCOPE_PACKAGES = new Set(["repository", "frontend", "backend", "directory", "files"] as const);
 const MAX_TURNS_RANGE = { min: 1, max: 64 };
 const TIMEOUT_RANGE = { min: 60, max: 3600 };
 // Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles closed range.
@@ -117,6 +128,25 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
   // Review round 1 fix: was silently missing -- see MODES comment above.
   if (MODES.has(contract.mode)) {
     args.push("--mode", contract.mode);
+  }
+
+  // Review MJ4: forward the contract's scope -- see SCOPE_PACKAGES above.
+  // Flag names/shapes are glimmer-v2.py's own (`--scope-package` choices,
+  // `--scope-area`, and `--scope-paths` as action="append", hence one flag per
+  // path). Empty/blank values are dropped: an empty --scope-area would make
+  // the orchestrator's _expected_prefixes guard against "" and report every
+  // file out of scope.
+  const scope = contract.scope;
+  if (SCOPE_PACKAGES.has(scope.package)) {
+    args.push("--scope-package", scope.package);
+  }
+  if (scope.area?.trim()) {
+    args.push("--scope-area", scope.area.trim());
+  }
+  for (const scopePath of scope.paths ?? []) {
+    if (typeof scopePath === "string" && scopePath.trim()) {
+      args.push("--scope-paths", scopePath.trim());
+    }
   }
 
   // §7 Advanced controls: typed-only, closed-enum mapping. Every check here

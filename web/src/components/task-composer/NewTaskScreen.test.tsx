@@ -286,6 +286,27 @@ describe("NewTaskScreen", () => {
       expect((screen.getByLabelText(/scope path/i) as HTMLInputElement).value).toBe("frontend/src");
     });
 
+    // Review MN4: picking the workspace root itself used to store ".", which
+    // matches no changed-file path — computeScopeGuard then reported every file
+    // in the run out of scope.
+    it("does not store '.' when the workspace root itself is picked as a directory scope", async () => {
+      vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
+        root: "/tmp/ws", path: "/tmp/ws", parent: null, entries: [], truncated: false,
+      });
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "directory" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Choose directory…" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Use this directory" }));
+
+      const scopeInput = screen.getByLabelText(/scope path/i) as HTMLInputElement;
+      expect(scopeInput.value).toBe("");
+      expect(screen.getByText("A path is required for this scope.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeDisabled();
+    });
+
     it("refuses a picked path outside the workspace instead of storing an unusable absolute path", async () => {
       vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
         root: "/tmp/ws", path: "/somewhere/else", parent: null, entries: [], truncated: false,

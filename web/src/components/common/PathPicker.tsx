@@ -12,6 +12,9 @@ import { pickPathsNatively } from "../../state/pickPath";
 //
 // Selection is always handed back as ABSOLUTE paths — callers that need a
 // workspace-relative path convert (see NewTaskScreen's toWorkspaceRelative).
+// Paths below are joined with a literal "/" (review MN8): POSIX-only, which
+// matches where this app ships today; a Windows shell would need path
+// semantics from the server's response instead.
 export function PathPicker({
   mode,
   root,
