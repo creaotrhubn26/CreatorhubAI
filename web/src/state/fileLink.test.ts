@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fileHref, absolutePath, ancestorDirs } from "./fileLink";
+import { fileHref, absolutePath, ancestorDirs, looksLikeDirectoryPath } from "./fileLink";
 
 describe("fileHref", () => {
   it("encodes the path and carries a line only when one is actually known", () => {
@@ -10,6 +10,22 @@ describe("fileHref", () => {
   it("never invents a line number from a missing or nonsensical one", () => {
     for (const line of [undefined, 0, -3, NaN]) {
       expect(fileHref("/x.ts", line as number)).not.toContain("line=");
+    }
+  });
+});
+
+describe("looksLikeDirectoryPath", () => {
+  it("recognises the spellings a doc-graph node uses for a directory", () => {
+    // A service node for the repo root records ".", and "Open file" on it
+    // would be an affordance that cannot work.
+    for (const p of [".", "./", "src/", "web/src/..", "a/b/."]) {
+      expect(looksLikeDirectoryPath(p)).toBe(true);
+    }
+  });
+
+  it("leaves ordinary file paths alone", () => {
+    for (const p of ["a.ts", "docs/README.md", "src/.hidden", "..gitignore"]) {
+      expect(looksLikeDirectoryPath(p)).toBe(false);
     }
   });
 });

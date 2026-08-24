@@ -243,12 +243,18 @@ export const glimmerApi = {
   },
   // Task 4c(2/3): read-only directory listing for the composer's path pickers
   // (browser/dev fallback — the Tauri app uses the native Finder dialog).
-  listDirectory: (params: { path?: string; root?: string; includeFiles?: boolean }) => {
+  // Bypasses request() for the same reason readFile does: a refusal has a
+  // reason ("root must be inside …", "that path is not browsable"), and a
+  // status code echoed back with the whole query string is not one.
+  listDirectory: async (params: { path?: string; root?: string; includeFiles?: boolean }): Promise<FsListing> => {
     const query = new URLSearchParams();
     if (params.path) query.set("path", params.path);
     if (params.root) query.set("root", params.root);
     if (params.includeFiles) query.set("includeFiles", "1");
-    return request<FsListing>(`/api/fs/dirs?${query.toString()}`);
+    const res = await fetch(`${API_BASE}/api/fs/dirs?${query.toString()}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `GET /api/fs/dirs failed: ${res.status}`);
+    return body as FsListing;
   },
   // Task A1/A3: one file's text for the read-only viewer. Bypasses request()
   // — which throws a status-only message — because the viewer must be able to

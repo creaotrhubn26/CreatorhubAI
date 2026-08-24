@@ -6,3 +6,5 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/binaries/
 src-tauri/resources/gateway/
+.vite/
+.playwright-mcp/

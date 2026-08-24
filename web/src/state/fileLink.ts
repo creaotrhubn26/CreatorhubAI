@@ -12,6 +12,17 @@ export function fileHref(path: string, line?: number): string {
   return `/files?${q.toString()}`;
 }
 
+// True when a recorded path plainly names a DIRECTORY rather than a file —
+// doc-graph service nodes carry "." for the repo root, and offering to open
+// that "file" would be an affordance that cannot work. This only recognises
+// the unambiguous spellings; anything else needs a stat, which is the
+// gateway's job (it answers "path is a directory" honestly).
+export function looksLikeDirectoryPath(p: string): boolean {
+  if (p.endsWith("/")) return true;
+  const last = p.split("/").pop() ?? "";
+  return last === "." || last === "..";
+}
+
 // Absolute path for a repo-relative one. A path that is already absolute is
 // returned untouched, so a caller that has real absolute paths (the diff
 // screen's session workspace) can pass them straight through.

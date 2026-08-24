@@ -6,7 +6,7 @@ import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
 import { EmptyState } from "../common/EmptyState";
 import { edgesForNode, filterDocNodes, groupDocNodesByType, str } from "../../state/docGraph";
-import { absolutePath, fileHref } from "../../state/fileLink";
+import { absolutePath, fileHref, looksLikeDirectoryPath } from "../../state/fileLink";
 
 // Task 7.5 (V7 "System Explorer") -- click-to-expand row, same shape as
 // EvidencePanel: no separate detail fetch, the whole graph is already one
@@ -19,8 +19,11 @@ function NodeRow({
   const { in: inEdges, out: outEdges } = edgesForNode(edges, node.id);
   // Task A4: the node's own path opens in the read-only viewer. Only when the
   // graph actually recorded one — str() renders a missing path as
-  // "Unavailable", which is not something to link anywhere.
-  const nodePath = typeof node.path === "string" && node.path.trim() ? node.path.trim() : null;
+  // "Unavailable", which is not something to link anywhere — and only when
+  // that path is a file: service nodes carry "." for the repo root, and
+  // "Open file" on a directory is an affordance that cannot work.
+  const recorded = typeof node.path === "string" && node.path.trim() ? node.path.trim() : null;
+  const nodePath = recorded && !looksLikeDirectoryPath(recorded) ? recorded : null;
   return (
     <li className="row">
       <button
