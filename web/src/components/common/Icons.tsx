@@ -54,6 +54,16 @@ export function IconRepository(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Task A2: the read-only code surface (file tree + viewer).
+export function IconFiles(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base(props)}>
+      <path d="M2 3.5h4l1.2 1.5H14v7.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-9Z" />
+      <path d="M5 8h6M5 10.5h4" />
+    </svg>
+  );
+}
+
 export function IconModel(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...base(props)}>

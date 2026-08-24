@@ -3,7 +3,7 @@ import type {
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, DeliveryPacket, GlimmerTask, HumanAcceptance,
   CreateWorkspaceResult,
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
-  ApprovalRequest, FsListing,
+  ApprovalRequest, FsListing, FsFile,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -249,5 +249,18 @@ export const glimmerApi = {
     if (params.root) query.set("root", params.root);
     if (params.includeFiles) query.set("includeFiles", "1");
     return request<FsListing>(`/api/fs/dirs?${query.toString()}`);
+  },
+  // Task A1/A3: one file's text for the read-only viewer. Bypasses request()
+  // — which throws a status-only message — because the viewer must be able to
+  // tell the user WHY a read failed ("path is a directory", "permission
+  // denied", "path does not exist"), and a failed read must never be able to
+  // render as an empty file.
+  readFile: async (params: { path: string; root?: string }): Promise<FsFile> => {
+    const query = new URLSearchParams({ path: params.path });
+    if (params.root) query.set("root", params.root);
+    const res = await fetch(`${API_BASE}/api/fs/file?${query.toString()}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `GET /api/fs/file failed: ${res.status}`);
+    return body as FsFile;
   },
 };

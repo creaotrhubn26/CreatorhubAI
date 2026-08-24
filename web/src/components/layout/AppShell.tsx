@@ -17,7 +17,7 @@ import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state
 import { sendCompletionNotification } from "../../state/desktopNotify";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
-  IconBack, IconChevron, IconClose, IconDashboard, IconForward, IconModel,
+  IconBack, IconChevron, IconClose, IconDashboard, IconFiles, IconForward, IconModel,
   IconNewTask, IconRepository, IconSearch, IconSessions, IconSettings, IconVerification,
 } from "../common/Icons";
 
@@ -44,13 +44,15 @@ function isRunningStatus(status: GlimmerSession["status"]): boolean {
   return RUNNING_STATES.includes(status);
 }
 
-type ActivityKey = "dashboard" | "sessions" | "new-task" | "verification" | "repository" | "system-explorer" | "model" | "settings";
+type ActivityKey = "dashboard" | "sessions" | "new-task" | "verification" | "files" | "repository" | "system-explorer" | "model" | "settings";
 
 const ACTIVITY_ITEMS: Array<{ key: ActivityKey; label: string; to: string; Icon: typeof IconDashboard }> = [
   { key: "dashboard", label: "Dashboard", to: "/", Icon: IconDashboard },
   { key: "sessions", label: "Sessions", to: "/sessions", Icon: IconSessions },
   { key: "new-task", label: "New Task", to: "/tasks/new", Icon: IconNewTask },
   { key: "verification", label: "Verification", to: "/verification", Icon: IconVerification },
+  // Round A / Task A2 -- read-only file tree + code viewer.
+  { key: "files", label: "Files", to: "/files", Icon: IconFiles },
   { key: "repository", label: "Repository", to: "/repository", Icon: IconRepository },
   // Task 7.5 (V7 "System Explorer") -- read-only doc-graph browser.
   { key: "system-explorer", label: "System Explorer", to: "/system-explorer", Icon: IconSearch },
@@ -62,6 +64,7 @@ function activePageOf(pathname: string): ActivityKey {
   if (pathname === "/settings") return "settings";
   if (pathname === "/verification" || pathname.endsWith("/verification")) return "verification";
   if (pathname === "/tasks/new") return "new-task";
+  if (pathname === "/files") return "files";
   if (pathname === "/repository") return "repository";
   if (pathname === "/system-explorer") return "system-explorer";
   if (pathname === "/model") return "model";
