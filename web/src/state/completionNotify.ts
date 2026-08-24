@@ -1,6 +1,13 @@
 import { STATES as RUNNING_STATES } from "../components/session/AgentStateStepper";
 
-const RUNNING = new Set<string>(RUNNING_STATES);
+// `waiting_for_approval` is a stepper state but NOT a running state for
+// notification purposes: the session has stopped and is waiting on a human
+// (V7 §35). Counting it as running meant entering the pause fired no
+// notification and no title badge — a user who switched away saw a session
+// that looked busy for the full 300 s timeout, then an unexplained
+// POLICY_BLOCK. Harmless while the pause was unreachable for gateway runs;
+// forwarding the scope flags (buildArgs) is exactly what makes it live.
+const RUNNING = new Set<string>(RUNNING_STATES.filter((s) => s !== "waiting_for_approval"));
 
 // document.title helper: base title, or "(N) " + base once there are
 // completions the user hasn't looked at yet.

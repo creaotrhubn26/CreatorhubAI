@@ -70,10 +70,25 @@ const MAX_FS_ENTRIES = 500;
 // who can reach this endpoint at all can already spawn a session through
 // POST /api/sessions. It removes the gratuitous "here are the user's key and
 // profile names" answer, nothing more.
+//
+// The list is KNOWINGLY INCOMPLETE, and the known hole is worth naming rather
+// than papering over: `~/.local/share` holds the same data by another route
+// (aws-cli and claude both keep state there), so denying `.aws`/`.claude`
+// while `.local` is listable is porous by construction. Extending the list
+// until it looks complete would only make it look like a boundary. Treat it
+// as noise reduction; the real boundary is FS_BOUNDARY plus the fact that
+// this endpoint never returns file contents.
 const SENSITIVE_NAMES = new Set([
-  ".ssh", ".aws", ".gnupg", ".gpg", ".docker", ".kube", ".config",
-  ".password-store", ".claude", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+  ".ssh", ".aws", ".gnupg", ".gpg", ".docker", ".kube",
+  ".password-store", ".claude", ".claude.json", ".git-credentials", ".gitconfig",
+  ".netrc", ".npmrc", ".pypirc", ".zsh_history",
+  ".appstoreconnect", ".fastlane-creds", ".render", ".copilot",
 ]);
+
+// `.config` is denied only as a FIRST segment (the XDG config home under
+// $HOME). Denying it at any depth would also hide ordinary repository
+// content named config/, which is the picker's whole job to reach.
+const SENSITIVE_FIRST_SEGMENT = new Set([".config"]);
 
 function isSensitive(name: string): boolean {
   return SENSITIVE_NAMES.has(name.toLowerCase());
@@ -99,7 +114,11 @@ function contains(root: string, target: string): boolean {
 // name — used for the requested path AND for each listed entry, so the rule
 // cannot drift apart between the two the way the old dotfile filter did.
 function hasSensitiveSegment(base: string, target: string): boolean {
-  return path.relative(base, target).split(path.sep).some(isSensitive);
+  const segments = path.relative(base, target).split(path.sep);
+  if (segments.some(isSensitive)) return true;
+  // First-segment-only names (.config): denied directly under the boundary,
+  // allowed deeper, where they are ordinary repository content.
+  return SENSITIVE_FIRST_SEGMENT.has((segments[0] ?? "").toLowerCase());
 }
 
 workspacesRouter.get("/fs/dirs", async (req, res) => {

@@ -140,11 +140,16 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
   if (SCOPE_PACKAGES.has(scope.package)) {
     args.push("--scope-package", scope.package);
   }
-  if (scope.area?.trim()) {
+  // A value starting with "-" is dropped rather than forwarded: argparse
+  // would read it as the next flag and abort the whole run ("expected one
+  // argument"). Not an injection (argparse fails closed), but it is the only
+  // free-form value here, so it gets the same drop-invalid posture as every
+  // other field below.
+  if (scope.area?.trim() && !scope.area.trim().startsWith("-")) {
     args.push("--scope-area", scope.area.trim());
   }
   for (const scopePath of scope.paths ?? []) {
-    if (typeof scopePath === "string" && scopePath.trim()) {
+    if (typeof scopePath === "string" && scopePath.trim() && !scopePath.trim().startsWith("-")) {
       args.push("--scope-paths", scopePath.trim());
     }
   }
