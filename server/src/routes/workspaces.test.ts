@@ -67,6 +67,181 @@ describe("GET /api/workspaces (untouched)", () => {
   });
 });
 
+// Task 4c(2/3): the composer's path pickers in a plain browser. Read-only,
+// names only, and contained — these cases exist mostly to pin the containment
+// rules, since this is the gateway's only filesystem-listing endpoint.
+describe("GET /api/fs/dirs", () => {
+  let browseRoot: string;
+  let outside: string;
+
+  beforeAll(async () => {
+    // realpath: macOS tmpdir is a symlink (/var -> /private/var) and the route
+    // compares resolved paths, so the fixture must be expressed the same way.
+    browseRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-root-")));
+    outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-outside-")));
+    process.env.GLIMMER_BROWSE_ROOT = browseRoot;
+
+    await fs.mkdir(path.join(browseRoot, "project", "src"), { recursive: true });
+    await fs.writeFile(path.join(browseRoot, "project", "README.md"), "FILE-BODY-MARKER");
+    await fs.writeFile(path.join(browseRoot, "project", ".hidden"), "x");
+    await fs.writeFile(path.join(outside, "secret.txt"), "top secret");
+    await fs.symlink(outside, path.join(browseRoot, "escape-hatch"));
+  });
+
+  afterAll(async () => {
+    delete process.env.GLIMMER_BROWSE_ROOT;
+    await fs.rm(browseRoot, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  });
+
+  it("lists subdirectory names only, hiding files by default", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}`);
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toEqual([{ name: "src", isDir: true }]);
+    expect(res.body.path).toBe(path.join(browseRoot, "project"));
+    expect(res.body.truncated).toBe(false);
+  });
+
+  it("includes file names (never contents) when includeFiles=1", async () => {
+    const res = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}&includeFiles=1`
+    );
+    expect(res.status).toBe(200);
+    // Review MJ2: ordinary dotfiles are listed now — .hidden here stands for
+    // the .github/.env/dot-named-repo content the picker has to be able to see.
+    expect(res.body.entries).toEqual([
+      { name: ".hidden", isDir: false },
+      { name: "README.md", isDir: false },
+      { name: "src", isDir: true },
+    ]);
+    expect(JSON.stringify(res.body)).not.toContain("FILE-BODY-MARKER");
+  });
+
+  it("reports no parent at the root, so the UI can never walk above it", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.parent).toBeNull();
+  });
+
+  it("rejects ../ traversal out of the browse root", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "..", ".."))}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects an absolute path outside the browse root", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(outside)}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a symlink that escapes the root, even though it lives inside it", async () => {
+    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "escape-hatch"))}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a caller-supplied root outside the browse root (scope picker can't widen the boundary)", async () => {
+    const res = await request(app).get(
+      `/api/fs/dirs?root=${encodeURIComponent(outside)}&path=${encodeURIComponent(outside)}`
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("confines the listing to a caller-supplied root inside the boundary", async () => {
+    const root = path.join(browseRoot, "project");
+    const inside = await request(app).get(
+      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path.join(root, "src"))}`
+    );
+    expect(inside.status).toBe(200);
+    expect(inside.body.parent).toBe(root);
+
+    const above = await request(app).get(
+      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(browseRoot)}`
+    );
+    expect(above.status).toBe(403);
+  });
+
+  // Review MJ1: realpath() used to run before the containment check, so the
+  // status code told the caller whether an arbitrary path ANYWHERE on the disk
+  // existed (403 = exists, 404 = doesn't). Outside the boundary, existence must
+  // make no observable difference.
+  it("answers identically for existing and non-existent paths outside the boundary (no existence oracle)", async () => {
+    const existing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(outside)}`);
+    const missing = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(outside, "definitely-not-here-zzz"))}`
+    );
+    expect(existing.status).toBe(403);
+    expect(missing.status).toBe(existing.status);
+    expect(missing.body).toEqual(existing.body);
+
+    // Same for absolute system paths the boundary has nothing to do with.
+    const realSystemPath = await request(app).get("/api/fs/dirs?path=%2Fetc");
+    const fakeSystemPath = await request(app).get("/api/fs/dirs?path=%2Fetc-not-a-real-directory-zzz");
+    expect(realSystemPath.status).toBe(403);
+    expect(fakeSystemPath.status).toBe(403);
+    expect(fakeSystemPath.body).toEqual(realSystemPath.body);
+  });
+
+  // Review MJ2: the old dotfile filter applied to listed entries but not to the
+  // requested path, so ~/.ssh was directly listable while a legitimate
+  // dot-named workspace was unreachable. Both halves are now explicit.
+  describe("hidden and sensitive paths", () => {
+    it("refuses to browse a credential directory, and never lists one as an entry", async () => {
+      await fs.mkdir(path.join(browseRoot, ".ssh"), { recursive: true });
+      await fs.writeFile(path.join(browseRoot, ".ssh", "id_ed25519"), "PRIVATE");
+
+      const direct = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, ".ssh"))}&includeFiles=1`);
+      expect(direct.status).toBe(403);
+      expect(JSON.stringify(direct.body)).not.toContain("id_ed25519");
+
+      const listing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot)}`);
+      expect(listing.body.entries.map((e: { name: string }) => e.name)).not.toContain(".ssh");
+    });
+
+    it("refuses a credential directory at any depth, not just at the boundary", async () => {
+      await fs.mkdir(path.join(browseRoot, "project", ".aws"), { recursive: true });
+      const res = await request(app).get(
+        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", ".aws"))}&includeFiles=1`
+      );
+      expect(res.status).toBe(403);
+    });
+
+    it("still lists and enters an ordinary dot-named directory — a dot-named repo is pickable project content", async () => {
+      await fs.mkdir(path.join(browseRoot, ".smoke-test-repo", "src"), { recursive: true });
+
+      const listing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot)}`);
+      expect(listing.body.entries.map((e: { name: string }) => e.name)).toContain(".smoke-test-repo");
+
+      const entered = await request(app).get(
+        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, ".smoke-test-repo"))}`
+      );
+      expect(entered.status).toBe(200);
+      expect(entered.body.entries).toEqual([{ name: "src", isDir: true }]);
+    });
+  });
+
+  // Review MN3: client errors were reported as 500s that echoed the caller's
+  // own input back in the message.
+  it("400s (without echoing the input) on a null byte or an over-long path", async () => {
+    const nullByte = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot + "\0/etc")}`);
+    expect(nullByte.status).toBe(400);
+    expect(nullByte.body.error).not.toContain(browseRoot);
+
+    const tooLong = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "a".repeat(300).split("").join("/")))}`
+    );
+    expect([400, 403, 404]).toContain(tooLong.status);
+    expect(tooLong.status).not.toBe(500);
+  });
+
+  it("404s for a path that does not exist, and 400s for a file", async () => {
+    const missing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "nope"))}`);
+    expect(missing.status).toBe(404);
+    const file = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", "README.md"))}`
+    );
+    expect(file.status).toBe(400);
+  });
+});
+
 describe("POST /api/workspaces — validation", () => {
   it("400s when taskName is missing", async () => {
     const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({});

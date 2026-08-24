@@ -716,6 +716,23 @@ pre {
   .composer__columns { grid-template-columns: 1fr; }
 }
 
+/* ---- path picker (workspace + scope paths) ---- */
+.composer__recent { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; font-size: var(--fs-xs); }
+.composer__recent > span { color: var(--text-muted); }
+.composer__recent button { font-size: var(--fs-xs); }
+.path-picker__hint { font-size: var(--fs-xs); color: var(--text-muted); }
+.path-picker__browser {
+  margin-top: var(--space-2); border: 1px solid var(--border); border-radius: 6px; padding: var(--space-2);
+}
+.path-picker__bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.path-picker__bar code { font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.path-picker__list {
+  list-style: none; margin: var(--space-2) 0; padding: 0; max-height: 240px; overflow-y: auto;
+  font-size: var(--fs-xs);
+}
+.path-picker__list button { background: none; border: none; color: var(--text-primary); padding: 2px 0; text-align: left; }
+.path-picker__list button:hover { color: var(--accent, var(--text-primary)); }
+
 /* ---- right panel (AI assistant) collapse ---- */
 .ide-rightpanel.is-collapsed { width: 32px; }
 .ide-rightpanel__header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }

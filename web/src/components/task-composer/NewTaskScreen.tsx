@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
-import { computeArchitectRisk, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
+import { computeArchitectRisk, deriveVerificationLevel, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
+import { PathPicker } from "../common/PathPicker";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
@@ -46,6 +47,23 @@ function buildArchitectRiskLine(form: TaskComposerFormState): string | null {
   return `Architect mode will auto-trigger (score ${risk.score}: ${risk.signals.join(", ")})`;
 }
 
+// Task 4c(3): scope paths are stored (and submitted) workspace-RELATIVE —
+// that's the form the backend's scope guard compares changed-file paths in.
+// A path the user picked outside the chosen workspace has no relative form at
+// all, and is refused rather than silently stored as an absolute path the
+// guard could never match.
+export function toWorkspaceRelative(workspace: string, absolute: string): string | null {
+  const base = workspace.trim().replace(/\/+$/, "");
+  if (!base) return null;
+  // Review MN4: the workspace root itself has no usable relative form — "."
+  // matches no changed-file path, so computeScopeGuard reported every file in
+  // the run out of scope. Empty instead, which the scopePathMissing guard then
+  // reports honestly ("a path is required"); whole-workspace work is what the
+  // "Entire repository" scope is for.
+  if (absolute === base) return "";
+  return absolute.startsWith(base + "/") ? absolute.slice(base.length + 1) : null;
+}
+
 export function NewTaskScreen() {
   const location = useLocation();
   // Task 8.2 (V7 §23.14): DeliveryReviewPanel's "convert next step to task"
@@ -61,7 +79,17 @@ export function NewTaskScreen() {
   );
   const [workspace, setWorkspace] = useState("");
   const [newTaskName, setNewTaskName] = useState("");
+  const [scopePickError, setScopePickError] = useState<string | null>(null);
   const navigate = useNavigate();
+
+  // Task 4c(2): quick-pick of workspaces the gateway already knows about
+  // (the same GET /api/workspaces list the Workspaces screen shows) — the
+  // common case is re-running against a workspace used before.
+  const recentWorkspaces = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: () => glimmerApi.listWorkspaces(),
+    retry: false,
+  });
 
   // §27/§4.1 — "New worktree" affordance: cuts a fresh git worktree+branch
   // off the source repo and adopts it as the workspace path above, the same
@@ -104,6 +132,21 @@ export function NewTaskScreen() {
               Workspace path
               <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
             </label>
+            {/* Task 4c(2): pick a directory instead of typing one — native
+                Finder dialog in the desktop app, the gateway's read-only
+                directory browser in a plain browser. The text input above
+                still works for pasting a path. */}
+            <PathPicker mode="directory" buttonLabel="Choose workspace…" onPick={(paths) => setWorkspace(paths[0])} />
+            {recentWorkspaces.data && recentWorkspaces.data.length > 0 && (
+              <div className="composer__recent">
+                <span>Recent workspaces</span>
+                {recentWorkspaces.data.map((ws) => (
+                  <button key={ws.path} type="button" onClick={() => setWorkspace(ws.path)}>
+                    {ws.path}
+                  </button>
+                ))}
+              </div>
+            )}
 
             <fieldset>
               <legend>New worktree</legend>
@@ -148,6 +191,27 @@ export function NewTaskScreen() {
                   {scopePathMissing && <span role="alert"> A path is required for this scope.</span>}
                 </label>
               )}
+              {/* Task 4c(3): same picker as the workspace field, but rooted at
+                  the chosen workspace and storing what it returns
+                  workspace-relative (what scope.paths/scope.area mean). */}
+              {needsScopePath && (
+                <PathPicker
+                  mode={form.scopePackage === "files" ? "files" : "directory"}
+                  root={workspace.trim() || undefined}
+                  buttonLabel={form.scopePackage === "files" ? "Choose files…" : "Choose directory…"}
+                  disabledReason={workspace.trim() ? undefined : "Choose a workspace first."}
+                  onPick={(paths) => {
+                    const relative = paths.map((p) => toWorkspaceRelative(workspace, p));
+                    if (relative.some((p) => p === null)) {
+                      setScopePickError("That path is outside the chosen workspace — scope paths must be inside it.");
+                      return;
+                    }
+                    setScopePickError(null);
+                    setForm({ ...form, scopeArea: (relative as string[]).join(", ") });
+                  }}
+                />
+              )}
+              {scopePickError && <span role="alert"> {scopePickError}</span>}
             </fieldset>
 
             <fieldset>
@@ -195,7 +259,21 @@ export function NewTaskScreen() {
           </div>
 
           <div className="composer__side">
-            <TaskIntelligencePanel scopePackage={form.scopePackage} scopeArea={form.scopeArea || undefined} />
+            {/* Task 4c(a): the endpoint only scores risk when it is given the
+                hints it scores on, and only resolves the RIGHT repo map when
+                it is told which workspace — so the composer passes its live
+                state through (objective is debounced inside the panel).
+                candidateCount is sent only when the contract genuinely has a
+                path list to count (multi-file scope), never as a zero. */}
+            <TaskIntelligencePanel
+              scopePackage={form.scopePackage}
+              scopeArea={form.scopeArea || undefined}
+              workspace={workspace.trim() || undefined}
+              mode={form.mode}
+              objective={form.objective}
+              verificationLevel={deriveVerificationLevel(buildTaskContract(form))}
+              candidateCount={buildTaskContract(form).scope.paths?.length}
+            />
 
             <fieldset>
               <legend>Permissions</legend>

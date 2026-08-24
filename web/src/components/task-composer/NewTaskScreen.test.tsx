@@ -23,7 +23,14 @@ describe("NewTaskScreen", () => {
     // NewTaskScreen now renders TaskIntelligencePanel, which fetches on mount.
     // Stub it so these tests exercise the composer form, not the network.
     vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: null, provenance: "deterministic-backend",
+      likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: null,
+      provenance: "deterministic-backend", repoMapStatus: "none",
+    });
+    // Task 4c(2): the composer now also lists known workspaces for quick-pick
+    // and can browse directories. Stub both network boundaries.
+    vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([]);
+    vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
+      root: "/tmp/ws", path: "/tmp/ws", parent: null, entries: [{ name: "src", isDir: true }], truncated: false,
     });
   });
 
@@ -226,6 +233,119 @@ describe("NewTaskScreen", () => {
       expect(await screen.findByRole("alert")).toHaveTextContent(/glimmer-x-20260821-010000/);
       // Workspace path must NOT be silently adopted on failure.
       expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe("");
+    });
+  });
+
+  // Task 4c(2/3): picking paths instead of typing them.
+  describe("path pickers", () => {
+    it("adopts a browsed directory as the workspace path", async () => {
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.click(screen.getByRole("button", { name: "Choose workspace…" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Use this directory" }));
+      expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe("/tmp/ws");
+    });
+
+    it("offers known workspaces as one-click quick picks", async () => {
+      vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([
+        { path: "/Users/u/glimmer-x", branch: "glimmer/x", headSha: "a", baselineSha: null, dirty: false, changedFiles: [] },
+      ]);
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.click(await screen.findByRole("button", { name: "/Users/u/glimmer-x" }));
+      expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe("/Users/u/glimmer-x");
+    });
+
+    it("keeps the workspace text input editable for pasted paths", () => {
+      render(withQuery(<NewTaskScreen />));
+      const input = screen.getByLabelText("Workspace path") as HTMLInputElement;
+      fireEvent.change(input, { target: { value: "/pasted/path" } });
+      expect(input.value).toBe("/pasted/path");
+    });
+
+    it("refuses to browse a scope path before a workspace is chosen (nothing to root it at)", () => {
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "directory" },
+      });
+      expect(screen.getByRole("button", { name: "Choose directory…" })).toBeDisabled();
+      expect(screen.getByText("Choose a workspace first.")).toBeInTheDocument();
+    });
+
+    // The scope contract stores workspace-RELATIVE paths; an absolute one
+    // would never match a changed-file path in the backend's scope guard.
+    it("stores a browsed scope directory workspace-relative, rooted at the workspace", async () => {
+      vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
+        root: "/tmp/ws", path: "/tmp/ws/frontend/src", parent: "/tmp/ws/frontend", entries: [], truncated: false,
+      });
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "directory" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Choose directory…" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Use this directory" }));
+      expect((screen.getByLabelText(/scope path/i) as HTMLInputElement).value).toBe("frontend/src");
+    });
+
+    // Review MN4: picking the workspace root itself used to store ".", which
+    // matches no changed-file path — computeScopeGuard then reported every file
+    // in the run out of scope.
+    it("does not store '.' when the workspace root itself is picked as a directory scope", async () => {
+      vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
+        root: "/tmp/ws", path: "/tmp/ws", parent: null, entries: [], truncated: false,
+      });
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "directory" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Choose directory…" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Use this directory" }));
+
+      const scopeInput = screen.getByLabelText(/scope path/i) as HTMLInputElement;
+      expect(scopeInput.value).toBe("");
+      expect(screen.getByText("A path is required for this scope.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeDisabled();
+    });
+
+    it("refuses a picked path outside the workspace instead of storing an unusable absolute path", async () => {
+      vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
+        root: "/tmp/ws", path: "/somewhere/else", parent: null, entries: [], truncated: false,
+      });
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "directory" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Choose directory…" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Use this directory" }));
+      // (the "a path is required" guard also renders role="alert" here, so
+      // match on the text of this specific refusal)
+      expect(await screen.findByText(/outside the chosen workspace/i)).toBeInTheDocument();
+      expect((screen.getByLabelText(/scope path/i) as HTMLInputElement).value).toBe("");
+    });
+
+    it("stores multi-selected files as a comma-separated relative list, still hand-editable", async () => {
+      vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
+        root: "/tmp/ws",
+        path: "/tmp/ws/src",
+        parent: "/tmp/ws",
+        entries: [{ name: "a.ts", isDir: false }, { name: "b.ts", isDir: false }],
+        truncated: false,
+      });
+      render(withQuery(<NewTaskScreen />));
+      fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+      fireEvent.change(screen.getByText("Scope").closest("fieldset")!.querySelector("select")!, {
+        target: { value: "files" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Choose files…" }));
+      fireEvent.click(await screen.findByLabelText("a.ts"));
+      fireEvent.click(screen.getByLabelText("b.ts"));
+      fireEvent.click(screen.getByRole("button", { name: /Use 2 selected files/ }));
+
+      const scopeInput = screen.getByLabelText(/scope path/i) as HTMLInputElement;
+      expect(scopeInput.value).toBe("src/a.ts, src/b.ts");
+      fireEvent.change(scopeInput, { target: { value: "src/a.ts" } });
+      expect(scopeInput.value).toBe("src/a.ts");
     });
   });
 

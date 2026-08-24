@@ -28,8 +28,14 @@ describe("newlyCompleted", () => {
     expect(newlyCompleted({}, { s1: "verified" })).toEqual([]);
   });
 
-  it("flags waiting_for_approval -> blocked as a completion (per AgentStateStepper.STATES)", () => {
-    expect(newlyCompleted({ s1: "waiting_for_approval" }, { s1: "blocked" })).toEqual(["s1"]);
+  // waiting_for_approval is not a running state: the session has stopped and
+  // is waiting on a human, so ENTERING it is the moment worth notifying about.
+  it("flags implementing -> waiting_for_approval as a completion, so the pause is announced", () => {
+    expect(newlyCompleted({ s1: "implementing" }, { s1: "waiting_for_approval" })).toEqual(["s1"]);
+  });
+
+  it("does not re-flag waiting_for_approval -> blocked, already announced when the pause began", () => {
+    expect(newlyCompleted({ s1: "waiting_for_approval" }, { s1: "blocked" })).toEqual([]);
   });
 
   it("evaluates multiple sessions independently", () => {

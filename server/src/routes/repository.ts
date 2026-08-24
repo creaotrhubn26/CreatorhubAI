@@ -22,6 +22,46 @@ export async function findRepoMap(): Promise<RepoMap | null> {
   return null;
 }
 
+// Task 4c(b): findRepoMap() above answers "some repo map, from whichever
+// session happens to sort first" -- fine for the repository screen (which has
+// no workspace context), a fabrication for the composer (the user is composing
+// against ONE workspace, and an unrelated repo's packages/areas presented as
+// theirs is a lie). This variant matches on the session's own manifest
+// `workspace` (same manifest read findDocGraph does), and returns null rather
+// than falling back to anything else -- "no repo map for this workspace yet"
+// is an honest, common answer (the workspace has simply never been run).
+export async function findRepoMapForWorkspace(
+  workspace: string
+): Promise<{ map: RepoMap; sessionId: string } | null> {
+  const target = path.resolve(workspace);
+  for (const id of await listSessionIds()) {
+    if (!isValidSessionId(id)) continue;
+    let manifestRaw: string;
+    try {
+      manifestRaw = await fs.readFile(path.join(sessionsDir(), id, "manifest.json"), "utf-8");
+    } catch (err: any) {
+      if (err.code !== "ENOENT") throw err;
+      continue; // no manifest: can't attribute this session to a workspace
+    }
+    let manifestWorkspace: unknown;
+    try {
+      manifestWorkspace = JSON.parse(manifestRaw)?.workspace;
+    } catch {
+      continue; // torn manifest (glimmer-v2.py rewrites it non-atomically) — skip, don't fail the panel
+    }
+    if (typeof manifestWorkspace !== "string" || path.resolve(manifestWorkspace) !== target) continue;
+    try {
+      const raw = await fs.readFile(path.join(sessionsDir(), id, "repo-map.json"), "utf-8");
+      return { map: JSON.parse(raw) as RepoMap, sessionId: id };
+    } catch (err: any) {
+      if (err.code !== "ENOENT") throw err;
+      // This session matched but never got a repo-map.json — an older run of
+      // the same workspace still might, so keep walking.
+    }
+  }
+  return null;
+}
+
 repositoryRouter.get("/repository/map", async (_req, res) => {
   try {
     const map = await findRepoMap();
