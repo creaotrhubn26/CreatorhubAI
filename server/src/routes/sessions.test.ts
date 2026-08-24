@@ -9,6 +9,10 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Express } from "express";
 
+// Writes require an allowed Origin (app.ts localOnlyGuard): a browser always
+// sends one on a state-changing request, so the tests speak the same way.
+const UI_ORIGIN = "http://127.0.0.1:5183";
+
 const execGit = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -123,7 +127,7 @@ describe("readSessionEventsBatch", () => {
 describe("POST /api/sessions/:id/revert-file", () => {
   it("returns 404 for a path-traversal session id instead of touching the filesystem", async () => {
     const res = await request(app)
-      .post("/api/sessions/..%2F..%2Fevil/revert-file")
+      .post("/api/sessions/..%2F..%2Fevil/revert-file").set("Origin", UI_ORIGIN)
       .send({ path: "a.txt" });
     expect(res.status).toBe(404);
   });
@@ -134,7 +138,7 @@ describe("POST /api/sessions/:id/revert-file", () => {
 // idempotent, 404 for an unknown session.
 describe("POST /api/sessions/:id/accept", () => {
   it("returns 404 for an unknown session", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/accept");
+    const res = await request(app).post("/api/sessions/does-not-exist/accept").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -147,7 +151,7 @@ describe("POST /api/sessions/:id/accept", () => {
       JSON.stringify({ task: "test", status: "verified", workspace, branch: "main", baseline: null, attempts: [] })
     );
 
-    const res = await request(app).post(`/api/sessions/${id}/accept`);
+    const res = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body.accepted).toBe(true);
     expect(typeof res.body.acceptedAt).toBe("string");
@@ -168,8 +172,8 @@ describe("POST /api/sessions/:id/accept", () => {
       JSON.stringify({ task: "test", status: "verified", workspace, branch: "main", baseline: null, attempts: [] })
     );
 
-    const first = await request(app).post(`/api/sessions/${id}/accept`);
-    const second = await request(app).post(`/api/sessions/${id}/accept`);
+    const first = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
+    const second = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
     expect(second.body).toEqual(first.body);
   });
 });
@@ -177,7 +181,7 @@ describe("POST /api/sessions/:id/accept", () => {
 describe("POST /api/sessions", () => {
   it("rejects a taskContract missing verification/repairBudget instead of accepting it", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: { objective: "x" }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
     expect(res.body).toHaveProperty("error");
@@ -185,7 +189,7 @@ describe("POST /api/sessions", () => {
 
   it("accepts a well-formed taskContract", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({
         taskContract: {
           objective: "Fix a thing",
@@ -214,7 +218,7 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
 
   it("rejects maxTurns out of 1..64 range with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: { ...validBase, maxTurns: 100 }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
     expect(res.body).toHaveProperty("error");
@@ -222,34 +226,34 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
 
   it("rejects timeoutSeconds out of 60..3600 range with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: { ...validBase, advanced: { timeoutSeconds: 5 } }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
   });
 
   it("rejects a toolchainMode outside the closed enum with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: { ...validBase, advanced: { toolchainMode: "rm -rf /" } }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
   });
 
   it("rejects an unparseable/injection-attempt modelReadinessUrl with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: { ...validBase, advanced: { modelReadinessUrl: "http://x; rm -rf /" } }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
   });
 
   it("rejects a non-http(s) modelReadinessUrl scheme with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: { ...validBase, advanced: { modelReadinessUrl: "javascript:alert(1)" } }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
   });
 
   it("accepts a well-formed advanced block", async () => {
-    const res = await request(app).post("/api/sessions").send({
+    const res = await request(app).post("/api/sessions").set("Origin", UI_ORIGIN).send({
       taskContract: {
         ...validBase,
         maxTurns: 20,
@@ -273,26 +277,26 @@ describe("POST /api/sessions/:id/run replay protection", () => {
 
   it("a second /run call for the same id does not spawn a second process", async () => {
     const createRes = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: validContract, workspace: "/tmp/ws" });
     const id = createRes.body.id as string;
 
-    const firstRun = await request(app).post(`/api/sessions/${id}/run`);
+    const firstRun = await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
     expect(firstRun.status).toBe(200);
 
     // Called immediately, before the fake fixture's process has necessarily
     // exited: activeRuns should still hold the first handle, so this must be
     // rejected rather than spawning a second child process.
-    const secondRun = await request(app).post(`/api/sessions/${id}/run`);
+    const secondRun = await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
     expect([404, 409]).toContain(secondRun.status);
   });
 
   it("POST /run persists the task contract so it survives pendingContracts being cleared", async () => {
     const created = await request(app)
-      .post("/api/sessions")
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
       .send({ taskContract: validContract, workspace: "/tmp/ws" });
     const id = created.body.id;
-    await request(app).post(`/api/sessions/${id}/run`);
+    await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
     const contractPath = path.join(stateRoot, "sessions", id, "gateway-contract.json");
     const written = JSON.parse(await fs.readFile(contractPath, "utf-8"));
     expect(written).toEqual(validContract);
@@ -851,7 +855,7 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    const res = await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
+    const res = await request(app).post(`/api/sessions/${id}/tasks/t1/skip`).set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ taskId: "t1", action: "skip" });
     expect(typeof res.body.at).toBe("string");
@@ -868,8 +872,8 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
-    const res = await request(app).post(`/api/sessions/${id}/tasks/t2/approve`);
+    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`).set("Origin", UI_ORIGIN);
+    const res = await request(app).post(`/api/sessions/${id}/tasks/t2/approve`).set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ taskId: "t2", action: "approve" });
 
@@ -879,7 +883,7 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
   });
 
   it("404s for an unknown session id", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/tasks/t1/skip");
+    const res = await request(app).post("/api/sessions/does-not-exist/tasks/t1/skip").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -889,7 +893,7 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    const res = await request(app).post(`/api/sessions/${id}/tasks/does-not-exist/skip`);
+    const res = await request(app).post(`/api/sessions/${id}/tasks/does-not-exist/skip`).set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
 
     // And the sidecar must not have been written for the rejected call.
@@ -902,8 +906,8 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`);
-    await request(app).post(`/api/sessions/${id}/tasks/t2/approve`);
+    await request(app).post(`/api/sessions/${id}/tasks/t1/skip`).set("Origin", UI_ORIGIN);
+    await request(app).post(`/api/sessions/${id}/tasks/t2/approve`).set("Origin", UI_ORIGIN);
 
     const res = await request(app).get(`/api/sessions/${id}/tasks`);
     expect(res.status).toBe(200);
@@ -926,7 +930,7 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    const skipRes = await request(app).post(`/api/sessions/${id}/tasks/t2/skip`);
+    const skipRes = await request(app).post(`/api/sessions/${id}/tasks/t2/skip`).set("Origin", UI_ORIGIN);
     expect(skipRes.body).toMatchObject({ taskId: "t2", action: "skip" });
 
     // Simulate a replan: t2 now names a completely different task.
@@ -963,7 +967,7 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
 
-    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "daniel" });
+    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).set("Origin", UI_ORIGIN).send({ approvedBy: "daniel" });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ approvalId: "appr-1", status: "approved", approvedBy: "daniel" });
     expect(typeof res.body.resolvedAt).toBe("string");
@@ -978,7 +982,7 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-2": pendingApproval }));
 
-    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-2/deny`);
+    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-2/deny`).set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ approvalId: "appr-2", status: "denied" });
     expect(typeof res.body.approvedBy).toBe("string");
@@ -986,7 +990,7 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
   });
 
   it("404s for an unknown session id", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/approvals/appr-1/approve");
+    const res = await request(app).post("/api/sessions/does-not-exist/approvals/appr-1/approve").set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -996,7 +1000,7 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
 
-    const res = await request(app).post(`/api/sessions/${id}/approvals/does-not-exist/approve`);
+    const res = await request(app).post(`/api/sessions/${id}/approvals/does-not-exist/approve`).set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -1006,14 +1010,14 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
 
-    const first = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "daniel" });
+    const first = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).set("Origin", UI_ORIGIN).send({ approvedBy: "daniel" });
     expect(first.status).toBe(200);
-    const second = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).send({ approvedBy: "someone-else" });
+    const second = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).set("Origin", UI_ORIGIN).send({ approvedBy: "someone-else" });
     expect(second.status).toBe(200);
     expect(second.body).toEqual(first.body); // unchanged -- not re-resolved to "someone-else"/a new timestamp
 
     // A denial after an approval is already recorded is equally a no-op.
-    const third = await request(app).post(`/api/sessions/${id}/approvals/appr-1/deny`);
+    const third = await request(app).post(`/api/sessions/${id}/approvals/appr-1/deny`).set("Origin", UI_ORIGIN);
     expect(third.body).toEqual(first.body);
   });
 
@@ -1161,12 +1165,12 @@ describe("opt-in artifact routes reject path-traversal ids", () => {
 
 describe("POST /api/sessions/:id/ask", () => {
   it("returns 400 without a question", async () => {
-    const res = await request(app).post("/api/sessions/some-id/ask").send({});
+    const res = await request(app).post("/api/sessions/some-id/ask").set("Origin", UI_ORIGIN).send({});
     expect(res.status).toBe(400);
   });
 
   it("returns 404 for an unknown session", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/ask").send({ question: "why?" });
+    const res = await request(app).post("/api/sessions/does-not-exist/ask").set("Origin", UI_ORIGIN).send({ question: "why?" });
     expect(res.status).toBe(404);
   });
 
@@ -1186,7 +1190,7 @@ describe("POST /api/sessions/:id/ask", () => {
     vi.resetModules();
     const { createApp: createAppFresh } = await import("../app.js");
     const appFresh = createAppFresh();
-    const res = await request(appFresh).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
+    const res = await request(appFresh).post(`/api/sessions/${id}/ask`).set("Origin", UI_ORIGIN).send({ question: "why?" });
     expect(res.status).toBe(502);
   });
 
@@ -1202,7 +1206,7 @@ describe("POST /api/sessions/:id/ask", () => {
     // ever reached — this must not be reported as "model unreachable" (502).
     await fs.mkdir(path.join(dir, "events.jsonl"));
 
-    const res = await request(app).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
+    const res = await request(app).post(`/api/sessions/${id}/ask`).set("Origin", UI_ORIGIN).send({ question: "why?" });
     expect(res.status).toBe(500);
   });
 });
@@ -1241,7 +1245,7 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       res.end();
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).send({ question: "why?" });
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).set("Origin", UI_ORIGIN).send({ question: "why?" });
       expect(res.status).toBe(200);
       expect(res.headers["content-type"]).toContain("text/event-stream");
       const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
@@ -1268,7 +1272,7 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       setTimeout(() => res.destroy(), 20);
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).send({ question: "why?" });
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).set("Origin", UI_ORIGIN).send({ question: "why?" });
       expect(res.status).toBe(200);
       const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
       expect(frames[0]).toEqual({ delta: "Partial" });
@@ -1279,7 +1283,7 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
   });
 
   it("returns 400 without a question, same as the non-streaming path, before ever writing SSE headers", async () => {
-    const res = await request(app).post("/api/sessions/some-id/ask?stream=1").send({});
+    const res = await request(app).post("/api/sessions/some-id/ask?stream=1").set("Origin", UI_ORIGIN).send({});
     expect(res.status).toBe(400);
   });
 
@@ -1291,7 +1295,7 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       res.end("data: [DONE]\n\n");
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).send({ question: "why?" });
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).set("Origin", UI_ORIGIN).send({ question: "why?" });
       expect(res.status).toBe(200);
       const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
       expect(frames).toEqual([{ error: "unavailable" }]);
@@ -1323,7 +1327,11 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
         const clientReq = http.request(
           {
             hostname: "127.0.0.1", port, path: `/api/sessions/${id}/ask?stream=1`, method: "POST",
-            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(body),
+              Origin: UI_ORIGIN, // writes need one (app.ts localOnlyGuard), same as a browser sends
+            },
           },
           (res) => {
             res.once("data", () => clientReq.destroy()); // simulate the browser tab closing mid-stream
@@ -1353,7 +1361,7 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       res.end(JSON.stringify({ choices: [{ message: { content: "It owns the parser state." } }] }));
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask`).send({ question: "why?" });
+      const res = await request(streamApp).post(`/api/sessions/${id}/ask`).set("Origin", UI_ORIGIN).send({ question: "why?" });
       expect(res.status).toBe(200);
       expect(res.headers["content-type"]).toContain("application/json");
       expect(res.body).toEqual({ answer: "It owns the parser state.", provenance: "model-output" });

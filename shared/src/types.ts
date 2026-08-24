@@ -1093,6 +1093,18 @@ export interface DocGraphSource {
   sessionId: string;
 }
 
+// Lifecycle of the local llama-server process, as far as the gateway can
+// honestly tell. Deliberately separate from ModelStatus.status, which stays
+// purely probe-derived: spawning a process is never evidence that the model
+// is ONLINE — only a 200 from /health is.
+//   OFFLINE  nothing listening, nothing spawned by us still alive
+//   STARTING we spawned the start script and the port is not accepting yet
+//   LOADING  the port answers but /health isn't 200 yet (llama-server replies
+//            503 "Loading model" for the ~1-2 min it takes to load the GGUF)
+//   ONLINE   /health said so (or 401/403 — reachable, auth-gated)
+//   FAILED   the process we spawned exited without ever coming up
+export type ModelRunState = "OFFLINE" | "STARTING" | "LOADING" | "ONLINE" | "FAILED";
+
 export interface ModelStatus {
   status: "ONLINE" | "REACHABLE_AUTH" | "OFFLINE" | "UNKNOWN";
   endpoint: string;
@@ -1104,6 +1116,12 @@ export interface ModelStatus {
   contextSize?: number;
   modelPath?: string;
   speculativeDecoding?: boolean;
+  // Process-control facts, served by /api/model/{status,start,stop} only —
+  // absent from the dashboard's /api/status payload, which probes and nothing
+  // more. exitCode/logTail are present only for FAILED.
+  runState?: ModelRunState;
+  exitCode?: number | null;
+  logTail?: string;
 }
 
 export interface WorkspaceInfo {

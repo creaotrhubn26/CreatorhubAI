@@ -17,6 +17,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type ModelControlResult = ModelStatus & {
+  started?: boolean;
+  stopped?: boolean;
+  pid?: number;
+  error?: string;
+  // Why a stop reported `stopped: false` — nothing was running, or the target
+  // survived the attempt. Present only in that case.
+  detail?: string;
+};
+
+async function modelControl(action: "start" | "stop"): Promise<ModelControlResult> {
+  const res = await fetch(`${API_BASE}/api/model/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = await res.json().catch(() => ({}));
+  // 409 = already running / already coming up: a real state, not a failure.
+  if (!res.ok && res.status !== 409) {
+    throw new Error(body.error || `POST /api/model/${action} failed: ${res.status}`);
+  }
+  return body as ModelControlResult;
+}
+
 export const glimmerApi = {
   getStatus: () => request<DashboardStatus>("/api/status"),
   getModelStatus: () => request<ModelStatus>("/api/model/status"),
@@ -190,6 +213,12 @@ export const glimmerApi = {
   // §14 Diff Review — human "accept for review", distinct from technical
   // verification. Gateway-owned; see server/src/lib/sessions.ts.
   acceptSession: (id: string) => request<HumanAcceptance>(`/api/sessions/${id}/accept`, { method: "POST" }),
+  // Model server process control. Both bypass the generic request() helper:
+  // "already running" (409 from start) is an honest current-state answer the
+  // screen renders, not an error — the body carries the same ModelStatus
+  // shape as a success, so the caller never has to invent one.
+  startModelServer: () => modelControl("start"),
+  stopModelServer: () => modelControl("stop"),
   getTaskIntelligence: (scopePackage: string, scopeArea?: string) => {
     const params = new URLSearchParams({ scopePackage });
     if (scopeArea) params.set("scopeArea", scopeArea);

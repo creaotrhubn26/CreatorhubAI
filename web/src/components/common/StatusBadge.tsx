@@ -6,6 +6,10 @@ const COLOR: Record<string, string> = {
   implementing: "var(--blue)", verifying: "var(--blue)", discovery: "var(--blue)",
   preflight: "var(--blue)", understanding: "var(--blue)", candidate_selection: "var(--blue)",
   NOT_RUN: "var(--gray)", created: "var(--gray)", cancelled: "var(--gray)",
+  // ModelRunState intermediates (ModelStatusScreen). OFFLINE/ONLINE/FAILED
+  // already map above; these two are the "in progress" pair — blue while the
+  // process comes up, amber while the model loads (minutes, not seconds).
+  STARTING: "var(--blue)", LOADING: "var(--amber)",
   // V7 §20: non-success terminal (workspace changed after VERIFIED) -- same
   // amber as needs_review/repairing, not red: no failure occurred, a re-run
   // just needs to happen.

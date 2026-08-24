@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
 import { EmptyState } from "../common/EmptyState";
@@ -19,6 +20,9 @@ export function DashboardScreen() {
       <section>
         <h2>Muse Glimmer</h2>
         <StatusBadge status={data.model.status} />
+        {/* Nothing can run without the model server, and starting it is no
+            longer a terminal errand — point at the screen that owns it. */}
+        {data.model.status !== "ONLINE" && <Link to="/model">Start the model server</Link>}
       </section>
       <section>
         <h2>Active session</h2>
