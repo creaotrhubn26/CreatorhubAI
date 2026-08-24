@@ -15,17 +15,29 @@
 //! itself is bundled: `node_binary()` prefers the sidecar shipped via
 //! `bundle.externalBin` (see scripts/prepare-sidecar.sh), falling back to
 //! `node` on PATH in dev.
+//!
+//! PATH: a GUI-launched .app inherits launchd's minimal PATH, which has no
+//! node/npm — so the gateway child gets an explicitly resolved PATH (see
+//! `resolve_user_path`), which is what glimmer-v2.py and every verification
+//! command it runs will inherit.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{Manager, RunEvent, WindowEvent};
 
 const GATEWAY_PORT: u16 = 4317;
 const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Login shells can be slow (nvm, rbenv, conda init...). Long enough for a
+/// realistic rc chain, short enough that a broken/hanging profile can't hold
+/// app startup hostage — on timeout we fall back instead of waiting.
+const SHELL_PATH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Where node/npm actually live on a developer Mac. Only used as a fallback
+/// when the login shell can't be asked (see `resolve_user_path`).
+const FALLBACK_PATH_DIRS: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
 
 /// Holds the spawned gateway child process, if this app instance started one.
 /// `None` means either the gateway wasn't spawned (port already in use) or it
@@ -62,6 +74,89 @@ fn gateway_dir(app: &tauri::AppHandle) -> PathBuf {
     }
 }
 
+/// First directory of `path` (a `:`-separated PATH) holding an executable
+/// named `program`. Also the honest answer to "is node actually reachable?".
+fn find_in_path(path: &str, program: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Asks the user's login shell for its PATH, exactly as a Terminal session
+/// would see it. `-i` so interactive-only rc files (the usual home of
+/// nvm/homebrew shims) are sourced too. The marker keeps us honest about
+/// which output line is the PATH: an interactive rc file is free to print
+/// banners, and mistaking one for a PATH is how you end up with a PATH that
+/// silently contains nothing.
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").ok()?;
+    let mut child = Command::new(&shell)
+        .args(["-ilc", "printf '__GLIMMER_PATH__%s\\n' \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + SHELL_PATH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                eprintln!("[glimmer] login shell ({shell}) did not report its PATH within {SHELL_PATH_TIMEOUT:?} — killing it and falling back.");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+
+    let out = child.wait_with_output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("__GLIMMER_PATH__"))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+}
+
+/// The PATH the gateway child (and therefore glimmer-v2.py, and therefore the
+/// verification commands it runs — `npm run typecheck` and friends) will see.
+///
+/// A GUI-launched .app inherits launchd's minimal PATH (`/usr/bin:/bin:
+/// /usr/sbin:/sbin`), which has no node and no npm: every real task in the
+/// packaged app died as INFRA_BLOCKED with `npm: command not found`. So ask
+/// the login shell once at startup; if that fails, times out, or yields a
+/// PATH without node, prepend the standard install locations to whatever we
+/// inherited. Whatever happens is logged, including the case where node is
+/// still not found — never silently proceed pretending it's fine.
+fn resolve_user_path() -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+
+    if let Some(shell_path) = login_shell_path() {
+        if let Some(node) = find_in_path(&shell_path, "node") {
+            println!("[glimmer] PATH resolved from login shell (node at {}): {shell_path}", node.display());
+            return shell_path;
+        }
+        eprintln!("[glimmer] login shell PATH contains no node — falling back to the standard locations. Shell PATH was: {shell_path}");
+    } else {
+        eprintln!("[glimmer] could not read the login shell's PATH — falling back to the standard locations.");
+    }
+
+    let mut dirs: Vec<&str> = FALLBACK_PATH_DIRS.to_vec();
+    dirs.extend(inherited.split(':').filter(|d| !d.is_empty() && !FALLBACK_PATH_DIRS.contains(d)));
+    let fallback = dirs.join(":");
+    match find_in_path(&fallback, "node") {
+        Some(node) => println!("[glimmer] PATH resolved from fallback locations (node at {}): {fallback}", node.display()),
+        None => eprintln!(
+            "[glimmer] PATH resolved from fallback locations but NO node was found in it: {fallback}. The gateway will start, but verification commands (npm run typecheck, ...) will fail with 'command not found'."
+        ),
+    }
+    fallback
+}
+
 fn port_in_use(port: u16) -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     TcpStream::connect_timeout(&addr, GATEWAY_PROBE_TIMEOUT).is_ok()
@@ -90,8 +185,18 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
         return None;
     }
 
-    let node = node_binary();
-    match Command::new(&node).arg("dist/index.js").current_dir(&dir).spawn() {
+    // Resolved before the spawn and passed explicitly: the child's env is the
+    // only thing that reaches glimmer-v2.py and the verification subprocesses
+    // it runs. It also decides where `node` itself is found when no sidecar
+    // is bundled (dev), so don't rely on the ambiguous execvp PATH lookup.
+    let path = resolve_user_path();
+    let node = node_binary(&path);
+    match Command::new(&node)
+        .arg("dist/index.js")
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .spawn()
+    {
         Ok(child) => {
             println!(
                 "[glimmer] spawned gateway (pid {}) from {} via {}",
@@ -116,8 +221,11 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
 /// glimmer-node so a linux package never shadows /usr/bin/node), falling
 /// back to `node` on PATH so `tauri dev` and repo-checkout runs keep working
 /// without the ~50MB binary present (it's gitignored; produced by
-/// `scripts/prepare-sidecar.sh` before a bundling build).
-fn node_binary() -> PathBuf {
+/// `scripts/prepare-sidecar.sh` before a bundling build). The fallback looks
+/// `node` up in the resolved user PATH rather than leaving it to the OS's
+/// exec lookup, which searches the *parent's* PATH — the launchd one that
+/// started this whole bug.
+fn node_binary(path: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let sidecar = dir.join(if cfg!(windows) { "glimmer-node.exe" } else { "glimmer-node" });
@@ -126,7 +234,7 @@ fn node_binary() -> PathBuf {
             }
         }
     }
-    PathBuf::from("node")
+    find_in_path(path, "node").unwrap_or_else(|| PathBuf::from("node"))
 }
 
 /// Desktop notification bridge: WKWebView has no `window.Notification`, so

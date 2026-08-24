@@ -6,4 +6,11 @@ const app = createApp();
 // from other hosts on the network.
 app.listen(CONFIG.port, "127.0.0.1", () => {
   console.log(`Glimmer Local API listening on http://127.0.0.1:${CONFIG.port}`);
+  // The PATH this process inherited is the PATH glimmer-v2.py and every
+  // verification command it spawns will run with. A GUI-launched .app gets
+  // launchd's minimal PATH unless the Tauri shell resolved a real one
+  // (src-tauri/src/lib.rs resolve_user_path), and "npm: command not found"
+  // is indistinguishable from a real failure once it reaches a session log —
+  // so state it here, at boot, where it can be checked.
+  console.log(`[gateway] PATH=${process.env.PATH ?? "(unset)"}`);
 });
