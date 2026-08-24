@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened runtime is required for notarization, and it blocks writable-
+       executable memory by default. The bundled node sidecar (glimmer-node)
+       runs V8, which JIT-compiles: without allow-jit it dies immediately with
+       a SIGILL/"Bad system call" on arm64. Verified empirically — the app
+       runs with exactly this one entitlement; allow-unsigned-executable-memory
+       and disable-library-validation were tested and are NOT needed
+       (V8 uses proper MAP_JIT pages, and nothing here dlopens unsigned code). -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+</dict>
+</plist>

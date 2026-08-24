@@ -33,6 +33,10 @@
     "category": "DeveloperTool",
     "externalBin": ["binaries/glimmer-node"],
     "resources": ["resources/gateway"],
+    "macOS": {
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist"
+    },
     "shortDescription": "Local desktop shell for the Glimmer autonomous engineering gateway",
     "icon": [
       "icons/32x32.png",

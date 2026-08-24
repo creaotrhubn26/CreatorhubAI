@@ -104,6 +104,63 @@ src-tauri/scripts/prepare-sidecar.sh
   app executable (`Contents/MacOS/glimmer-node` on macOS) wins; `node` on
   PATH is the dev-mode fallback, so `tauri dev` works without the binary.
 
+## PATH for the gateway child
+A GUI-launched .app inherits launchd's minimal PATH
+(`/usr/bin:/bin:/usr/sbin:/sbin`) — no node, no npm. That PATH reached the
+gateway, then glimmer-v2.py, then its verification commands, so every real
+task in the packaged app failed with `npm: command not found` →
+INFRA_BLOCKED. `src/lib.rs::resolve_user_path` fixes it at the source:
+
+- Ask the login shell once at startup: `$SHELL -ilc 'printf
+  __GLIMMER_PATH__%s\n "$PATH"'`, 5s timeout (killed on timeout). `-i` so
+  interactive-only rc files are sourced; the marker prefix means an rc-file
+  banner can never be mistaken for the PATH.
+- Fall back to `/opt/homebrew/bin:/usr/local/bin:/usr/bin` prepended to the
+  inherited PATH if the shell can't be asked, times out, or returns a PATH
+  with no node in it.
+- The result is passed explicitly as the gateway child's `PATH` env (and
+  used to locate `node` when no sidecar is bundled — `execvp` searches the
+  *parent's* PATH, which is the launchd one). Every outcome is logged,
+  including "no node found anywhere", which is never silently swallowed.
+- The gateway logs its own inherited PATH at boot (`[gateway] PATH=...`),
+  so a packaged run can be checked from the app's stdout or `ps eww <pid>`.
+
+## Code signing & notarization (macOS)
+The bundle is Developer ID signed, hardened-runtime, notarized and stapled,
+so it opens with no Gatekeeper prompt. **No credential lives in this repo** —
+Tauri reads all of them from the environment at build time:
+
+| Env var | What |
+| --- | --- |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <Org> (<TeamID>)`, as listed by `security find-identity -v -p codesigning` |
+| `APPLE_API_KEY` | App Store Connect API key id (must be an **Admin** key — an App Manager key cannot notarize) |
+| `APPLE_API_ISSUER` | API issuer UUID |
+| `APPLE_API_KEY_PATH` | Path to the `AuthKey_<id>.p8` file (keep it outside the repo, e.g. `~/.appstoreconnect/private_keys/`) |
+
+With those exported, plain `npm run tauri:build` signs (app + the
+`glimmer-node` sidecar, inside-out), notarizes via `notarytool submit
+--wait`, and staples. Config side (committed, no secrets):
+`bundle.macOS.hardenedRuntime: true` and
+`bundle.macOS.entitlements: "entitlements.plist"`.
+
+`entitlements.plist` carries exactly one entitlement,
+`com.apple.security.cs.allow-jit`, and that minimum is measured, not
+guessed: under hardened runtime the bundled node dies immediately
+(exit 133) without it and runs fine with it alone —
+`allow-unsigned-executable-memory` and `disable-library-validation` are not
+needed (V8 uses proper MAP_JIT pages; nothing here dlopens unsigned code).
+
+Verify a build:
+
+```
+codesign --verify --deep --strict --verbose=2 "Glimmer Control Center.app"
+spctl -a -vvv -t install "Glimmer Control Center.app"   # must say: source=Notarized Developer ID
+xcrun stapler validate "Glimmer Control Center.app"
+```
+
+If notarization is rejected, read the real reason with `xcrun notarytool
+log <submission-id>` — never "fix" it by turning off hardened runtime.
+
 ## Notifications
 WKWebView has no `window.Notification`, so the web UI feature-detects
 `window.__TAURI__` (enabled via `app.withGlobalTauri`) and invokes the Rust
