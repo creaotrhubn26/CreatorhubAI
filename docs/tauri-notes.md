@@ -125,6 +125,38 @@ INFRA_BLOCKED. `src/lib.rs::resolve_user_path` fixes it at the source:
 - The gateway logs its own inherited PATH at boot (`[gateway] PATH=...`),
   so a packaged run can be checked from the app's stdout or `ps eww <pid>`.
 
+## Who may call the gateway
+`server/src/app.ts::localOnlyGuard` runs ahead of every router:
+
+- **Host** must be a loopback spelling (`127.0.0.1`, `localhost`, `[::1]`,
+  any port — never pin one, supertest binds ephemeral ports). This is what
+  stops DNS rebinding making an attacker page same-origin with the API.
+- **State-changing methods** (POST/PUT/PATCH/DELETE) must carry an `Origin`
+  from the allowlist: the dev web server (`:5183`, both spellings) and
+  `tauri://localhost` — captured from the installed bundle, not assumed.
+  A **missing** Origin is rejected too: browsers always send one on
+  cross-origin writes (including `text/plain` form posts, which is the
+  attack shape), so allowing Origin-less writes would only be a
+  header-omission bypass. A CLI client must therefore send
+  `-H "Origin: http://127.0.0.1:5183"`.
+- CORS is unchanged and still governs what may be *read*; it never stopped a
+  cross-origin request from *executing*, which is why the guard exists.
+
+## Model server lifecycle
+Start/Stop from the Model screen run only `start-glimmer.sh` /
+`stop-glimmer.sh` (absolute paths from CONFIG, argv, no shell). Two things
+worth knowing:
+
+- llama-server is spawned **detached** and keeps running after you quit the
+  app — a 1–2 minute model load is worth more than tidiness, but that also
+  means ~20 GB stays resident until someone presses Stop. The Model screen
+  says so in the ONLINE/LOADING notes.
+- Stop is port-keyed (the script uses `lsof` on the model port), so it also
+  stops a llama-server started by hand in a terminal. The gateway
+  additionally SIGTERMs the process group of a process it started itself,
+  because a process that hasn't bound yet is invisible to the script — and
+  it reports `stopped: false` with a reason when the target survives.
+
 ## Code signing & notarization (macOS)
 The bundle is Developer ID signed, hardened-runtime, notarized and stapled,
 so it opens with no Gatekeeper prompt. **No credential lives in this repo** —
