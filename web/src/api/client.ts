@@ -6,6 +6,7 @@ import type {
   ApprovalRequest, FsListing, FsFile, RepositorySelection,
   ModelRegistry, ModelRegistryUpdate,
   SessionDiff, HunkReviewResult,
+  TaskReport,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -124,6 +125,7 @@ export const glimmerApi = {
   getSessionDiff: (id: string) => request<SessionDiff>(`/api/sessions/${id}/diff`),
   getSessionAnalysis: (id: string) => request<SessionAnalysis>(`/api/sessions/${id}/analysis`),
   getArchitecturePlan: (id: string) => request<ArchitecturePlan>(`/api/sessions/${id}/plan`),
+  getTaskReport: (id: string) => request<TaskReport>(`/api/sessions/${id}/task-report`),
   getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),
   // Task 8.2 (V7 §23.16) -- the concise session close-out handoff document.

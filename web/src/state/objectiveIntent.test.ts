@@ -12,20 +12,20 @@ describe("interpretObjectiveIntent", () => {
     expect(interpretObjectiveIntent(objective, "implement")?.kind).toBe("improvement-assessment");
   });
 
-  it("turns implement mode into an evidence-first improvement task without carrying the literal wording", () => {
+  it("records structured intent without replacing the literal objective", () => {
     const result = interpretObjectiveIntent("Hva kan bli bedre?", "implement");
 
-    expect(result?.effectiveObjective).toContain("evidence-backed defects and improvement opportunities");
-    expect(result?.effectiveObjective).toContain("Do not search the repository for words or phrases");
-    expect(result?.effectiveObjective).toContain("implement it, and verify the change");
-    expect(result?.effectiveObjective).not.toContain("Hva kan bli bedre");
+    expect(result?.intent).toEqual({
+      kind: "improvement-assessment",
+      source: "deterministic-inference",
+    });
   });
 
   it("keeps review intent read-only and tailored to the selected mode", () => {
     const result = interpretObjectiveIntent("Hva som kan bli bedre?", "review");
 
-    expect(result?.effectiveObjective).toContain("Do not modify files");
-    expect(result?.effectiveObjective).toContain("prioritized review");
+    expect(result?.intent.kind).toBe("improvement-assessment");
+    expect(result?.explanation).toContain("prioritized findings");
   });
 
   it.each([

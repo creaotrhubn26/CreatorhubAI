@@ -20,6 +20,13 @@ export type GlimmerSessionStatus =
   | "blocked"
   | "failed"
   | "verified"
+  // A read-only inspect/plan/review run finished and produced its report.
+  // This deliberately makes no verification claim.
+  | "completed"
+  // An implementation-capable run finished without changing the workspace.
+  // Kept separate from VERIFIED so "nothing changed" cannot masquerade as
+  // verified delivery.
+  | "no_change"
   | "needs_review"
   | "cancelled"
   // V7 §20 verification freeze: never written by the orchestrator. The
@@ -101,6 +108,9 @@ export interface FinalStatus {
 
 export interface TaskContract {
   objective: string;
+  // The human's objective above is immutable source text. intent records a
+  // narrow, deterministic semantic interpretation without replacing it.
+  intent?: TaskIntent;
   scope: {
     package: "repository" | "frontend" | "backend" | "directory" | "files";
     area?: string;
@@ -146,6 +156,41 @@ export interface TaskContract {
     customerReadinessRequired?: boolean;
     minimumCustomerReadiness?: DeliveryReviewCustomerReadiness;
   };
+}
+
+export type TaskMode = TaskContract["mode"];
+export type ReadOnlyTaskMode = Extract<TaskMode, "inspect" | "plan" | "review">;
+
+export interface TaskIntent {
+  kind: "direct" | "improvement-assessment";
+  source: "explicit" | "deterministic-inference";
+}
+
+export type TaskReportSeverity = "critical" | "high" | "medium" | "low" | "info";
+
+export interface TaskReportFinding {
+  severity: TaskReportSeverity;
+  category: string;
+  title: string;
+  description: string;
+  evidence: Array<{
+    path: string;
+    line?: number;
+    detail: string;
+  }>;
+  recommendedFix: string;
+}
+
+export interface TaskReport {
+  schemaVersion: 1;
+  mode: ReadOnlyTaskMode;
+  objective: string;
+  summary: string;
+  findings: TaskReportFinding[];
+  implementationPlan: string[];
+  confidence: "high" | "medium" | "low";
+  reportFailed?: boolean;
+  reportFailureReason?: string;
 }
 
 // V7 §18: manifest.verificationPlan, command strings (not results) for the
@@ -1312,4 +1357,26 @@ export interface CreateWorkspaceResult {
   workspace: string;
   branch: string;
   baselineSha: string;
+}
+
+const OPEN_ENDED_IMPROVEMENT_PATTERNS = [
+  /^(?:kan du\s+)?(?:(?:se(?:\s+på)?|sjekk|vurder|analyser|gjennomgå)\s+)?(?:hva|hvilke)\b.*\b(?:bedre|forbedres|forbedringer|fikses|rettes)\b/i,
+  /^(?:kan du\s+)?(?:finn|identifiser|kartlegg)\b.*\b(?:forbedring(?:er|smuligheter)?|svakheter|problemer)\b/i,
+  /^(?:can you\s+)?(?:(?:look at|check|assess|analy[sz]e|review)\s+)?(?:what|which)\b.*\b(?:better|improved|improvement|fixed)\b/i,
+  /^(?:can you\s+)?(?:find|identify|map)\b.*\b(?:improvements?|weaknesses|issues)\b/i,
+];
+
+/** Narrow deterministic inference shared by every TaskContract producer. */
+export function inferTaskIntent(objective: string): TaskIntent {
+  const normalized = objective.normalize("NFKC").trim().replace(/\s+/g, " ");
+  const improvementAssessment = normalized.length > 0 && normalized.length <= 240 &&
+    OPEN_ENDED_IMPROVEMENT_PATTERNS.some((pattern) => pattern.test(normalized));
+  return {
+    kind: improvementAssessment ? "improvement-assessment" : "direct",
+    source: "deterministic-inference",
+  };
+}
+
+export function taskModeAllowsWrites(mode: TaskMode): boolean {
+  return mode !== "inspect" && mode !== "plan" && mode !== "review";
 }

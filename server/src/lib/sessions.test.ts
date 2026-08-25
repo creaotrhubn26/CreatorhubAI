@@ -38,6 +38,7 @@ const REAL_MANIFEST = {
     },
   ],
   status: "verified",
+  startedAt: "2026-08-16T16:19:28.000000+00:00",
   updatedAt: "2026-08-16T16:23:20.283745+00:00",
   finalHead: "42fe48ab49aac02747c65802a003ed977eb9da38",
   finalChangedFiles: ["frontend/client/env.d.ts"],
@@ -52,6 +53,8 @@ describe("parseManifest", () => {
     expect(session.headSha).toBe("42fe48ab49aac02747c65802a003ed977eb9da38");
     expect(session.changedFiles).toEqual([{ path: "frontend/client/env.d.ts", status: "modified" }]);
     expect(session.repairBudget).toBe(1);
+    expect(session.startedAt).toBe(REAL_MANIFEST.startedAt);
+    expect(session.completedAt).toBe(REAL_MANIFEST.updatedAt);
     expect(session.repairsUsed).toBe(0);
     expect(session.verification.overall).toBe("VERIFIED");
     expect(session.verification.checks).toHaveLength(2);
@@ -192,8 +195,11 @@ describe("mapManifestStatus", () => {
     ["understanding", "understanding"],
     ["repo-map-only", "cancelled"],
     ["verified", "verified"],
-    ["no-change-verified", "verified"],
-    ["no-change-unverified", "needs_review"],
+    ["no-change-verified", "no_change"],
+    ["no-change-unverified", "no_change"],
+    ["inspect-completed", "completed"],
+    ["plan-completed", "completed"],
+    ["review-completed", "completed"],
     ["blocked-infra_blocked", "blocked"],
     ["blocked-timeout", "blocked"],
     ["blocked-no-changes", "blocked"],
@@ -782,7 +788,7 @@ describe("session-level verification freeze (V7 §20)", () => {
     });
 
     const session = await sessionsIsolated.readSession(id, { computeStale: true });
-    expect(session?.status).toBe("needs_review");
+    expect(session?.status).toBe("no_change");
 
     await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), POST_VERIFY_CONTENT);
   });

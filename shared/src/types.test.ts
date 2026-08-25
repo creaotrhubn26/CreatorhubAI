@@ -1,6 +1,6 @@
 // shared/src/types.test.ts
 import { describe, it, expect } from "vitest";
-import { isGlimmerEvent } from "./types";
+import { inferTaskIntent, isGlimmerEvent, taskModeAllowsWrites } from "./types";
 
 describe("isGlimmerEvent", () => {
   it("accepts a well-formed tool_started event", () => {
@@ -32,5 +32,32 @@ describe("isGlimmerEvent", () => {
     expect(isGlimmerEvent(evt)).toBe(true);
     expect(evt).not.toHaveProperty("apiKey");
     expect(evt).not.toHaveProperty("baseUrl");
+  });
+});
+
+describe("task intent and execution policy", () => {
+  it.each([
+    "Hva kan bli bedre?",
+    "Se hva som kan forbedres i frontenden",
+    "Finn forbedringsmuligheter",
+    "What can be improved?",
+    "Identify improvement opportunities",
+  ])("recognizes an open-ended improvement assessment: %s", (objective) => {
+    expect(inferTaskIntent(objective)).toEqual({
+      kind: "improvement-assessment",
+      source: "deterministic-inference",
+    });
+  });
+
+  it("keeps concrete objectives direct", () => {
+    expect(inferTaskIntent("Fix cancellation after a gateway restart").kind).toBe("direct");
+  });
+
+  it.each(["inspect", "plan", "review"] as const)("makes %s structurally read-only", (mode) => {
+    expect(taskModeAllowsWrites(mode)).toBe(false);
+  });
+
+  it.each(["implement", "debug", "test", "refactor"] as const)("allows %s to write", (mode) => {
+    expect(taskModeAllowsWrites(mode)).toBe(true);
   });
 });

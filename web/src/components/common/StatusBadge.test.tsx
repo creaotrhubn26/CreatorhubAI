@@ -5,6 +5,8 @@ import { statusColor, StatusBadge } from "./StatusBadge";
 describe("statusColor", () => {
   it("classifies verified as green and the other terminal statuses per their existing severity", () => {
     expect(statusColor("verified")).toBe("var(--green)");
+    expect(statusColor("completed")).toBe("var(--green)");
+    expect(statusColor("no_change")).toBe("var(--gray)");
     expect(statusColor("failed")).toBe("var(--red)");
     expect(statusColor("blocked")).toBe("var(--red)");
     expect(statusColor("needs_review")).toBe("var(--amber)");

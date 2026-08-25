@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
-import type { TaskIntelligence } from "@glimmer/shared";
+import { taskModeAllowsWrites, type TaskIntelligence } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
 import { computeArchitectRisk, deriveVerificationLevel, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
@@ -162,14 +162,12 @@ export function NewTaskScreen() {
   const needsScopePath = PATH_SCOPED_PACKAGES.has(form.scopePackage);
   const scopePathMissing = needsScopePath && !form.scopeArea?.trim();
   const objectiveInterpretation = interpretObjectiveIntent(form.objective, form.mode);
-  // Keep the human's wording in the editable field while sending the engine a
-  // precise semantic objective. This makes the interpretation visible and
-  // reversible (editing the task or mode recomputes it immediately) without
-  // letting an open-ended question become a literal repository text search.
-  const effectiveForm = objectiveInterpretation
-    ? { ...form, objective: objectiveInterpretation.effectiveObjective }
-    : form;
-  const effectiveContract = buildTaskContract(effectiveForm);
+  // Preserve the human's exact wording as the source objective. A separate,
+  // typed intent tells every executor how to interpret an open question.
+  const baseContract = buildTaskContract(form);
+  const effectiveContract = objectiveInterpretation
+    ? { ...baseContract, intent: objectiveInterpretation.intent }
+    : baseContract;
 
   const runMutation = useMutation({
     mutationFn: async () => {
@@ -354,7 +352,7 @@ export function NewTaskScreen() {
               <legend>Permissions</legend>
               <label><input type="checkbox" checked readOnly /> Read repository</label>
               <label><input type="checkbox" checked readOnly /> Search repository</label>
-              <label><input type="checkbox" checked readOnly /> Modify files</label>
+              <label><input type="checkbox" checked={taskModeAllowsWrites(form.mode)} readOnly /> Modify files</label>
               <label><input type="checkbox" checked={false} disabled /> Commit</label>
               <label><input type="checkbox" checked={false} disabled /> Push</label>
               <label><input type="checkbox" checked={false} disabled /> Deploy</label>
@@ -433,8 +431,8 @@ export function NewTaskScreen() {
 
       <div className="composer__runbar">
         <p className="composer__summary">{buildSummaryLine(form)}</p>
-        {buildArchitectRiskLine(effectiveForm) && (
-          <p className="composer__architect-risk">{buildArchitectRiskLine(effectiveForm)}</p>
+        {buildArchitectRiskLine(form) && (
+          <p className="composer__architect-risk">{buildArchitectRiskLine(form)}</p>
         )}
         {runMutation.isError && (
           <p role="alert" style={{ color: "var(--red)" }}>

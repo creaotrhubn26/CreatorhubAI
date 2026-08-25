@@ -14,16 +14,9 @@ const IN_FLIGHT_STATUSES = new Set<GlimmerSessionStatus>([
 statusRouter.get("/status", async (_req, res) => {
   const model = await probeModel(CONFIG.modelBaseUrl);
   const ids = await listSessionIds();
-  // Filter first, slice after: listSessionIds() sorts dir names in reverse-
-  // lexical order, and stale `pending-<uuid>` dirs (their in-memory alias
-  // died with a past gateway process, so nothing ever cleans them up — see
-  // sessions.ts's never-delete rule) sort ahead of `<timestamp>-...` real
-  // session ids because "p" > digits. readSession returns null for them
-  // (no manifest.json). Slicing ids to 10 BEFORE that filter let a handful
-  // of leftover pending dirs poison the whole top-N window with nulls,
-  // leaving recentSessions/latestSession/activeSession empty even with
-  // plenty of real sessions on disk. Read+filter everything, then take the
-  // newest 10 real sessions.
+  // Filter first, slice after. Unknown or legacy on-disk entries may not have
+  // readable manifests/run records; they must not consume the top-N window
+  // and hide newer real sessions from the dashboard.
   // V7 §20: plain readSession(id) (computeStale left false) -- this reads
   // the whole session list on this polled status endpoint, same reasoning
   // as GET /sessions.

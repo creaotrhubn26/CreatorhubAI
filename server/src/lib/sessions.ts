@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
 import { computeDiffHash } from "./git.js";
+import { gatewayRunToSession, listGatewayRunIds, readGatewayRun } from "./runState.js";
 import type {
   GlimmerSession, GlimmerSessionStatus, ChangedFile,
   VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
@@ -10,6 +11,7 @@ import type {
   GlimmerTask, HumanAcceptance,
   FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
   EvidenceIndexEntry, EvidenceEntryResponse, ApprovalRequest, HunkAcceptance,
+  TaskReport,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -17,11 +19,12 @@ import type {
 // overallFromManifest/gating has always been computed from.
 
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
-  "verified", "failed", "blocked", "needs_review", "cancelled",
+  "verified", "completed", "no_change", "failed", "blocked", "needs_review", "cancelled",
 ]);
 
 // glimmer-v2.py's real manifest["status"] values: initialized, repo-map-only,
-// no-change-verified, no-change-unverified, verified, blocked-<reason>,
+// no-change-verified, no-change-unverified, report completion, verified,
+// blocked-<reason>,
 // failed-verifier-mutated-repo, failed-repair-budget-exhausted, and (R6/C2)
 // cancelled-sigterm, failed-aborted, needs-architect-review(-rejected|-budget-exhausted).
 export function mapManifestStatus(raw: string): GlimmerSessionStatus {
@@ -31,8 +34,9 @@ export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   // -- identity mapping, kept in sync with glimmer-v2.py's own
   // canonical_session_state.
   if (raw === "understanding") return "understanding";
-  if (raw === "verified" || raw === "no-change-verified") return "verified";
-  if (raw === "no-change-unverified") return "needs_review";
+  if (raw === "verified") return "verified";
+  if (raw === "no-change-verified" || raw === "no-change-unverified") return "no_change";
+  if (raw === "inspect-completed" || raw === "plan-completed" || raw === "review-completed") return "completed";
   // Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string
   // directly into manifest.json while it's blocked polling approvals.json
   // for a YELLOW-classified action, and reverts it as soon as the wait
@@ -139,7 +143,7 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
     branch: m.branch,
     baselineSha: m.baseline,
     headSha: m.finalHead ?? lastAttempt?.diffHashAfterVerify,
-    startedAt: undefined,
+    startedAt: typeof m.startedAt === "string" ? m.startedAt : undefined,
     completedAt: TERMINAL_STATUSES.has(status) ? m.updatedAt : undefined,
     changedFiles: toChangedFiles(m.finalChangedFiles ?? lastAttempt?.changedFiles),
     verification,
@@ -151,6 +155,7 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
     // literal. `visual` is finalized by readSession's async override.
     finalStatus: composeFinalStatus(verification.overall, m.gates),
   };
+  if (m.contract) session.taskContract = m.contract as TaskContract;
   // C2/C3 (glimmer-v7): pass these through only when the manifest actually
   // carries them — older sessions predating architect mode have none of these
   // keys, and GlimmerSession leaves them optional for exactly that reason.
@@ -227,13 +232,15 @@ export function isValidSessionId(id: string): boolean {
 }
 
 export async function listSessionIds(): Promise<string[]> {
+  let directoryIds: string[] = [];
   try {
     const entries = await fs.readdir(sessionsDir(), { withFileTypes: true });
-    return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort().reverse();
+    directoryIds = entries.filter((e) => e.isDirectory()).map((e) => e.name);
   } catch (err: any) {
-    if (err.code === "ENOENT") return [];
-    throw err;
+    if (err.code !== "ENOENT") throw err;
   }
+  const gatewayIds = await listGatewayRunIds();
+  return [...new Set([...directoryIds, ...gatewayIds])].sort().reverse();
 }
 
 export async function readManifestRaw(id: string): Promise<unknown | null> {
@@ -276,6 +283,10 @@ async function readSessionJsonFile<T>(id: string, filename: string): Promise<T |
   } catch {
     return null;
   }
+}
+
+export function readTaskReport(id: string): Promise<TaskReport | null> {
+  return readSessionJsonFile<TaskReport>(id, "task-report.json");
 }
 
 export function readArchitecturePlan(id: string): Promise<ArchitecturePlan | null> {
@@ -715,16 +726,6 @@ export async function clearHunkAcceptancesForPath(id: string, filePath: string):
   await writeHunkAcceptances(id, next);
 }
 
-async function copyGatewayContract(fromId: string, toId: string): Promise<void> {
-  try {
-    const raw = await fs.readFile(path.join(sessionsDir(), fromId, "gateway-contract.json"), "utf-8");
-    await fs.writeFile(path.join(sessionsDir(), toId, "gateway-contract.json"), raw, "utf-8");
-  } catch {
-    // No contract to carry over — e.g. glimmer-v2.py was run standalone from a
-    // terminal, not through this gateway. Not an error.
-  }
-}
-
 // computeStale defaults to false: staleness detection spawns git (see
 // currentDiffHash above), and this function backs BOTH the session-list
 // endpoint (polled every few seconds by the sidebar) and the single-session
@@ -739,10 +740,13 @@ export async function readSession(
 ): Promise<GlimmerSession | null> {
   const real = resolveSessionId(id);
   const raw = await readManifestRaw(real);
-  if (!raw) return null;
+  if (!raw) {
+    const gatewayRun = await readGatewayRun(real);
+    return gatewayRun ? gatewayRunToSession(gatewayRun) : null;
+  }
   let session = parseManifest(raw, real);
   const taskContract = await readGatewayContract(real);
-  if (taskContract) session = { ...session, taskContract };
+  if (!session.taskContract && taskContract) session = { ...session, taskContract };
   const humanAcceptance = await readHumanAcceptance(real);
   if (humanAcceptance) session = { ...session, humanAcceptance };
   // V7 §22.17: the one finalStatus leg that needs I/O -- composeFinalStatus
@@ -777,103 +781,6 @@ export async function readSession(
   return session;
 }
 
-// --- pending-id -> real-session-id aliasing -------------------------------
-// The gateway creates `pending-<uuid>` and hands it to the client, but
-// glimmer-v2.py creates its OWN `<timestamp>-<branch>` session directory and
-// writes manifest.json there. Without an alias the client's id never resolves.
-const sessionAliases = new Map<string, string>();
-
-// FIFO of pendingIds currently waiting on adoption, in the order /run spawned
-// them. Used only to break ties when multiple real directories show up
-// unclaimed at once (see adoptRealSessionDir below).
-const pendingSpawnQueue: string[] = [];
-
 export function resolveSessionId(id: string): string {
-  return sessionAliases.get(id) ?? id;
-}
-
-/**
- * Poll sessionsDir() for a directory that did not exist at spawn time and
- * alias `pendingId` to it. Resolves to the real id, or null on timeout (which
- * honestly means glimmer-v2.py never got as far as creating its session dir).
- */
-export async function adoptRealSessionDir(
-  pendingId: string,
-  before: Set<string>,
-  timeoutMs = 10_000,
-  intervalMs = 250
-): Promise<string | null> {
-  if (!pendingSpawnQueue.includes(pendingId)) pendingSpawnQueue.push(pendingId);
-  try {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const ids = await listSessionIds();
-      // Computed AFTER the await, synchronously with the filter below: JS
-      // callbacks run to completion, so this whole block is atomic relative to
-      // any other concurrent adoptRealSessionDir call's own claim-and-set —
-      // a claim made while we were awaiting listSessionIds() is visible here.
-      const claimed = new Set(sessionAliases.values());
-      const candidates = ids.filter(
-        (id) => !before.has(id) && !id.startsWith("pending-") && !claimed.has(id)
-      );
-      if (candidates.length === 1) {
-        sessionAliases.set(pendingId, candidates[0]);
-        await copyGatewayContract(pendingId, candidates[0]);
-        return candidates[0];
-      }
-      if (candidates.length > 1) {
-        // F2: two (or more) sessions started back-to-back can both create
-        // their real directory before either poll loop runs, so neither side
-        // ever sees exactly one candidate and both pending ids would spin
-        // forever. Break the tie by spawn order: if the number of unclaimed
-        // candidates matches the number of pending ids still waiting, pair
-        // the earliest-created directory with the earliest-spawned pending id
-        // (and so on). This is a heuristic, not a true fix — it relies on
-        // orchestrator startup order roughly matching directory-creation
-        // order. A deterministic fix needs glimmer-v2.py to hand back an
-        // explicit session tag (future work, out of scope here).
-        // Note: pendingSpawnQueue is global across ALL in-flight adoptions,
-        // not scoped to the ones actually racing — a 3rd, unrelated pending
-        // id still polling delays this pairing (via the count check below)
-        // until it resolves or times out and is spliced out. Self-heals,
-        // does not deadlock, but is unbounded-latency by design.
-        const waiting = pendingSpawnQueue.filter((id) => !sessionAliases.has(id));
-        if (candidates.length === waiting.length) {
-          const stamped = await Promise.all(
-            candidates.map(async (id) => ({
-              id,
-              birth: (await fs.stat(path.join(sessionsDir(), id))).birthtime.getTime(),
-            }))
-          );
-          stamped.sort((a, b) => a.birth - b.birth);
-          // Re-check: nothing may be claimed and the queue may not have
-          // changed while we were stat()-ing (no other await point between
-          // here and the alias write below, so this recheck is authoritative).
-          const stillClaimed = new Set(sessionAliases.values());
-          const stillCandidates = stamped.filter((c) => !stillClaimed.has(c.id));
-          const stillWaiting = pendingSpawnQueue.filter((id) => !sessionAliases.has(id));
-          if (stillCandidates.length === stillWaiting.length) {
-            const myIndex = stillWaiting.indexOf(pendingId);
-            const match = myIndex === -1 ? undefined : stillCandidates[myIndex]?.id;
-            if (match && !stillClaimed.has(match)) {
-              sessionAliases.set(pendingId, match);
-              await copyGatewayContract(pendingId, match);
-              return match;
-            }
-          }
-        }
-      }
-      // 0 candidates: nothing new yet that isn't already claimed by another
-      // pending adoption — keep polling.
-      // count mismatch: genuinely ambiguous this tick — don't guess which is
-      // ours. Bail without aliasing; the next tick re-evaluates once counts
-      // line up (another adoption claims its directory, or another candidate
-      // appears).
-      await new Promise((r) => setTimeout(r, intervalMs));
-    }
-    return null;
-  } finally {
-    const idx = pendingSpawnQueue.indexOf(pendingId);
-    if (idx !== -1) pendingSpawnQueue.splice(idx, 1);
-  }
+  return id;
 }

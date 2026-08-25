@@ -44,7 +44,7 @@ describe("NewTaskScreen", () => {
     }
   });
 
-  it("renders read/search/modify as checked and enabled", () => {
+  it("renders read/search/modify as checked for implementation mode", () => {
     render(withQuery(<NewTaskScreen />));
     for (const label of ["Read repository", "Search repository", "Modify files"]) {
       const box = screen.getByLabelText(label) as HTMLInputElement;
@@ -91,10 +91,11 @@ describe("NewTaskScreen", () => {
     await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
     const [contract] = createSpy.mock.calls[0];
     expect(contract.mode).toBe("implement");
-    expect(contract.objective).toContain("evidence-backed defects and improvement opportunities");
-    expect(contract.objective).toContain("Do not search the repository for words or phrases");
-    expect(contract.objective).toContain("implement it, and verify the change");
-    expect(contract.objective).not.toContain("Hva kan bli bedre");
+    expect(contract.objective).toBe("Hva kan bli bedre?");
+    expect(contract.intent).toEqual({
+      kind: "improvement-assessment",
+      source: "deterministic-inference",
+    });
   });
 
   it("respects a manually selected review mode when interpreting an improvement question", async () => {
@@ -114,8 +115,9 @@ describe("NewTaskScreen", () => {
     await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
     const [contract] = createSpy.mock.calls[0];
     expect(contract.mode).toBe("review");
-    expect(contract.objective).toContain("Do not modify files");
-    expect(contract.objective).toContain("prioritized review");
+    expect(contract.objective).toBe("Hva som kan bli bedre?");
+    expect(contract.intent?.kind).toBe("improvement-assessment");
+    expect(screen.getByLabelText("Modify files")).not.toBeChecked();
   });
 
   it("lets the user toggle a verification checkbox on", () => {

@@ -8,13 +8,13 @@ import { StatusBadge, statusColor } from "../common/StatusBadge";
 // rather than guessing an outcome.
 const PAST_IMPLEMENTATION: ReadonlySet<GlimmerSessionStatus> = new Set([
   "verifying", "repairing", "waiting_for_approval",
-  "verified", "failed", "blocked", "needs_review", "cancelled",
+  "verified", "completed", "no_change", "failed", "blocked", "needs_review", "cancelled",
 ]);
 const REACHED_VERIFICATION: ReadonlySet<GlimmerSessionStatus> = new Set([
-  "repairing", "waiting_for_approval", "verified", "failed", "blocked", "needs_review", "cancelled",
+  "repairing", "waiting_for_approval", "verified", "completed", "no_change", "failed", "blocked", "needs_review", "cancelled",
 ]);
 const TERMINAL: ReadonlySet<GlimmerSessionStatus> = new Set([
-  "verified", "failed", "blocked", "needs_review", "cancelled",
+  "verified", "completed", "no_change", "failed", "blocked", "needs_review", "cancelled",
 ]);
 
 export function RepairCycleStepper({ session }: { session: GlimmerSession }) {
