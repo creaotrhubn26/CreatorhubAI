@@ -6,7 +6,6 @@ import datetime as dt
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
@@ -20,6 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from glimmer_events import emit as emit_event
 from glimmer_models import load_model_registry, model_for_role

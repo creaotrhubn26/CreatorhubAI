@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from urllib import request, error
+from urllib import error, request
 
 API_BASE = os.environ.get("GLIMMER_URL", "http://127.0.0.1:8080")
 API_KEY_FILE = Path.home() / "AI/muse-glimmer/config/api-key.txt"
@@ -251,7 +251,7 @@ def run_agent(prompt, workspace, max_turns):
 
     print(f"Workspace: {workspace}")
     print(f"Tools:     {len(tools)}")
-    print(f"Model:     muse-glimmer")
+    print("Model:     muse-glimmer")
     print()
 
     messages = [

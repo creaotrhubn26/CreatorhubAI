@@ -4,6 +4,8 @@ Muse-Glimmer-30B-GGUF/
 .venv/
 __pycache__/
 *.pyc
+.mypy_cache/
+.ruff_cache/
 
 # Secrets
 config/api-key.txt

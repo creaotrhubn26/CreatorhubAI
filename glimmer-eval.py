@@ -47,11 +47,11 @@ temperature actually used per-request, only its configured default).
     ./glimmer-eval.py --live-smoke       # cheap live reachability + 1 task
 """
 from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json
 import os
-import shlex
 import signal
 import socket
 import subprocess
@@ -535,6 +535,40 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
 
     env = os.environ.copy()
     env["GLIMMER_URL"] = resolved_url
+    if not live:
+        # The deterministic stub must not depend on a developer's real
+        # ~/.muse-glimmer/models.json or secret API-key file. CI has neither,
+        # and a missing default key would make the engineer exit before its
+        # first tool/model request. Give this task an isolated, secret-free
+        # registry that points every role at the in-process stub instead.
+        model_config = tmp_root / f"model-config-{task['id']}.json"
+        model_config.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "id": "eval-stub",
+                            "label": "Evaluation stub",
+                            "baseUrl": resolved_url,
+                            "modelId": "glimmer-eval-stub",
+                            "apiKeyFile": None,
+                        }
+                    ],
+                    "roles": {
+                        "engineer": "eval-stub",
+                        "architect": "eval-stub",
+                        "consult": "eval-stub",
+                        "vision": "eval-stub",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["GLIMMER_MODEL_CONFIG"] = str(model_config)
+        stub_key = tmp_root / "stub-api-key.txt"
+        stub_key.write_text("glimmer-eval-stub", encoding="utf-8")
+        env["GLIMMER_API_KEY_FILE"] = str(stub_key)
     # Round 9 review (M2): without this, glimmer-v2.py's STATE_ROOT is the
     # real ~/.muse-glimmer/sessions -- every eval task wrote a real synthetic
     # session dir straight into the same corpus glimmer-metrics.py scans by
@@ -776,6 +810,8 @@ def run_suite(suite: dict, *, only_id=None, v2_path: Path, engineer_path: Path,
             results.append(r)
             print(f"    -> taskSuccess={r['taskSuccess']} falseVerified={r['falseVerified']} "
                   f"budgetAdherence={r['budgetAdherence']} honestyChecks={r['honestyChecks']}", flush=True)
+            if r.get("problems"):
+                print(f"       problems={r['problems']}", flush=True)
     return results
 
 

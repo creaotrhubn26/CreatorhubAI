@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["control-center", "llama.cpp"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.9"
+cache_dir = ".mypy_cache"
+check_untyped_defs = true
+ignore_missing_imports = true
+pretty = true
+show_error_codes = true
