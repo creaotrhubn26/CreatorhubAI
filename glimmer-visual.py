@@ -48,6 +48,7 @@ from urllib import error, request
 
 DEFAULT_VIEWPORTS = ("1440x900", "390x844")  # V7 §22.6 desktop+mobile minimum
 DEFAULT_MODEL_URL = "http://127.0.0.1:8080"
+DEFAULT_MODEL_ID = "muse-glimmer"
 DEFAULT_VISION_TIMEOUT_S = 120
 
 # Same convention as glimmer-engineer.py's API_KEY_FILE/api_key() (mirrored,
@@ -246,7 +247,7 @@ def _extract_json_object(text):
     raise ValueError("no parseable JSON object found in vision model reply")
 
 
-def _build_vision_payload(image_b64, route, viewport_slug, checks, state="initial"):
+def _build_vision_payload(image_b64, route, viewport_slug, checks, state="initial", model_id=DEFAULT_MODEL_ID):
     """Pure request-builder (mirrors glimmer-engineer.py's
     _build_delivery_review_payload split) so a self-check can assert the
     constructed payload has no "tools" key -- omission of that key IS the
@@ -268,7 +269,7 @@ def _build_vision_payload(image_b64, route, viewport_slug, checks, state="initia
         "only what is actually visible in the image."
     )
     return {
-        "model": "muse-glimmer",
+        "model": model_id,
         "messages": [
             {"role": "system", "content": VISION_SYSTEM_PROMPT},
             {
@@ -321,6 +322,12 @@ def _http_post_json(url, payload, timeout_s, headers=None):
     return json.loads(raw)
 
 
+def _model_endpoint_url(model_url):
+    """Accept both an origin and a standard OpenAI ``.../v1`` base URL."""
+    base = model_url.rstrip("/")
+    return base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
+
+
 # Round 6 (V7 §16/§31, glimmer-engineer.py's ModelProvider/MODEL_ROLES):
 # this is a SEPARATE model-runtime provider from glimmer-engineer.py's, by
 # design -- this script stays standalone (see the module docstring above).
@@ -329,7 +336,7 @@ def _http_post_json(url, payload, timeout_s, headers=None):
 # the vision endpoint per call, same effect as a "vision" role would have.
 def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
                        timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None,
-                       state="initial"):
+                       state="initial", model_id=DEFAULT_MODEL_ID):
     """One chat-completions call for one screenshot. Returns the model's
     raw (untrusted) findings list. Raises on any failure -- network error,
     timeout, non-2xx (401 included -- a missing/wrong Authorization header
@@ -346,8 +353,10 @@ def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
     # Add an explicit size cap before base64-encoding if a real capture
     # ever produces multi-tens-of-MB screenshots in practice.
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
-    payload = _build_vision_payload(image_b64, route, viewport_slug, checks, state=state)
-    endpoint = model_url.rstrip("/") + "/v1/chat/completions"
+    payload = _build_vision_payload(
+        image_b64, route, viewport_slug, checks, state=state, model_id=model_id
+    )
+    endpoint = _model_endpoint_url(model_url)
     response = post_fn(endpoint, payload, timeout_s, _auth_headers(api_key_text))
     content = response["choices"][0]["message"].get("content") or ""
     data = _extract_json_object(content)
@@ -400,7 +409,8 @@ def _coerce_finding(raw, viewport_slug, state="initial"):
 
 
 def run_vision_model(captures, output_dir, route, checks, model_url,
-                      timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None):
+                      timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None,
+                      model_id=DEFAULT_MODEL_ID):
     """Real implementation of the extension point C4-plumbing left
     documented-but-stubbed. One chat-completions call per successfully
     captured (viewport, state) pair -- V7 §22.7: a capture entry with no
@@ -437,7 +447,7 @@ def run_vision_model(captures, output_dir, route, checks, model_url,
             raw_findings = call_vision_model(
                 image_bytes, route, viewport_slug, checks, model_url,
                 timeout_s=timeout_s, post_fn=post_fn, api_key_text=api_key_text,
-                state=state,
+                state=state, model_id=model_id,
             )
         except Exception as exc:  # noqa: BLE001 -- one call must never crash the run or fabricate findings
             reports.append({
@@ -671,6 +681,8 @@ def main(argv=None):
                           "as before -- capture-only, findings.json status NOT_RUN.")
     ap.add_argument("--model-url", default=DEFAULT_MODEL_URL,
                      help=f"Base URL of the multimodal llama-server. Default {DEFAULT_MODEL_URL}.")
+    ap.add_argument("--model-id", default=DEFAULT_MODEL_ID,
+                     help=f"OpenAI-compatible model id sent in each vision call. Default {DEFAULT_MODEL_ID}.")
     ap.add_argument("--check", action="append", default=None,
                      help="A V7 §22.3 contract check, e.g. "
                           '"primary button fully visible". Repeatable. Defaults to a small '
@@ -717,8 +729,10 @@ def main(argv=None):
             captures, output_dir, args.url, checks, args.model_url,
             timeout_s=args.vision_timeout,
             api_key_text=_read_api_key(args.api_key_file),
+            model_id=args.model_id,
         )
         findings_doc = build_findings(captures, findings, reports)
+        findings_doc["modelId"] = args.model_id
     else:
         findings_doc = build_findings(captures)
     (output_dir / "findings.json").write_text(json.dumps(findings_doc, indent=2), encoding="utf-8")
@@ -820,6 +834,10 @@ def _selfcheck() -> None:
             "image_url": {"url": "data:image/png;base64,QkFTRTY0"},
         }
         assert payload["messages"][0]["role"] == "system"
+        routed_payload = _build_vision_payload(
+            "QkFTRTY0", "http://x/route", "1440x900", DEFAULT_CHECKS, model_id="vision-frontier"
+        )
+        assert routed_payload["model"] == "vision-frontier"
 
         # --- llama-server auth (--api-key): request construction includes
         # Authorization: Bearer <key> when a key file resolves, and omits
@@ -839,17 +857,23 @@ def _selfcheck() -> None:
         assert _auth_headers(None) == {}
 
         seen_headers = []
+        seen_urls = []
 
         def fake_post_spy(url, payload, timeout_s, headers=None):
+            seen_urls.append(url)
             seen_headers.append(headers)
             return {"choices": [{"message": {"content": '{"findings": []}'}}]}
 
         call_vision_model(b"png", "http://x/route", "1440x900", DEFAULT_CHECKS,
                            "http://model", post_fn=fake_post_spy, api_key_text="sekrit-123")
         call_vision_model(b"png", "http://x/route", "1440x900", DEFAULT_CHECKS,
-                           "http://model", post_fn=fake_post_spy, api_key_text=None)
+                           "https://models.example/v1", post_fn=fake_post_spy, api_key_text=None)
         assert seen_headers[0] == {"Authorization": "Bearer sekrit-123"}
         assert seen_headers[1] == {}, "no key resolved -> no Authorization header, not a crash"
+        assert seen_urls == [
+            "http://model/v1/chat/completions",
+            "https://models.example/v1/chat/completions",
+        ], "origin and /v1 base URLs must both produce exactly one /v1 segment"
 
         # --- finding coercion (mirrors validate_delivery_review's tolerant
         # conventions): unknown severity -> "low", missing/blank description

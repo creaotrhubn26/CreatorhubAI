@@ -27,7 +27,7 @@ EVENT_TYPES = {
     # §23.13). "architect_replan_started" is emitted by glimmer-v2.py's
     # review loop (Task 2.2, V7 §5.12) right before re-invoking the
     # architect on a REPLAN_REQUIRED decision -- see run_architect_replan.
-    "session_created", "skill_loaded", "model_retry", "context_selected",
+    "session_created", "skill_loaded", "model_retry", "model_request_started", "context_selected",
     "architect_planning_started", "architect_plan_created",
     "architect_review_requested", "architect_review_completed",
     "architect_replan_started",
@@ -140,6 +140,8 @@ def _selfcheck() -> None:
             ("session_created", {"taskSummary": "add widget", "workspace": "/tmp/ws"}),
             ("skill_loaded", {"name": "frontend", "path": "/skills/frontend.md"}),
             ("model_retry", {"attempt": 2, "strategy": "same_turn"}),
+            ("model_request_started", {"requestId": "req-1", "role": "engineer",
+                                       "providerId": "private", "modelId": "local-30b"}),
             # Fix round 1 (MED): sample updated to the real Task 5.1 shape
             # glimmer-engineer.py actually emits (tier0Chars/tier1Chars/
             # tier2Refs/tier3Note) -- the old systemBytes/taskBytes sample

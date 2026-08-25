@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib import request, error
 
 from glimmer_events import emit as emit_event
+from glimmer_models import load_model_registry, model_for_role
 
 GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
 GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
@@ -487,11 +488,22 @@ PROTECTED_FILES = {
 # HTTP
 # ============================================================
 
-def api_key():
-    return API_KEY_FILE.read_text().strip()
+def _model_endpoint_url(base_url, endpoint):
+    """Join either an origin-style or OpenAI ``.../v1`` base URL.
+
+    Registry users commonly paste ``https://provider.example/v1`` while
+    Glimmer's legacy local URL is only an origin. Both must resolve to one
+    and only one ``/v1`` segment for OpenAI-compatible endpoints.
+    """
+    base = str(base_url).rstrip("/")
+    if base.endswith("/v1") and endpoint.startswith("/v1/"):
+        return f"{base}{endpoint[3:]}"
+    return f"{base}{endpoint}"
 
 
-def http_json(
+def _http_json_at(
+    base_url,
+    api_key_path,
     method,
     endpoint,
     payload=None,
@@ -501,9 +513,12 @@ def http_json(
     timeout_s=3600,
 ):
     headers = {
-        "Authorization": f"Bearer {api_key()}",
         "Content-Type": "application/json",
     }
+    if api_key_path is not None:
+        key = Path(api_key_path).read_text(encoding="utf-8").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
 
     if extra_headers:
         headers.update(extra_headers)
@@ -514,7 +529,7 @@ def http_json(
         data = json.dumps(payload).encode("utf-8")
 
     req = request.Request(
-        f"{API_BASE}{endpoint}",
+        _model_endpoint_url(base_url, endpoint),
         data=data,
         headers=headers,
         method=method,
@@ -544,49 +559,58 @@ def http_json(
         ) from exc
 
 
+def http_json(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+    """Legacy tools/default-model transport retained for non-provider calls."""
+    return _http_json_at(
+        API_BASE, API_KEY_FILE, method, endpoint, payload, extra_headers, timeout_s
+    )
+
+
+def model_http_json(provider, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+    """Provider-bound transport: URL and key path come from that provider."""
+    return _http_json_at(
+        provider.base_url, provider.api_key_path, method, endpoint,
+        payload, extra_headers, timeout_s,
+    )
+
+
 # ============================================================
 # MODEL PROVIDER (V7 §16 Model Runtime, §31 Model routing)
 # ============================================================
 #
-# Task 6.1. Wraps http_json (the internal transport -- unchanged, still
-# the one function every self-check monkeypatches) behind a stable
-# interface so the rest of the engineer doesn't depend on llama.cpp's
-# specific request/response shape. This is the ROUTING SEAM the spec
-# asks for, not live routing: every role in MODEL_ROLES below points at
-# the same API_BASE today, and .generate() still calls the shared
-# http_json (still always API_BASE + api_key()) rather than using its own
-# base_url/api_key_path for the actual transport -- those two attributes
-# are carried on the instance so a future real router has somewhere to
-# read them from, without this round rewriting http_json into a
-# multi-endpoint client for a distinction that doesn't exist yet.
+# C1 activates the routing seam Task 6.1 introduced. The registry is written
+# by the local control center, contains paths rather than secret contents, and
+# is loaded once per engineer subprocess. Every physical request below now
+# uses its provider's URL, key path, and model id.
 # glimmer-visual.py's vision model call is a SEPARATE provider in this
 # same sense (see its own module comment) -- it already takes its
 # endpoint as a CLI arg, which IS its routing; it stays standalone.
 
+MODEL_REGISTRY = load_model_registry(default_base_url=API_BASE)
 MODEL_ROLES = {
-    "engineer": API_BASE,
-    "architect": API_BASE,
-    "consult": API_BASE,
+    role: MODEL_REGISTRY["roles"][role]
+    for role in ("engineer", "architect", "consult")
 }
 
 # Round 6 usage-metrics totals, keyed by role: {"promptTokens",
-# "completionTokens", "calls"}. Written out once at process exit by
+# "completionTokens", "calls", "models"}. Written out once at process exit by
 # _write_model_usage_file (registered below) -- see that function's
 # docstring for why atexit rather than an explicit call at every
 # run_engineer/run_architect return point.
 _MODEL_USAGE_TOTALS = {}
 
 
-def _accumulate_usage(role, usage):
+def _accumulate_usage(role, model_id, usage):
     """Never raises -- usage metrics are observability, not correctness.
     `usage` is the OpenAI-compatible {"prompt_tokens", "completion_tokens",
     ...} dict from a chat-completions response when the server includes
     one; absent/malformed usage still counts the call."""
     try:
         bucket = _MODEL_USAGE_TOTALS.setdefault(
-            role, {"promptTokens": 0, "completionTokens": 0, "calls": 0}
+            role, {"promptTokens": 0, "completionTokens": 0, "calls": 0, "models": {}}
         )
         bucket["calls"] += 1
+        bucket["models"][model_id] = bucket["models"].get(model_id, 0) + 1
         if isinstance(usage, dict):
             bucket["promptTokens"] += int(usage.get("prompt_tokens") or 0)
             bucket["completionTokens"] += int(usage.get("completion_tokens") or 0)
@@ -634,15 +658,14 @@ def _is_retryable_network_error(exc):
 
 
 class ModelProvider:
-    """Task 6.1 (V7 §16). One instance per role (see MODEL_ROLES). All
-    network calls go through the module-level http_json so every existing
-    self-check's `global http_json; http_json = fake_http_json` pattern
-    keeps working unchanged against this class too."""
+    """One configured, role-bound OpenAI-compatible model provider."""
 
-    def __init__(self, base_url, api_key_path, role):
+    def __init__(self, base_url, api_key_path, role, model_id="muse-glimmer", provider_id=None):
         self.base_url = base_url
         self.api_key_path = api_key_path
         self.role = role
+        self.model_id = model_id
+        self.provider_id = provider_id or role
         self.last_request_id = None
         self._capabilities_cache = None  # None = not yet probed; {} on a failed probe
 
@@ -667,9 +690,19 @@ class ModelProvider:
             )
             self.last_request_id = this_id
 
+            request_payload = dict(payload)
+            request_payload["model"] = self.model_id
+            _emit(
+                "model_request_started",
+                requestId=this_id,
+                role=self.role,
+                providerId=self.provider_id,
+                modelId=self.model_id,
+            )
+
             try:
-                response = http_json(
-                    "POST", "/v1/chat/completions", payload, **kwargs
+                response = model_http_json(
+                    self, "POST", "/v1/chat/completions", request_payload, **kwargs
                 )
             except RuntimeError as exc:
                 # HTTP 4xx/5xx: http_json already converted the response
@@ -688,7 +721,7 @@ class ModelProvider:
                 raise
             else:
                 usage = response.get("usage") if isinstance(response, dict) else None
-                _accumulate_usage(self.role, usage)
+                _accumulate_usage(self.role, self.model_id, usage)
                 return response
 
     def health(self):
@@ -696,7 +729,7 @@ class ModelProvider:
         Never raises: an unreachable/unhealthy server degrades to a
         {"ok": False, "error": ...} dict instead of an exception."""
         try:
-            return http_json("GET", "/health")
+            return model_http_json(self, "GET", "/health")
         except Exception as exc:  # noqa: BLE001 - health probe must never blow up a caller
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -709,7 +742,7 @@ class ModelProvider:
         if self._capabilities_cache is not None:
             return self._capabilities_cache
         try:
-            result = http_json("GET", "/v1/models")
+            result = model_http_json(self, "GET", "/v1/models")
             if not isinstance(result, dict):
                 result = {}
         except Exception:  # noqa: BLE001 - fail-open, see docstring
@@ -718,10 +751,16 @@ class ModelProvider:
         return result
 
 
-_MODEL_PROVIDERS = {
-    role: ModelProvider(base_url=url, api_key_path=API_KEY_FILE, role=role)
-    for role, url in MODEL_ROLES.items()
-}
+_MODEL_PROVIDERS = {}
+for _role, _provider_id in MODEL_ROLES.items():
+    _entry = model_for_role(MODEL_REGISTRY, _role)
+    _MODEL_PROVIDERS[_role] = ModelProvider(
+        base_url=_entry["baseUrl"],
+        api_key_path=_entry["apiKeyFile"],
+        role=_role,
+        model_id=_entry["modelId"],
+        provider_id=_provider_id,
+    )
 
 
 def _provider_for_role(role):
@@ -729,17 +768,82 @@ def _provider_for_role(role):
 
 
 def _model_provider_selfcheck() -> None:
-    """Task 6.1 (V7 §16/§31): ModelProvider, monkeypatching http_json (the
-    shared transport) so no live llama-server is needed. Run with:
+    """Task 6.1/C1 (V7 §16/§31): ModelProvider routing, intercepting the
+    final URL opener and provider transport so no live server is needed. Run with:
     python3 glimmer-engineer.py --model-provider-selfcheck
     """
-    global http_json
+    import tempfile
 
-    real_http_json = http_json
+    global model_http_json, GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+
+    real_model_http_json = model_http_json
+    real_events_path = GLIMMER_EVENTS_PATH
+    real_session_id = GLIMMER_SESSION_ID
     real_totals = dict(_MODEL_USAGE_TOTALS)
     _MODEL_USAGE_TOTALS.clear()
+    event_dir = tempfile.TemporaryDirectory()
+    GLIMMER_EVENTS_PATH = str(Path(event_dir.name) / "events.jsonl")
+    GLIMMER_SESSION_ID = "model-provider-selfcheck"
 
     try:
+        # ------------------------------------------------------------
+        # 0. Real provider transport wiring: configured URL, model id,
+        #    and key FILE are used at the final HTTP boundary. urlopen is
+        #    replaced, so no network request leaves this self-check.
+        # ------------------------------------------------------------
+        transport_seen = {}
+        key_file = Path(event_dir.name) / "provider.key"
+        key_file.write_text("transport-test-key\n", encoding="utf-8")
+        real_urlopen = request.urlopen
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": "routed"}}]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            transport_seen.update({
+                "url": req.full_url,
+                "authorization": req.headers.get("Authorization"),
+                "payload": json.loads(req.data.decode("utf-8")),
+                "timeout": timeout,
+            })
+            return FakeResponse()
+
+        request.urlopen = fake_urlopen
+        try:
+            routed = ModelProvider(
+                base_url="https://models.example/v1", api_key_path=key_file,
+                role="architect", model_id="frontier-model", provider_id="frontier",
+            )
+            routed.generate({"model": "ignored", "messages": []}, timeout_s=41)
+        finally:
+            request.urlopen = real_urlopen
+        assert transport_seen == {
+            "url": "https://models.example/v1/chat/completions",
+            "authorization": "Bearer transport-test-key",
+            "payload": {"model": "frontier-model", "messages": []},
+            "timeout": 41,
+        }, transport_seen
+        routed_event = json.loads(Path(GLIMMER_EVENTS_PATH).read_text(encoding="utf-8").splitlines()[-1])
+        assert routed_event["providerId"] == "frontier" and routed_event["modelId"] == "frontier-model"
+        assert "transport-test-key" not in json.dumps(routed_event)
+        _MODEL_USAGE_TOTALS.clear()
+
+        assert _model_endpoint_url("https://models.example/v1", "/v1/chat/completions") == (
+            "https://models.example/v1/chat/completions"
+        )
+        assert _model_endpoint_url("http://127.0.0.1:8080", "/v1/models") == (
+            "http://127.0.0.1:8080/v1/models"
+        )
+
         # ------------------------------------------------------------
         # 1. generate() byte-compat: same request shape (method/endpoint/
         #    payload/timeout_s) a direct http_json call would have used,
@@ -747,23 +851,34 @@ def _model_provider_selfcheck() -> None:
         # ------------------------------------------------------------
         calls = []
 
-        def fake_ok(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
-            calls.append((method, endpoint, payload, timeout_s))
+        def fake_ok(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+            calls.append((provider_arg.base_url, provider_arg.api_key_path, method, endpoint, payload, timeout_s))
             return {
                 "choices": [{"message": {"role": "assistant", "content": "hi"}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5},
             }
 
-        http_json = fake_ok
-        provider = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="test-role")
+        model_http_json = fake_ok
+        provider = ModelProvider(
+            base_url="http://x", api_key_path=Path("/nope"), role="test-role",
+            model_id="test-model", provider_id="test-provider",
+        )
         response = provider.generate({"model": "m", "messages": []})
-        assert calls == [("POST", "/v1/chat/completions", {"model": "m", "messages": []}, 3600)], calls
+        assert calls == [(
+            "http://x", Path("/nope"), "POST", "/v1/chat/completions",
+            {"model": "test-model", "messages": []}, 3600,
+        )], calls
         assert response["choices"][0]["message"]["content"] == "hi"
         assert provider.last_request_id is not None and len(provider.last_request_id) == 12
+        event = json.loads(Path(GLIMMER_EVENTS_PATH).read_text(encoding="utf-8").splitlines()[-1])
+        assert event["type"] == "model_request_started"
+        assert event["requestId"] == provider.last_request_id
+        assert event["providerId"] == "test-provider" and event["modelId"] == "test-model"
+        assert "baseUrl" not in event and "apiKey" not in event, "events carry identity, never connection secrets"
 
         calls.clear()
         provider.generate({"model": "m", "messages": []}, timeout_s=30)
-        assert calls[-1][3] == 30, "a supplied timeout_s must be forwarded to http_json"
+        assert calls[-1][5] == 30, "a supplied timeout_s must be forwarded to the provider transport"
 
         # ------------------------------------------------------------
         # 2. Usage accumulation: promptTokens/completionTokens/calls per
@@ -772,12 +887,13 @@ def _model_provider_selfcheck() -> None:
         # ------------------------------------------------------------
         assert _MODEL_USAGE_TOTALS["test-role"] == {
             "promptTokens": 20, "completionTokens": 10, "calls": 2,
+            "models": {"test-model": 2},
         }, _MODEL_USAGE_TOTALS
 
-        def fake_no_usage(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_no_usage(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             return {"choices": [{"message": {"content": "x"}}]}
 
-        http_json = fake_no_usage
+        model_http_json = fake_no_usage
         provider.generate({"model": "m", "messages": []})
         assert _MODEL_USAGE_TOTALS["test-role"]["calls"] == 3
         assert _MODEL_USAGE_TOTALS["test-role"]["promptTokens"] == 20, "missing usage must not add fake tokens"
@@ -789,24 +905,24 @@ def _model_provider_selfcheck() -> None:
         # ------------------------------------------------------------
         attempts_seen = []
 
-        def fake_refused_then_ok(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_refused_then_ok(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             attempts_seen.append(1)
             if len(attempts_seen) == 1:
                 raise ConnectionRefusedError("refused")
             return {"choices": [{"message": {"content": "recovered"}}]}
 
-        http_json = fake_refused_then_ok
+        model_http_json = fake_refused_then_ok
         response = provider.generate({"model": "m", "messages": []})
         assert len(attempts_seen) == 2, "must retry exactly once on connection-refused"
         assert response["choices"][0]["message"]["content"] == "recovered"
 
         attempts_seen.clear()
 
-        def fake_refused_twice(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_refused_twice(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             attempts_seen.append(1)
             raise ConnectionResetError("reset")
 
-        http_json = fake_refused_twice
+        model_http_json = fake_refused_twice
         try:
             provider.generate({"model": "m", "messages": []})
             assert False, "must raise once the one retry is also exhausted"
@@ -816,11 +932,11 @@ def _model_provider_selfcheck() -> None:
 
         attempts_seen.clear()
 
-        def fake_http_error(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_http_error(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             attempts_seen.append(1)
             raise RuntimeError("HTTP 500 /v1/chat/completions\nboom")
 
-        http_json = fake_http_error
+        model_http_json = fake_http_error
         try:
             provider.generate({"model": "m", "messages": []})
             assert False, "an HTTP error must propagate"
@@ -830,11 +946,11 @@ def _model_provider_selfcheck() -> None:
 
         attempts_seen.clear()
 
-        def fake_timeout(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_timeout(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             attempts_seen.append(1)
             raise TimeoutError("timed out")
 
-        http_json = fake_timeout
+        model_http_json = fake_timeout
         try:
             provider.generate({"model": "m", "messages": []})
             assert False, "a timeout must propagate"
@@ -846,7 +962,7 @@ def _model_provider_selfcheck() -> None:
         # 4. Request ids: unique per call; a caller-supplied id is used
         #    for the first physical attempt.
         # ------------------------------------------------------------
-        http_json = fake_ok
+        model_http_json = fake_ok
         seen_ids = set()
         for _ in range(5):
             provider.generate({"model": "m", "messages": []})
@@ -863,11 +979,11 @@ def _model_provider_selfcheck() -> None:
         # ------------------------------------------------------------
         probe_calls = []
 
-        def fake_models(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_models(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             probe_calls.append(endpoint)
             return {"data": [{"id": "muse-glimmer"}]}
 
-        http_json = fake_models
+        model_http_json = fake_models
         cap_provider = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="cap-role")
         caps1 = cap_provider.capabilities()
         caps2 = cap_provider.capabilities()
@@ -875,10 +991,10 @@ def _model_provider_selfcheck() -> None:
         assert caps2 == caps1
         assert probe_calls == ["/v1/models"], "capabilities() must probe /v1/models exactly ONCE, then cache"
 
-        def fake_models_fail(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_models_fail(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             raise RuntimeError("HTTP 500 /v1/models")
 
-        http_json = fake_models_fail
+        model_http_json = fake_models_fail
         fail_provider = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="fail-role")
         assert fail_provider.capabilities() == {}, "a failed probe must degrade to {} honestly, never raise"
         assert fail_provider.capabilities() == {}, "the failed-probe result is cached too (probed only once)"
@@ -886,25 +1002,27 @@ def _model_provider_selfcheck() -> None:
         # ------------------------------------------------------------
         # 6. health(): never raises.
         # ------------------------------------------------------------
-        def fake_health_down(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_health_down(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             raise ConnectionRefusedError("down")
 
-        http_json = fake_health_down
+        model_http_json = fake_health_down
         health = ModelProvider(base_url="http://x", api_key_path=Path("/nope"), role="h").health()
         assert health.get("ok") is False and "error" in health
 
         # ------------------------------------------------------------
-        # 7. MODEL_ROLES / _provider_for_role: the documented routing
-        #    seam -- every role present, all pointing at the same
-        #    endpoint today (no live routing yet).
+        # 7. MODEL_ROLES / _provider_for_role: every runtime role resolves
+        #    to the configured provider (roles may intentionally share one).
         # ------------------------------------------------------------
         assert set(MODEL_ROLES) == {"engineer", "architect", "consult"}
-        assert len(set(MODEL_ROLES.values())) == 1, "every role points at the same endpoint today (routing seam only)"
         assert _provider_for_role("architect").role == "architect"
+        assert _provider_for_role("architect").provider_id == MODEL_ROLES["architect"]
         assert _provider_for_role("unknown-role").role == "engineer", "an unknown role must fail open to engineer"
 
     finally:
-        http_json = real_http_json
+        model_http_json = real_model_http_json
+        GLIMMER_EVENTS_PATH = real_events_path
+        GLIMMER_SESSION_ID = real_session_id
+        event_dir.cleanup()
         _MODEL_USAGE_TOTALS.clear()
         _MODEL_USAGE_TOTALS.update(real_totals)
 
@@ -6411,9 +6529,9 @@ def _recovery_ladder_selfcheck() -> None:
     import inspect
     import tempfile
 
-    global http_json, GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    global model_http_json, GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
 
-    real_http_json = http_json
+    real_model_http_json = model_http_json
     real_events_path = GLIMMER_EVENTS_PATH
     real_session_id = GLIMMER_SESSION_ID
     # Fix round 1 (MED): same discipline as _model_provider_selfcheck --
@@ -6440,7 +6558,7 @@ def _recovery_ladder_selfcheck() -> None:
 
     seen_payloads = []
 
-    def fake_peg_failure(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+    def fake_peg_failure(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
         seen_payloads.append(payload)
         raise RuntimeError("peg-native parse failure: bad tool call")
 
@@ -6451,7 +6569,7 @@ def _recovery_ladder_selfcheck() -> None:
             GLIMMER_EVENTS_PATH = str(events_path)
             GLIMMER_SESSION_ID = "sess-ladder"
 
-            http_json = fake_peg_failure
+            model_http_json = fake_peg_failure
             try:
                 chat_with_retry(payload, attempts=3)
                 assert False, "must raise once every ladder rung is exhausted"
@@ -6542,13 +6660,13 @@ def _recovery_ladder_selfcheck() -> None:
         # ------------------------------------------------------------
         call_count = {"n": 0}
 
-        def fake_fail_then_succeed(method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
+        def fake_fail_then_succeed(provider_arg, method, endpoint, payload=None, extra_headers=None, timeout_s=3600):
             call_count["n"] += 1
             if call_count["n"] <= 3:
                 raise RuntimeError("peg-native parse failure")
             return {"choices": [{"message": {"role": "assistant", "content": "recovered"}}]}
 
-        http_json = fake_fail_then_succeed
+        model_http_json = fake_fail_then_succeed
         response = chat_with_retry(payload, attempts=3)
         assert response["choices"][0]["message"]["content"] == "recovered"
         assert call_count["n"] == 4, "must succeed on exactly the reduced-context (4th) attempt"
@@ -6572,7 +6690,7 @@ def _recovery_ladder_selfcheck() -> None:
         )
 
     finally:
-        http_json = real_http_json
+        model_http_json = real_model_http_json
         GLIMMER_EVENTS_PATH = real_events_path
         GLIMMER_SESSION_ID = real_session_id
         _MODEL_USAGE_TOTALS.clear()
