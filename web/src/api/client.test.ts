@@ -36,6 +36,20 @@ describe("glimmerApi", () => {
     expect(JSON.parse(init?.body as string)).toEqual(update);
   });
 
+  it("gets the secret-free CLI integration status", async () => {
+    const response = {
+      checkedAt: "now",
+      platform: "darwin arm64",
+      integrations: [],
+      policy: { automaticSystemInstall: false, externalWritesRequireApproval: true, gitPushAllowed: false },
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(response), { status: 200 }),
+    );
+    expect(await glimmerApi.getCliIntegrations()).toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/integrations/cli`, expect.anything());
+  });
+
   it("createSession POSTs the task contract as JSON", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ id: "s1" }), { status: 201 })

@@ -125,6 +125,29 @@ INFRA_BLOCKED. `src/lib.rs::resolve_user_path` fixes it at the source:
 - The gateway logs its own inherited PATH at boot (`[gateway] PATH=...`),
   so a packaged run can be checked from the app's stdout or `ps eww <pid>`.
 
+## CLI and integration checks
+Settings → **CLI & Integrations** reports the tools visible on that resolved
+PATH. `GET /api/integrations/cli` performs fixed-argument, no-shell probes for
+Git, GitHub CLI, Python, npm, Cargo, pnpm, Yarn and Homebrew, and separately
+checks the bundled Node runtime and configured orchestrator files.
+
+- Detection never installs a package, starts an authentication flow or returns
+  command output that may contain credentials. GitHub authentication is reduced
+  to `ready` / `authentication_required`; an invalid token is never included in
+  the response.
+- Missing tools get a visible, copyable manual command when there is a safe
+  macOS suggestion. Authentication likewise remains a Terminal action. The app
+  does not silently mutate the user's machine during install or first launch.
+- The agent can use GitHub CLI only through a positive read-only allowlist:
+  `gh auth status` and selected `repo`, `pr`, `issue`, `run`, `workflow` and
+  `release` list/view/status/checks/diff operations. `gh api`, token/auth
+  changes, repository overrides, create/edit/comment/merge actions, workflow
+  triggers, release changes, `--web` and `--watch` are blocked before dispatch.
+- Git push and deployment remain blocked. npm dependency changes keep the
+  existing explicit approval boundary; validation-only Python/Cargo/npm actions
+  keep their existing allowlists. Detected pnpm, Yarn and Homebrew binaries are
+  informational and are not agent-executable.
+
 ## Who may call the gateway
 `server/src/app.ts::localOnlyGuard` runs ahead of every router:
 

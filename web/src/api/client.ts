@@ -7,6 +7,7 @@ import type {
   ModelRegistry, ModelRegistryUpdate,
   SessionDiff, HunkReviewResult,
   TaskReport,
+  CliIntegrationsStatus,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -116,6 +117,7 @@ async function streamAssistant(
 
 export const glimmerApi = {
   getStatus: () => request<DashboardStatus>("/api/status"),
+  getCliIntegrations: () => request<CliIntegrationsStatus>("/api/integrations/cli"),
   getModelStatus: () => request<ModelStatus>("/api/model/status"),
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>

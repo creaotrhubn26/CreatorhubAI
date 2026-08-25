@@ -1207,6 +1207,59 @@ export interface ModelStatus {
   logTail?: string;
 }
 
+export type CliIntegrationId =
+  | "github_cli"
+  | "git"
+  | "node"
+  | "npm"
+  | "python"
+  | "cargo"
+  | "pnpm"
+  | "yarn"
+  | "homebrew"
+  | "orchestrator";
+
+export type CliIntegrationState =
+  | "ready"
+  | "authentication_required"
+  | "missing"
+  | "blocked";
+
+export type CliAgentAccess =
+  | "runtime"
+  | "read_only"
+  | "validation_only"
+  | "approval_required"
+  | "blocked";
+
+export interface CliIntegration {
+  id: CliIntegrationId;
+  name: string;
+  executable: string;
+  required: boolean;
+  state: CliIntegrationState;
+  installed: boolean;
+  authenticated?: boolean;
+  version?: string;
+  path?: string;
+  source: "bundled" | "path" | "configured";
+  agentAccess: CliAgentAccess;
+  detail: string;
+  installCommand?: string;
+  authCommand?: string;
+}
+
+export interface CliIntegrationsStatus {
+  checkedAt: string;
+  platform: string;
+  integrations: CliIntegration[];
+  policy: {
+    automaticSystemInstall: false;
+    externalWritesRequireApproval: true;
+    gitPushAllowed: false;
+  };
+}
+
 export type ModelRole = "engineer" | "architect" | "consult" | "vision";
 
 export interface ModelRegistryEntry {

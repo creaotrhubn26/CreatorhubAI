@@ -6,6 +6,7 @@ import { workspacesRouter } from "./routes/workspaces.js";
 import { modelRouter } from "./routes/model.js";
 import { repositoryRouter } from "./routes/repository.js";
 import { taskIntelligenceRouter } from "./routes/taskIntelligence.js";
+import { integrationsRouter } from "./routes/integrations.js";
 
 // The only origins allowed to reach this API: the local web dev server
 // (web/vite.config.ts port 5183, either loopback spelling) and the packaged
@@ -78,6 +79,7 @@ export function createApp(): Express {
   app.use("/api", modelRouter);
   app.use("/api", repositoryRouter);
   app.use("/api", taskIntelligenceRouter);
+  app.use("/api", integrationsRouter);
   // Terminal error handler: Express 4 does not catch async handler rejections,
   // and an unhandled rejection kills the gateway (orphaning running agents).
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
