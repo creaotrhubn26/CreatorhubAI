@@ -413,6 +413,29 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
 });
 
 describe("POST /api/sessions/:id/run replay protection", () => {
+  let runWorkspace: string;
+  let mainWorkspace: string;
+
+  beforeAll(async () => {
+    runWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-run-route-"));
+    mainWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-main-route-"));
+    for (const repo of [runWorkspace, mainWorkspace]) {
+      await execGit("git", ["init", "-q"], { cwd: repo });
+      await execGit("git", ["config", "user.email", "t@t.com"], { cwd: repo });
+      await execGit("git", ["config", "user.name", "t"], { cwd: repo });
+      await fs.writeFile(path.join(repo, "README.md"), "fixture\n");
+      await execGit("git", ["add", "README.md"], { cwd: repo });
+      await execGit("git", ["commit", "-q", "-m", "baseline"], { cwd: repo });
+    }
+    await execGit("git", ["switch", "-q", "-c", "glimmer/run-route-test"], { cwd: runWorkspace });
+    await execGit("git", ["branch", "-M", "main"], { cwd: mainWorkspace });
+  });
+
+  afterAll(async () => {
+    await fs.rm(runWorkspace, { recursive: true, force: true });
+    await fs.rm(mainWorkspace, { recursive: true, force: true });
+  });
+
   const validContract = {
     objective: "Fix a thing",
     scope: { package: "frontend" },
@@ -422,10 +445,34 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     repairBudget: 1,
   };
 
+  it("rejects a non-glimmer branch synchronously with a recovery instruction", async () => {
+    const created = await request(app)
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .send({ taskContract: validContract, workspace: mainWorkspace });
+
+    const run = await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN);
+
+    expect(run.status).toBe(409);
+    expect(run.body.error).toContain("branch main");
+    expect(run.body.error).toContain("glimmer/*");
+    await expect(fs.stat(path.join(stateRoot, "sessions", created.body.id))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a non-Git workspace before spawning the orchestrator", async () => {
+    const created = await request(app)
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .send({ taskContract: validContract, workspace });
+
+    const run = await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN);
+
+    expect(run.status).toBe(400);
+    expect(run.body.error).toContain("Git worktree");
+  });
+
   it("a second /run call for the same id does not spawn a second process", async () => {
     const createRes = await request(app)
       .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: validContract, workspace: "/tmp/ws" });
+      .send({ taskContract: validContract, workspace: runWorkspace });
     const id = createRes.body.id as string;
 
     const firstRun = await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
@@ -441,7 +488,7 @@ describe("POST /api/sessions/:id/run replay protection", () => {
   it("POST /run persists the task contract so it survives pendingContracts being cleared", async () => {
     const created = await request(app)
       .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: validContract, workspace: "/tmp/ws" });
+      .send({ taskContract: validContract, workspace: runWorkspace });
     const id = created.body.id;
     await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
     const contractPath = path.join(stateRoot, "sessions", id, "gateway-contract.json");

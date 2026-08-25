@@ -422,6 +422,11 @@ export function NewTaskScreen() {
         {buildArchitectRiskLine(form) && (
           <p className="composer__architect-risk">{buildArchitectRiskLine(form)}</p>
         )}
+        {runMutation.isError && (
+          <p role="alert" style={{ color: "var(--red)" }}>
+            Could not start task: {(runMutation.error as Error).message}
+          </p>
+        )}
         <button
           className="btn-primary"
           onClick={() => runMutation.mutate()}

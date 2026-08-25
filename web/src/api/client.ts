@@ -15,7 +15,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (!res.ok) throw new Error(`${init?.method ?? "GET"} ${path} failed: ${res.status}`);
+  if (!res.ok) {
+    // Preserve the gateway's actionable explanation (for example, that a
+    // task workspace is on `main` instead of an isolated `glimmer/*`
+    // branch). Dropping the JSON body here used to leave the composer with
+    // only an opaque status code, even when the server had already explained
+    // exactly how to recover.
+    const body = await res.json().catch(() => null) as { error?: unknown } | null;
+    const detail = typeof body?.error === "string" ? body.error : null;
+    throw new Error(detail ?? `${init?.method ?? "GET"} ${path} failed: ${res.status}`);
+  }
   return res.json() as Promise<T>;
 }
 

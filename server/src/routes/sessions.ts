@@ -12,7 +12,7 @@ import {
   readEvidenceIndex, readEvidenceEntry, resolveApproval,
   readHunkAcceptances, writeHunkAcceptance, clearHunkAcceptance, clearHunkAcceptancesForPath,
 } from "../lib/sessions.js";
-import { gitDiff, gitRevertFile, gitRejectHunk, parseGitDiffHunks, GitHunkReviewError } from "../lib/git.js";
+import { gitDiff, gitRevertFile, gitRejectHunk, gitStatus, parseGitDiffHunks, GitHunkReviewError } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
@@ -324,6 +324,28 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   if (activeRuns.has(req.params.id)) return res.status(409).json({ error: "already running" });
   const pending = pendingContracts.get(req.params.id);
   if (!pending) return res.status(404).json({ error: "no pending task contract for this session id" });
+
+  // Mirror the orchestrator's non-negotiable branch boundary before we
+  // spawn it. An early glimmer-v2.py preflight rejection creates no real
+  // session directory, so the pending id can never be adopted; previously
+  // the client navigated to that unresolvable id and displayed "Loading
+  // session…" forever. This check makes the failure synchronous and leaves
+  // the composer on screen with a recovery instruction. gitStatus uses
+  // execFile argv (never a shell) and also proves the selected path is a Git
+  // worktree before any child process starts.
+  let workspaceStatus: Awaited<ReturnType<typeof gitStatus>>;
+  try {
+    workspaceStatus = await gitStatus(pending.workspace);
+  } catch {
+    return res.status(400).json({
+      error: "Workspace must be a Git worktree on an isolated glimmer/* branch.",
+    });
+  }
+  if (!workspaceStatus.branch.startsWith("glimmer/")) {
+    return res.status(409).json({
+      error: `Refusing branch ${workspaceStatus.branch}: create or choose a worktree on a glimmer/* branch.`,
+    });
+  }
 
   const dir = path.join(sessionsDir(), req.params.id);
   await fs.mkdir(dir, { recursive: true });

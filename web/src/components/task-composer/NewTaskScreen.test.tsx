@@ -57,6 +57,23 @@ describe("NewTaskScreen", () => {
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
   });
 
+  it("keeps the composer visible and shows the gateway reason when a run is rejected", async () => {
+    vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "pending-1" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockRejectedValue(
+      new Error("Refusing branch main: create or choose a worktree on a glimmer/* branch."),
+    );
+
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Check if everything works" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/refusing branch main/i);
+    expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
+  });
+
   it("lets the user toggle a verification checkbox on", () => {
     render(withQuery(<NewTaskScreen />));
     const box = screen.getByLabelText("Frontend typecheck") as HTMLInputElement;

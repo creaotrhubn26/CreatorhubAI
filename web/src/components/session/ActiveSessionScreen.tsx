@@ -159,12 +159,13 @@ export function ActiveSessionScreen() {
       queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
     },
   });
-  const { data: session } = useQuery({
+  const sessionQuery = useQuery({
     queryKey: ["session", id],
     queryFn: () => glimmerApi.getSession(id!),
     enabled: !!id,
     refetchInterval: 4000,
   });
+  const session = sessionQuery.data;
   const { data: analysis } = useQuery({
     queryKey: ["session-analysis", id],
     queryFn: () => glimmerApi.getSessionAnalysis(id!),
@@ -182,6 +183,18 @@ export function ActiveSessionScreen() {
   const state = session ? deriveSessionState(events, session.status) : null;
   const isRunning = session != null && RUNNING_STATES.includes(session.status);
 
+  // A missing pending-id alias (most commonly an orchestrator preflight
+  // rejection before it can create its real session directory) is a query
+  // failure, not loading. Ignoring isError here previously rendered
+  // "Loading session…" forever after the gateway had already returned 404.
+  if (sessionQuery.isError) {
+    return (
+      <div role="alert">
+        <p>Session unavailable: {(sessionQuery.error as Error).message}</p>
+        <Link to="/tasks/new">Back to New Task</Link>
+      </div>
+    );
+  }
   if (!session || !state) return <div>Loading session…</div>;
 
   // startedAt isn't populated by the gateway yet (server/src/lib/sessions.ts

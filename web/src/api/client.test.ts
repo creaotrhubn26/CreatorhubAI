@@ -68,6 +68,16 @@ describe("glimmerApi", () => {
     await expect(glimmerApi.getStatus()).rejects.toThrow();
   });
 
+  it("preserves the gateway's actionable error message on a non-2xx response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify({ error: "Refusing branch main: create or choose a worktree on a glimmer/* branch." }),
+      { status: 409, headers: { "Content-Type": "application/json" } },
+    ));
+    await expect(glimmerApi.runSession("pending-1")).rejects.toThrow(
+      "Refusing branch main: create or choose a worktree on a glimmer/* branch.",
+    );
+  });
+
   it("getTaskIntelligence calls GET /api/task-intelligence with query params", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ likelyArea: "frontend", likelyPackage: "x", suggestedVerification: [], estimatedRisk: null, provenance: "git-derived" }), { status: 200 })
