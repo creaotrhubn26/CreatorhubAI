@@ -95,8 +95,8 @@ def emit(events_path: str, event_type: str, session_id: str, **fields) -> None:
 
 
 def _selfcheck() -> None:
-    import tempfile
     import concurrent.futures
+    import tempfile
 
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "events.jsonl")
@@ -136,7 +136,7 @@ def _selfcheck() -> None:
         # 4. V7 event vocabulary expansion (Task 1.2): a representative new
         # type from each family (core/architect/task/visual/self-review)
         # emits successfully and round-trips with its fields intact.
-        new_type_samples = [
+        new_type_samples: list[tuple[str, dict[str, object]]] = [
             ("session_created", {"taskSummary": "add widget", "workspace": "/tmp/ws"}),
             ("skill_loaded", {"name": "frontend", "path": "/skills/frontend.md"}),
             ("model_retry", {"attempt": 2, "strategy": "same_turn"}),

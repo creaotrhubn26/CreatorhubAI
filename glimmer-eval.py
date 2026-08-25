@@ -47,11 +47,11 @@ temperature actually used per-request, only its configured default).
     ./glimmer-eval.py --live-smoke       # cheap live reachability + 1 task
 """
 from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json
 import os
-import shlex
 import signal
 import socket
 import subprocess

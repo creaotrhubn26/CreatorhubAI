@@ -44,7 +44,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
-from urllib import error, request
+from urllib import request
 
 DEFAULT_VIEWPORTS = ("1440x900", "390x844")  # V7 §22.6 desktop+mobile minimum
 DEFAULT_MODEL_URL = "http://127.0.0.1:8080"

@@ -14,7 +14,6 @@ import re
 from pathlib import Path
 from urllib import parse
 
-
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ROLES = ("engineer", "architect", "consult", "vision")
 DEFAULT_PROVIDER_ID = "local"
@@ -90,6 +89,7 @@ def load_model_registry(path: Path | None = None, default_base_url: str | None =
             (key_file is not None and (not isinstance(key_file, str) or not key_file.strip()))
         ):
             return fallback
+        assert isinstance(entry_base_url, str)
         models[provider_id] = {
             "id": provider_id,
             "label": label.strip(),

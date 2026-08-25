@@ -40,10 +40,10 @@ Usage:
     ./glimmer-metrics.py --selfcheck            # synthetic fixture dirs only, never touches real state
 """
 from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent

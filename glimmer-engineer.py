@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib import request, error
+from urllib import error, request
 
 from glimmer_events import emit as emit_event
 from glimmer_models import load_model_registry, model_for_role
@@ -4680,7 +4680,7 @@ def execute_tool(
 
             if cache_key in cache:
                 print(
-                    f"\n↻ CACHE: exec_shell_command "
+                    "\n↻ CACHE: exec_shell_command "
                     "(already ran this exact command — reusing prior result)"
                 )
 
@@ -5180,7 +5180,9 @@ def _tool_envelope_selfcheck() -> None:
             #    POLICY_BLOCK envelope -- not just a stringified message
             #    swallowed by the caller's generic except.
             # ------------------------------------------------------
-            events_before = [json.loads(l) for l in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()]
+            events_before = [
+                json.loads(line) for line in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()
+            ]
 
             env_message, env_changed = execute_tool(
                 "write_file",
@@ -5205,7 +5207,9 @@ def _tool_envelope_selfcheck() -> None:
             assert env_envelope["tool"] == "write_file"
             assert env_envelope["error"]["code"] == "POLICY_BLOCK"
 
-            events_after = [json.loads(l) for l in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()]
+            events_after = [
+                json.loads(line) for line in Path(GLIMMER_EVENTS_PATH).read_text().splitlines()
+            ]
             new_events = events_after[len(events_before):]
             blocked_events = [e for e in new_events if e.get("type") == "tool_blocked"]
             assert len(blocked_events) == 1, (
@@ -5540,9 +5544,9 @@ def _architect_mode_selfcheck() -> None:
             ):
                 try:
                     parsed_bad = _extract_json_object(bad_text)
-                    ok_bad, reason = validate_architecture_plan(parsed_bad)
+                    ok_bad, _reason = validate_architecture_plan(parsed_bad)
                 except ValueError:
-                    ok_bad, reason = False, "unparseable"
+                    ok_bad, _reason = False, "unparseable"
                 assert ok_bad is False, f"must reject: {bad_text!r}"
 
             fallback = _fallback_architecture_plan("original objective text", "model never produced valid JSON")
@@ -7942,7 +7946,10 @@ def run_architect(task, workspace, max_turns, review_request_path=None, task_mod
     user_content = _build_review_task_message(review_request) if review_mode else task
     if report_mode:
         objective = _extract_task_objective(task)
-        validate_fn = lambda data: validate_task_report(data, task_mode, objective)
+
+        def validate_fn(data):
+            return validate_task_report(data, task_mode, objective)
+
         answer_label = "TaskReport"
     else:
         validate_fn = validate_architect_review if review_mode else validate_architecture_plan
