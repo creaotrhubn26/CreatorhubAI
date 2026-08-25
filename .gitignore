@@ -6,3 +6,8 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/binaries/
 src-tauri/resources/gateway/
+.vite/
+.playwright-mcp/
+
+# Gateway run logs — runtime output, not source
+.gateway.log

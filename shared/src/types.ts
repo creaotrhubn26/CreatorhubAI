@@ -1138,6 +1138,27 @@ export interface FsListing {
   truncated: boolean;
 }
 
+// Round A / Task A1: one file's text for the read-only code viewer
+// (GET /api/fs/file). Same containment as FsListing above.
+//
+// The three fields the UI must never blur together:
+//   * `size` is always the REAL on-disk byte size, `bytesReturned` is what
+//     this response actually carries, and `truncated` is true only when bytes
+//     past the ceiling exist — so a capped file can never render as complete.
+//   * `content` is null, never "", when nothing was decoded (binary): an
+//     empty string would be indistinguishable from a genuinely empty file.
+//   * `binary` true means the bytes were refused, not shown as garbage.
+// `path` is the realpath-resolved path the server actually read, not the
+// caller's spelling.
+export interface FsFile {
+  path: string;
+  size: number;
+  bytesReturned: number;
+  truncated: boolean;
+  binary: boolean;
+  content: string | null;
+}
+
 export interface WorkspaceInfo {
   path: string;
   branch: string;

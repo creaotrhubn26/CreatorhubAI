@@ -1,8 +1,10 @@
-import { memo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useState } from "react";
+import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
-import { highlightLine, langFromPath, type Lang } from "../../state/highlight";
+import { langFromPath, type Lang } from "../../state/highlight";
+import { HighlightedText } from "../common/HighlightedText";
+import { absolutePath, fileHref } from "../../state/fileLink";
 
 type DiffLineKind = "add" | "del" | "context" | "hunk" | "file";
 interface DiffLine {
@@ -93,24 +95,6 @@ function groupLinesByFile(lines: DiffLine[]): DiffFileGroup[] {
   return groups;
 }
 
-// Renders one line's content through the hand-rolled tokenizer — used by
-// both unified and split modes so highlighting stays consistent everywhere.
-const HighlightedText = memo(function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
-  // ponytail: bail to plain text past 400 chars — an extra-long single line
-  // (minified bundle, huge JSON blob) would turn into hundreds of tok-*
-  // spans for a line no one reads token-by-token anyway.
-  if (text.length > 400) return <>{text}</>;
-  return (
-    <>
-      {highlightLine(text, lang).map((t, i) => (
-        <span className={`tok-${t.kind}`} key={i}>
-          {t.text}
-        </span>
-      ))}
-    </>
-  );
-});
-
 function UnifiedLine({ l, lang }: { l: DiffLine; lang: Lang }) {
   if (l.kind === "file") return <div className="diff-view__file">{l.text}</div>;
   if (l.kind === "hunk") return <div className="diff-view__hunk">{l.text}</div>;
@@ -168,7 +152,17 @@ function SplitCell({ line, side, lang }: { line?: DiffLine; side: "del" | "add";
   );
 }
 
-function DiffView({ diff, mode, wrap }: { diff: string; mode: "unified" | "split"; wrap: boolean }) {
+// Task A4: the new-side line the file's first hunk starts at, so the viewer
+// opens where the change is. Undefined when the diff never stated one (a
+// pure-rename/mode-change section has no hunk) — never a fabricated 1.
+function firstChangedLine(lines: DiffLine[]): number | undefined {
+  for (const l of lines) {
+    if (l.kind === "add" || l.kind === "context") return l.newNo;
+  }
+  return undefined;
+}
+
+function DiffView({ diff, mode, wrap, workspace }: { diff: string; mode: "unified" | "split"; wrap: boolean; workspace?: string }) {
   if (!diff) return <div>Unavailable</div>;
   const groups = groupLinesByFile(parseUnifiedDiff(diff));
   const className = `diff-view${mode === "split" ? " diff-view--split" : ""}${wrap ? " wrap" : ""}`;
@@ -182,7 +176,16 @@ function DiffView({ diff, mode, wrap }: { diff: string; mode: "unified" | "split
         return (
           <div className="diff-view__filegroup" key={gi}>
             <div className="diff-view__file-header">
-              <span className="mono">{g.path}</span>
+              {/* Opens the working-tree file in the read-only viewer. Only
+                  when the session's workspace is known — without it there is
+                  no absolute path to open, and guessing one would be a lie. */}
+              {workspace ? (
+                <Link className="mono" to={fileHref(absolutePath(workspace, g.path), firstChangedLine(g.lines))}>
+                  {g.path}
+                </Link>
+              ) : (
+                <span className="mono">{g.path}</span>
+              )}
               <span className="diff-view__stat-add">+{g.added}</span>
               <span className="diff-view__stat-del">-{g.removed}</span>
             </div>
@@ -267,7 +270,7 @@ export function DiffReviewScreen() {
           {wrap ? "Unwrap" : "Wrap"}
         </button>
       </div>
-      <DiffView diff={diffResult?.diff ?? ""} mode={mode} wrap={wrap} />
+      <DiffView diff={diffResult?.diff ?? ""} mode={mode} wrap={wrap} workspace={session?.workspace} />
     </div>
   );
 }

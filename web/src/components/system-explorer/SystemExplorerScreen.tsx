@@ -1,20 +1,29 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import type { DocEdge, DocNode } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
 import { EmptyState } from "../common/EmptyState";
 import { edgesForNode, filterDocNodes, groupDocNodesByType, str } from "../../state/docGraph";
+import { absolutePath, fileHref, looksLikeDirectoryPath } from "../../state/fileLink";
 
 // Task 7.5 (V7 "System Explorer") -- click-to-expand row, same shape as
 // EvidencePanel: no separate detail fetch, the whole graph is already one
 // payload so selection is just local state indexing into it.
 function NodeRow({
-  node, edges, selected, onSelect,
+  node, edges, workspace, selected, onSelect,
 }: {
-  node: DocNode; edges: DocEdge[]; selected: boolean; onSelect(): void;
+  node: DocNode; edges: DocEdge[]; workspace: string; selected: boolean; onSelect(): void;
 }) {
   const { in: inEdges, out: outEdges } = edgesForNode(edges, node.id);
+  // Task A4: the node's own path opens in the read-only viewer. Only when the
+  // graph actually recorded one — str() renders a missing path as
+  // "Unavailable", which is not something to link anywhere — and only when
+  // that path is a file: service nodes carry "." for the repo root, and
+  // "Open file" on a directory is an affordance that cannot work.
+  const recorded = typeof node.path === "string" && node.path.trim() ? node.path.trim() : null;
+  const nodePath = recorded && !looksLikeDirectoryPath(recorded) ? recorded : null;
   return (
     <li className="row">
       <button
@@ -26,6 +35,14 @@ function NodeRow({
         <span>{str(node.title)}</span>
         <code style={{ fontSize: 12, color: "var(--text-muted)" }}>{str(node.path)}</code>
       </button>
+      {nodePath && (
+        <Link
+          to={fileHref(absolutePath(workspace, nodePath))}
+          style={{ fontSize: 12, marginLeft: 8 }}
+        >
+          Open file
+        </Link>
+      )}
       {selected && (
         <div style={{ marginTop: 4, marginLeft: 12 }}>
           <dl>
@@ -111,6 +128,7 @@ export function SystemExplorerScreen() {
                     key={n.id}
                     node={n}
                     edges={data.edges}
+                    workspace={data.source.workspace}
                     selected={selectedId === n.id}
                     onSelect={() => setSelectedId(selectedId === n.id ? null : n.id)}
                   />

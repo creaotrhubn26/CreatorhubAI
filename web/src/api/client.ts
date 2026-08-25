@@ -3,7 +3,7 @@ import type {
   SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, DeliveryPacket, GlimmerTask, HumanAcceptance,
   CreateWorkspaceResult,
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
-  ApprovalRequest, FsListing,
+  ApprovalRequest, FsListing, FsFile,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -243,11 +243,32 @@ export const glimmerApi = {
   },
   // Task 4c(2/3): read-only directory listing for the composer's path pickers
   // (browser/dev fallback — the Tauri app uses the native Finder dialog).
-  listDirectory: (params: { path?: string; root?: string; includeFiles?: boolean }) => {
+  // Bypasses request() for the same reason readFile does: a refusal has a
+  // reason ("root must be inside …", "that path is not browsable"), and a
+  // status code echoed back with the whole query string is not one.
+  listDirectory: async (params: { path?: string; root?: string; includeFiles?: boolean }): Promise<FsListing> => {
     const query = new URLSearchParams();
     if (params.path) query.set("path", params.path);
     if (params.root) query.set("root", params.root);
     if (params.includeFiles) query.set("includeFiles", "1");
-    return request<FsListing>(`/api/fs/dirs?${query.toString()}`);
+    const res = await fetch(`${API_BASE}/api/fs/dirs?${query.toString()}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `GET /api/fs/dirs failed: ${res.status}`);
+    return body as FsListing;
+  },
+  // Task A1/A3: one file's text for the read-only viewer. Bypasses request()
+  // — which throws a status-only message — because the viewer must be able to
+  // tell the user WHY a read failed ("path is a directory", "permission
+  // denied", "path does not exist"), and a failed read must never be able to
+  // render as an empty file.
+  // No `root` here on purpose (review M1): the gateway picks the root itself —
+  // the known workspace containing the path — so the client cannot influence
+  // what boundary a content read is checked against.
+  readFile: async (params: { path: string }): Promise<FsFile> => {
+    const query = new URLSearchParams({ path: params.path });
+    const res = await fetch(`${API_BASE}/api/fs/file?${query.toString()}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `GET /api/fs/file failed: ${res.status}`);
+    return body as FsFile;
   },
 };
