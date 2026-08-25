@@ -274,7 +274,7 @@ export function ActiveSessionScreen() {
       <GatesRow gates={session.gates} />
       <StatusesRow statuses={session.statuses} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
-      {id && readOnlyMode && <TaskReportPanel sessionId={id} />}
+      {id && readOnlyMode && <TaskReportPanel sessionId={id} ready={!isRunning} />}
       {id && !readOnlyMode && <ArchitecturePlanPanel sessionId={id} />}
       {id && !readOnlyMode && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
       {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} />}

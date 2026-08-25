@@ -2,11 +2,14 @@ import { useQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
 
-export function TaskReportPanel({ sessionId }: { sessionId: string }) {
+export function TaskReportPanel({ sessionId, ready = true }: { sessionId: string; ready?: boolean }) {
   const { data: report } = useQuery({
     queryKey: ["task-report", sessionId],
     queryFn: () => glimmerApi.getTaskReport(sessionId),
-    enabled: !!sessionId,
+    // The report is written immediately before the session becomes terminal.
+    // Fetching while the run is active returns 404; with retry disabled that
+    // failed query would otherwise remain cached after completion.
+    enabled: !!sessionId && ready,
     retry: false,
   });
   if (!report) return null;
