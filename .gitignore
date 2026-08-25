@@ -23,3 +23,6 @@ eval-results/
 
 # Already its own independent git repo (github.com/creaotrhubn26/CreatorhubAI) — do not nest
 control-center/
+
+# macOS folder metadata
+.DS_Store
