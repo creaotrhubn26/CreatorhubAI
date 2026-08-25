@@ -30,5 +30,10 @@ jobs:
       - name: Install Rust quality components
         run: rustup component add rustfmt clippy
 
+      - name: Prepare Tauri build resources
+        run: |
+          src-tauri/scripts/prepare-sidecar.sh
+          src-tauri/scripts/prepare-gateway.sh
+
       - name: Run quality gates
         run: npm run quality

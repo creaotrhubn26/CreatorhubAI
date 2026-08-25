@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { NewTaskScreen } from "./NewTaskScreen";
 import * as client from "../../api/client";
+
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-probe">{location.pathname}</div>;
+}
 
 // NewTaskScreen calls useNavigate() (per the task-12 brief's exact implementation),
 // which requires a Router context to render. MemoryRouter is added here (matching
@@ -16,7 +21,10 @@ function withQuery(
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={initialEntries}>{ui}</MemoryRouter>
+      <MemoryRouter initialEntries={initialEntries}>
+        {ui}
+        <LocationProbe />
+      </MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -25,17 +33,12 @@ describe("NewTaskScreen", () => {
   beforeEach(() => {
     // NewTaskScreen now renders TaskIntelligencePanel, which fetches on mount.
     // Stub it so these tests exercise the composer form, not the network.
-    vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: null,
-      likelyPackage: null,
-      suggestedVerification: [],
-      estimatedRisk: null,
-      provenance: "deterministic-backend",
-      repoMapStatus: "none",
-    });
+    vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockImplementation(
+      () => new Promise(() => {}),
+    );
     // Task 4c(2): the composer now also lists known workspaces for quick-pick
     // and can browse directories. Stub both network boundaries.
-    vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([]);
+    vi.spyOn(client.glimmerApi, "listWorkspaces").mockImplementation(() => new Promise(() => {}));
     vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
       root: "/tmp/ws",
       path: "/tmp/ws",
@@ -103,7 +106,9 @@ describe("NewTaskScreen", () => {
     ).toBe("implement");
     fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
 
-    await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/sessions/s-improve"),
+    );
     const [contract] = createSpy.mock.calls[0];
     expect(contract.mode).toBe("implement");
     expect(contract.objective).toBe("Hva kan bli bedre?");
@@ -129,7 +134,9 @@ describe("NewTaskScreen", () => {
     fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
     fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
 
-    await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/sessions/s-review"),
+    );
     const [contract] = createSpy.mock.calls[0];
     expect(contract.mode).toBe("review");
     expect(contract.objective).toBe("Hva som kan bli bedre?");
@@ -204,7 +211,11 @@ describe("NewTaskScreen", () => {
         .value,
     ).toBe("files");
     expect(screen.getByText(/nothing has started yet/i)).toBeInTheDocument();
-    await vi.waitFor(() => expect(screen.getByLabelText("Frontend typecheck")).toBeChecked());
+    await waitFor(() => expect(screen.getByLabelText("Frontend typecheck")).toBeChecked());
+    await waitFor(() => expect(client.glimmerApi.getTaskIntelligence).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
     expect(screen.getByLabelText("Targeted test")).toBeChecked();
     expect(createSession).not.toHaveBeenCalled();
   });
@@ -242,7 +253,7 @@ describe("NewTaskScreen", () => {
         },
       ]),
     );
-    await vi.waitFor(() => expect(client.glimmerApi.getTaskIntelligence).toHaveBeenCalled());
+    await waitFor(() => expect(client.glimmerApi.getTaskIntelligence).toHaveBeenCalled());
     fireEvent.change(screen.getByPlaceholderText("What should Glimmer work on?"), {
       target: { value: "Keep the human wording" },
     });
@@ -250,7 +261,7 @@ describe("NewTaskScreen", () => {
     await act(async () => {
       resolveIntelligence(intelligence);
     });
-    await vi.waitFor(() => expect(screen.getByText("frontend-typecheck")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("frontend-typecheck")).toBeInTheDocument());
     expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue(
       "Keep the human wording",
     );
@@ -334,7 +345,9 @@ describe("NewTaskScreen", () => {
       fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
       fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
 
-      await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(screen.getByTestId("location-probe")).toHaveTextContent("/sessions/s1"),
+      );
       const [contract] = createSpy.mock.calls[0];
       expect(contract.advanced).toBeUndefined();
     });
@@ -355,7 +368,9 @@ describe("NewTaskScreen", () => {
       fireEvent.click(screen.getByLabelText("Architect first"));
       fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
 
-      await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(screen.getByTestId("location-probe")).toHaveTextContent("/sessions/s2"),
+      );
       const [contract] = createSpy.mock.calls[0];
       expect(contract.advanced).toEqual({
         timeoutSeconds: 300,
@@ -398,10 +413,12 @@ describe("NewTaskScreen", () => {
       // instead of looking inert/clickable-again.
       expect(await screen.findByRole("button", { name: /creating worktree/i })).toBeInTheDocument();
 
-      resolveCreate!({
-        workspace: "/Users/danielqazi/glimmer-role-room-story-logic-20260821-010000",
-        branch: "glimmer/role-room-story-logic-20260821-010000",
-        baselineSha: "a".repeat(40),
+      await act(async () => {
+        resolveCreate!({
+          workspace: "/Users/danielqazi/glimmer-role-room-story-logic-20260821-010000",
+          branch: "glimmer/role-room-story-logic-20260821-010000",
+          baselineSha: "a".repeat(40),
+        });
       });
 
       await vi.waitFor(() =>

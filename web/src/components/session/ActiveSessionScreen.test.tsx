@@ -197,6 +197,9 @@ describe("ActiveSessionScreen", () => {
     const analysisSpy = vi
       .spyOn(client.glimmerApi, "getSessionAnalysis")
       .mockResolvedValue({ riskScore: "LOW", scopeGuard: null, provenance: "git-derived" });
+    vi.spyOn(client.glimmerApi, "getVisualVerification").mockImplementation(
+      () => new Promise(() => {}),
+    );
 
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
@@ -210,6 +213,7 @@ describe("ActiveSessionScreen", () => {
     );
 
     await vi.waitFor(() => expect(analysisSpy).toHaveBeenCalledTimes(1));
+    await screen.findByText(/Changed files/);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(4000);
     });

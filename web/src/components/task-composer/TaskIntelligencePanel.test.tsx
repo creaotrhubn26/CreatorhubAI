@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 import * as client from "../../api/client";
@@ -178,12 +178,17 @@ describe("TaskIntelligencePanel", () => {
       </QueryClientProvider>
     );
     const { rerender } = render(panel("a"));
+    await act(async () => {
+      await Promise.resolve();
+    });
     rerender(panel("ab"));
     rerender(panel("abc"));
     // The first render queries with what it was mounted with; the two edits
     // that follow have not landed yet.
     expect(spy.mock.calls.map(([params]) => params.objective)).toEqual(["a"]);
-    await vi.advanceTimersByTimeAsync(500);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
     // Only the settled value was ever requested — the intermediate "ab" never
     // reached the network.
     expect(spy.mock.calls.some(([params]) => params.objective === "abc")).toBe(true);

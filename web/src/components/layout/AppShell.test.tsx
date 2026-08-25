@@ -218,7 +218,8 @@ describe("AppShell", () => {
   it("opens the command palette on cmd+K even when focus is inside an input", async () => {
     render(withProviders(<AppShell repoContext={null}>content</AppShell>));
     const searchInput = screen.getByPlaceholderText("Search sessions…");
-    searchInput.focus();
+    await screen.findByText(/model: OFFLINE/);
+    fireEvent.focus(searchInput);
     fireEvent.keyDown(searchInput, { key: "k", metaKey: true });
     expect(await screen.findByRole("combobox", { name: "Command palette" })).toBeInTheDocument();
   });
