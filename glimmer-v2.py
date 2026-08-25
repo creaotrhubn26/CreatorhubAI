@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 
 from glimmer_events import emit as emit_event
+from glimmer_models import load_model_registry, model_for_role
 
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
 # Round 9 review (M2): GLIMMER_STATE_ROOT is the same env var control-center's
@@ -1056,13 +1057,11 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
     used for live checkpointing did. --model-url reuses
     model_readiness_url (v2's existing, single source of the
     llama-server's address) via _model_base_url -- not hardcoded again.
-    --api-key-file is deliberately NOT passed: glimmer-visual.py's own
-    default already resolves to the identical
-    Path.home()/"AI/muse-glimmer/config/api-key.txt" convention
-    glimmer-engineer.py uses, so there is nothing a v2-supplied value
-    here could improve on. No opt-out flag -- "visual" in the plan is
-    already the opt-in; capture-only mode stays available by running
-    glimmer-visual.py directly without --vision.
+    C1 model routing: the selected vision role contributes --model-url,
+    --model-id and --api-key-file. Only the key FILE PATH enters argv; key
+    contents never do. No opt-out flag -- "visual" in the plan is already
+    the opt-in; capture-only mode stays available by running glimmer-visual.py
+    directly without --vision.
 
     V7 §22.10: `visual_requirements` (already sanitize_visual_requirements-
     capped by the caller) become extra --check entries alongside
@@ -1071,10 +1070,21 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
     """
     out_dir = session / "visual"
     out_dir.mkdir(parents=True, exist_ok=True)
+    vision_model = model_for_role(
+        load_model_registry(default_base_url=_model_base_url(model_readiness_url)),
+        "vision",
+    )
     cmd = [sys.executable, str(GLIMMER_VISUAL), "--url", url, "--output-dir", str(out_dir)]
     for vp in VISUAL_DEFAULT_VIEWPORTS:
         cmd += ["--viewport", vp]
-    cmd += ["--vision", "--model-url", _model_base_url(model_readiness_url)]
+    cmd += [
+        "--vision",
+        "--model-url", vision_model["baseUrl"],
+        "--model-id", vision_model["modelId"],
+        # An explicit empty value is meaningful: it overrides glimmer-visual's
+        # legacy local-key default when the selected provider needs no key.
+        "--api-key-file", vision_model["apiKeyFile"] or "",
+    ]
     if visual_requirements:
         # glimmer-visual.py's --check replaces its own defaults when given
         # at all -- send the basics explicitly alongside the extras so
@@ -10339,12 +10349,20 @@ def _visual_selfcheck() -> None:
         # model-readiness URL (not a hardcoded, possibly-wrong default).
         assert "--vision" in visual_cmd
         assert "--model-url" in visual_cmd
-        assert "http://127.0.0.1:9999" in visual_cmd, "must derive from model_readiness_url, not hardcode"
+        expected_vision = model_for_role(
+            load_model_registry(default_base_url="http://127.0.0.1:9999"), "vision"
+        )
+        assert expected_vision["baseUrl"] in visual_cmd
+        assert expected_vision["modelId"] in visual_cmd
+        assert (expected_vision["apiKeyFile"] or "") in visual_cmd
 
         # Default model_readiness_url (no override) resolves through
         # READINESS_URL_DEFAULT, same as every other model-readiness use.
         default_cmd = build_visual_verify_command(session, "http://x/route")
-        assert _model_base_url(READINESS_URL_DEFAULT) in default_cmd
+        expected_default_vision = model_for_role(
+            load_model_registry(default_base_url=_model_base_url(READINESS_URL_DEFAULT)), "vision"
+        )
+        assert expected_default_vision["baseUrl"] in default_cmd
 
     # Fix round 3: visual_requirements threaded through expand_verify_entries
     # for an EXPLICIT "visual" --verify/contract.verification entry -- the
