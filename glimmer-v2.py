@@ -144,10 +144,12 @@ def canonical_session_state(raw_status: str) -> str:
     # site's comment). Kept in sync with control-center's mapManifestStatus.
     if raw_status == "understanding":
         return "understanding"
-    if raw_status in ("verified", "no-change-verified"):
+    if raw_status == "verified":
         return "verified"
-    if raw_status == "no-change-unverified":
-        return "needs_review"
+    if raw_status in ("no-change-verified", "no-change-unverified"):
+        return "no_change"
+    if raw_status in ("inspect-completed", "plan-completed", "review-completed"):
+        return "completed"
     # Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string
     # directly into manifest.json (the ONLY writer while it's blocked inside
     # invoke_engineer's subprocess, session directory is shared and no other
@@ -337,7 +339,10 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
     """
     raw = manifest.get("status") or ""
 
-    if raw in ("verified", "no-change-verified"):
+    if raw in (
+        "verified", "no-change-verified", "no-change-unverified",
+        "inspect-completed", "plan-completed", "review-completed",
+    ):
         return None
     if raw == "repo-map-only":
         return None  # deliberate --repo-map-only early exit, not a failure
@@ -392,6 +397,10 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
                            "(e.g. model server unreachable at readiness_probe, or another "
                            "run()/setup failure) — no repair loop iteration ever started",
                 "evidenceIds": []}
+    if raw == "failed-task-report":
+        return {"class": "ORCHESTRATION_ABORTED", "detail": "read-only task report was not produced successfully", "evidenceIds": []}
+    if raw == "failed-read-only-mutation":
+        return {"class": "POLICY_BLOCK", "detail": "a read-only task changed workspace files", "evidenceIds": []}
     if raw.startswith("cancelled"):
         return {"class": "USER_CANCELLED", "detail": "session terminated by SIGTERM/interrupt before reaching a terminal state", "evidenceIds": []}
     # Task 1.3: TOOL_EXECUTION_FAILURE covers a tool-result envelope (Task
@@ -434,7 +443,7 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
                 "evidenceIds": [e["id"] for e in parser_events if "id" in e]}
 
     # Anything else reaching here is a real terminal status this function
-    # doesn't specifically recognize — e.g. "no-change-unverified", or a
+    # doesn't specifically recognize, or a
     # legacy "blocked-no-changes" string a pre-refactor orchestrator version
     # wrote (still present in archived sessions, no longer produced by
     # current code). Report it rather than guessing or raising.
@@ -1750,6 +1759,36 @@ def _contract_scope_text(contract):
     return ", ".join(scope_bits)
 
 
+def _intent_instruction(contract):
+    """Deterministic semantics for a narrow inferred intent.
+
+    The original objective remains untouched in the contract/manifest. This
+    block prevents an open question such as "Hva kan bli bedre?" from being
+    treated as literal repository search text.
+    """
+    intent = contract.get("intent") or {}
+    if intent.get("kind") != "improvement-assessment":
+        return ""
+    mode = contract.get("mode")
+    action = {
+        "inspect": "Return prioritized evidence-backed findings; do not modify files.",
+        "review": "Return a prioritized code review with concrete recommended fixes; do not modify files.",
+        "plan": "Return a prioritized implementation plan grounded in repository evidence; do not modify files.",
+        "debug": "Select one high-confidence bounded defect, fix it, and verify it.",
+        "test": "Select one high-impact bounded test or verification gap, implement it, and verify it.",
+        "refactor": "Select one high-impact bounded maintainability improvement, implement it, and verify behavior.",
+        "implement": "Select one high-impact bounded improvement, implement it, and verify it.",
+    }.get(mode, "Inspect the repository and report evidence-backed improvements.")
+    return (
+        "\n\nSTRUCTURED INTENT — IMPROVEMENT ASSESSMENT:\n"
+        "Do not search the repository for words or phrases from the user's question. "
+        "Discover candidates from repository structure, behavior, tests, and code evidence. "
+        "Consider correctness, maintainability, architecture, reliability, performance, "
+        "accessibility/UX, tests, and documentation where relevant. Prioritize by impact "
+        "and confidence and cite concrete files or symbols. " + action
+    )
+
+
 def make_architect_prompt(contract, summary, ws=None):
     """C1 (glimmer-v7): the "task" text handed to `glimmer-engineer.py
     --mode architect` — NOT make_prompt's full engineering OPERATING
@@ -1778,7 +1817,7 @@ def make_architect_prompt(contract, summary, ws=None):
 
     TRUSTED REPOSITORY MAP:
     {summary}
-    """).strip() + build_adr_prompt_section(contract, ws)
+    """).strip() + _intent_instruction(contract) + build_adr_prompt_section(contract, ws)
 
 
 
@@ -2623,12 +2662,12 @@ a genuine fix may still require another file if the evidence supports it.
     - Narrow diagnostic commands are allowed when needed.
     - Inspect the exact diff before finishing.
     - If the task cannot safely be completed, do not make speculative changes.
-    """).strip() + plan_block + focus_block + build_skills_block(contract, plan)
+    """).strip() + _intent_instruction(contract) + plan_block + focus_block + build_skills_block(contract, plan)
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
                      plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
-                     consult_request=None, timeout=None, scope_prefixes=None):
+                     consult_request=None, timeout=None, scope_prefixes=None, task_mode=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -2643,6 +2682,8 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         # branches on this flag's presence). No new mode string, so every
         # existing architect read-only guard still applies unchanged.
         cmd += ["--review-request", str(review_request)]
+    if task_mode is not None:
+        cmd += ["--task-mode", task_mode]
     if consult_request is not None:
         # Task 8.2 (V7 §23.15): only ever set alongside mode="consult" —
         # see run_architect_escalation below.
@@ -2917,6 +2958,27 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
     return plan
+
+
+def load_task_report(session_dir):
+    path = Path(session_dir) / "task-report.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def run_read_only_task(engineer, ws, contract, summary, session, events_path, sid):
+    """Run inspect/plan/review through Architect's structurally read-only loop."""
+    prompt = make_architect_prompt(contract, summary, ws)
+    (session / "task-report-prompt.txt").write_text(prompt, encoding="utf-8")
+    rc = invoke_engineer(
+        engineer, ws, prompt, True, None,
+        session / "task-report.log", events_path, sid,
+        mode="architect", task_mode=contract["mode"],
+    )
+    return rc, load_task_report(session)
 
 
 # ============================================================
@@ -5948,6 +6010,8 @@ def main():
     ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
     ap.add_argument("task", nargs="+")
     ap.add_argument("--workspace", required=True)
+    ap.add_argument("--session-id", default=None,
+                    help="Canonical session id supplied by the gateway; the same id is used for the directory, manifest and events")
     ap.add_argument("--engineer", default=str(ENGINEER_DEFAULT))
     ap.add_argument("--max-repairs", type=int, default=2)
     # Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles. None (the
@@ -5982,6 +6046,10 @@ def main():
     # could ever produce it.
     ap.add_argument("--mode", choices=("inspect", "plan", "implement", "debug", "test", "review", "refactor"),
                     default="implement", help="Contract mode: the kind of work this task performs")
+    ap.add_argument("--intent", choices=("direct", "improvement-assessment"), default="direct",
+                    help="Structured task intent; never replaces the original objective")
+    ap.add_argument("--intent-source", choices=("explicit", "deterministic-inference"),
+                    default="deterministic-inference")
     ap.add_argument("--auto-approve", action="store_true")
     ap.add_argument("--repo-map-only", action="store_true")
     ap.add_argument("--allow-non-glimmer-branch", action="store_true")
@@ -6039,6 +6107,11 @@ def main():
         raise V2Error("--max-changed-files must be 1..500")
     validate_architect_flags(args.architect_first, args.no_architect)
     validate_visual_url(args.verify, args.visual_url)
+    if args.session_id is not None and (
+        not re.fullmatch(r"[A-Za-z0-9._-]+", args.session_id)
+        or args.session_id in (".", "..")
+    ):
+        raise V2Error("--session-id must contain only letters, digits, '.', '_' or '-'")
 
     recovery = recover_interrupted_checkpoint(ws)
     if recovery:
@@ -6062,8 +6135,9 @@ def main():
         raise V2Error(f"Refusing branch with upstream: {up}")
 
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
-    sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    session = STATE_ROOT / f"{sid}-{b.replace('/', '-')}"
+    legacy_sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    sid = args.session_id or legacy_sid
+    session = STATE_ROOT / (sid if args.session_id else f"{sid}-{b.replace('/', '-')}")
     session.mkdir()
     events_path = session / "events.jsonl"
     emit_event(events_path, "session_created", sid,
@@ -6097,6 +6171,7 @@ def main():
 
     contract = {
         "objective": task,
+        "intent": {"kind": args.intent, "source": args.intent_source},
         "scope": scope,
         "mode": args.mode,
         "constraints": {
@@ -6134,7 +6209,10 @@ def main():
     # architect_risk's docstring.
     architect_candidate_count = len(scope.get("paths") or [])
     architect_risk = compute_architect_risk(contract, architect_candidate_count, args.verification_level)
-    if args.architect_first:
+    read_only_task = args.mode in ("inspect", "plan", "review")
+    if read_only_task:
+        architect_trigger_mode = "off"
+    elif args.architect_first:
         architect_trigger_mode = "manual"
     elif architect_risk["score"] >= ARCHITECT_RISK_THRESHOLD and not args.no_architect:
         architect_trigger_mode = "auto"
@@ -6146,9 +6224,11 @@ def main():
                    score=architect_risk["score"], threshold=ARCHITECT_RISK_THRESHOLD,
                    signals=architect_risk["signals"])
 
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     manifest = {
         "version": "2.1", "sessionId": sid, "workspace": str(ws), "branch": b,
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
+        "startedAt": started_at,
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
         "state": canonical_session_state("initialized"),
         "eventsFile": "events.jsonl", "contract": contract,
@@ -6323,6 +6403,50 @@ def main():
         manifest["state"] = canonical_session_state(manifest["status"])
         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
         save()
+
+        if read_only_task:
+            # inspect/plan/review are not aliases for the write-capable
+            # engineer. They run through Architect's one structurally
+            # read-only tool loop and produce a first-class report artifact.
+            # Skip the documentation pass too: it may update docs/graph.json
+            # and would violate this mode's no-workspace-writes contract.
+            doc_pass_done = True
+            emit_event(events_path, "agent_state_changed", sid, state="discovery")
+            report_rc, report = run_read_only_task(
+                engineer, ws, contract, summary, session, events_path, sid,
+            )
+            report_files = changed_files(ws, baseline)
+            manifest["attempts"].append({
+                "iteration": 0,
+                "engineerReturnCode": report_rc,
+                "changedFiles": report_files,
+                "verificationResults": [],
+                "status": "report-completed" if report is not None else "report-failed",
+            })
+            if report is not None:
+                manifest["taskReportFile"] = "task-report.json"
+
+            report_ok = (
+                report_rc == 0
+                and isinstance(report, dict)
+                and not report.get("reportFailed")
+                and report.get("mode") == args.mode
+                and report.get("objective") == task
+            )
+            if report_files:
+                manifest["status"] = "failed-read-only-mutation"
+                final_label = "READ-ONLY POLICY VIOLATION — NOT COMPLETED"
+            elif report_ok:
+                manifest["status"] = f"{args.mode}-completed"
+                final_label = f"{args.mode.upper()} REPORT COMPLETED"
+                success = True
+            else:
+                manifest["status"] = "failed-task-report"
+                final_label = "TASK REPORT FAILED"
+            manifest["state"] = canonical_session_state(manifest["status"])
+            emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+            save()
+            return 0 if report_ok and not report_files else 2
 
         # C1 (glimmer-v7) + Task 2.1 (V7 §5.5): runs once before iteration 0
         # whenever run_architect is True -- manual force-on (--architect-
@@ -7256,14 +7380,14 @@ def main():
         # never a second gate) can do should be able to take those down with
         # it.
         try:
-            if compute_architect_escalation_trigger(_delivery_review_final, run_architect):
+            if not read_only_task and compute_architect_escalation_trigger(_delivery_review_final, run_architect):
                 run_architect_escalation(
                     engineer, ws, architecture_plan, _delivery_review_final,
                     session, events_path, sid,
                 )
         except Exception as exc:  # noqa: BLE001 - escalation must never break session finalization
             print(f"[V2] WARN: architect escalation failed: {exc}")
-        if write_delivery_packet(manifest, session, _delivery_review_final) is not None:
+        if not read_only_task and write_delivery_packet(manifest, session, _delivery_review_final) is not None:
             emit_event(events_path, "delivery_packet_created", sid)
 
         save()
@@ -7296,6 +7420,8 @@ def _r6_selfcheck() -> None:
     """
     assert classify_failure({"status": "verified"}, []) is None
     assert classify_failure({"status": "no-change-verified"}, []) is None
+    assert classify_failure({"status": "no-change-unverified"}, []) is None
+    assert classify_failure({"status": "inspect-completed"}, []) is None
     assert classify_failure({"status": "repo-map-only"}, []) is None
     assert classify_failure({"status": "blocked-infra_blocked"}, [])["class"] == "INFRA_BLOCKED"
     assert classify_failure({"status": "blocked-timeout"}, [])["class"] == "TIMEOUT"
@@ -7332,11 +7458,11 @@ def _r6_selfcheck() -> None:
 
     # A terminal status this function doesn't specifically recognize falls
     # through to event evidence when present...
-    r = classify_failure({"status": "no-change-unverified"}, [blocked_evt])
+    r = classify_failure({"status": "legacy-unclassified-terminal"}, [blocked_evt])
     assert r == {"class": "POLICY_BLOCK", "detail": "rm -rf blocked", "evidenceIds": ["e1"]}
 
     scope_evt = {"id": "e2", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/x.ts"]}
-    r = classify_failure({"status": "no-change-unverified"}, [scope_evt])
+    r = classify_failure({"status": "legacy-unclassified-terminal"}, [scope_evt])
     assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2"]
 
     # m5 (followup-1-2 review): the SAME shape, but a human explicitly
@@ -7344,17 +7470,17 @@ def _r6_selfcheck() -> None:
     # pause) -- must NOT be classified as a failure, even alongside an
     # unrelated, genuinely unapproved one, which must still be caught.
     approved_scope_evt = {**scope_evt, "id": "e2b", "approved": True, "approvedBy": "daniel"}
-    r = classify_failure({"status": "no-change-unverified"}, [approved_scope_evt])
+    r = classify_failure({"status": "legacy-unclassified-terminal"}, [approved_scope_evt])
     assert r is None or r["class"] != "SCOPE_FAILURE", r
     unapproved_scope_evt = {"id": "e2c", "type": "scope_expanded", "expected": ["frontend"], "actual": ["backend/y.ts"]}
-    r = classify_failure({"status": "no-change-unverified"}, [approved_scope_evt, unapproved_scope_evt])
+    r = classify_failure({"status": "legacy-unclassified-terminal"}, [approved_scope_evt, unapproved_scope_evt])
     assert r["class"] == "SCOPE_FAILURE" and r["evidenceIds"] == ["e2c"], r
 
     parser_evts = [{"id": f"p{i}", "type": "parser_recovery", "attempt": i} for i in range(1, 3)]
-    r = classify_failure({"status": "no-change-unverified"}, parser_evts)
+    r = classify_failure({"status": "legacy-unclassified-terminal"}, parser_evts)
     assert r["class"] == "PARSER_FAILURE" and r["evidenceIds"] == ["p1", "p2"]
     # ...but a single recovery is below threshold and stays UNKNOWN.
-    assert classify_failure({"status": "no-change-unverified"}, parser_evts[:1])["class"] == "UNKNOWN"
+    assert classify_failure({"status": "legacy-unclassified-terminal"}, parser_evts[:1])["class"] == "UNKNOWN"
 
     # Legacy raw status this function was never taught (real archived
     # "blocked-no-changes"), and no status at all — both degrade to
@@ -7368,6 +7494,9 @@ def _r6_selfcheck() -> None:
     # now writes right after readiness -- identity-mapped, same as
     # "waiting-for-approval" below.
     assert canonical_session_state("understanding") == "understanding"
+    assert canonical_session_state("no-change-verified") == "no_change"
+    assert canonical_session_state("no-change-unverified") == "no_change"
+    assert canonical_session_state("inspect-completed") == "completed"
     # Round 9 review (C1): the `finally` block's abort catch-all normalizes
     # every status in NON_TERMINAL_STATUSES to "failed-aborted" -- this was
     # keyed on "initialized" alone, so a session that crashed after main()
@@ -10005,11 +10134,11 @@ def _quality_gates_selfcheck() -> None:
     finally_idx = main_source.index("_resolve_orphaned_pending_approval(session)")
     statuses_idx = main_source.index('manifest["statuses"] = compute_statuses(manifest, session)')
     escalation_trigger_idx = main_source.index(
-        "if compute_architect_escalation_trigger(_delivery_review_final, run_architect):"
+        "if not read_only_task and compute_architect_escalation_trigger(_delivery_review_final, run_architect):"
     )
     escalation_call_idx = main_source.index("run_architect_escalation(")
     packet_idx = main_source.index(
-        "if write_delivery_packet(manifest, session, _delivery_review_final) is not None:"
+        "if not read_only_task and write_delivery_packet(manifest, session, _delivery_review_final) is not None:"
     )
     packet_event_idx = main_source.index('emit_event(events_path, "delivery_packet_created", sid)')
     save_idx = main_source.rindex("save()")
