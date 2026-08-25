@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { NewTaskScreen } from "./NewTaskScreen";
@@ -81,6 +81,63 @@ describe("NewTaskScreen", () => {
   it("defaults the objective to empty when arriving with no router state", () => {
     render(withQuery(<NewTaskScreen />));
     expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("");
+  });
+
+  it("prefills a selection draft with workspace, file scope, and task-intelligence verification defaults", async () => {
+    vi.mocked(client.glimmerApi.getTaskIntelligence).mockResolvedValue({
+      likelyArea: "src", likelyPackage: "web", suggestedVerification: ["frontend-typecheck", "targeted-test"],
+      estimatedRisk: "LOW", provenance: "git-derived", repoMapStatus: "workspace-matched",
+    });
+    const createSession = vi.spyOn(client.glimmerApi, "createSession");
+    render(withQuery(<NewTaskScreen />, [{
+      pathname: "/tasks/new",
+      state: {
+        selectionDraft: {
+          objective: "Extract this validation into a helper",
+          workspace: "/tmp/ws",
+          path: "/tmp/ws/src/a.ts",
+          startLine: 3,
+          endLine: 5,
+        },
+      },
+    }]));
+
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("Extract this validation into a helper");
+    expect(screen.getByLabelText("Workspace path")).toHaveValue("/tmp/ws");
+    expect(screen.getByLabelText(/scope path/i)).toHaveValue("src/a.ts");
+    expect((screen.getByText("Scope").closest("fieldset")!.querySelector("select") as HTMLSelectElement).value).toBe("files");
+    expect(screen.getByText(/nothing has started yet/i)).toBeInTheDocument();
+    await vi.waitFor(() => expect(screen.getByLabelText("Frontend typecheck")).toBeChecked());
+    expect(screen.getByLabelText("Targeted test")).toBeChecked();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite the human's edits when selection intelligence arrives later", async () => {
+    const intelligence = {
+      likelyArea: "src", likelyPackage: "web", suggestedVerification: ["frontend-typecheck" as const],
+      estimatedRisk: "LOW" as const, provenance: "git-derived" as const, repoMapStatus: "workspace-matched" as const,
+    };
+    let resolveIntelligence!: (value: typeof intelligence) => void;
+    const pending = new Promise<typeof intelligence>((resolve) => { resolveIntelligence = resolve; });
+    vi.mocked(client.glimmerApi.getTaskIntelligence).mockReturnValueOnce(pending).mockResolvedValue(intelligence);
+
+    render(withQuery(<NewTaskScreen />, [{
+      pathname: "/tasks/new",
+      state: {
+        selectionDraft: {
+          objective: "Extract this helper", workspace: "/tmp/ws", path: "/tmp/ws/src/a.ts", startLine: 3, endLine: 5,
+        },
+      },
+    }]));
+    await vi.waitFor(() => expect(client.glimmerApi.getTaskIntelligence).toHaveBeenCalled());
+    fireEvent.change(screen.getByPlaceholderText("What should Glimmer work on?"), {
+      target: { value: "Keep the human wording" },
+    });
+
+    await act(async () => { resolveIntelligence(intelligence); });
+    await vi.waitFor(() => expect(screen.getByText("frontend-typecheck")).toBeInTheDocument());
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("Keep the human wording");
+    expect(screen.getByLabelText("Frontend typecheck")).not.toBeChecked();
   });
 
   // F5: "directory"/"files" scope previously had no way to enter a concrete

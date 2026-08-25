@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CodeViewer } from "./CodeViewer";
 import * as client from "../../api/client";
+import { SessionEventsContext } from "../../api/useSessionEvents";
 
 function withQuery(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -108,5 +109,79 @@ describe("CodeViewer", () => {
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector("[contenteditable]")).toBeNull();
     expect(screen.queryByRole("button", { name: /save/i })).not.toBeInTheDocument();
+  });
+
+  it("reports the complete line range selected in the read-only viewer", async () => {
+    vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
+    const onSelectionChange = vi.fn();
+    const { container } = render(withQuery(
+      <CodeViewer path="/w/src/a.ts" onSelectionChange={onSelectionChange} />
+    ));
+    await waitFor(() => expect(container.querySelectorAll(".code-view__line")).toHaveLength(2));
+
+    const rows = container.querySelectorAll<HTMLElement>(".code-view__line");
+    const firstText = rows[0].querySelector<HTMLElement>(".code-view__text")!;
+    const secondText = rows[1].querySelector<HTMLElement>(".code-view__text")!;
+    const range = document.createRange();
+    range.setStart(firstText, 0);
+    range.setEnd(secondText, secondText.childNodes.length);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    fireEvent.mouseUp(container.querySelector(".code-view__body")!);
+    expect(onSelectionChange).toHaveBeenCalledWith(1, 2);
+  });
+
+  it("keeps the selected range visibly marked after URL state replaces the native selection", async () => {
+    vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
+    const { container } = render(withQuery(
+      <CodeViewer path="/tmp/a.ts" selectionStart={1} selectionEnd={2} />
+    ));
+    await waitFor(() => expect(container.querySelectorAll(".code-view__line")).toHaveLength(2));
+    expect(container.querySelectorAll(".code-view__line.is-selected")).toHaveLength(2);
+  });
+
+  it("re-reads the open file once for a new matching file_changed event", async () => {
+    const readFile = vi.spyOn(client.glimmerApi, "readFile")
+      .mockResolvedValueOnce(textFile)
+      .mockResolvedValue({ ...textFile, content: "const x = 2;\nconst y = 2;\n" });
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const empty = { events: [], lastEventAt: null };
+    const changed = {
+      events: [{
+        id: "e-file-1", sessionId: "s1", timestamp: "2026-08-25T00:00:00.000Z",
+        type: "file_changed", path: "src/a.ts", changeType: "modified",
+      }] as any,
+      lastEventAt: Date.now(),
+    };
+    const { rerender } = render(
+      <QueryClientProvider client={qc}>
+        <SessionEventsContext.Provider value={empty}>
+          <CodeViewer path="/w/src/a.ts" workspace="/w" />
+        </SessionEventsContext.Provider>
+      </QueryClientProvider>
+    );
+    await waitFor(() => expect(readFile).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <QueryClientProvider client={qc}>
+        <SessionEventsContext.Provider value={changed}>
+          <CodeViewer path="/w/src/a.ts" workspace="/w" />
+        </SessionEventsContext.Provider>
+      </QueryClientProvider>
+    );
+    await waitFor(() => expect(readFile).toHaveBeenCalledTimes(2));
+
+    // Replaying the same event id is not another edit.
+    rerender(
+      <QueryClientProvider client={qc}>
+        <SessionEventsContext.Provider value={changed}>
+          <CodeViewer path="/w/src/a.ts" workspace="/w" />
+        </SessionEventsContext.Provider>
+      </QueryClientProvider>
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(readFile).toHaveBeenCalledTimes(2);
   });
 });

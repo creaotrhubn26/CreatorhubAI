@@ -283,6 +283,36 @@ describe("GET /api/fs/file", () => {
   });
 
   const get = (p: string) => request(app).get(`/api/fs/file?path=${encodeURIComponent(p)}`);
+  const askSelection = (selection: unknown, question = "What does this do?") =>
+    request(app).post("/api/repository/ask").set("Origin", UI_ORIGIN).send({ question, selection });
+
+  it("validates a sessionless repository selection before any model request", async () => {
+    const missingQuestion = await askSelection({
+      path: path.join(browseRoot, "repo", "src", "a.ts"), startLine: 1, endLine: 1,
+    }, "");
+    expect(missingQuestion.status).toBe(400);
+    expect(missingQuestion.body.error).toBe("question is required");
+
+    const backwards = await askSelection({
+      path: path.join(browseRoot, "repo", "src", "a.ts"), startLine: 2, endLine: 1,
+    });
+    expect(backwards.status).toBe(400);
+    expect(backwards.body.error).toMatch(/valid repository selection/i);
+
+    const pastExcerpt = await askSelection({
+      path: path.join(browseRoot, "repo", "src", "a.ts"), startLine: 1, endLine: 99,
+    });
+    expect(pastExcerpt.status).toBe(400);
+    expect(pastExcerpt.body.error).toMatch(/outside the file excerpt/i);
+  });
+
+  it("gives the selection route the same workspace confinement and no-existence-oracle answer as the viewer", async () => {
+    const existing = await askSelection({ path: path.join(outside, "secret.txt"), startLine: 1, endLine: 1 });
+    const missing = await askSelection({ path: path.join(outside, "not-real.txt"), startLine: 1, endLine: 1 });
+    expect(existing.status).toBe(403);
+    expect(missing.status).toBe(403);
+    expect(missing.body).toEqual(existing.body);
+  });
 
   it("returns the file's text with its real size, untruncated and not binary", async () => {
     const res = await get(path.join(browseRoot, "repo", "src", "a.ts"));

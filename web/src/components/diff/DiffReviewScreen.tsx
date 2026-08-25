@@ -162,7 +162,13 @@ function firstChangedLine(lines: DiffLine[]): number | undefined {
   return undefined;
 }
 
-function DiffView({ diff, mode, wrap, workspace }: { diff: string; mode: "unified" | "split"; wrap: boolean; workspace?: string }) {
+function DiffView({ diff, mode, wrap, workspace, sessionId }: {
+  diff: string;
+  mode: "unified" | "split";
+  wrap: boolean;
+  workspace?: string;
+  sessionId?: string;
+}) {
   if (!diff) return <div>Unavailable</div>;
   const groups = groupLinesByFile(parseUnifiedDiff(diff));
   const className = `diff-view${mode === "split" ? " diff-view--split" : ""}${wrap ? " wrap" : ""}`;
@@ -180,7 +186,7 @@ function DiffView({ diff, mode, wrap, workspace }: { diff: string; mode: "unifie
                   when the session's workspace is known — without it there is
                   no absolute path to open, and guessing one would be a lie. */}
               {workspace ? (
-                <Link className="mono" to={fileHref(absolutePath(workspace, g.path), firstChangedLine(g.lines))}>
+                <Link className="mono" to={fileHref(absolutePath(workspace, g.path), firstChangedLine(g.lines), sessionId)}>
                   {g.path}
                 </Link>
               ) : (
@@ -270,7 +276,13 @@ export function DiffReviewScreen() {
           {wrap ? "Unwrap" : "Wrap"}
         </button>
       </div>
-      <DiffView diff={diffResult?.diff ?? ""} mode={mode} wrap={wrap} workspace={session?.workspace} />
+      <DiffView
+        diff={diffResult?.diff ?? ""}
+        mode={mode}
+        wrap={wrap}
+        workspace={session?.workspace}
+        sessionId={id}
+      />
     </div>
   );
 }

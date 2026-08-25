@@ -816,5 +816,7 @@ pre {
 .code-view__body { overflow-x: auto; }
 .code-view__line { display: flex; white-space: pre; }
 .code-view__line.is-current { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.code-view__line.is-selected { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.code-view__line.is-selected .code-view__lineno { color: var(--accent-strong); }
 .code-view__lineno { flex-shrink: 0; width: 56px; text-align: right; padding: 0 8px; color: var(--text-muted); user-select: none; }
 .code-view__text { padding-right: var(--space-3); }

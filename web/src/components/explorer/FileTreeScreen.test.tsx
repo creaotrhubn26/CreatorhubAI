@@ -1,15 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FileTreeScreen } from "./FileTreeScreen";
 import * as client from "../../api/client";
+
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location">{location.pathname}{location.search}</div>;
+}
 
 function withProviders(ui: React.ReactElement, entry = "/files") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={[entry]}>{ui}</MemoryRouter>
+      <MemoryRouter initialEntries={[entry]}>{ui}<LocationProbe /></MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -68,6 +73,29 @@ describe("FileTreeScreen", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "README.md" }));
     await waitFor(() => expect(readFile).toHaveBeenCalledWith({ path: "/w/README.md" }));
+  });
+
+  it("stores a selected line range in the URL without dropping its session context", async () => {
+    mockListing();
+    vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
+    vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
+      path: "/w/README.md", size: 3, bytesReturned: 3, truncated: false, binary: false, content: "hi\n",
+    });
+    const { container } = render(withProviders(
+      <FileTreeScreen />,
+      "/files?path=%2Fw%2FREADME.md&session=s1",
+    ));
+    await waitFor(() => expect(container.querySelector(".code-view__text")).not.toBeNull());
+    const text = container.querySelector<HTMLElement>(".code-view__text")!;
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(container.querySelector(".code-view__body")!);
+
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("start=1"));
+    expect(screen.getByTestId("location")).toHaveTextContent("end=1");
+    expect(screen.getByTestId("location")).toHaveTextContent("session=s1");
   });
 
   it("expands the branch that reveals a file handed to it in the URL, and opens it", async () => {

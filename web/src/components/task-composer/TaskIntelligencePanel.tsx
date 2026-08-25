@@ -65,6 +65,7 @@ export function TaskIntelligencePanel({
   objective,
   verificationLevel,
   candidateCount,
+  onIntelligence,
 }: {
   scopePackage: string;
   scopeArea?: string;
@@ -73,9 +74,10 @@ export function TaskIntelligencePanel({
   objective?: string;
   verificationLevel?: string;
   candidateCount?: number;
+  onIntelligence?: (data: TaskIntelligence) => void;
 }) {
   const debouncedObjective = useDebounced(objective ?? "", OBJECTIVE_DEBOUNCE_MS);
-  const { data, error } = useQuery({
+  const { data, error, isFetching } = useQuery({
     queryKey: [
       "task-intelligence", scopePackage, scopeArea, workspace, mode, debouncedObjective, verificationLevel, candidateCount,
     ],
@@ -90,6 +92,12 @@ export function TaskIntelligencePanel({
         candidateCount,
       }),
   });
+  useEffect(() => {
+    // A stale cached result can render while React Query refreshes it, but it
+    // must not become a composer's one-shot default. Wait for the current
+    // request to settle successfully before handing suggestions upward.
+    if (data && !error && !isFetching) onIntelligence?.(data);
+  }, [data, error, isFetching, onIntelligence]);
 
   // Review MN6: the panel used to vanish whenever the request failed (a very
   // long objective makes the GET exceed Node's header limit and the gateway

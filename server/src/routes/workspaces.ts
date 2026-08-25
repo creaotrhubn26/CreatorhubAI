@@ -289,10 +289,21 @@ async function knownWorkspaceRoots(): Promise<string[]> {
 //     writer appears and would hang the gateway
 const MAX_FILE_BYTES = 512 * 1024;
 
-workspacesRouter.get("/fs/file", async (req, res) => {
-  const rawPath = typeof req.query.path === "string" ? req.query.path.trim() : "";
-  if (!rawPath) return res.status(400).json({ error: "path is required" });
-  if (rawPath.includes("\0")) return res.status(400).json({ error: "path is not a valid filesystem path" });
+export type WorkspaceFileReadResult =
+  | { ok: true; file: FsFile }
+  | { ok: false; status: number; error: string };
+
+// Shared by GET /fs/file and Round B's repository-selection assistant. The
+// latter must not grow a second file-read implementation just because its
+// consumer is a model request: both surfaces get exactly the same workspace
+// confinement, credential-name reduction, symlink handling, byte ceiling,
+// binary refusal, and error vocabulary.
+export async function readWorkspaceFile(rawPathInput: string): Promise<WorkspaceFileReadResult> {
+  const rawPath = rawPathInput.trim();
+  if (!rawPath) return { ok: false, status: 400, error: "path is required" };
+  if (rawPath.includes("\0")) {
+    return { ok: false, status: 400, error: "path is not a valid filesystem path" };
+  }
 
   // Review M1: the root is NOT caller-supplied and never defaults to $HOME —
   // it is whichever known workspace contains the requested path. Matched
@@ -302,17 +313,17 @@ workspacesRouter.get("/fs/file", async (req, res) => {
   const lexicalPath = path.resolve(rawPath);
   const workspace = (await knownWorkspaceRoots()).find((root) => contains(root, lexicalPath));
   if (!workspace) {
-    return res.status(403).json({ error: "path is not inside a known workspace" });
+    return { ok: false, status: 403, error: "path is not inside a known workspace" };
   }
 
   const resolved = await resolveContained(workspace, rawPath);
-  if (!resolved.ok) return res.status(resolved.status).json({ error: resolved.error });
+  if (!resolved.ok) return resolved;
   const file = resolved.target;
 
   try {
     const stat = await fs.stat(file);
-    if (stat.isDirectory()) return res.status(400).json({ error: "path is a directory" });
-    if (!stat.isFile()) return res.status(400).json({ error: "path is not a regular file" });
+    if (stat.isDirectory()) return { ok: false, status: 400, error: "path is a directory" };
+    if (!stat.isFile()) return { ok: false, status: 400, error: "path is not a regular file" };
 
     const fh = await fs.open(file, "r");
     let read: Buffer;
@@ -332,7 +343,7 @@ workspacesRouter.get("/fs/file", async (req, res) => {
       // Nothing was returned, so nothing was truncated — `binary` is the whole
       // story and the viewer renders a notice, never bytes.
       const answer: FsFile = { path: file, size: stat.size, bytesReturned: 0, truncated: false, binary: true, content: null };
-      return res.json(answer);
+      return { ok: true, file: answer };
     }
 
     const truncated = stat.size > MAX_FILE_BYTES;
@@ -354,10 +365,24 @@ workspacesRouter.get("/fs/file", async (req, res) => {
       binary: false,
       content: slice.toString("utf8"),
     };
-    res.json(answer);
+    return { ok: true, file: answer };
   } catch (err: any) {
     const mapped = fsErrorStatus(err);
-    res.status(mapped.status).json({ error: mapped.error });
+    return { ok: false, ...mapped };
+  }
+}
+
+workspacesRouter.get("/fs/file", async (req, res) => {
+  const rawPath = typeof req.query.path === "string" ? req.query.path : "";
+  try {
+    const result = await readWorkspaceFile(rawPath);
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json(result.file);
+  } catch (err: any) {
+    // knownWorkspaceRoots() reads session manifests before the file-specific
+    // error mapping begins. Keep a corrupt/unreadable session store from
+    // becoming an unhandled rejected Express handler.
+    res.status(500).json({ error: String(err?.message ?? err) });
   }
 });
 

@@ -100,6 +100,15 @@ describe("DiffReviewScreen", () => {
     expect(screen.getByText(/human review: not yet accepted/i)).toBeInTheDocument();
   });
 
+  it("keeps the real session id on a diff-header file link for live viewer refresh", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
+      diff: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n",
+    });
+    renderScreen();
+    const link = await screen.findByRole("link", { name: "a.ts" });
+    expect(link).toHaveAttribute("href", "/files?path=%2Fws%2Fa.ts&line=1&session=s1");
+  });
+
   // §14 side-by-side: a mode toggle switches between the unified diff and a
   // two-column split view, built from the same parsed diff.
   it("toggles between Unified and Split diff modes, rendering both without throwing", async () => {

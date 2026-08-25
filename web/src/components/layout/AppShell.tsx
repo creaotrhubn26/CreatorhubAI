@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import type { GlimmerEvent, GlimmerSession } from "@glimmer/shared";
+import type { GlimmerEvent, GlimmerSession, RepositorySelection } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { SessionEventsContext, useSessionEvents } from "../../api/useSessionEvents";
 import { statusColor } from "../common/StatusBadge";
@@ -15,6 +15,7 @@ import { buildCommands, type PaletteMode } from "../../state/paletteCommands";
 import { CommandPalette } from "../common/CommandPalette";
 import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
 import { sendCompletionNotification } from "../../state/desktopNotify";
+import { mostSpecificContainingWorkspace } from "../../state/fileLink";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
   IconBack, IconChevron, IconClose, IconDashboard, IconFiles, IconForward, IconModel,
@@ -109,13 +110,30 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const navigate = useNavigate();
 
   const sessionMatch = location.pathname.match(/^\/sessions\/([^/]+)/);
-  const activeSessionId = sessionMatch?.[1];
+  const fileQuery = new URLSearchParams(location.search);
+  const fileSessionId = location.pathname === "/files" ? fileQuery.get("session") : null;
+  // The Files route can retain the real session it came from so the one
+  // shared SSE stream stays alive. Reject slash-bearing/empty URL input here
+  // rather than opening a reconnecting stream to a path-shaped id.
+  const contextualFileSessionId = fileSessionId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(fileSessionId)
+    ? fileSessionId
+    : undefined;
+  const activeSessionId = sessionMatch?.[1] ?? contextualFileSessionId;
+  const selectionStart = Number(fileQuery.get("start"));
+  const selectionEnd = Number(fileQuery.get("end"));
+  const selectionPath = location.pathname === "/files" ? fileQuery.get("path") : null;
+  const repositorySelection: RepositorySelection | null = selectionPath &&
+    Number.isInteger(selectionStart) && Number.isInteger(selectionEnd) &&
+    selectionStart > 0 && selectionEnd >= selectionStart
+    ? { path: selectionPath, startLine: selectionStart, endLine: selectionEnd }
+    : null;
   const activePage = activePageOf(location.pathname);
   // Status bar's session-status/verification items: the open session's own
   // verification view, or the Verification Center when nothing is open.
   const verificationTarget = activeSessionId ? `/sessions/${activeSessionId}/verification` : "/verification";
 
   const { data: rawSessions } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions, refetchInterval: 5000 });
+  const { data: workspaces } = useQuery({ queryKey: ["workspaces"], queryFn: glimmerApi.listWorkspaces, refetchInterval: 5000 });
   // pending-* rows are transient adopted-workspace placeholders — once the
   // real session id shows up they're a duplicate, not a second session, so
   // they never belong in any session-browsing list.
@@ -127,6 +145,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     enabled: !!activeSessionId,
     refetchInterval: 4000,
   });
+  const selectionWorkspace = repositorySelection
+    ? mostSpecificContainingWorkspace((workspaces ?? []).map((workspace) => workspace.path), repositorySelection.path)
+    : undefined;
   const events = useSessionEvents(activeSessionId ?? "");
   // lastEventAt must be the max of the events' own `timestamp` field, not
   // Date.now() at receipt: the SSE route replays the whole events.jsonl
@@ -624,7 +645,22 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                 </button>
               </div>
               <div className="ide-rightpanel__body">
-                {activeSessionId ? (
+                {repositorySelection ? (
+                  <SessionAssistant
+                    selection={repositorySelection}
+                    onDraftTask={selectionWorkspace ? (objective) => navigate("/tasks/new", {
+                      state: {
+                        selectionDraft: {
+                          objective,
+                          workspace: selectionWorkspace,
+                          path: repositorySelection.path,
+                          startLine: repositorySelection.startLine,
+                          endLine: repositorySelection.endLine,
+                        },
+                      },
+                    }) : undefined}
+                  />
+                ) : activeSessionId ? (
                   <SessionAssistant sessionId={activeSessionId} session={activeSession} />
                 ) : (
                   <EmptyState icon="💬" text="Open a session to ask questions about it." />

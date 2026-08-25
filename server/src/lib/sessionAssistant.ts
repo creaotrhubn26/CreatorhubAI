@@ -34,28 +34,32 @@ function summarizeEvidence(session: GlimmerSession, events: GlimmerEvent[]): str
 // incapable of triggering a tool call, regardless of what the model outputs.
 // The read-only guarantee (spec §20) does not depend on the model obeying the
 // system prompt below.
-function buildMessages(evidence: string, question: string) {
+interface AssistantContext {
+  kind: "session" | "repository selection";
+  label: "Session evidence" | "Repository evidence";
+  evidence: string;
+}
+
+function buildMessages(context: AssistantContext, question: string) {
   return [
     {
       role: "system",
       content:
-        "You are a read-only assistant explaining a completed or in-progress Glimmer engineering " +
-        "session. Answer only from the session evidence given to you. You cannot modify files, run " +
+        `You are a read-only assistant explaining a Glimmer ${context.kind}. ` +
+        `Answer only from the ${context.kind} evidence given to you. You cannot modify files, run ` +
         "commands, or take any action — only explain, summarize, and answer questions about what " +
-        "already happened.",
+        "the evidence contains.",
     },
-    { role: "user", content: `Session evidence:\n${evidence}\n\nQuestion: ${question}` },
+    { role: "user", content: `${context.label}:\n${context.evidence}\n\nQuestion: ${question}` },
   ];
 }
 
-export async function askSessionAssistant(
+async function askAssistant(
   modelBaseUrl: string,
-  session: GlimmerSession,
-  events: GlimmerEvent[],
+  context: AssistantContext,
   question: string,
-  timeoutMs = 30_000
+  timeoutMs: number
 ): Promise<SessionAssistantAnswer> {
-  const evidence = summarizeEvidence(session, events);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -63,7 +67,9 @@ export async function askSessionAssistant(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
-      body: JSON.stringify({ model: "muse-glimmer", messages: buildMessages(evidence, question) }),
+      // Deliberately no `tools`/`functions` field — this is the architectural
+      // read-only boundary for BOTH session and repository-selection asks.
+      body: JSON.stringify({ model: "muse-glimmer", messages: buildMessages(context, question) }),
     });
     if (!res.ok) throw new Error(`model request failed: ${res.status}`);
     const body = await res.json();
@@ -73,6 +79,35 @@ export async function askSessionAssistant(
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function askSessionAssistant(
+  modelBaseUrl: string,
+  session: GlimmerSession,
+  events: GlimmerEvent[],
+  question: string,
+  timeoutMs = 30_000
+): Promise<SessionAssistantAnswer> {
+  return askAssistant(
+    modelBaseUrl,
+    { kind: "session", label: "Session evidence", evidence: summarizeEvidence(session, events) },
+    question,
+    timeoutMs,
+  );
+}
+
+export function askRepositoryAssistant(
+  modelBaseUrl: string,
+  evidence: string,
+  question: string,
+  timeoutMs = 30_000,
+): Promise<SessionAssistantAnswer> {
+  return askAssistant(
+    modelBaseUrl,
+    { kind: "repository selection", label: "Repository evidence", evidence },
+    question,
+    timeoutMs,
+  );
 }
 
 // Streaming variant: forwards `stream: true` upstream (OpenAI-compatible SSE:
@@ -85,17 +120,14 @@ export async function askSessionAssistant(
 // (see below) so the caller (the route handler) can abort the upstream
 // request the moment its own client disconnects, instead of leaving it
 // running to completion for nothing.
-export async function streamSessionAssistant(
+async function streamAssistant(
   modelBaseUrl: string,
-  session: GlimmerSession,
-  events: GlimmerEvent[],
+  context: AssistantContext,
   question: string,
   onDelta: (delta: string) => void,
   timeoutMs = 30_000,
   signal?: AbortSignal
 ): Promise<string> {
-  const evidence = summarizeEvidence(session, events);
-
   // Idle timeout, not one wall-clock deadline: a slow-but-steady stream of
   // deltas must not be killed just because the whole answer takes longer
   // than timeoutMs to finish — only actual silence (no delta at all) for
@@ -136,7 +168,9 @@ export async function streamSessionAssistant(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: combinedSignal,
-      body: JSON.stringify({ model: "muse-glimmer", stream: true, messages: buildMessages(evidence, question) }),
+      // Same no-tools boundary as askAssistant above; streaming changes only
+      // transport, never the model's capabilities.
+      body: JSON.stringify({ model: "muse-glimmer", stream: true, messages: buildMessages(context, question) }),
     });
     if (!res.ok || !res.body) throw new Error(`model request failed: ${res.status}`);
 
@@ -158,4 +192,41 @@ export async function streamSessionAssistant(
   } finally {
     clearTimeout(idleTimer);
   }
+}
+
+export function streamSessionAssistant(
+  modelBaseUrl: string,
+  session: GlimmerSession,
+  events: GlimmerEvent[],
+  question: string,
+  onDelta: (delta: string) => void,
+  timeoutMs = 30_000,
+  signal?: AbortSignal,
+): Promise<string> {
+  return streamAssistant(
+    modelBaseUrl,
+    { kind: "session", label: "Session evidence", evidence: summarizeEvidence(session, events) },
+    question,
+    onDelta,
+    timeoutMs,
+    signal,
+  );
+}
+
+export function streamRepositoryAssistant(
+  modelBaseUrl: string,
+  evidence: string,
+  question: string,
+  onDelta: (delta: string) => void,
+  timeoutMs = 30_000,
+  signal?: AbortSignal,
+): Promise<string> {
+  return streamAssistant(
+    modelBaseUrl,
+    { kind: "repository selection", label: "Repository evidence", evidence },
+    question,
+    onDelta,
+    timeoutMs,
+    signal,
+  );
 }
