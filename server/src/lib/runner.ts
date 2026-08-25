@@ -105,8 +105,11 @@ export function validateAdvanced(contract: TaskContract): string | null {
   return null;
 }
 
-export function buildArgs(contract: TaskContract, workspace: string): string[] {
+export function buildArgs(contract: TaskContract, workspace: string, sessionId?: string): string[] {
   const args = ["--workspace", workspace];
+  if (sessionId && /^[A-Za-z0-9._-]+$/.test(sessionId)) {
+    args.push("--session-id", sessionId);
+  }
   args.push("--max-repairs", String(contract.repairBudget));
   if (contract.verification.length === 0) {
     args.push("--verification-level", "minimal");
@@ -128,6 +131,12 @@ export function buildArgs(contract: TaskContract, workspace: string): string[] {
   // Review round 1 fix: was silently missing -- see MODES comment above.
   if (MODES.has(contract.mode)) {
     args.push("--mode", contract.mode);
+  }
+  if (contract.intent?.kind === "improvement-assessment" || contract.intent?.kind === "direct") {
+    args.push("--intent", contract.intent.kind);
+    if (contract.intent.source === "explicit" || contract.intent.source === "deterministic-inference") {
+      args.push("--intent-source", contract.intent.source);
+    }
   }
 
   // Review MJ4: forward the contract's scope -- see SCOPE_PACKAGES above.
@@ -210,25 +219,39 @@ export function runGlimmer(
   const log = createWriteStream(logPath, { flags: "a" });
   const isNodeFixture = engineerScriptPath.endsWith(".mjs");
   const child = isNodeFixture
-    ? spawn(process.execPath, [engineerScriptPath, ...args])
-    : spawn("python3", [engineerScriptPath, ...args]);
+    ? spawn(process.execPath, [engineerScriptPath, ...args], { detached: process.platform !== "win32" })
+    : spawn("python3", [engineerScriptPath, ...args], { detached: process.platform !== "win32" });
+
+  let settled = false;
+  const finish = (code: number | null) => {
+    if (settled) return;
+    settled = true;
+    log.end();
+    onExit(code);
+  };
 
   child.stdout.on("data", (chunk) => log.write(chunk));
   child.stderr.on("data", (chunk) => log.write(chunk));
-  child.on("exit", (code) => {
-    log.end();
-    onExit(code);
-  });
+  child.on("exit", finish);
   // A failed spawn (e.g. python3 missing) never fires "exit"; without this the
   // caller's cancel handle would stay registered forever and every retry 409s.
   child.on("error", (err) => {
     log.write(String(err) + "\n");
-    log.end();
-    onExit(null);
+    finish(null);
   });
 
   return {
     pid: child.pid ?? -1,
-    cancel: () => child.kill("SIGTERM"),
+    cancel: () => {
+      if (settled || !child.pid) return;
+      try {
+        // Each orchestrator is a process-group leader on Unix. Cancelling the
+        // group also terminates an in-flight engineer/model child instead of
+        // leaving it orphaned after the top-level process exits.
+        process.kill(process.platform === "win32" ? child.pid : -child.pid, "SIGTERM");
+      } catch {
+        // The process may have exited between the settled check and signal.
+      }
+    },
   };
 }

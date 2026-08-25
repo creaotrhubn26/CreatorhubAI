@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import request from "supertest";
 import { promises as fs } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
@@ -152,6 +152,7 @@ describe("per-hunk diff review routes", () => {
     expect(content).toContain("line 2 changed");
     expect(content).not.toContain("line 25 changed");
     const reread = await request(app).get(`/api/sessions/${id}/diff`);
+    expect(reread.status).toBe(200);
     expect(reread.body.hunks).toHaveLength(1);
   });
 
@@ -351,6 +352,62 @@ describe("POST /api/sessions", () => {
     expect(res.status).toBe(201);
     expect(res.body).toHaveProperty("id");
   });
+
+  it("preserves the exact objective and adds deterministic improvement intent", async () => {
+    const objective = "Hva kan bli bedre?";
+    const res = await request(app)
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: {
+          objective,
+          scope: { package: "repository" },
+          mode: "inspect",
+          constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+          verification: [],
+          repairBudget: 0,
+        },
+        workspace: "/tmp/ws",
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toMatch(/^\d{8}-\d{6}-[a-f0-9-]{12}$/);
+    expect(res.body.task).toBe(objective);
+    expect(res.body.taskContract.objective).toBe(objective);
+    expect(res.body.taskContract.intent).toEqual({
+      kind: "improvement-assessment",
+      source: "deterministic-inference",
+    });
+  });
+});
+
+describe("GET /api/sessions/:id/task-report", () => {
+  it("returns the first-class read-only artifact with the original objective", async () => {
+    const id = "20260825-000002-task-report-route";
+    const dir = path.join(stateRoot, "sessions", id);
+    const report = {
+      schemaVersion: 1,
+      mode: "inspect",
+      objective: "Hva kan bli bedre?",
+      summary: "Two focused improvements were identified.",
+      findings: [{
+        severity: "medium",
+        category: "reliability",
+        title: "Persist run ownership",
+        description: "In-memory ownership disappears on restart.",
+        evidence: [{ path: "server/src/routes/sessions.ts", line: 1, detail: "Run state was process-local." }],
+        recommendedFix: "Persist the canonical run record.",
+      }],
+      implementationPlan: ["Persist the run record atomically."],
+      confidence: "high",
+    };
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "task-report.json"), JSON.stringify(report));
+
+    const res = await request(app).get(`/api/sessions/${id}/task-report`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(report);
+    expect((await request(app).get("/api/sessions/missing-task-report/task-report")).status).toBe(404);
+  });
 });
 
 describe("POST /api/sessions — §7 advanced controls validation", () => {
@@ -413,6 +470,29 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
 });
 
 describe("POST /api/sessions/:id/run replay protection", () => {
+  let runWorkspace: string;
+  let mainWorkspace: string;
+
+  beforeAll(async () => {
+    runWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-run-route-"));
+    mainWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-main-route-"));
+    for (const repo of [runWorkspace, mainWorkspace]) {
+      await execGit("git", ["init", "-q"], { cwd: repo });
+      await execGit("git", ["config", "user.email", "t@t.com"], { cwd: repo });
+      await execGit("git", ["config", "user.name", "t"], { cwd: repo });
+      await fs.writeFile(path.join(repo, "README.md"), "fixture\n");
+      await execGit("git", ["add", "README.md"], { cwd: repo });
+      await execGit("git", ["commit", "-q", "-m", "baseline"], { cwd: repo });
+    }
+    await execGit("git", ["switch", "-q", "-c", "glimmer/run-route-test"], { cwd: runWorkspace });
+    await execGit("git", ["branch", "-M", "main"], { cwd: mainWorkspace });
+  });
+
+  afterAll(async () => {
+    await fs.rm(runWorkspace, { recursive: true, force: true });
+    await fs.rm(mainWorkspace, { recursive: true, force: true });
+  });
+
   const validContract = {
     objective: "Fix a thing",
     scope: { package: "frontend" },
@@ -422,10 +502,104 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     repairBudget: 1,
   };
 
+  it("rejects a non-glimmer branch synchronously with a recovery instruction", async () => {
+    const created = await request(app)
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .send({ taskContract: validContract, workspace: mainWorkspace });
+
+    const run = await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN);
+
+    expect(run.status).toBe(409);
+    expect(run.body.error).toContain("branch main");
+    expect(run.body.error).toContain("glimmer/*");
+    await expect(fs.stat(path.join(stateRoot, "sessions", created.body.id))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a non-Git workspace before spawning the orchestrator", async () => {
+    const created = await request(app)
+      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .send({ taskContract: validContract, workspace });
+
+    const run = await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN);
+
+    expect(run.status).toBe(400);
+    expect(run.body.error).toContain("Git worktree");
+  });
+
+  it("cancels an active run by the same canonical id returned at creation", async () => {
+    process.env.GLIMMER_FAKE_REAL_ID = "stay-running";
+    try {
+      const created = await request(app)
+        .post("/api/sessions").set("Origin", UI_ORIGIN)
+        .send({ taskContract: validContract, workspace: runWorkspace });
+      expect((await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN)).status).toBe(200);
+      expect(created.body.id).not.toMatch(/^pending-/);
+
+      let manifestVisible = false;
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const current = await request(app).get(`/api/sessions/${created.body.id}`);
+        if (current.status === 200 && current.body.id === created.body.id && current.body.task === "cancellable fixture") {
+          manifestVisible = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(manifestVisible).toBe(true);
+
+      const cancelled = await request(app).post(`/api/sessions/${created.body.id}/cancel`).set("Origin", UI_ORIGIN);
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body).toEqual({ cancelled: true });
+    } finally {
+      delete process.env.GLIMMER_FAKE_REAL_ID;
+    }
+  });
+
+  it("cancels an owned process from durable state after gateway memory is gone", async () => {
+    const id = "20260825-000003-restart-cancel";
+    const fixture = path.join(__dirname, "..", "lib", "__fixtures__", "fake-glimmer-v2.mjs");
+    let orphan: ChildProcess | undefined;
+    try {
+      orphan = spawn(process.execPath, [fixture, "--session-id", id, "--workspace", runWorkspace], {
+        detached: process.platform !== "win32",
+        env: { ...process.env, GLIMMER_FAKE_REAL_ID: "stay-running", GLIMMER_STATE_ROOT: stateRoot },
+        stdio: "ignore",
+      });
+      await new Promise<void>((resolve, reject) => {
+        orphan!.once("spawn", resolve);
+        orphan!.once("error", reject);
+      });
+      await fs.mkdir(path.join(stateRoot, "gateway-runs"), { recursive: true });
+      await fs.writeFile(path.join(stateRoot, "gateway-runs", `${id}.json`), JSON.stringify({
+        version: 1,
+        id,
+        contract: validContract,
+        workspace: runWorkspace,
+        state: "running",
+        createdAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+        pid: orphan.pid,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 75));
+
+      const exited = new Promise<void>((resolve) => orphan!.once("exit", () => resolve()));
+      const cancelled = await request(app).post(`/api/sessions/${id}/cancel`).set("Origin", UI_ORIGIN);
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body).toEqual({ cancelled: true });
+      await exited;
+      orphan = undefined;
+
+      const record = JSON.parse(await fs.readFile(path.join(stateRoot, "gateway-runs", `${id}.json`), "utf8"));
+      expect(record.state).toBe("cancel_requested");
+      expect(typeof record.completedAt).toBe("string");
+    } finally {
+      orphan?.kill("SIGTERM");
+    }
+  });
+
   it("a second /run call for the same id does not spawn a second process", async () => {
     const createRes = await request(app)
       .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: validContract, workspace: "/tmp/ws" });
+      .send({ taskContract: validContract, workspace: runWorkspace });
     const id = createRes.body.id as string;
 
     const firstRun = await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
@@ -438,15 +612,15 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     expect([404, 409]).toContain(secondRun.status);
   });
 
-  it("POST /run persists the task contract so it survives pendingContracts being cleared", async () => {
+  it("POST /sessions persists the task contract before the run starts", async () => {
     const created = await request(app)
       .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: validContract, workspace: "/tmp/ws" });
+      .send({ taskContract: validContract, workspace: runWorkspace });
     const id = created.body.id;
-    await request(app).post(`/api/sessions/${id}/run`).set("Origin", UI_ORIGIN);
-    const contractPath = path.join(stateRoot, "sessions", id, "gateway-contract.json");
-    const written = JSON.parse(await fs.readFile(contractPath, "utf-8"));
-    expect(written).toEqual(validContract);
+    const recordPath = path.join(stateRoot, "gateway-runs", `${id}.json`);
+    const written = JSON.parse(await fs.readFile(recordPath, "utf-8"));
+    expect(written.contract).toMatchObject(validContract);
+    expect(written.contract.intent).toEqual({ kind: "direct", source: "deterministic-inference" });
   });
 });
 

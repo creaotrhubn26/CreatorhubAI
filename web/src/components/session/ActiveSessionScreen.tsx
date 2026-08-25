@@ -19,6 +19,7 @@ import { DeliveryReviewPanel } from "./DeliveryReviewPanel";
 import { DeliveryPacketPanel } from "./DeliveryPacketPanel";
 import { VisualVerificationPanel } from "./VisualVerificationPanel";
 import { EvidencePanel } from "./EvidencePanel";
+import { TaskReportPanel } from "./TaskReportPanel";
 
 // Non-success terminal states where a `failure` cause (if present) is worth
 // surfacing as a banner. "verified" is terminal but not a failure to
@@ -159,12 +160,13 @@ export function ActiveSessionScreen() {
       queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
     },
   });
-  const { data: session } = useQuery({
+  const sessionQuery = useQuery({
     queryKey: ["session", id],
     queryFn: () => glimmerApi.getSession(id!),
     enabled: !!id,
     refetchInterval: 4000,
   });
+  const session = sessionQuery.data;
   const { data: analysis } = useQuery({
     queryKey: ["session-analysis", id],
     queryFn: () => glimmerApi.getSessionAnalysis(id!),
@@ -182,13 +184,22 @@ export function ActiveSessionScreen() {
   const state = session ? deriveSessionState(events, session.status) : null;
   const isRunning = session != null && RUNNING_STATES.includes(session.status);
 
+  // A missing session is a query failure, not loading. Ignoring isError here
+  // previously rendered "Loading session…" forever after a gateway 404.
+  if (sessionQuery.isError) {
+    return (
+      <div role="alert">
+        <p>Session unavailable: {(sessionQuery.error as Error).message}</p>
+        <Link to="/tasks/new">Back to New Task</Link>
+      </div>
+    );
+  }
   if (!session || !state) return <div>Loading session…</div>;
 
-  // startedAt isn't populated by the gateway yet (server/src/lib/sessions.ts
-  // hardcodes it undefined); fall back to the deterministic timestamp
-  // embedded in the session id — the same parse the sidebar uses — rather
-  // than omitting elapsed entirely. Still omitted if neither is available.
+  // Older archived manifests predate startedAt; their timestamp-shaped id is
+  // still a deterministic fallback.
   const startedAtBase = session.startedAt ?? sessionTimestamp({ id: session.id })?.toISOString() ?? null;
+  const readOnlyMode = session.taskContract != null && ["inspect", "plan", "review"].includes(session.taskContract.mode);
 
   const showFailureBanner = session.failure && NON_SUCCESS_TERMINAL.includes(state);
 
@@ -210,24 +221,33 @@ export function ActiveSessionScreen() {
         <ApprovalCard sessionId={id} approval={session.pendingApproval} stalled={isStalled(lastEventAt, Date.now())} />
       )}
       <div className="toolbar">
-        <Link to={`/sessions/${id}/diff`}>View diff</Link>
-        <Link to={`/sessions/${id}/verification`}>Verification Center</Link>
-        <button onClick={() => cancelMutation.mutate()} disabled={cancelMutation.isPending}>
-          Cancel
-        </button>
+        {!readOnlyMode && <Link to={`/sessions/${id}/diff`}>View diff</Link>}
+        {!readOnlyMode && <Link to={`/sessions/${id}/verification`}>Verification Center</Link>}
+        {isRunning && (
+          <button
+            onClick={() => cancelMutation.mutate()}
+            disabled={cancelMutation.isPending || cancelMutation.isSuccess}
+          >
+            {cancelMutation.isPending || cancelMutation.isSuccess ? "Cancelling…" : "Cancel"}
+          </button>
+        )}
       </div>
-      {cancelMutation.isError && <div>Unavailable — could not cancel this session.</div>}
+      {isRunning && cancelMutation.isError && (
+        <div>Could not send the cancellation request. Refresh the session; it may already have stopped.</div>
+      )}
       <AgentStateStepper current={state} />
       <dl>
         <dt>Changed files</dt>
         <dd>{session.changedFiles.length}</dd>
       </dl>
-      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
-        Human review:{" "}
-        {session.humanAcceptance?.accepted
-          ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
-          : "Not yet accepted"}
-      </p>
+      {!readOnlyMode && (
+        <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          Human review:{" "}
+          {session.humanAcceptance?.accepted
+            ? `Accepted ${new Date(session.humanAcceptance.acceptedAt).toLocaleString()}`
+            : "Not yet accepted"}
+        </p>
+      )}
       {/* V7 §20: session.status here comes straight from the gateway's own
           read (readSession's computeStale), not the event-derived `state`
           above -- glimmer-v2.py never emits a "stale" agent_state_changed
@@ -250,16 +270,17 @@ export function ActiveSessionScreen() {
             session.architectTrigger.signals?.length ? `: ${session.architectTrigger.signals.join(", ")}` : ""})`}
         </p>
       )}
-      <RepairCycleStepper session={session} />
+      {!readOnlyMode && <RepairCycleStepper session={session} />}
       <GatesRow gates={session.gates} />
       <StatusesRow statuses={session.statuses} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
-      {id && <ArchitecturePlanPanel sessionId={id} />}
-      {id && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
-      {id && <DeliveryReviewPanel sessionId={id} />}
-      {id && <DeliveryPacketPanel sessionId={id} />}
-      {id && <VisualVerificationPanel sessionId={id} />}
-      {id && <EvidencePanel sessionId={id} />}
+      {id && readOnlyMode && <TaskReportPanel sessionId={id} />}
+      {id && !readOnlyMode && <ArchitecturePlanPanel sessionId={id} />}
+      {id && !readOnlyMode && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
+      {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} />}
+      {id && !readOnlyMode && <DeliveryPacketPanel sessionId={id} />}
+      {id && !readOnlyMode && <VisualVerificationPanel sessionId={id} />}
+      {id && !readOnlyMode && <EvidencePanel sessionId={id} />}
     </div>
   );
 }

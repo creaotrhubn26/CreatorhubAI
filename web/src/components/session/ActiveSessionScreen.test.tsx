@@ -8,6 +8,25 @@ import * as sseHook from "../../api/useSessionEvents";
 import { SessionEventsContext } from "../../api/useSessionEvents";
 
 describe("ActiveSessionScreen", () => {
+  it("shows an actionable error instead of loading forever when the session id is unavailable", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockRejectedValue(new Error("not found"));
+    vi.spyOn(client.glimmerApi, "getSessionAnalysis").mockRejectedValue(new Error("not found"));
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/pending-missing"]}>
+          <Routes><Route path="/sessions/:id" element={<ActiveSessionScreen />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/session unavailable: not found/i);
+    expect(screen.queryByText("Loading session…")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /back to new task/i })).toHaveAttribute("href", "/tasks/new");
+  });
+
   it("shows the session's changed-file count and derived state", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
       id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
@@ -72,6 +91,7 @@ describe("ActiveSessionScreen", () => {
     await waitFor(() => screen.getByRole("button", { name: /cancel/i }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith("s1"));
+    expect(screen.getByRole("button", { name: /cancelling/i })).toBeDisabled();
     expect(screen.getByRole("link", { name: /diff/i })).toHaveAttribute("href", "/sessions/s1/diff");
   });
 
@@ -96,7 +116,7 @@ describe("ActiveSessionScreen", () => {
 
     await waitFor(() => screen.getByRole("button", { name: /cancel/i }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
-    await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/could not send the cancellation request/i)).toBeInTheDocument());
   });
 
   it("polls session-analysis on the same 4000ms cadence as the session query, so it never goes stale while live", async () => {
@@ -219,6 +239,7 @@ describe("ActiveSessionScreen", () => {
     expect(title).toBeInTheDocument();
     const banner = title.closest(".failure-banner") as HTMLElement;
     expect(banner.style.getPropertyValue("--badge-color")).toBe("var(--gray)");
+    expect(screen.queryByRole("button", { name: /^cancel$/i })).not.toBeInTheDocument();
   });
 
   it("falls back to the session id's embedded timestamp for elapsed when startedAt is absent", async () => {

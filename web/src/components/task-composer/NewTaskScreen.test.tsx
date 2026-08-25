@@ -44,7 +44,7 @@ describe("NewTaskScreen", () => {
     }
   });
 
-  it("renders read/search/modify as checked and enabled", () => {
+  it("renders read/search/modify as checked for implementation mode", () => {
     render(withQuery(<NewTaskScreen />));
     for (const label of ["Read repository", "Search repository", "Modify files"]) {
       const box = screen.getByLabelText(label) as HTMLInputElement;
@@ -55,6 +55,69 @@ describe("NewTaskScreen", () => {
   it("shows the RUN GLIMMER primary action", () => {
     render(withQuery(<NewTaskScreen />));
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
+  });
+
+  it("keeps the composer visible and shows the gateway reason when a run is rejected", async () => {
+    vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "pending-1" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockRejectedValue(
+      new Error("Refusing branch main: create or choose a worktree on a glimmer/* branch."),
+    );
+
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Check if everything works" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/refusing branch main/i);
+    expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
+  });
+
+  it("turns an open-ended improvement question into an evidence-first implementation task", async () => {
+    const createSpy = vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "s-improve" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Hva kan bli bedre?" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+
+    expect(screen.getByRole("status")).toHaveTextContent(/not search for those words/i);
+    expect((screen.getByText("Mode").closest("fieldset")!.querySelector("select") as HTMLSelectElement).value).toBe("implement");
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+    const [contract] = createSpy.mock.calls[0];
+    expect(contract.mode).toBe("implement");
+    expect(contract.objective).toBe("Hva kan bli bedre?");
+    expect(contract.intent).toEqual({
+      kind: "improvement-assessment",
+      source: "deterministic-inference",
+    });
+  });
+
+  it("respects a manually selected review mode when interpreting an improvement question", async () => {
+    const createSpy = vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "s-review" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Hva som kan bli bedre?" },
+    });
+    fireEvent.change(screen.getByText("Mode").closest("fieldset")!.querySelector("select")!, {
+      target: { value: "review" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+    const [contract] = createSpy.mock.calls[0];
+    expect(contract.mode).toBe("review");
+    expect(contract.objective).toBe("Hva som kan bli bedre?");
+    expect(contract.intent?.kind).toBe("improvement-assessment");
+    expect(screen.getByLabelText("Modify files")).not.toBeChecked();
   });
 
   it("lets the user toggle a verification checkbox on", () => {

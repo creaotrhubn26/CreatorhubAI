@@ -1,18 +1,18 @@
 import { Router, type Request, type Response } from "express";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
-import { CONFIG, sessionsDir } from "../config.js";
+import { CONFIG, gatewayRunLogsDir, sessionsDir } from "../config.js";
 import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
-  resolveSessionId, adoptRealSessionDir, writeGatewayContract,
+  resolveSessionId,
   readArchitecturePlan, readArchitectReviews, readDeliveryReview, readDeliveryPacket, readSessionTasks,
   writeHumanAcceptance, clearHumanAcceptance, readVisualManifest, readVisualFindings,
   readTaskOverrides, writeTaskOverride, applyTaskOverrides,
   readEvidenceIndex, readEvidenceEntry, resolveApproval,
+  readTaskReport,
   readHunkAcceptances, writeHunkAcceptance, clearHunkAcceptance, clearHunkAcceptancesForPath,
 } from "../lib/sessions.js";
-import { gitDiff, gitRevertFile, gitRejectHunk, parseGitDiffHunks, GitHunkReviewError } from "../lib/git.js";
+import { gitDiff, gitRevertFile, gitRejectHunk, gitStatus, parseGitDiffHunks, GitHunkReviewError } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
@@ -21,14 +21,19 @@ import {
 } from "../lib/sessionAssistant.js";
 import { readWorkspaceFile } from "./workspaces.js";
 import {
-  isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap,
+  inferTaskIntent, isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap,
   type VisualVerification, type RepositorySelection, type SessionDiff,
 } from "@glimmer/shared";
+import {
+  createGatewayRun, readGatewayRun, terminateRecordedProcess, updateGatewayRun,
+} from "../lib/runState.js";
 
 export const sessionsRouter = Router();
 
 const activeRuns = new Map<string, { cancel(): void }>();
-const pendingContracts = new Map<string, { contract: TaskContract; workspace: string }>();
+const TASK_MODES = new Set(["inspect", "plan", "implement", "debug", "test", "review", "refactor"]);
+const TASK_INTENTS = new Set(["direct", "improvement-assessment"]);
+const TASK_INTENT_SOURCES = new Set(["explicit", "deterministic-inference"]);
 
 // This session's own repo-map.json, if glimmer-v2.py wrote one for this run.
 // Must take priority over the global findRepoMap() fallback (which walks ALL
@@ -209,9 +214,8 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
     let lastCount = 0;
     const interval = setInterval(async () => {
       try {
-        // readSessionEventsBatch re-resolves the pending -> real session alias
-        // and re-reads events.jsonl (append-only) on every tick, so a stale
-        // lastCount never outruns the file — it only ever grows.
+        // Re-read the canonical session's append-only events file on every
+        // tick, so a stale lastCount never outruns the file — it only grows.
         const events = await readSessionEventsBatch(req.params.id);
         for (const evt of events.slice(lastCount)) {
           res.write(`data: ${JSON.stringify(evt)}\n\n`);
@@ -297,11 +301,19 @@ sessionsRouter.post("/sessions", async (req, res) => {
   const workspace = req.body?.workspace as string | undefined;
   if (
     !contract || typeof contract.objective !== "string" || !contract.objective ||
+    !TASK_MODES.has(contract.mode) ||
     !Array.isArray(contract.verification) ||
     typeof contract.repairBudget !== "number" ||
     typeof workspace !== "string" || !workspace
   ) {
     return res.status(400).json({ error: "invalid taskContract or workspace" });
+  }
+  if (contract.intent !== undefined && (
+    typeof contract.intent !== "object" ||
+    !TASK_INTENTS.has(contract.intent.kind) ||
+    !TASK_INTENT_SOURCES.has(contract.intent.source)
+  )) {
+    return res.status(400).json({ error: "invalid taskContract.intent" });
   }
   // §7 Advanced controls: server is the validation boundary, not the
   // composer UI — a client posting an out-of-range/wrong-type value directly
@@ -309,46 +321,105 @@ sessionsRouter.post("/sessions", async (req, res) => {
   const advancedError = validateAdvanced(contract);
   if (advancedError) return res.status(400).json({ error: advancedError });
 
-  const id = `pending-${randomUUID()}`;
-  pendingContracts.set(id, { contract, workspace });
-  const session: Partial<GlimmerSession> & { id: string } = {
-    id, task: contract.objective, status: "created", workspace,
-    branch: "Unavailable", baselineSha: "Unavailable", changedFiles: [],
-    verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: contract.repairBudget,
+  const normalizedContract: TaskContract = {
+    ...contract,
+    intent: contract.intent ?? inferTaskIntent(contract.objective),
   };
+  const record = await createGatewayRun(normalizedContract, workspace);
+  const session = await readSession(record.id);
   res.status(201).json(session);
 });
 
 sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
   if (activeRuns.has(req.params.id)) return res.status(409).json({ error: "already running" });
-  const pending = pendingContracts.get(req.params.id);
-  if (!pending) return res.status(404).json({ error: "no pending task contract for this session id" });
+  const record = await readGatewayRun(req.params.id);
+  if (!record) return res.status(404).json({ error: "no task contract for this session id" });
+  if (record.state !== "created") return res.status(409).json({ error: "session has already been started" });
 
-  const dir = path.join(sessionsDir(), req.params.id);
-  await fs.mkdir(dir, { recursive: true });
-  await writeGatewayContract(dir, pending.contract);
+  // Mirror the orchestrator's non-negotiable branch boundary before we
+  // spawn it. This makes an early rejection synchronous and leaves
+  // the composer on screen with a recovery instruction. gitStatus uses
+  // execFile argv (never a shell) and also proves the selected path is a Git
+  // worktree before any child process starts.
+  let workspaceStatus: Awaited<ReturnType<typeof gitStatus>>;
+  try {
+    workspaceStatus = await gitStatus(record.workspace);
+  } catch {
+    return res.status(400).json({
+      error: "Workspace must be a Git worktree on an isolated glimmer/* branch.",
+    });
+  }
+  if (!workspaceStatus.branch.startsWith("glimmer/")) {
+    return res.status(409).json({
+      error: `Refusing branch ${workspaceStatus.branch}: create or choose a worktree on a glimmer/* branch.`,
+    });
+  }
 
-  // Snapshot before spawning: glimmer-v2.py creates its own session directory
-  // early in main(), and whichever directory appears next is this run's.
-  const before = new Set(await listSessionIds());
+  try {
+    await updateGatewayRun(req.params.id, (current) => {
+      if (current.state !== "created") throw new Error("already-started");
+      return {
+        ...current,
+        state: "starting",
+        branch: workspaceStatus.branch,
+        baselineSha: workspaceStatus.headSha,
+        startedAt: new Date().toISOString(),
+      };
+    });
+  } catch (err: any) {
+    if (err?.message === "already-started") return res.status(409).json({ error: "session has already been started" });
+    throw err;
+  }
 
-  const args = buildArgs(pending.contract, pending.workspace);
-  const handle = runGlimmer(dir, CONFIG.glimmerV2Path, ["--engineer", CONFIG.engineerPath, ...args], () => {
+  const logDir = path.join(gatewayRunLogsDir(), req.params.id);
+  await fs.mkdir(logDir, { recursive: true });
+  const args = buildArgs(record.contract, record.workspace, req.params.id);
+  const handle = runGlimmer(logDir, CONFIG.glimmerV2Path, ["--engineer", CONFIG.engineerPath, ...args], (code) => {
     activeRuns.delete(req.params.id);
+    void updateGatewayRun(req.params.id, (current) => ({
+      ...current,
+      state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+      exitCode: code,
+      completedAt: new Date().toISOString(),
+    }));
   });
-  void adoptRealSessionDir(req.params.id, before);
+  if (handle.pid <= 1) {
+    await updateGatewayRun(req.params.id, (current) => ({
+      ...current, state: "start_failed", error: "orchestrator process did not start",
+      completedAt: new Date().toISOString(),
+    }));
+    return res.status(500).json({ error: "orchestrator process did not start" });
+  }
   activeRuns.set(req.params.id, handle);
-  pendingContracts.delete(req.params.id); // consumed: a second /run 404s instead of re-spawning
+  await updateGatewayRun(req.params.id, (current) => ({ ...current, state: "running", pid: handle.pid }));
   res.json({ started: true, pid: handle.pid });
 });
 
 sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
-  if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
-  const run = activeRuns.get(req.params.id);
-  if (!run) return res.status(404).json({ error: "no active run for this session id" });
-  run.cancel();
-  activeRuns.delete(req.params.id);
+  if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
+  const record = await readGatewayRun(req.params.id);
+  if (!record) return res.status(404).json({ error: "not found" });
+  const active = activeRuns.get(req.params.id);
+  if (active) {
+    active.cancel();
+    activeRuns.delete(req.params.id);
+  } else {
+    if (record.state !== "running" && record.state !== "starting") {
+      return res.status(409).json({ error: "session is not running" });
+    }
+    // After a gateway restart the in-memory handle is gone. Only signal a PID
+    // whose live command line proves it belongs to this exact canonical run.
+    if (!(await terminateRecordedProcess(record))) {
+      await updateGatewayRun(req.params.id, (current) => ({
+        ...current, state: "exited", completedAt: current.completedAt ?? new Date().toISOString(),
+      }));
+      return res.status(409).json({ error: "session process is no longer running" });
+    }
+  }
+  await updateGatewayRun(req.params.id, (current) => ({
+    ...current, state: "cancel_requested", completedAt: new Date().toISOString(),
+  }));
   res.json({ cancelled: true });
 });
 
@@ -381,6 +452,16 @@ sessionsRouter.get("/sessions/:id/plan", async (req, res) => {
     const plan = await readArchitecturePlan(req.params.id);
     if (!plan) return res.status(404).json({ error: "not found" });
     res.json(plan);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.get("/sessions/:id/task-report", async (req, res) => {
+  try {
+    const report = await readTaskReport(req.params.id);
+    if (!report) return res.status(404).json({ error: "not found" });
+    res.json(report);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

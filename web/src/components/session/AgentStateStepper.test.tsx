@@ -10,7 +10,9 @@ describe("AgentStateStepper", () => {
   });
 
   it("renders a terminal status as its own badge instead of an unhighlighted flow", () => {
-    for (const terminal of ["blocked", "failed", "needs_review", "verified", "cancelled"] as const) {
+    for (const terminal of [
+      "blocked", "failed", "needs_review", "verified", "completed", "no_change", "cancelled",
+    ] as const) {
       const { unmount } = render(<AgentStateStepper current={terminal} />);
       expect(screen.getByText(terminal)).toBeInTheDocument();
       // No stepper rendered: a finished session never looks mid-flow.

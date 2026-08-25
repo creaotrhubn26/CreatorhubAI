@@ -33,6 +33,19 @@ describe("buildArgs", () => {
     expect(args).toContain("2");
   });
 
+  it("passes the canonical session id and structured intent without replacing the objective", () => {
+    const contract = {
+      ...CONTRACT,
+      objective: "Hva kan bli bedre?",
+      intent: { kind: "improvement-assessment" as const, source: "deterministic-inference" as const },
+    };
+    const args = buildArgs(contract, "/tmp/ws", "20260825-173500-abcdef123456");
+    expect(args[args.indexOf("--session-id") + 1]).toBe("20260825-173500-abcdef123456");
+    expect(args[args.indexOf("--intent") + 1]).toBe("improvement-assessment");
+    expect(args[args.indexOf("--intent-source") + 1]).toBe("deterministic-inference");
+    expect(args.at(-1)).toBe("Hva kan bli bedre?");
+  });
+
   it("puts the objective last, after a literal -- separator, so argparse can never read it as a flag", () => {
     const args = buildArgs(CONTRACT, "/tmp/ws");
     expect(args[args.length - 2]).toBe("--");

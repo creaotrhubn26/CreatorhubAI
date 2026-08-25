@@ -36,7 +36,7 @@ function TaskStatusBadge({ status }: { status: GlimmerTask["status"] }) {
 // below, but a human is exactly who's expected to act on required tasks in
 // that state).
 const READONLY_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set([
-  "verified", "failed", "blocked", "cancelled",
+  "verified", "completed", "no_change", "failed", "blocked", "cancelled",
 ]);
 
 // Review round 1 (Important 2): every status where glimmer-v2.py's process
@@ -47,7 +47,7 @@ const READONLY_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set
 // whether to show the "takes effect on the next run" note, never to hide
 // the buttons themselves (needs_review must stay actionable).
 const TERMINAL_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set([
-  "verified", "failed", "blocked", "cancelled", "needs_review",
+  "verified", "completed", "no_change", "failed", "blocked", "cancelled", "needs_review",
 ]);
 
 function PriorityBadge({ priority }: { priority?: GlimmerTask["priority"] }) {

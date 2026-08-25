@@ -33,3 +33,5 @@ export const CONFIG = {
 } as const;
 
 export const sessionsDir = () => path.join(CONFIG.stateRoot, "sessions");
+export const gatewayRunsDir = () => path.join(CONFIG.stateRoot, "gateway-runs");
+export const gatewayRunLogsDir = () => path.join(CONFIG.stateRoot, "gateway-run-logs");

@@ -1,10 +1,11 @@
 import { useCallback, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
-import type { TaskIntelligence } from "@glimmer/shared";
+import { taskModeAllowsWrites, type TaskIntelligence } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
 import { computeArchitectRisk, deriveVerificationLevel, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
+import { interpretObjectiveIntent } from "../../state/objectiveIntent";
 import { PathPicker } from "../common/PathPicker";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
@@ -160,11 +161,17 @@ export function NewTaskScreen() {
   // state is now rare, not the default outcome of picking these scope types.
   const needsScopePath = PATH_SCOPED_PACKAGES.has(form.scopePackage);
   const scopePathMissing = needsScopePath && !form.scopeArea?.trim();
+  const objectiveInterpretation = interpretObjectiveIntent(form.objective, form.mode);
+  // Preserve the human's exact wording as the source objective. A separate,
+  // typed intent tells every executor how to interpret an open question.
+  const baseContract = buildTaskContract(form);
+  const effectiveContract = objectiveInterpretation
+    ? { ...baseContract, intent: objectiveInterpretation.intent }
+    : baseContract;
 
   const runMutation = useMutation({
     mutationFn: async () => {
-      const contract = buildTaskContract(form);
-      const session = await glimmerApi.createSession(contract, workspace);
+      const session = await glimmerApi.createSession(effectiveContract, workspace);
       await glimmerApi.runSession(session.id);
       return session;
     },
@@ -188,6 +195,11 @@ export function NewTaskScreen() {
               onChange={(e) => setForm({ ...form, objective: e.target.value })}
               placeholder="What should Glimmer work on?"
             />
+            {objectiveInterpretation && (
+              <p role="status" className="composer__intent">
+                {objectiveInterpretation.explanation}
+              </p>
+            )}
             <label>
               Workspace path
               <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
@@ -330,9 +342,9 @@ export function NewTaskScreen() {
               scopeArea={form.scopeArea || undefined}
               workspace={workspace.trim() || undefined}
               mode={form.mode}
-              objective={form.objective}
-              verificationLevel={deriveVerificationLevel(buildTaskContract(form))}
-              candidateCount={buildTaskContract(form).scope.paths?.length}
+              objective={effectiveContract.objective}
+              verificationLevel={deriveVerificationLevel(effectiveContract)}
+              candidateCount={effectiveContract.scope.paths?.length}
               onIntelligence={selectionDraft ? applySelectionIntelligence : undefined}
             />
 
@@ -340,7 +352,7 @@ export function NewTaskScreen() {
               <legend>Permissions</legend>
               <label><input type="checkbox" checked readOnly /> Read repository</label>
               <label><input type="checkbox" checked readOnly /> Search repository</label>
-              <label><input type="checkbox" checked readOnly /> Modify files</label>
+              <label><input type="checkbox" checked={taskModeAllowsWrites(form.mode)} readOnly /> Modify files</label>
               <label><input type="checkbox" checked={false} disabled /> Commit</label>
               <label><input type="checkbox" checked={false} disabled /> Push</label>
               <label><input type="checkbox" checked={false} disabled /> Deploy</label>
@@ -421,6 +433,11 @@ export function NewTaskScreen() {
         <p className="composer__summary">{buildSummaryLine(form)}</p>
         {buildArchitectRiskLine(form) && (
           <p className="composer__architect-risk">{buildArchitectRiskLine(form)}</p>
+        )}
+        {runMutation.isError && (
+          <p role="alert" style={{ color: "var(--red)" }}>
+            Could not start task: {(runMutation.error as Error).message}
+          </p>
         )}
         <button
           className="btn-primary"
