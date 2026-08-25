@@ -241,6 +241,17 @@ legend {
   margin-top: var(--space-3);
 }
 
+.model-registry__models {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: var(--space-3);
+}
+.model-registry__models fieldset > label,
+#model-registry-heading ~ fieldset > label {
+  display: grid;
+  gap: var(--space-1);
+}
+
 /* details/summary as a subtle disclosure, not the default triangle box */
 details {
   background: var(--surface-1);

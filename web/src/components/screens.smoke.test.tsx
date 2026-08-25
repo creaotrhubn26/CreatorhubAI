@@ -18,6 +18,12 @@ vi.spyOn(client.glimmerApi, "getRepositoryMap").mockRejectedValue(new Error("404
 vi.spyOn(client.glimmerApi, "getDocGraph").mockResolvedValue(null);
 vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
 vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+vi.spyOn(client.glimmerApi, "getModelRegistry").mockResolvedValue({
+  version: 1,
+  models: [{ id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080", modelId: "muse-glimmer", hasApiKey: false }],
+  roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
+  source: "default",
+});
 
 function withProviders(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });

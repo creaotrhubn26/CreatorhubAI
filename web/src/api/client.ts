@@ -4,6 +4,7 @@ import type {
   CreateWorkspaceResult,
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
   ApprovalRequest, FsListing, FsFile, RepositorySelection,
+  ModelRegistry, ModelRegistryUpdate,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -105,6 +106,9 @@ async function streamAssistant(
 export const glimmerApi = {
   getStatus: () => request<DashboardStatus>("/api/status"),
   getModelStatus: () => request<ModelStatus>("/api/model/status"),
+  getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
+  saveModelRegistry: (registry: ModelRegistryUpdate) =>
+    request<ModelRegistry>("/api/models/config", { method: "PUT", body: JSON.stringify(registry) }),
   listSessions: () => request<GlimmerSession[]>("/api/sessions"),
   getSession: (id: string) => request<GlimmerSession>(`/api/sessions/${id}`),
   getSessionDiff: (id: string) => request<{ diff: string }>(`/api/sessions/${id}/diff`),

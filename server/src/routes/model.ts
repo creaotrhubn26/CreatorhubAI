@@ -2,8 +2,27 @@ import { Router } from "express";
 import { probeModel, probeModelProps } from "../lib/modelStatus.js";
 import { describeRunState, forgetSpawned, startModelServer, stopModelServer } from "../lib/modelServer.js";
 import { CONFIG } from "../config.js";
+import { ModelRegistryValidationError, readModelRegistry, saveModelRegistry } from "../lib/modelRegistry.js";
 
 export const modelRouter = Router();
+
+modelRouter.get("/models/config", async (_req, res) => {
+  try {
+    res.json(await readModelRegistry());
+  } catch (err: any) {
+    res.status(500).json({ error: String(err?.message ?? err) });
+  }
+});
+
+modelRouter.put("/models/config", async (req, res) => {
+  try {
+    res.json(await saveModelRegistry(req.body));
+  } catch (err: any) {
+    const message = String(err?.message ?? err);
+    const clientError = err instanceof ModelRegistryValidationError;
+    res.status(clientError ? 400 : 500).json({ error: clientError ? message : "could not save model registry" });
+  }
+});
 
 modelRouter.get("/model/status", async (_req, res) => {
   // Independent, best-effort probes run in parallel: a /props failure (or

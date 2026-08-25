@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { getTheme, setTheme, type ThemePreference } from "../../state/themePreference";
 import { tauriGlobal } from "../../state/desktopNotify";
+import { ModelRegistrySettings } from "./ModelRegistrySettings";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -56,6 +57,8 @@ export function SettingsScreen() {
           </button>
         ))}
       </div>
+
+      <ModelRegistrySettings />
 
       <h2 style={{ fontSize: "var(--fs-h1)", fontWeight: 600, textTransform: "none", letterSpacing: "-0.01em", color: "inherit" }}>
         Notifications
