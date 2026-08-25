@@ -1341,6 +1341,132 @@ SAFE_READONLY_GIT_SUBCOMMANDS = {
     "rev-parse",
 }
 
+# GitHub CLI integration is deliberately narrower than the `gh` command
+# surface. Every entry here is a built-in read operation; commands that
+# create/edit/merge/comment, trigger workflows, expose tokens, invoke the
+# generic API client, or select another repository never reach execution.
+SAFE_READONLY_GH_COMMANDS = {
+    "repo": {"view"},
+    "pr": {"list", "view", "status", "checks", "diff"},
+    "issue": {"list", "view", "status"},
+    "run": {"list", "view"},
+    "workflow": {"list", "view"},
+    "release": {"list", "view"},
+}
+
+GH_REPOSITORY_SELECTOR_FLAGS = {"-R", "--repo"}
+GH_INTERACTIVE_FLAGS = {"-w", "--web", "--watch"}
+
+
+def _github_auth_status_policy(tokens):
+    """Allow only non-secret github.com auth status inspection."""
+    args = tokens[3:]
+    index = 0
+
+    while index < len(args):
+        token = args[index]
+
+        if token == "--active":
+            index += 1
+            continue
+
+        if token in {"-h", "--hostname"}:
+            if index + 1 >= len(args) or args[index + 1].lower() != "github.com":
+                return False, "GitHub auth status is restricted to github.com"
+            index += 2
+            continue
+
+        if token.startswith("--hostname="):
+            if token.split("=", 1)[1].lower() != "github.com":
+                return False, "GitHub auth status is restricted to github.com"
+            index += 1
+            continue
+
+        return False, "Only non-secret GitHub auth status flags are allowed"
+
+    return True, "safe GitHub authentication status"
+
+
+def _github_repo_view_policy(args):
+    """Keep `gh repo view` bound to the repository selected by cwd."""
+    flags_with_value = {"--branch", "--json", "--jq", "--template"}
+    boolean_flags = {"--exit-status"}
+    index = 0
+
+    while index < len(args):
+        token = args[index]
+
+        if token in boolean_flags:
+            index += 1
+            continue
+
+        if token in flags_with_value:
+            if index + 1 >= len(args):
+                return False, f"{token} requires a value"
+            index += 2
+            continue
+
+        if any(token.startswith(flag + "=") for flag in flags_with_value):
+            index += 1
+            continue
+
+        return False, (
+            "gh repo view may only inspect the current repository; "
+            "repository arguments are blocked"
+        )
+
+    return True, "safe read-only GitHub repo view"
+
+
+def github_cli_policy(tokens):
+    """Positive allowlist for a single, already-tokenized `gh` command."""
+    if len(tokens) < 3:
+        return False, "Incomplete GitHub CLI command"
+
+    namespace = tokens[1].lower()
+    subcommand = tokens[2].lower()
+
+    if namespace == "auth":
+        if subcommand != "status":
+            return False, "GitHub authentication changes and token access are blocked"
+        return _github_auth_status_policy(tokens)
+
+    if subcommand not in SAFE_READONLY_GH_COMMANDS.get(namespace, set()):
+        return False, (
+            f"gh {namespace} {subcommand} is outside the read-only allowlist. "
+            "Create/edit/comment/merge/trigger/API operations are blocked."
+        )
+
+    args = tokens[3:]
+    for index, token in enumerate(args):
+        if token in GH_REPOSITORY_SELECTOR_FLAGS:
+            return False, "GitHub repository override flags are blocked"
+        if token.startswith("--repo=") or token.startswith("-R=") or (
+            token.startswith("-R") and token != "-R"
+        ):
+            return False, "GitHub repository override flags are blocked"
+        if token in GH_INTERACTIVE_FLAGS or token.startswith("--web="):
+            return False, "Interactive GitHub CLI flags are blocked"
+        if token in {"-h", "--hostname"} or token.startswith("--hostname="):
+            return False, "GitHub hostname overrides are blocked"
+        lowered = token.lower()
+        if (
+            "://" in lowered
+            or lowered.startswith("git@")
+            or "github.com/" in lowered
+        ):
+            return False, "GitHub URL arguments are blocked; use the current repository"
+
+        # A selector flag's value can never be reached as an independent
+        # repository argument, even if future parsing changes above.
+        if index > 0 and args[index - 1] in GH_REPOSITORY_SELECTOR_FLAGS:
+            return False, "GitHub repository override flags are blocked"
+
+    if namespace == "repo":
+        return _github_repo_view_policy(args)
+
+    return True, f"safe read-only GitHub CLI: gh {namespace} {subcommand}"
+
 
 def _is_typecheck_script(script):
     return script == "typecheck" or script.startswith("typecheck:")
@@ -1465,6 +1591,14 @@ def shell_policy(
             "No add/commit/push/reset/clean/"
             "checkout/switch/stash/merge/rebase."
         )
+
+
+    # --------------------------------------------------------
+    # READ-ONLY GITHUB CLI
+    # --------------------------------------------------------
+
+    if executable == "gh":
+        return github_cli_policy(tokens)
 
 
     # --------------------------------------------------------
@@ -2220,13 +2354,11 @@ def architect_shell_policy(command, workspace):
     after any future change to shell_policy, without anyone having to
     remember to mirror that change here too.
 
-    Additionally requires `git <subcommand>` where subcommand is in the
-    SAME module-level SAFE_READONLY_GIT_SUBCOMMANDS set shell_policy's own
-    git branch and the repeat-command guard already share (per ADR-0002's
-    "one allowlist" rule) — architect mode has no legitimate use for
-    npm/cargo/py_compile validation commands or `git branch
-    --show-current` (shell_policy allows all of those; architect mode is
-    narrower still).
+    Additionally requires either a Git subcommand in the shared
+    SAFE_READONLY_GIT_SUBCOMMANDS set or a command accepted by the shared
+    GitHub CLI read-only policy. Architect mode still has no legitimate
+    use for npm/cargo/py_compile validation commands or `git branch
+    --show-current` (shell_policy allows those; architect mode is narrower).
     """
     allowed, reason = shell_policy(command, workspace)
 
@@ -2237,13 +2369,16 @@ def architect_shell_policy(command, workspace):
     # can't raise — re-split just to inspect the executable/subcommand.
     tokens = shlex.split(command.strip())
 
-    if tokens[0] != "git" or len(tokens) < 2 or tokens[1] not in SAFE_READONLY_GIT_SUBCOMMANDS:
-        return False, (
-            "Architect mode allows only read-only git commands: "
-            "git {" + ", ".join(sorted(SAFE_READONLY_GIT_SUBCOMMANDS)) + "}"
-        )
+    if tokens[0] == "git" and len(tokens) >= 2 and tokens[1] in SAFE_READONLY_GIT_SUBCOMMANDS:
+        return True, f"safe read-only git {tokens[1]} (architect mode)"
 
-    return True, f"safe read-only git {tokens[1]} (architect mode)"
+    if tokens[0] == "gh":
+        return True, f"safe read-only GitHub CLI (architect mode): {tokens[1]} {tokens[2]}"
+
+    return False, (
+        "Architect mode allows only read-only git and allowlisted "
+        "GitHub CLI inspection commands"
+    )
 
 
 def _is_idempotent_validation_command(command):
@@ -4443,7 +4578,8 @@ def execute_tool(
                 arguments["timeout"] = minimum_timeout
 
         if mode == "architect":
-            # Stricter than shell_policy: read-only git only. See
+            # Stricter than shell_policy: read-only git and the shared
+            # positive GitHub CLI inspection allowlist only. See
             # architect_shell_policy's docstring.
             allowed, reason = architect_shell_policy(command, workspace)
         else:
@@ -5087,6 +5223,62 @@ def _tool_envelope_selfcheck() -> None:
     print("tool envelope self-check: PASS")
 
 
+def _github_cli_policy_selfcheck() -> None:
+    """Regression coverage for the positive GitHub CLI allowlist."""
+    workspace = Path("/tmp")
+
+    allowed_commands = (
+        "gh auth status",
+        "gh auth status --hostname github.com --active",
+        "gh pr list",
+        "gh pr view 42 --comments",
+        "gh pr status",
+        "gh pr checks 42",
+        "gh issue list --limit 20",
+        "gh run view 123 --log",
+        "gh workflow view ci.yml",
+        "gh release view v1",
+        "gh repo view",
+        "gh repo view --json name,url",
+    )
+    blocked_commands = (
+        "gh auth login",
+        "gh auth logout",
+        "gh auth token",
+        "gh auth status --hostname enterprise.example.com",
+        "gh api repos/owner/repo",
+        "gh secret list",
+        "gh pr create --title x --body y",
+        "gh pr merge 42",
+        "gh pr comment 42 --body x",
+        "gh issue create --title x --body y",
+        "gh workflow run ci.yml",
+        "gh run rerun 123",
+        "gh run cancel 123",
+        "gh release create v1",
+        "gh pr list --repo owner/other",
+        "gh pr list -Rowner/other",
+        "gh repo view owner/other",
+        "gh pr view https://github.com/owner/other/pull/42",
+        "gh pr view 42 --web",
+        "gh pr checks 42 --watch",
+        "gh pr list; gh pr create --title x --body y",
+    )
+
+    for command in allowed_commands:
+        allowed, reason = shell_policy(command, workspace)
+        assert allowed is True, f"expected GitHub CLI read to pass: {command!r}: {reason}"
+
+    for command in blocked_commands:
+        allowed, reason = shell_policy(command, workspace)
+        assert allowed is False, f"expected GitHub CLI mutation/scope escape to fail: {command!r}: {reason}"
+
+    assert architect_shell_policy("gh pr list", workspace)[0] is True
+    assert architect_shell_policy("gh workflow run ci.yml", workspace)[0] is False
+
+    print("GitHub CLI policy self-check: PASS")
+
+
 def _architect_mode_selfcheck() -> None:
     """C1 (glimmer-v7): proves architect mode's core invariants without a
     live llama-server. Run with:
@@ -5165,11 +5357,16 @@ def _architect_mode_selfcheck() -> None:
         "existing call site (which never passes mode=) is unaffected"
     )
 
-    # exec_shell_command in architect mode: only read-only git passes.
+    # exec_shell_command in architect mode: read-only git and the shared,
+    # positive GitHub CLI inspection allowlist pass.
     ws = Path("/tmp")
     assert architect_shell_policy("git status", ws)[0] is True
     assert architect_shell_policy("git diff --stat", ws)[0] is True
     assert architect_shell_policy("git rev-parse --show-toplevel", ws)[0] is True
+    assert architect_shell_policy("gh pr list", ws)[0] is True
+    assert architect_shell_policy("gh issue view 42", ws)[0] is True
+    assert architect_shell_policy("gh pr create --title x --body y", ws)[0] is False
+    assert architect_shell_policy("gh api repos/owner/repo", ws)[0] is False
     assert architect_shell_policy("npm run typecheck", ws)[0] is False
     assert architect_shell_policy("git commit -m x", ws)[0] is False
     assert architect_shell_policy("git push", ws)[0] is False
@@ -6903,8 +7100,12 @@ ARCHITECT_SYSTEM_PROMPT = (
     "You have NO write access. write_file and edit_file are not offered "
     "to you in this mode, and any attempt to call them is rejected "
     "before it can touch the filesystem. Your exec_shell_command access "
-    "is restricted to read-only git commands only "
-    "(git status, git diff, git show, git log, git rev-parse). You "
+    "is restricted to read-only git commands "
+    "(git status, git diff, git show, git log, git rev-parse) and an "
+    "allowlisted read-only subset of GitHub CLI (status/list/view/checks/"
+    "diff for the current repository). GitHub CLI auth changes, token/API "
+    "access, repository overrides, comments, merges and workflow triggers "
+    "are blocked. You "
     "cannot install dependencies, run tests or builds, commit, push, or "
     "deploy.\n\n"
 
@@ -7194,6 +7395,182 @@ def _extract_json_object(text):
 
 
 # ============================================================
+# READ-ONLY TASK REPORTS (inspect / plan / review)
+# ============================================================
+
+TASK_REPORT_MODES = {"inspect", "plan", "review"}
+TASK_REPORT_SEVERITIES = {"critical", "high", "medium", "low", "info"}
+TASK_REPORT_CONFIDENCE = {"high", "medium", "low"}
+
+TASK_REPORT_SYSTEM_PROMPT = (
+    "Reasoning strength: high. You are Glimmer's read-only repository analyst. "
+    "This is a terminal task mode, not a planning pre-step for a writer. You have "
+    "NO write access: write_file/edit_file are not offered and are hard-blocked; "
+    "exec_shell_command is restricted to read-only git and the allowlisted read-only "
+    "GitHub CLI subset for the current repository. Do not install dependencies, "
+    "run tests/builds, commit, push, or deploy. Inspect actual repository evidence "
+    "before making repository-specific claims. Cite concrete files and line numbers "
+    "when available; record uncertainty instead of inventing facts.\n\n"
+    "For inspect, identify and prioritize evidence-backed repository findings. For "
+    "plan, produce an actionable ordered implementation plan grounded in evidence. "
+    "For review, focus on correctness, regressions, security, maintainability and "
+    "missing tests in the selected scope.\n\n"
+    "Your FINAL answer must be exactly one JSON object, no prose or markdown fence:\n"
+    "{\n"
+    '  "summary": "concise evidence-based result",\n'
+    '  "findings": [{"severity":"critical|high|medium|low|info", "category":"...", '
+    '"title":"...", "description":"...", "evidence":[{"path":"src/x.ts", '
+    '"line":12, "detail":"..."}], "recommendedFix":"..."}],\n'
+    '  "implementationPlan": ["ordered step 1", "ordered step 2"],\n'
+    '  "confidence": "high|medium|low"\n'
+    "}\n"
+    "All four keys are required. Empty arrays are allowed when repository evidence "
+    "supports no findings or no implementation steps."
+)
+
+
+def validate_task_report(data, mode, objective):
+    if mode not in TASK_REPORT_MODES:
+        return False, "invalid task report mode"
+    if not isinstance(data, dict):
+        return False, "response is not a JSON object"
+    summary = data.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return False, "missing/invalid 'summary'"
+    confidence = data.get("confidence")
+    if confidence not in TASK_REPORT_CONFIDENCE:
+        return False, "missing/invalid 'confidence'"
+    raw_findings = data.get("findings")
+    raw_plan = data.get("implementationPlan")
+    if not isinstance(raw_findings, list) or not isinstance(raw_plan, list):
+        return False, "findings and implementationPlan must be arrays"
+
+    findings = []
+    for raw in raw_findings[:100]:
+        if not isinstance(raw, dict):
+            continue
+        severity = raw.get("severity")
+        if severity not in TASK_REPORT_SEVERITIES:
+            severity = "info"
+        title = raw.get("title")
+        description = raw.get("description")
+        category = raw.get("category")
+        recommended = raw.get("recommendedFix")
+        if not all(isinstance(v, str) and v.strip() for v in (title, description, category, recommended)):
+            continue
+        evidence = []
+        raw_evidence = raw.get("evidence")
+        if isinstance(raw_evidence, list):
+            for item in raw_evidence[:20]:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path")
+                detail = item.get("detail")
+                if not isinstance(path, str) or not path.strip() or not isinstance(detail, str) or not detail.strip():
+                    continue
+                record = {"path": path.strip()[:500], "detail": detail.strip()[:2000]}
+                line = item.get("line")
+                if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+                    record["line"] = line
+                evidence.append(record)
+        findings.append({
+            "severity": severity,
+            "category": category.strip()[:200],
+            "title": title.strip()[:500],
+            "description": description.strip()[:4000],
+            "evidence": evidence,
+            "recommendedFix": recommended.strip()[:4000],
+        })
+
+    plan = [step.strip()[:2000] for step in raw_plan[:100] if isinstance(step, str) and step.strip()]
+    return True, {
+        "schemaVersion": 1,
+        "mode": mode,
+        "objective": objective,
+        "summary": summary.strip()[:8000],
+        "findings": findings,
+        "implementationPlan": plan,
+        "confidence": confidence,
+    }
+
+
+def _fallback_task_report(mode, objective, reason):
+    return {
+        "schemaVersion": 1,
+        "mode": mode,
+        "objective": objective,
+        "summary": "The read-only report could not be completed.",
+        "findings": [],
+        "implementationPlan": [],
+        "confidence": "low",
+        "reportFailed": True,
+        "reportFailureReason": reason,
+    }
+
+
+def _write_task_report_file(output):
+    if not GLIMMER_EVENTS_PATH or not GLIMMER_SESSION_ID:
+        print("[glimmer-engineer] no session dir available; task-report.json not written.")
+        return None
+    path = Path(GLIMMER_EVENTS_PATH).parent / "task-report.json"
+    try:
+        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Wrote: {path}")
+        return path
+    except OSError as exc:
+        print(f"[glimmer-engineer] failed to write task-report.json: {exc}")
+        return None
+
+
+def _task_report_selfcheck():
+    import inspect
+    import tempfile
+
+    valid = {
+        "summary": "One evidence-backed issue found.",
+        "findings": [{
+            "severity": "high", "category": "correctness", "title": "Unsafe fallback",
+            "description": "The fallback hides a real failure.",
+            "evidence": [{"path": "src/a.ts", "line": 12, "detail": "catch returns success"}],
+            "recommendedFix": "Preserve the failure state.",
+        }],
+        "implementationPlan": ["Change the fallback", "Add a regression test"],
+        "confidence": "high",
+    }
+    ok, normalized = validate_task_report(valid, "inspect", "Hva kan bli bedre?")
+    assert ok
+    assert normalized["schemaVersion"] == 1
+    assert normalized["mode"] == "inspect"
+    assert normalized["objective"] == "Hva kan bli bedre?"
+    assert validate_task_report(valid, "implement", "x")[0] is False
+    assert _fallback_task_report("review", "x", "failed")["reportFailed"] is True
+
+    tree = ast.parse(inspect.getsource(run_architect))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "execute_tool"
+    ]
+    assert len(calls) == 1
+    kwargs = {kw.arg: kw.value for kw in calls[0].keywords}
+    assert isinstance(kwargs.get("mode"), ast.Constant) and kwargs["mode"].value == "architect"
+
+    global GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    old_events, old_session = GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            GLIMMER_EVENTS_PATH = str(Path(td) / "events.jsonl")
+            GLIMMER_SESSION_ID = "task-report-selfcheck"
+            written = _write_task_report_file(normalized)
+            assert written == Path(td) / "task-report.json"
+            assert json.loads(written.read_text(encoding="utf-8"))["objective"] == "Hva kan bli bedre?"
+    finally:
+        GLIMMER_EVENTS_PATH, GLIMMER_SESSION_ID = old_events, old_session
+
+    print("read-only task report self-check: PASS")
+
+
+# ============================================================
 # ARCHITECT REVIEW (C2, glimmer-v7 — V7 §§5.6-5.13)
 # ============================================================
 #
@@ -7229,7 +7606,8 @@ ARCHITECT_REVIEW_SYSTEM_PROMPT = (
     "(V7 §5.9) of an implementation an engineer just produced, before "
     "the trusted verifier runs. You have the SAME read-only access as "
     "architecture planning: no write_file/edit_file, exec_shell_command "
-    "restricted to read-only git. You cannot install dependencies, run "
+    "restricted to read-only git and allowlisted GitHub CLI inspection. "
+    "You cannot install dependencies, run "
     "tests or builds, commit, push, or deploy.\n\n"
 
     "You are not a rubber stamp (V7 §5.8). Using the ArchitecturePlan, "
@@ -7463,7 +7841,7 @@ def _build_review_task_message(review_request):
     return message
 
 
-def run_architect(task, workspace, max_turns, review_request_path=None):
+def run_architect(task, workspace, max_turns, review_request_path=None, task_mode=None):
     """C1/C2 (glimmer-v7): read-only architecture-planning loop, and (C2)
     the SAME loop reused for pre-verification review when
     review_request_path is given.
@@ -7503,6 +7881,9 @@ def run_architect(task, workspace, max_turns, review_request_path=None):
         )
 
     review_mode = review_request_path is not None
+    report_mode = task_mode in TASK_REPORT_MODES
+    if review_mode and report_mode:
+        raise RuntimeError("architect review and task-report modes are mutually exclusive")
     review_request = None
     review_iteration, review_round = 0, 1
 
@@ -7527,6 +7908,8 @@ def run_architect(task, workspace, max_turns, review_request_path=None):
 
     if review_mode:
         _emit_architect_review_started()
+    elif report_mode:
+        _emit("agent_state_changed", state="discovery")
     else:
         _emit_architect_started()
 
@@ -7548,13 +7931,22 @@ def run_architect(task, workspace, max_turns, review_request_path=None):
     print(f"Workspace: {workspace}")
     print(f"Tools:     {len(architect_tools)} (read-only)")
     print("Writes:    STRUCTURALLY BLOCKED")
-    print(f"Sub-mode:  {'review' if review_mode else 'planning'}")
+    print(f"Sub-mode:  {task_mode if report_mode else ('review' if review_mode else 'planning')}")
     print()
 
-    system_prompt = ARCHITECT_REVIEW_SYSTEM_PROMPT if review_mode else ARCHITECT_SYSTEM_PROMPT
+    system_prompt = (
+        TASK_REPORT_SYSTEM_PROMPT if report_mode
+        else ARCHITECT_REVIEW_SYSTEM_PROMPT if review_mode
+        else ARCHITECT_SYSTEM_PROMPT
+    )
     user_content = _build_review_task_message(review_request) if review_mode else task
-    validate_fn = validate_architect_review if review_mode else validate_architecture_plan
-    answer_label = "ArchitectReview" if review_mode else "ArchitecturePlan"
+    if report_mode:
+        objective = _extract_task_objective(task)
+        validate_fn = lambda data: validate_task_report(data, task_mode, objective)
+        answer_label = "TaskReport"
+    else:
+        validate_fn = validate_architect_review if review_mode else validate_architecture_plan
+        answer_label = "ArchitectReview" if review_mode else "ArchitecturePlan"
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -7717,6 +8109,25 @@ def run_architect(task, workspace, max_turns, review_request_path=None):
 
     except Exception as exc:  # noqa: BLE001 - architect failure must degrade, never crash the caller
         failure_reason = f"{type(exc).__name__}: {exc}"
+
+    if report_mode:
+        if final_result is not None:
+            output = final_result
+            print()
+            print("════════════════════════════════════")
+            print(f"{task_mode.upper()} TASK REPORT")
+            print("════════════════════════════════════")
+            print(f"Findings:   {len(output['findings'])}")
+            print(f"Confidence: {output['confidence']}")
+        else:
+            output = _fallback_task_report(
+                task_mode, _extract_task_objective(task), failure_reason or "unknown failure",
+            )
+            print()
+            print(f"⚠ Task report failed: {failure_reason or 'unknown failure'}")
+            print("Writing fallback task-report.json (reportFailed=true).")
+        _write_task_report_file(output)
+        return
 
     if review_mode:
         if final_result is not None:
@@ -9736,6 +10147,13 @@ def run_engineer(
         "git merge, git rebase, production commands, "
         "releases or deployment -- these are always blocked. "
 
+        "GitHub CLI is available only for allowlisted read-only inspection "
+        "of the current repository (auth status and repo/PR/issue/run/"
+        "workflow/release list or view operations). Never attempt gh api, "
+        "authentication changes, token access, repository overrides, PR/"
+        "issue creation or edits, comments, merges, workflow triggers, or "
+        "release changes -- these are always blocked. "
+
         "Dependency installation (npm install/i/ci/add) and "
         "npm run migration/seed scripts are different: they "
         "are not flat-blocked. When the task genuinely "
@@ -11416,6 +11834,16 @@ def main():
     )
 
     parser.add_argument(
+        "--task-mode",
+        choices=("inspect", "plan", "review"),
+        default=None,
+        help=(
+            "Terminal read-only task mode used with --mode architect. "
+            "Produces task-report.json instead of architecture-plan.json."
+        ),
+    )
+
+    parser.add_argument(
         "--consult-request",
         type=Path,
         default=None,
@@ -11457,6 +11885,7 @@ def main():
             args.workspace,
             max_turns,
             review_request_path=args.review_request,
+            task_mode=args.task_mode,
         )
     else:
         max_turns = (
@@ -11486,12 +11915,20 @@ if __name__ == "__main__":
         _tool_envelope_selfcheck()
         sys.exit(0)
 
+    if sys.argv[1:] == ["--github-cli-selfcheck"]:
+        _github_cli_policy_selfcheck()
+        sys.exit(0)
+
     if sys.argv[1:] == ["--architect-mode-selfcheck"]:
         _architect_mode_selfcheck()
         sys.exit(0)
 
     if sys.argv[1:] == ["--architect-review-selfcheck"]:
         _architect_review_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--task-report-selfcheck"]:
+        _task_report_selfcheck()
         sys.exit(0)
 
     if sys.argv[1:] == ["--delivery-review-selfcheck"]:
