@@ -1225,6 +1225,17 @@ export interface SessionAssistantAnswer {
   provenance: "model-output";
 }
 
+// Round B / Task B1: a line range selected in the read-only code viewer.
+// The client sends only this pointer, never arbitrary evidence text; the
+// gateway re-reads the file through the same workspace-confined boundary as
+// GET /api/fs/file and labels the resulting excerpt before it reaches the
+// tool-less assistant request.
+export interface RepositorySelection {
+  path: string;
+  startLine: number;
+  endLine: number;
+}
+
 // §27/§4.1 workspace creation — POST /api/workspaces response.
 export interface CreateWorkspaceResult {
   workspace: string;

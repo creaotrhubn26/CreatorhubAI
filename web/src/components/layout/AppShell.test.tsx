@@ -24,6 +24,7 @@ class FakeEventSource {
 
 function withProviders(ui: React.ReactElement, initialEntries = ["/"]) {
   vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
+  vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([]);
   vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
@@ -227,6 +228,41 @@ describe("AppShell", () => {
       });
 
       await waitFor(() => expect(screen.getByText(/last activity/i)).toBeInTheDocument());
+    });
+
+    it("keeps a diff-origin session stream alive on /files and shows the sessionless selection assistant", async () => {
+      (globalThis as any).EventSource = FakeEventSource;
+      const session = {
+        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/w", branch: "glimmer/x",
+        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0, repairBudget: 2,
+      } as any;
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session);
+
+      const tree = withProviders(
+        <>
+          <AppShell repoContext={null}>file content</AppShell>
+          <LocationProbe />
+        </>,
+        ["/files?path=%2Fw%2Fsrc%2Fa.ts&start=2&end=3&session=s1"],
+      );
+      vi.mocked(client.glimmerApi.listSessions).mockResolvedValue([session]);
+      vi.mocked(client.glimmerApi.listWorkspaces).mockResolvedValue([{
+        path: "/w", branch: "glimmer/x", headSha: "abc", baselineSha: "abc", dirty: false, changedFiles: [],
+      }]);
+      render(tree);
+
+      expect(await screen.findByText("/w/src/a.ts")).toBeInTheDocument();
+      expect(screen.getByText(/lines 2-3/i)).toBeInTheDocument();
+      expect(FakeEventSource.instances).toHaveLength(1);
+      expect(FakeEventSource.instances[0].url).toContain("/api/sessions/s1/events");
+
+      fireEvent.change(screen.getByPlaceholderText(/ask, or describe a change/i), {
+        target: { value: "Extract this helper" },
+      });
+      await waitFor(() => expect(screen.getByRole("button", { name: "Draft task" })).not.toBeDisabled());
+      fireEvent.click(screen.getByRole("button", { name: "Draft task" }));
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/tasks/new");
     });
   });
 

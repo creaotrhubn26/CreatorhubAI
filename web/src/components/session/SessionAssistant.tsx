@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import type { GlimmerSession } from "@glimmer/shared";
+import type { GlimmerSession, RepositorySelection } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { loadTurns, saveTurns, type Turn } from "../../state/assistantHistory";
 
@@ -9,6 +9,11 @@ const SUGGESTIONS = [
   "Summarize the changes",
   "What did verification check?",
   "What risks remain?",
+];
+const SELECTION_SUGGESTIONS = [
+  "Explain this selection",
+  "What does this depend on?",
+  "What could break if this changes?",
 ];
 
 const UNAVAILABLE_MESSAGE = "Unavailable — the assistant could not answer that.";
@@ -45,9 +50,26 @@ function applyToSession(prev: AssistantState, forSession: string, fn: (turns: Tu
   return prev.sid === forSession ? { sid: prev.sid, turns: fn(prev.turns) } : prev;
 }
 
-export function SessionAssistant({ sessionId, session }: { sessionId: string; session?: GlimmerSession }) {
+export function SessionAssistant({
+  sessionId,
+  session,
+  selection,
+  onDraftTask,
+}: {
+  sessionId?: string;
+  session?: GlimmerSession;
+  selection?: RepositorySelection;
+  onDraftTask?: (objective: string) => void;
+}) {
+  // A repository selection is a real assistant context of its own, not a
+  // fabricated session. The range forms the persistence key so changing the
+  // selection swaps history with the same no-cross-context guarantees as a
+  // session switch.
+  const contextId = selection
+    ? `selection:${selection.path}:${selection.startLine}-${selection.endLine}`
+    : sessionId ?? "unavailable";
   const [question, setQuestion] = useState("");
-  const [chatState, setChatState] = useState<AssistantState>(() => loadState(sessionId));
+  const [chatState, setChatState] = useState<AssistantState>(() => loadState(contextId));
   const [pending, setPending] = useState(false);
 
   // The panel can be reused across sessions without unmounting. Resetting
@@ -56,8 +78,8 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
   // sessionId — no stale-session frame is ever committed, and the save
   // effect below (keyed on chatState.sid, not the sessionId prop) never races a
   // save-on-change against this load.
-  if (chatState.sid !== sessionId) {
-    setChatState(loadState(sessionId));
+  if (chatState.sid !== contextId) {
+    setChatState(loadState(contextId));
     // The old session's in-flight ask (if any) is discarded by the
     // same-session guard — the new panel must not inherit its disabled
     // "Asking…" state.
@@ -74,21 +96,26 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
   }, [chatState]);
 
   async function ask(q: string) {
-    if (!q || pending) return;
+    if (!q || pending || (!selection && !sessionId)) return;
     const id = Date.now();
-    const forSession = sessionId;
-    setChatState((prev) => applyToSession(prev, forSession, (turns) => [...turns, { id, question: q, askedAt: new Date().toISOString() }]));
+    const forContext = contextId;
+    const selected = selection;
+    const sid = sessionId;
+    setChatState((prev) => applyToSession(prev, forContext, (turns) => [...turns, { id, question: q, askedAt: new Date().toISOString() }]));
     setQuestion("");
     setPending(true);
     let streamedAnyDelta = false;
     try {
-      const answer = await glimmerApi.askSessionStream(forSession, q, (delta) => {
+      const answer = await (selected
+        ? glimmerApi.askRepositoryStream(selected, q, onDelta)
+        : glimmerApi.askSessionStream(sid!, q, onDelta));
+      function onDelta(delta: string) {
         streamedAnyDelta = true;
-        setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+        setChatState((prev) => applyToSession(prev, forContext, (turns) =>
           turns.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t))
         ));
-      });
-      setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+      }
+      setChatState((prev) => applyToSession(prev, forContext, (turns) =>
         turns.map((t) => (t.id === id ? { ...t, answer, answeredAt: new Date().toISOString() } : t))
       ));
     } catch (streamErr: any) {
@@ -99,17 +126,19 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
       // server at all) is worth a fallback attempt.
       const upstreamReportedDead = streamErr?.name === "AssistantUpstreamError";
       if (streamedAnyDelta || upstreamReportedDead) {
-        setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+        setChatState((prev) => applyToSession(prev, forContext, (turns) =>
           turns.map((t) => (t.id === id ? { ...t, answer: undefined, error: UNAVAILABLE_MESSAGE } : t))
         ));
       } else {
         try {
-          const data = await glimmerApi.askSession(forSession, q);
-          setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+          const data = selected
+            ? await glimmerApi.askRepository(selected, q)
+            : await glimmerApi.askSession(sid!, q);
+          setChatState((prev) => applyToSession(prev, forContext, (turns) =>
             turns.map((t) => (t.id === id ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() } : t))
           ));
         } catch {
-          setChatState((prev) => applyToSession(prev, forSession, (turns) =>
+          setChatState((prev) => applyToSession(prev, forContext, (turns) =>
             turns.map((t) => (t.id === id ? { ...t, error: UNAVAILABLE_MESSAGE } : t))
           ));
         }
@@ -119,7 +148,8 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
     }
   }
 
-  const turns = chatState.sid === sessionId ? chatState.turns : [];
+  const turns = chatState.sid === contextId ? chatState.turns : [];
+  const suggestions = selection ? SELECTION_SUGGESTIONS : SUGGESTIONS;
   const hasChanges = !!session?.changedFiles.length;
   // Line-count stats are optional on ChangedFile and this backend never
   // populates them today — showing "+0 -0" when they're simply absent would
@@ -131,14 +161,27 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
 
   return (
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100%" }}>
-      {turns.length === 0 && <p className="chat-greeting">👋 Hi! Ask me about this session.</p>}
+      {turns.length === 0 && (
+        <p className="chat-greeting">
+          👋 {selection ? "Ask me about the selected lines." : "Hi! Ask me about this session."}
+        </p>
+      )}
       <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
-        Answers are generated from this session's real evidence — not a general chat.
+        {selection
+          ? "Answers use only this file range, re-read by the gateway from the workspace at question time."
+          : "Answers are generated from this session's real evidence — not a general chat."}
       </p>
+
+      {selection && (
+        <div className="chat-filecard">
+          <span className="mono chat-filecard__path">{selection.path}</span>
+          <span className="mono">lines {selection.startLine}-{selection.endLine}</span>
+        </div>
+      )}
 
       <div className="chat-suggestions">
         <div className="chat-suggestions__label">Try these</div>
-        {SUGGESTIONS.map((s) => (
+        {suggestions.map((s) => (
           <button key={s} className="chat-suggestion" onClick={() => ask(s)} disabled={pending}>
             {s}
           </button>
@@ -185,7 +228,7 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
 
       <div className="chat-input-row">
         <input
-          placeholder="Ask about this session…"
+          placeholder={selection ? "Ask, or describe a change…" : "Ask about this session…"}
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") ask(question); }}
@@ -193,6 +236,11 @@ export function SessionAssistant({ sessionId, session }: { sessionId: string; se
         <button onClick={() => ask(question)} disabled={!question || pending} aria-label="Ask">
           {pending ? "Asking…" : "Ask"}
         </button>
+        {selection && onDraftTask && (
+          <button onClick={() => onDraftTask(question.trim())} disabled={!question.trim() || pending}>
+            Draft task
+          </button>
+        )}
       </div>
     </div>
   );

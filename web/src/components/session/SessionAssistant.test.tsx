@@ -148,4 +148,40 @@ describe("SessionAssistant", () => {
     await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
     expect(askSessionSpy).not.toHaveBeenCalled();
   });
+
+  it("asks from a repository selection without requiring a session", async () => {
+    const selection = { path: "/w/src/a.ts", startLine: 3, endLine: 5 };
+    const ask = vi.spyOn(client.glimmerApi, "askRepositoryStream").mockImplementation(
+      async (_selection, _question, onDelta) => {
+        onDelta("This range validates input.");
+        return "This range validates input.";
+      }
+    );
+    render(withQuery(<SessionAssistant selection={selection} />));
+    expect(screen.getByText(/lines 3-5/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText(/ask, or describe a change/i), {
+      target: { value: "What does this do?" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Ask" }));
+
+    await waitFor(() => expect(screen.getByText("This range validates input.")).toBeInTheDocument());
+    expect(ask).toHaveBeenCalledWith(selection, "What does this do?", expect.any(Function));
+  });
+
+  it("turns one sentence about a selection into a draft callback without starting a session", () => {
+    const onDraftTask = vi.fn();
+    const ask = vi.spyOn(client.glimmerApi, "askRepositoryStream");
+    render(withQuery(
+      <SessionAssistant
+        selection={{ path: "/w/src/a.ts", startLine: 3, endLine: 5 }}
+        onDraftTask={onDraftTask}
+      />
+    ));
+    fireEvent.change(screen.getByPlaceholderText(/ask, or describe a change/i), {
+      target: { value: "Extract this validation into a helper" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Draft task" }));
+    expect(onDraftTask).toHaveBeenCalledWith("Extract this validation into a helper");
+    expect(ask).not.toHaveBeenCalled();
+  });
 });

@@ -5,7 +5,7 @@ import { glimmerApi } from "../../api/client";
 import { EmptyState } from "../common/EmptyState";
 import { IconChevron } from "../common/Icons";
 import { CodeViewer } from "./CodeViewer";
-import { ancestorDirs } from "../../state/fileLink";
+import { ancestorDirs, mostSpecificContainingWorkspace } from "../../state/fileLink";
 
 // Task A2: read-only file tree over GET /api/fs/dirs, rooted at a session
 // workspace. Directories are listed only when they are actually expanded —
@@ -103,6 +103,11 @@ export function FileTreeScreen() {
   const filePath = search.get("path");
   const lineParam = Number(search.get("line"));
   const line = Number.isFinite(lineParam) && lineParam > 0 ? lineParam : undefined;
+  const startParam = Number(search.get("start"));
+  const endParam = Number(search.get("end"));
+  const selectedStart = Number.isInteger(startParam) && Number.isInteger(endParam) &&
+    startParam > 0 && endParam >= startParam ? startParam : undefined;
+  const selectedEnd = selectedStart === undefined ? undefined : endParam;
 
   const { data: workspaces, isPending, isError } = useQuery({
     queryKey: ["workspaces"],
@@ -117,7 +122,7 @@ export function FileTreeScreen() {
   // graph) may belong to a different workspace than the one last chosen —
   // switch to the workspace that actually contains it rather than showing a
   // tree the file isn't in.
-  const containing = target ? roots.find((r) => target === r || target.startsWith(r.replace(/\/+$/, "") + "/")) : undefined;
+  const containing = target ? mostSpecificContainingWorkspace(roots, target) : undefined;
   const root = containing ?? chosenRoot ?? roots[0] ?? null;
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -142,7 +147,23 @@ export function FileTreeScreen() {
   }
 
   function openFile(path: string) {
-    setSearch({ path });
+    // Preserve the originating session so its event stream stays alive while
+    // the user browses files from that run. A new file clears the old line
+    // range; it cannot honestly describe a different document.
+    const next = new URLSearchParams({ path });
+    const sessionId = search.get("session");
+    if (sessionId) next.set("session", sessionId);
+    setSearch(next);
+  }
+
+  function selectLines(startLine: number, endLine: number) {
+    if (!filePath) return;
+    const next = new URLSearchParams(search);
+    next.set("path", filePath);
+    next.set("start", String(startLine));
+    next.set("end", String(endLine));
+    next.delete("line");
+    setSearch(next);
   }
 
   if (isError) {
@@ -209,7 +230,14 @@ export function FileTreeScreen() {
             text="Not shown — this path is not inside any workspace Glimmer knows about."
           />
         ) : filePath ? (
-          <CodeViewer path={filePath} line={line} />
+          <CodeViewer
+            path={filePath}
+            line={line}
+            selectionStart={selectedStart}
+            selectionEnd={selectedEnd}
+            workspace={root}
+            onSelectionChange={selectLines}
+          />
         ) : (
           <EmptyState icon="▤" text="Select a file to view it. This viewer is read-only." />
         )}

@@ -15,10 +15,13 @@ import { gitDiff, gitRevertFile } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
-import { askSessionAssistant, streamSessionAssistant } from "../lib/sessionAssistant.js";
+import {
+  askRepositoryAssistant, askSessionAssistant, streamRepositoryAssistant, streamSessionAssistant,
+} from "../lib/sessionAssistant.js";
+import { readWorkspaceFile } from "./workspaces.js";
 import {
   isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap,
-  type VisualVerification,
+  type VisualVerification, type RepositorySelection,
 } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
@@ -63,6 +66,114 @@ export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]
   }
   return events;
 }
+
+const MAX_REPOSITORY_SELECTION_LINES = 400;
+const MAX_REPOSITORY_SELECTION_CHARS = 40_000;
+
+type SelectionEvidenceResult =
+  | { ok: true; evidence: string }
+  | { ok: false; status: number; error: string };
+
+async function repositorySelectionEvidence(raw: unknown): Promise<SelectionEvidenceResult> {
+  const selection = raw as Partial<RepositorySelection> | null;
+  if (
+    !selection || typeof selection.path !== "string" || !selection.path.trim() ||
+    !Number.isInteger(selection.startLine) || !Number.isInteger(selection.endLine) ||
+    (selection.startLine ?? 0) < 1 || (selection.endLine ?? 0) < (selection.startLine ?? 0)
+  ) {
+    return { ok: false, status: 400, error: "a valid repository selection is required" };
+  }
+  const startLine = selection.startLine as number;
+  const endLine = selection.endLine as number;
+  if (endLine - startLine + 1 > MAX_REPOSITORY_SELECTION_LINES) {
+    return { ok: false, status: 400, error: `selection exceeds ${MAX_REPOSITORY_SELECTION_LINES} lines` };
+  }
+
+  // Re-read at question time through Round A's exact content boundary. The
+  // client cannot smuggle arbitrary evidence text into the prompt, and a
+  // path outside every known workspace remains the same non-existence-oracle
+  // 403 it is in the viewer.
+  const read = await readWorkspaceFile(selection.path);
+  if (!read.ok) return read;
+  if (read.file.binary || read.file.content === null) {
+    return { ok: false, status: 400, error: "binary files cannot be used as assistant evidence" };
+  }
+  const lines = read.file.content.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  if (startLine > lines.length || endLine > lines.length) {
+    return { ok: false, status: 400, error: "selection is outside the file excerpt currently available" };
+  }
+  const excerpt = lines.slice(startLine - 1, endLine).join("\n");
+  if (excerpt.length > MAX_REPOSITORY_SELECTION_CHARS) {
+    return { ok: false, status: 400, error: `selection exceeds ${MAX_REPOSITORY_SELECTION_CHARS} characters` };
+  }
+  return {
+    ok: true,
+    evidence: [
+      `File: ${read.file.path}`,
+      `Lines: ${startLine}-${endLine}`,
+      "Provenance: gateway read from a known workspace at question time",
+      "--- begin selected lines ---",
+      excerpt,
+      "--- end selected lines ---",
+    ].join("\n"),
+  };
+}
+
+// Round B / Task B1: sessionless Q&A from a code selection. This is a
+// separate route on purpose: inventing a fake session would make the
+// provenance label false. Like /sessions/:id/ask it supports streaming, but
+// the model request carries no tools/functions in either mode.
+sessionsRouter.post("/repository/ask", async (req, res) => {
+  const question = req.body?.question;
+  if (typeof question !== "string" || !question.trim()) {
+    return res.status(400).json({ error: "question is required" });
+  }
+  let selected: SelectionEvidenceResult;
+  try {
+    selected = await repositorySelectionEvidence(req.body?.selection);
+  } catch (err: any) {
+    // Workspace discovery happens before the file reader's own fs-error
+    // mapping; surface infrastructure failure as a bounded HTTP response.
+    return res.status(500).json({ error: String(err?.message ?? err) });
+  }
+  if (!selected.ok) return res.status(selected.status).json({ error: selected.error });
+
+  if (req.query.stream === "1") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    let clientDisconnected = false;
+    const clientGone = new AbortController();
+    res.on("close", () => {
+      clientDisconnected = true;
+      clientGone.abort();
+    });
+    try {
+      const answer = await streamRepositoryAssistant(
+        CONFIG.modelBaseUrl,
+        selected.evidence,
+        question,
+        (delta) => { res.write(`data: ${JSON.stringify({ delta })}\n\n`); },
+        undefined,
+        clientGone.signal,
+      );
+      res.write(`data: ${JSON.stringify({ done: true, answer })}\n\n`);
+    } catch {
+      if (!clientDisconnected) res.write(`data: ${JSON.stringify({ error: "unavailable" })}\n\n`);
+    }
+    if (!clientDisconnected) res.end();
+    return;
+  }
+
+  try {
+    res.json(await askRepositoryAssistant(CONFIG.modelBaseUrl, selected.evidence, question));
+  } catch (err: any) {
+    res.status(502).json({ error: err.message });
+  }
+});
 
 sessionsRouter.get("/sessions", async (_req, res) => {
   const ids = await listSessionIds();

@@ -149,6 +149,20 @@ describe("glimmerApi", () => {
     expect(result.answer).toBe("It owns the parser state.");
   });
 
+  it("askRepository POSTs the selected file range without requiring a session", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ answer: "This branch handles retries.", provenance: "model-output" }), { status: 200 })
+    );
+    const selection = { path: "/ws/src/retry.ts", startLine: 12, endLine: 18 };
+    const result = await glimmerApi.askRepository(selection, "What does this branch do?");
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/repository/ask`, expect.objectContaining({ method: "POST" }));
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
+      question: "What does this branch do?",
+      selection,
+    });
+    expect(result.answer).toBe("This branch handles retries.");
+  });
+
   function sseResponse(frames: string[]): Response {
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
@@ -173,6 +187,25 @@ describe("glimmerApi", () => {
     expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/ask?stream=1`, expect.objectContaining({ method: "POST" }));
     expect(deltas).toEqual(["It owns ", "the parser state."]);
     expect(answer).toBe("It owns the parser state.");
+  });
+
+  it("askRepositoryStream sends selection evidence to the sessionless streaming endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      sseResponse([
+        `data: ${JSON.stringify({ delta: "It validates " })}\n\n`,
+        `data: ${JSON.stringify({ done: true, answer: "It validates input." })}\n\n`,
+      ])
+    );
+    const selection = { path: "/ws/src/input.ts", startLine: 4, endLine: 7 };
+    const deltas: string[] = [];
+    const answer = await glimmerApi.askRepositoryStream(selection, "Explain this.", (delta) => deltas.push(delta));
+    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/repository/ask?stream=1`, expect.objectContaining({ method: "POST" }));
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
+      question: "Explain this.",
+      selection,
+    });
+    expect(deltas).toEqual(["It validates "]);
+    expect(answer).toBe("It validates input.");
   });
 
   it("askSessionStream buffers a frame split across chunk boundaries instead of dropping it", async () => {

@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
+import type { TaskIntelligence } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
 import { computeArchitectRisk, deriveVerificationLevel, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
@@ -22,6 +23,19 @@ const SCOPE_LABEL: Record<TaskComposerFormState["scopePackage"], string> = {
   directory: "selected directory",
   files: "selected files",
 };
+
+interface SelectionDraftState {
+  objective: string;
+  workspace: string;
+  path: string;
+  startLine: number;
+  endLine: number;
+}
+
+interface ComposerRouteState {
+  objective?: string;
+  selectionDraft?: SelectionDraftState;
+}
 
 // Pre-run summary line: one sentence stating exactly what will run, derived
 // live from the real form state — never fabricated, updates as the user types.
@@ -73,14 +87,54 @@ export function NewTaskScreen() {
   // same "seed initial state, ignore afterward" pattern router.state-based
   // prefills always use -- a later in-place navigation to this same route
   // (e.g. clicking "New Task" again) does not fight the user's own typing.
-  const prefillObjective = (location.state as { objective?: string } | null)?.objective;
-  const [form, setForm] = useState<TaskComposerFormState>(() =>
-    prefillObjective ? { ...DEFAULT_FORM, objective: prefillObjective } : DEFAULT_FORM
+  const routeState = location.state as ComposerRouteState | null;
+  const rawSelectionDraft = routeState?.selectionDraft;
+  const selectionDraft = rawSelectionDraft &&
+    typeof rawSelectionDraft.objective === "string" &&
+    typeof rawSelectionDraft.workspace === "string" &&
+    typeof rawSelectionDraft.path === "string" &&
+    Number.isInteger(rawSelectionDraft.startLine) &&
+    Number.isInteger(rawSelectionDraft.endLine)
+    ? rawSelectionDraft
+    : undefined;
+  const prefillObjective = selectionDraft?.objective ?? routeState?.objective;
+  const selectionScopePath = selectionDraft
+    ? toWorkspaceRelative(selectionDraft.workspace, selectionDraft.path)
+    : null;
+  const [form, setForm] = useState<TaskComposerFormState>(() => selectionDraft
+    ? {
+        ...DEFAULT_FORM,
+        objective: selectionDraft.objective,
+        scopePackage: "files",
+        scopeArea: selectionScopePath ?? "",
+      }
+    : prefillObjective
+      ? { ...DEFAULT_FORM, objective: prefillObjective }
+      : DEFAULT_FORM
   );
-  const [workspace, setWorkspace] = useState("");
+  const [workspace, setWorkspace] = useState(selectionDraft?.workspace ?? "");
   const [newTaskName, setNewTaskName] = useState("");
   const [scopePickError, setScopePickError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const selectionDefaultsApplied = useRef(false);
+  const applySelectionIntelligence = useCallback((data: TaskIntelligence) => {
+    if (!selectionDraft || selectionDefaultsApplied.current) return;
+    selectionDefaultsApplied.current = true;
+    setForm((current) => {
+      // The async suggestion is a DEFAULT, never an overwrite: if the human
+      // changed the draft's objective/scope or picked verification while the
+      // repository lookup was in flight, their review wins.
+      if (
+        current.objective !== selectionDraft.objective ||
+        current.scopePackage !== "files" ||
+        current.scopeArea !== (selectionScopePath ?? "") ||
+        current.verification.length > 0
+      ) {
+        return current;
+      }
+      return { ...current, verification: data.suggestedVerification };
+    });
+  }, [selectionDraft, selectionScopePath]);
 
   // Task 4c(2): quick-pick of workspaces the gateway already knows about
   // (the same GET /api/workspaces list the Workspaces screen shows) — the
@@ -121,6 +175,12 @@ export function NewTaskScreen() {
     <div className="composer">
       <div className="composer__scroll">
         <h1>What should Glimmer work on?</h1>
+        {selectionDraft && (
+          <p role="status" className="composer__selection-draft">
+            Drafted from <span className="mono">{selectionDraft.path}</span>, lines {selectionDraft.startLine}-{selectionDraft.endLine}.
+            Review the contract below; nothing has started yet.
+          </p>
+        )}
         <div className="composer__columns">
           <div className="composer__main">
             <textarea
@@ -273,6 +333,7 @@ export function NewTaskScreen() {
               objective={form.objective}
               verificationLevel={deriveVerificationLevel(buildTaskContract(form))}
               candidateCount={buildTaskContract(form).scope.paths?.length}
+              onIntelligence={selectionDraft ? applySelectionIntelligence : undefined}
             />
 
             <fieldset>

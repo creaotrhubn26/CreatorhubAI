@@ -1,6 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
-import { askSessionAssistant, streamSessionAssistant } from "./sessionAssistant.js";
+import {
+  askRepositoryAssistant, askSessionAssistant, streamRepositoryAssistant, streamSessionAssistant,
+} from "./sessionAssistant.js";
 import type { GlimmerSession, GlimmerEvent } from "@glimmer/shared";
 
 let server: http.Server | undefined;
@@ -66,6 +68,54 @@ describe("askSessionAssistant", () => {
       res.end(JSON.stringify({ choices: [] }));
     });
     await expect(askSessionAssistant(url, SESSION, EVENTS, "Why?")).rejects.toThrow();
+  });
+});
+
+describe("repository selection assistant", () => {
+  const evidence = [
+    "File: /w/src/a.ts",
+    "Lines: 3-5",
+    "--- begin selected lines ---",
+    "return parse(input);",
+    "--- end selected lines ---",
+  ].join("\n");
+
+  it("labels repository evidence and still sends no tools/functions field", async () => {
+    let receivedBody: any;
+    const url = await listen((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "It parses the selected input." } }] }));
+      });
+    });
+    const result = await askRepositoryAssistant(url, evidence, "What does this do?");
+    expect(result.answer).toBe("It parses the selected input.");
+    expect(receivedBody).not.toHaveProperty("tools");
+    expect(receivedBody).not.toHaveProperty("functions");
+    expect(receivedBody.messages[1].content).toContain("Repository evidence:");
+    expect(receivedBody.messages[1].content).toContain("File: /w/src/a.ts");
+    expect(receivedBody.messages[1].content).toContain("Lines: 3-5");
+  });
+
+  it("streams repository evidence through the same tool-less transport", async () => {
+    let receivedBody: any;
+    const url = await listen((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "Selected answer" } }] })}\n\ndata: [DONE]\n\n`);
+      });
+    });
+    const answer = await streamRepositoryAssistant(url, evidence, "Why?", () => {});
+    expect(answer).toBe("Selected answer");
+    expect(receivedBody).not.toHaveProperty("tools");
+    expect(receivedBody).not.toHaveProperty("functions");
+    expect(receivedBody.messages[1].content).toContain("Repository evidence:");
   });
 });
 
