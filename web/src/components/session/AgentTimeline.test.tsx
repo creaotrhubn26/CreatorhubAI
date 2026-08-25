@@ -9,8 +9,15 @@ describe("AgentTimeline", () => {
     // would never let us write as a literal — the point is to prove the
     // render path allowlists fields rather than trusting the object shape.
     const eventWithExtraField = Object.assign(
-      { id: "e1", sessionId: "s1", timestamp: "t", type: "tool_started", tool: "read_file", args: {} },
-      { extraField: "should not appear" }
+      {
+        id: "e1",
+        sessionId: "s1",
+        timestamp: "t",
+        type: "tool_started",
+        tool: "read_file",
+        args: {},
+      },
+      { extraField: "should not appear" },
     ) as unknown as GlimmerEvent;
 
     render(<AgentTimeline events={[eventWithExtraField]} />);
@@ -28,7 +35,13 @@ describe("AgentTimeline", () => {
     // type this Control Center build predates) — the fallback in describe()/
     // eventDetails() must still render something readable, not throw or
     // silently drop the row.
-    const future = { id: "e3", sessionId: "s1", timestamp: "t", type: "future_event_type", widgetCount: 3 } as unknown as GlimmerEvent;
+    const future = {
+      id: "e3",
+      sessionId: "s1",
+      timestamp: "t",
+      type: "future_event_type",
+      widgetCount: 3,
+    } as unknown as GlimmerEvent;
 
     render(<AgentTimeline events={[future]} />);
 
@@ -42,7 +55,10 @@ describe("AgentTimeline", () => {
 
   it("renders a tool_blocked event as a formatted BLOCKED callout with the command and reason visible, no click needed", () => {
     const blocked: GlimmerEvent = {
-      id: "e2", sessionId: "s1", timestamp: "t", type: "tool_blocked",
+      id: "e2",
+      sessionId: "s1",
+      timestamp: "t",
+      type: "tool_blocked",
       command: "git push origin main",
       reason: "Remote writes are disabled for autonomous sessions.",
     };
@@ -50,18 +66,29 @@ describe("AgentTimeline", () => {
 
     expect(screen.getByText("BLOCKED")).toBeInTheDocument();
     expect(screen.getByText("git push origin main")).toBeInTheDocument();
-    expect(screen.getByText("Remote writes are disabled for autonomous sessions.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Remote writes are disabled for autonomous sessions."),
+    ).toBeInTheDocument();
   });
 
   it("shows model identity per call while allowlisting secret-free details", () => {
-    const modelCall = Object.assign({
-      id: "e-model", sessionId: "s1", timestamp: "t", type: "model_request_started",
-      requestId: "req-1", role: "architect", providerId: "frontier", modelId: "reasoner-1",
-    }, {
-      apiKey: "must-not-render",
-      apiKeyFile: "/private/key",
-      baseUrl: "https://private-endpoint.example/v1",
-    }) as unknown as GlimmerEvent;
+    const modelCall = Object.assign(
+      {
+        id: "e-model",
+        sessionId: "s1",
+        timestamp: "t",
+        type: "model_request_started",
+        requestId: "req-1",
+        role: "architect",
+        providerId: "frontier",
+        modelId: "reasoner-1",
+      },
+      {
+        apiKey: "must-not-render",
+        apiKeyFile: "/private/key",
+        baseUrl: "https://private-endpoint.example/v1",
+      },
+    ) as unknown as GlimmerEvent;
     render(<AgentTimeline events={[modelCall]} />);
 
     const label = screen.getByText("MODEL architect → frontier/reasoner-1");
@@ -79,8 +106,12 @@ describe("AgentTimeline", () => {
   // approval provenance must survive into the expanded detail view.
   it("renders an unapproved scope_expanded event with the plain label and red icon", () => {
     const unapproved: GlimmerEvent = {
-      id: "e4", sessionId: "s1", timestamp: "t", type: "scope_expanded",
-      expected: ["src/dialog"], actual: ["backend/x.ts"],
+      id: "e4",
+      sessionId: "s1",
+      timestamp: "t",
+      type: "scope_expanded",
+      expected: ["src/dialog"],
+      actual: ["backend/x.ts"],
     };
     const { container } = render(<AgentTimeline events={[unapproved]} />);
 
@@ -92,9 +123,15 @@ describe("AgentTimeline", () => {
 
   it("renders an approved scope_expanded event with a distinct label, amber icon, and approvedBy in the detail view", () => {
     const approved: GlimmerEvent = {
-      id: "e5", sessionId: "s1", timestamp: "t", type: "scope_expanded",
-      expected: ["src/dialog"], actual: ["backend/x.ts"],
-      approved: true, approvedBy: "daniel", approvalId: "s1-appr-1",
+      id: "e5",
+      sessionId: "s1",
+      timestamp: "t",
+      type: "scope_expanded",
+      expected: ["src/dialog"],
+      actual: ["backend/x.ts"],
+      approved: true,
+      approvedBy: "daniel",
+      approvalId: "s1-appr-1",
     };
     const { container } = render(<AgentTimeline events={[approved]} />);
 

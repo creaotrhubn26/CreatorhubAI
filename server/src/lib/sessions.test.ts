@@ -5,10 +5,20 @@ import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import {
-  parseManifest, isValidSessionId, readManifestRaw, readSession, mapManifestStatus, applyTaskOverrides,
+  parseManifest,
+  isValidSessionId,
+  readManifestRaw,
+  readSession,
+  mapManifestStatus,
+  applyTaskOverrides,
 } from "./sessions.js";
 import { computeDiffHash } from "./git.js";
-import type { ArchitecturePlan, ArchitectReview, DeliveryReview, GlimmerTask } from "@glimmer/shared";
+import type {
+  ArchitecturePlan,
+  ArchitectReview,
+  DeliveryReview,
+  GlimmerTask,
+} from "@glimmer/shared";
 import type { TaskContract } from "@glimmer/shared";
 
 const REAL_MANIFEST = {
@@ -27,11 +37,23 @@ const REAL_MANIFEST = {
       changedFiles: ["frontend/client/env.d.ts"],
       verificationCommands: ["git diff --check", "npm --prefix frontend run typecheck"],
       verificationResults: [
-        { command: "git diff --check", returncode: 0, status: "PASS", ok: true, elapsedSeconds: 0.02, outputTail: "" },
         {
-          command: "npm --prefix frontend run typecheck", returncode: 2, status: "PASS_BASELINE", ok: true,
-          elapsedSeconds: 6.46, outputTail: "error TS2688...",
-          baselineAccepted: true, newErrorSignatures: [],
+          command: "git diff --check",
+          returncode: 0,
+          status: "PASS",
+          ok: true,
+          elapsedSeconds: 0.02,
+          outputTail: "",
+        },
+        {
+          command: "npm --prefix frontend run typecheck",
+          returncode: 2,
+          status: "PASS_BASELINE",
+          ok: true,
+          elapsedSeconds: 6.46,
+          outputTail: "error TS2688...",
+          baselineAccepted: true,
+          newErrorSignatures: [],
         },
       ],
       status: "verified",
@@ -46,12 +68,17 @@ const REAL_MANIFEST = {
 
 describe("parseManifest", () => {
   it("maps a real glimmer-v2.py manifest to GlimmerSession", () => {
-    const session = parseManifest(REAL_MANIFEST, "20260816-181928-glimmer-glimmer-v2-smoke-20260816-134035");
+    const session = parseManifest(
+      REAL_MANIFEST,
+      "20260816-181928-glimmer-glimmer-v2-smoke-20260816-134035",
+    );
     expect(session.id).toBe("20260816-181928-glimmer-glimmer-v2-smoke-20260816-134035");
     expect(session.status).toBe("verified");
     expect(session.branch).toBe("glimmer/glimmer-v2-smoke-20260816-134035");
     expect(session.headSha).toBe("42fe48ab49aac02747c65802a003ed977eb9da38");
-    expect(session.changedFiles).toEqual([{ path: "frontend/client/env.d.ts", status: "modified" }]);
+    expect(session.changedFiles).toEqual([
+      { path: "frontend/client/env.d.ts", status: "modified" },
+    ]);
     expect(session.repairBudget).toBe(1);
     expect(session.startedAt).toBe(REAL_MANIFEST.startedAt);
     expect(session.completedAt).toBe(REAL_MANIFEST.updatedAt);
@@ -65,7 +92,7 @@ describe("parseManifest", () => {
   it("maps an in-progress manifest with no attempts to a non-terminal status", () => {
     const session = parseManifest(
       { ...REAL_MANIFEST, attempts: [], status: "initialized" },
-      "sid-2"
+      "sid-2",
     );
     expect(session.status).toBe("preflight");
     expect(session.verification.overall).toBe("NOT_RUN");
@@ -79,12 +106,20 @@ describe("parseManifest", () => {
           {
             ...REAL_MANIFEST.attempts[0],
             verificationResults: [
-              { command: "npm test", returncode: 1, status: "FAIL", ok: false, elapsedSeconds: 1.1, outputTail: "", newErrorSignatures: [] },
+              {
+                command: "npm test",
+                returncode: 1,
+                status: "FAIL",
+                ok: false,
+                elapsedSeconds: 1.1,
+                outputTail: "",
+                newErrorSignatures: [],
+              },
             ],
           },
         ],
       },
-      "sid-3"
+      "sid-3",
     );
     expect(session.verification.overall).toBe("FAILED");
   });
@@ -97,7 +132,7 @@ describe("parseManifest", () => {
         architectPlan: { used: true, risk: "low" },
         failure: null,
       },
-      "sid-4"
+      "sid-4",
     );
     expect(session.gates).toEqual({ architectureApproved: true });
     expect(session.architectPlan).toEqual({ used: true, risk: "low" });
@@ -120,15 +155,23 @@ describe("parseManifest", () => {
       {
         ...REAL_MANIFEST,
         statuses: {
-          technical: "VERIFIED", architecture: "approved", documentation: "not_run",
-          visual: "not_run", delivery: "needs_polish", overall: "needs_polish",
+          technical: "VERIFIED",
+          architecture: "approved",
+          documentation: "not_run",
+          visual: "not_run",
+          delivery: "needs_polish",
+          overall: "needs_polish",
         },
       },
-      "sid-statuses-1"
+      "sid-statuses-1",
     );
     expect(session.statuses).toEqual({
-      technical: "VERIFIED", architecture: "approved", documentation: "not_run",
-      visual: "not_run", delivery: "needs_polish", overall: "needs_polish",
+      technical: "VERIFIED",
+      architecture: "approved",
+      documentation: "not_run",
+      visual: "not_run",
+      delivery: "needs_polish",
+      overall: "needs_polish",
     });
   });
 
@@ -139,10 +182,21 @@ describe("parseManifest", () => {
 
   it("passes through a real failure object", () => {
     const session = parseManifest(
-      { ...REAL_MANIFEST, failure: { class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] } },
-      "sid-6"
+      {
+        ...REAL_MANIFEST,
+        failure: {
+          class: "SCOPE_FAILURE",
+          detail: "changed files exceeded scope",
+          evidenceIds: ["ev-1"],
+        },
+      },
+      "sid-6",
     );
-    expect(session.failure).toEqual({ class: "SCOPE_FAILURE", detail: "changed files exceeded scope", evidenceIds: ["ev-1"] });
+    expect(session.failure).toEqual({
+      class: "SCOPE_FAILURE",
+      detail: "changed files exceeded scope",
+      evidenceIds: ["ev-1"],
+    });
   });
 });
 
@@ -169,7 +223,10 @@ describe("finalStatus composition (V7 §22.17)", () => {
     [false, "rejected"],
     [null, "not_run"],
   ] as const)("gates.architectureApproved %s -> finalStatus.architecture %s", (raw, expected) => {
-    const session = parseManifest({ ...REAL_MANIFEST, gates: { architectureApproved: raw } }, "sid-final-3");
+    const session = parseManifest(
+      { ...REAL_MANIFEST, gates: { architectureApproved: raw } },
+      "sid-final-3",
+    );
     expect(session.finalStatus.architecture).toBe(expected);
   });
 
@@ -178,12 +235,18 @@ describe("finalStatus composition (V7 §22.17)", () => {
     [false, "rejected"],
     [null, "not_run"],
   ] as const)("gates.documentationCurrent %s -> finalStatus.documentation %s", (raw, expected) => {
-    const session = parseManifest({ ...REAL_MANIFEST, gates: { documentationCurrent: raw } }, "sid-final-4");
+    const session = parseManifest(
+      { ...REAL_MANIFEST, gates: { documentationCurrent: raw } },
+      "sid-final-4",
+    );
     expect(session.finalStatus.documentation).toBe(expected);
   });
 
   it("a manifest with no attempts (NOT_RUN) reports functional NOT_RUN, not a crash", () => {
-    const session = parseManifest({ ...REAL_MANIFEST, attempts: [], status: "initialized" }, "sid-final-5");
+    const session = parseManifest(
+      { ...REAL_MANIFEST, attempts: [], status: "initialized" },
+      "sid-final-5",
+    );
     expect(session.finalStatus.functional).toBe("NOT_RUN");
   });
 });
@@ -223,14 +286,26 @@ describe("mapManifestStatus", () => {
 
   it("maps repo-map-only and unknown statuses to a status that is NOT in-flight, and sets completedAt", () => {
     const IN_FLIGHT = new Set([
-      "preflight", "understanding", "discovery", "candidate_selection",
-      "implementing", "verifying", "repairing", "waiting_for_approval",
+      "preflight",
+      "understanding",
+      "discovery",
+      "candidate_selection",
+      "implementing",
+      "verifying",
+      "repairing",
+      "waiting_for_approval",
     ]);
-    const repoMapOnly = parseManifest({ ...REAL_MANIFEST, status: "repo-map-only", attempts: [] }, "sid-repo-map-only");
+    const repoMapOnly = parseManifest(
+      { ...REAL_MANIFEST, status: "repo-map-only", attempts: [] },
+      "sid-repo-map-only",
+    );
     expect(IN_FLIGHT.has(repoMapOnly.status)).toBe(false);
     expect(repoMapOnly.completedAt).toBe(REAL_MANIFEST.updatedAt);
 
-    const unknown = parseManifest({ ...REAL_MANIFEST, status: "some-future-status", attempts: [] }, "sid-unknown");
+    const unknown = parseManifest(
+      { ...REAL_MANIFEST, status: "some-future-status", attempts: [] },
+      "sid-unknown",
+    );
     expect(IN_FLIGHT.has(unknown.status)).toBe(false);
     expect(unknown.completedAt).toBe(REAL_MANIFEST.updatedAt);
   });
@@ -266,7 +341,13 @@ const REAL_CONTRACT: TaskContract = {
   objective: "Fix dialog state restoration",
   scope: { package: "frontend", area: "frontend/client/src/dialog" },
   mode: "implement",
-  constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+  constraints: {
+    minimalChange: true,
+    noCommit: true,
+    noPush: true,
+    noDeploy: true,
+    noDependencyInstall: true,
+  },
   verification: ["frontend-typecheck"],
   repairBudget: 2,
 };
@@ -303,7 +384,9 @@ describe("gateway contract persistence", () => {
   it("returns null when no contract was ever written for a session", async () => {
     const dir = path.join(contractStateRoot, "sessions", "20260817-000001-glimmer-nocontract");
     await fs.mkdir(dir, { recursive: true });
-    expect(await sessionsIsolated.readGatewayContract("20260817-000001-glimmer-nocontract")).toBeNull();
+    expect(
+      await sessionsIsolated.readGatewayContract("20260817-000001-glimmer-nocontract"),
+    ).toBeNull();
   });
 });
 
@@ -312,7 +395,10 @@ describe("readSession populates taskContract", () => {
     const id = "20260817-000002-glimmer-withcontract";
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...REAL_MANIFEST, sessionId: id }),
+    );
     await sessionsIsolated.writeGatewayContract(dir, REAL_CONTRACT);
     const session = await sessionsIsolated.readSession(id);
     expect(session?.taskContract).toEqual(REAL_CONTRACT);
@@ -351,16 +437,41 @@ const REAL_DELIVERY_REVIEW: DeliveryReview = {
   confidence: { level: "medium", reason: "File content confirmed by read-back." },
   approachRationale: ["Added whisper as a minimal additive function."],
   strengths: ["Implementation matches required signature."],
-  concerns: [{ severity: "medium", category: "verification", description: "No non-destructive validation ran.", evidenceIds: ["ev-1"] }],
+  concerns: [
+    {
+      severity: "medium",
+      category: "verification",
+      description: "No non-destructive validation ran.",
+      evidenceIds: ["ev-1"],
+    },
+  ],
   unresolvedItems: ["Runtime validation not performed."],
   intentionallyNotChanged: ["greet function implementation."],
   nextSteps: [{ priority: "recommended_next", action: "Run a quick node sanity check." }],
 };
 
 const REAL_TASKS: GlimmerTask[] = [
-  { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },
-  { id: "t2", description: "Add whisper", kind: "implementation", dependsOn: ["t1"], status: "complete" },
-  { id: "t3", description: "Manual smoke test", kind: "verification", dependsOn: ["t2"], status: "pending" },
+  {
+    id: "t1",
+    description: "Inspect src/greet.js",
+    kind: "implementation",
+    dependsOn: [],
+    status: "complete",
+  },
+  {
+    id: "t2",
+    description: "Add whisper",
+    kind: "implementation",
+    dependsOn: ["t1"],
+    status: "complete",
+  },
+  {
+    id: "t3",
+    description: "Manual smoke test",
+    kind: "verification",
+    dependsOn: ["t2"],
+    status: "pending",
+  },
 ];
 
 describe("opt-in orchestrator artifact reads", () => {
@@ -394,7 +505,10 @@ describe("opt-in orchestrator artifact reads", () => {
     const id = "20260817-000033-glimmer-delivery-review";
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(REAL_DELIVERY_REVIEW));
+    await fs.writeFile(
+      path.join(dir, "delivery-review.json"),
+      JSON.stringify(REAL_DELIVERY_REVIEW),
+    );
     expect(await sessionsIsolated.readDeliveryReview(id)).toEqual(REAL_DELIVERY_REVIEW);
   });
 
@@ -410,10 +524,13 @@ describe("opt-in orchestrator artifact reads", () => {
     const id = "20260821-000001-glimmer-escalation";
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(REAL_DELIVERY_REVIEW));
+    await fs.writeFile(
+      path.join(dir, "delivery-review.json"),
+      JSON.stringify(REAL_DELIVERY_REVIEW),
+    );
     await fs.writeFile(
       path.join(dir, "architect-escalation.json"),
-      JSON.stringify({ question: "Is this sound?", answer: "Yes, proceed." })
+      JSON.stringify({ question: "Is this sound?", answer: "Yes, proceed." }),
     );
     expect(await sessionsIsolated.readDeliveryReview(id)).toEqual({
       ...REAL_DELIVERY_REVIEW,
@@ -425,7 +542,10 @@ describe("opt-in orchestrator artifact reads", () => {
     const id = "20260821-000002-glimmer-no-escalation";
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(REAL_DELIVERY_REVIEW));
+    await fs.writeFile(
+      path.join(dir, "delivery-review.json"),
+      JSON.stringify(REAL_DELIVERY_REVIEW),
+    );
     expect(await sessionsIsolated.readDeliveryReview(id)).toEqual(REAL_DELIVERY_REVIEW);
   });
 
@@ -436,10 +556,24 @@ describe("opt-in orchestrator artifact reads", () => {
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
     const packet = {
-      task: "add widget", planRef: null, changedFiles: ["a.ts"], orchestratorUpdatedFiles: [],
-      verification: { status: "VERIFIED", results: null }, visual: "not_run",
-      statuses: { technical: "VERIFIED", architecture: "not_run", documentation: "not_run", visual: "not_run", delivery: "not_run", overall: "not_run" },
-      customerReadiness: null, limitations: null, forwardPlan: null, confidence: null,
+      task: "add widget",
+      planRef: null,
+      changedFiles: ["a.ts"],
+      orchestratorUpdatedFiles: [],
+      verification: { status: "VERIFIED", results: null },
+      visual: "not_run",
+      statuses: {
+        technical: "VERIFIED",
+        architecture: "not_run",
+        documentation: "not_run",
+        visual: "not_run",
+        delivery: "not_run",
+        overall: "not_run",
+      },
+      customerReadiness: null,
+      limitations: null,
+      forwardPlan: null,
+      confidence: null,
       humanReviewStatus: "pending",
     };
     await fs.writeFile(path.join(dir, "delivery-packet.json"), JSON.stringify(packet));
@@ -472,7 +606,7 @@ describe("opt-in orchestrator artifact reads", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "tasks.json"),
-      JSON.stringify({ schemaVersion: 2, tasks: REAL_TASKS })
+      JSON.stringify({ schemaVersion: 2, tasks: REAL_TASKS }),
     );
     expect(await sessionsIsolated.readSessionTasks(id)).toEqual(REAL_TASKS);
   });
@@ -531,7 +665,10 @@ describe("visual verification reads + finalStatus.visual override (V7 §22.14/§
     const id = "20260822-000050-glimmer-visual-manifest";
     const dir = path.join(contractStateRoot, "sessions", id, "visual");
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(dir, "visual-manifest.json"),
+      JSON.stringify(REAL_VISUAL_MANIFEST),
+    );
     expect(await sessionsIsolated.readVisualManifest(id)).toEqual(REAL_VISUAL_MANIFEST);
   });
 
@@ -547,11 +684,22 @@ describe("visual verification reads + finalStatus.visual override (V7 §22.14/§
     const dir = path.join(contractStateRoot, "sessions", id);
     const visualDir = path.join(dir, "visual");
     await fs.mkdir(visualDir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
-    await fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...REAL_MANIFEST, sessionId: id }),
+    );
+    await fs.writeFile(
+      path.join(visualDir, "visual-manifest.json"),
+      JSON.stringify(REAL_VISUAL_MANIFEST),
+    );
     await fs.writeFile(
       path.join(visualDir, "findings.json"),
-      JSON.stringify({ status: "PASS_WITH_WARNINGS", viewport: "multi", viewports: ["1440x900", "390x844"], findings: [] })
+      JSON.stringify({
+        status: "PASS_WITH_WARNINGS",
+        viewport: "multi",
+        viewports: ["1440x900", "390x844"],
+        findings: [],
+      }),
     );
     const session = await sessionsIsolated.readSession(id);
     expect(session?.finalStatus.visual).toBe("PASS_WITH_WARNINGS");
@@ -564,11 +712,22 @@ describe("visual verification reads + finalStatus.visual override (V7 §22.14/§
     const dir = path.join(contractStateRoot, "sessions", id);
     const visualDir = path.join(dir, "visual");
     await fs.mkdir(visualDir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
-    await fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(REAL_VISUAL_MANIFEST));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...REAL_MANIFEST, sessionId: id }),
+    );
+    await fs.writeFile(
+      path.join(visualDir, "visual-manifest.json"),
+      JSON.stringify(REAL_VISUAL_MANIFEST),
+    );
     await fs.writeFile(
       path.join(visualDir, "findings.json"),
-      JSON.stringify({ status: "SOMETHING_UNKNOWN", viewport: "multi", viewports: ["1440x900"], findings: [] })
+      JSON.stringify({
+        status: "SOMETHING_UNKNOWN",
+        viewport: "multi",
+        viewports: ["1440x900"],
+        findings: [],
+      }),
     );
     const session = await sessionsIsolated.readSession(id);
     expect(session?.finalStatus.visual).toBe("not_run");
@@ -578,7 +737,10 @@ describe("visual verification reads + finalStatus.visual override (V7 §22.14/§
     const id = "20260822-000053-glimmer-no-visual-session";
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...REAL_MANIFEST, sessionId: id }),
+    );
     const session = await sessionsIsolated.readSession(id);
     expect(session?.finalStatus.visual).toBe("not_run");
   });
@@ -600,7 +762,10 @@ describe("human acceptance (§14 Diff Review)", () => {
     expect(typeof record.acceptedAt).toBe("string");
 
     const onDisk = JSON.parse(
-      await fs.readFile(path.join(contractStateRoot, "sessions", id, "human-acceptance.json"), "utf-8")
+      await fs.readFile(
+        path.join(contractStateRoot, "sessions", id, "human-acceptance.json"),
+        "utf-8",
+      ),
     );
     expect(onDisk).toEqual(record);
     expect(await sessionsIsolated.readHumanAcceptance(id)).toEqual(record);
@@ -619,7 +784,10 @@ describe("human acceptance (§14 Diff Review)", () => {
     const id = "20260817-000053-glimmer-accept-in-session";
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...REAL_MANIFEST, sessionId: id }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...REAL_MANIFEST, sessionId: id }),
+    );
 
     const before = await sessionsIsolated.readSession(id);
     expect(before?.humanAcceptance).toBeUndefined();
@@ -666,7 +834,10 @@ describe("session-level verification freeze (V7 §20)", () => {
   async function writeSession(id: string, manifest: unknown) {
     const dir = path.join(contractStateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({ ...(manifest as object), sessionId: id }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({ ...(manifest as object), sessionId: id }),
+    );
   }
 
   beforeAll(async () => {
@@ -677,7 +848,9 @@ describe("session-level verification freeze (V7 §20)", () => {
     await fs.writeFile(path.join(verifiedWorkspace, "a.txt"), "one\n");
     await exec("git", ["add", "a.txt"], { cwd: verifiedWorkspace });
     await exec("git", ["commit", "-q", "-m", "init"], { cwd: verifiedWorkspace });
-    baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: verifiedWorkspace })).stdout.trim();
+    baselineSha = (
+      await exec("git", ["rev-parse", "HEAD"], { cwd: verifiedWorkspace })
+    ).stdout.trim();
   });
 
   afterAll(async () => {
@@ -770,7 +943,10 @@ describe("session-level verification freeze (V7 §20)", () => {
   });
 
   it("readSession with computeStale is NOT stale when the workspace directory no longer exists", async () => {
-    const goneWorkspace = path.join(os.tmpdir(), "glimmer-workspace-that-never-existed-" + Date.now());
+    const goneWorkspace = path.join(
+      os.tmpdir(),
+      "glimmer-workspace-that-never-existed-" + Date.now(),
+    );
     const id = "20260821-000066-glimmer-stale-workspace-gone";
     await writeSession(id, { ...verifiedManifest("irrelevant"), workspace: goneWorkspace });
 
@@ -800,19 +976,34 @@ describe("session-level verification freeze (V7 §20)", () => {
 // route/merge integration).
 describe("applyTaskOverrides (Task 4.3, review round 1: id-stability + fail-open)", () => {
   const task: GlimmerTask = {
-    id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required",
+    id: "t1",
+    description: "Add hook",
+    kind: "implementation",
+    dependsOn: [],
+    status: "pending",
+    priority: "required",
   };
 
   it("applies skip/approve when the override's captured kind+description match the current task", () => {
     const [skipped] = applyTaskOverrides([task], {
-      t1: { action: "skip", at: "2026-01-01T00:00:00Z", kind: "implementation", description: "Add hook" },
+      t1: {
+        action: "skip",
+        at: "2026-01-01T00:00:00Z",
+        kind: "implementation",
+        description: "Add hook",
+      },
     });
     expect(skipped).toMatchObject({ status: "skipped", priority: "optional" });
     expect(skipped.override).toMatchObject({ action: "skip" });
     expect(skipped.staleOverride).toBeUndefined();
 
     const [approved] = applyTaskOverrides([task], {
-      t1: { action: "approve", at: "2026-01-01T00:00:00Z", kind: "implementation", description: "Add hook" },
+      t1: {
+        action: "approve",
+        at: "2026-01-01T00:00:00Z",
+        kind: "implementation",
+        description: "Add hook",
+      },
     });
     expect(approved).toMatchObject({ status: "complete" });
     expect(approved.override).toMatchObject({ action: "approve" });
@@ -828,7 +1019,12 @@ describe("applyTaskOverrides (Task 4.3, review round 1: id-stability + fail-open
     // Same id "t1", but this override was recorded for a DIFFERENT task
     // that used to hold id t1 before a replan renumbered the task list.
     const [t] = applyTaskOverrides([task], {
-      t1: { action: "skip", at: "2026-01-01T00:00:00Z", kind: "verification", description: "Run the old tests" },
+      t1: {
+        action: "skip",
+        at: "2026-01-01T00:00:00Z",
+        kind: "verification",
+        description: "Run the old tests",
+      },
     });
     expect(t.status).toBe("pending"); // unchanged -- override NOT applied
     expect(t.override).toBeUndefined();

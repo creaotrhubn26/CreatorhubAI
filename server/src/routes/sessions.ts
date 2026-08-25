@@ -3,29 +3,66 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { CONFIG, gatewayRunLogsDir, sessionsDir } from "../config.js";
 import {
-  listSessionIds, readSession, readManifestRaw, isValidSessionId,
+  listSessionIds,
+  readSession,
+  readManifestRaw,
+  isValidSessionId,
   resolveSessionId,
-  readArchitecturePlan, readArchitectReviews, readDeliveryReview, readDeliveryPacket, readSessionTasks,
-  writeHumanAcceptance, clearHumanAcceptance, readVisualManifest, readVisualFindings,
-  readTaskOverrides, writeTaskOverride, applyTaskOverrides,
-  readEvidenceIndex, readEvidenceEntry, resolveApproval,
+  readArchitecturePlan,
+  readArchitectReviews,
+  readDeliveryReview,
+  readDeliveryPacket,
+  readSessionTasks,
+  writeHumanAcceptance,
+  clearHumanAcceptance,
+  readVisualManifest,
+  readVisualFindings,
+  readTaskOverrides,
+  writeTaskOverride,
+  applyTaskOverrides,
+  readEvidenceIndex,
+  readEvidenceEntry,
+  resolveApproval,
   readTaskReport,
-  readHunkAcceptances, writeHunkAcceptance, clearHunkAcceptance, clearHunkAcceptancesForPath,
+  readHunkAcceptances,
+  writeHunkAcceptance,
+  clearHunkAcceptance,
+  clearHunkAcceptancesForPath,
 } from "../lib/sessions.js";
-import { gitDiff, gitRevertFile, gitRejectHunk, gitStatus, parseGitDiffHunks, GitHunkReviewError } from "../lib/git.js";
+import {
+  gitDiff,
+  gitRevertFile,
+  gitRejectHunk,
+  gitStatus,
+  parseGitDiffHunks,
+  GitHunkReviewError,
+} from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
 import {
-  askRepositoryAssistant, askSessionAssistant, streamRepositoryAssistant, streamSessionAssistant,
+  askRepositoryAssistant,
+  askSessionAssistant,
+  streamRepositoryAssistant,
+  streamSessionAssistant,
 } from "../lib/sessionAssistant.js";
 import { readWorkspaceFile } from "./workspaces.js";
 import {
-  inferTaskIntent, isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap,
-  type VisualVerification, type RepositorySelection, type SessionDiff,
+  inferTaskIntent,
+  isGlimmerEvent,
+  type TaskContract,
+  type SessionAnalysis,
+  type GlimmerEvent,
+  type RepoMap,
+  type VisualVerification,
+  type RepositorySelection,
+  type SessionDiff,
 } from "@glimmer/shared";
 import {
-  createGatewayRun, readGatewayRun, terminateRecordedProcess, updateGatewayRun,
+  createGatewayRun,
+  readGatewayRun,
+  terminateRecordedProcess,
+  updateGatewayRun,
 } from "../lib/runState.js";
 
 export const sessionsRouter = Router();
@@ -77,22 +114,29 @@ const MAX_REPOSITORY_SELECTION_LINES = 400;
 const MAX_REPOSITORY_SELECTION_CHARS = 40_000;
 
 type SelectionEvidenceResult =
-  | { ok: true; evidence: string }
-  | { ok: false; status: number; error: string };
+  { ok: true; evidence: string } | { ok: false; status: number; error: string };
 
 async function repositorySelectionEvidence(raw: unknown): Promise<SelectionEvidenceResult> {
   const selection = raw as Partial<RepositorySelection> | null;
   if (
-    !selection || typeof selection.path !== "string" || !selection.path.trim() ||
-    !Number.isInteger(selection.startLine) || !Number.isInteger(selection.endLine) ||
-    (selection.startLine ?? 0) < 1 || (selection.endLine ?? 0) < (selection.startLine ?? 0)
+    !selection ||
+    typeof selection.path !== "string" ||
+    !selection.path.trim() ||
+    !Number.isInteger(selection.startLine) ||
+    !Number.isInteger(selection.endLine) ||
+    (selection.startLine ?? 0) < 1 ||
+    (selection.endLine ?? 0) < (selection.startLine ?? 0)
   ) {
     return { ok: false, status: 400, error: "a valid repository selection is required" };
   }
   const startLine = selection.startLine as number;
   const endLine = selection.endLine as number;
   if (endLine - startLine + 1 > MAX_REPOSITORY_SELECTION_LINES) {
-    return { ok: false, status: 400, error: `selection exceeds ${MAX_REPOSITORY_SELECTION_LINES} lines` };
+    return {
+      ok: false,
+      status: 400,
+      error: `selection exceeds ${MAX_REPOSITORY_SELECTION_LINES} lines`,
+    };
   }
 
   // Re-read at question time through Round A's exact content boundary. The
@@ -107,11 +151,19 @@ async function repositorySelectionEvidence(raw: unknown): Promise<SelectionEvide
   const lines = read.file.content.split("\n");
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
   if (startLine > lines.length || endLine > lines.length) {
-    return { ok: false, status: 400, error: "selection is outside the file excerpt currently available" };
+    return {
+      ok: false,
+      status: 400,
+      error: "selection is outside the file excerpt currently available",
+    };
   }
   const excerpt = lines.slice(startLine - 1, endLine).join("\n");
   if (excerpt.length > MAX_REPOSITORY_SELECTION_CHARS) {
-    return { ok: false, status: 400, error: `selection exceeds ${MAX_REPOSITORY_SELECTION_CHARS} characters` };
+    return {
+      ok: false,
+      status: 400,
+      error: `selection exceeds ${MAX_REPOSITORY_SELECTION_CHARS} characters`,
+    };
   }
   return {
     ok: true,
@@ -162,7 +214,9 @@ sessionsRouter.post("/repository/ask", async (req, res) => {
         CONFIG.modelBaseUrl,
         selected.evidence,
         question,
-        (delta) => { res.write(`data: ${JSON.stringify({ delta })}\n\n`); },
+        (delta) => {
+          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+        },
         undefined,
         clientGone.signal,
       );
@@ -203,7 +257,8 @@ sessionsRouter.get("/sessions/:id/manifest", async (req, res) => {
 });
 
 sessionsRouter.get("/sessions/:id/events", async (req, res) => {
-  if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
+  if (!isValidSessionId(resolveSessionId(req.params.id)))
+    return res.status(404).json({ error: "not found" });
 
   if (req.query.stream === "1") {
     res.writeHead(200, {
@@ -221,7 +276,9 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
           res.write(`data: ${JSON.stringify(evt)}\n\n`);
         }
         lastCount = events.length;
-      } catch { /* events.jsonl not written yet */ }
+      } catch {
+        /* events.jsonl not written yet */
+      }
     }, 1000);
     req.on("close", () => clearInterval(interval));
     return;
@@ -271,9 +328,15 @@ sessionsRouter.post("/sessions/:id/ask", async (req, res) => {
     });
     try {
       const answer = await streamSessionAssistant(
-        CONFIG.modelBaseUrl, session, events, question,
-        (delta) => { res.write(`data: ${JSON.stringify({ delta })}\n\n`); },
-        undefined, clientGone.signal
+        CONFIG.modelBaseUrl,
+        session,
+        events,
+        question,
+        (delta) => {
+          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+        },
+        undefined,
+        clientGone.signal,
       );
       res.write(`data: ${JSON.stringify({ done: true, answer })}\n\n`);
     } catch {
@@ -300,19 +363,23 @@ sessionsRouter.post("/sessions", async (req, res) => {
   const contract = req.body?.taskContract as TaskContract | undefined;
   const workspace = req.body?.workspace as string | undefined;
   if (
-    !contract || typeof contract.objective !== "string" || !contract.objective ||
+    !contract ||
+    typeof contract.objective !== "string" ||
+    !contract.objective ||
     !TASK_MODES.has(contract.mode) ||
     !Array.isArray(contract.verification) ||
     typeof contract.repairBudget !== "number" ||
-    typeof workspace !== "string" || !workspace
+    typeof workspace !== "string" ||
+    !workspace
   ) {
     return res.status(400).json({ error: "invalid taskContract or workspace" });
   }
-  if (contract.intent !== undefined && (
-    typeof contract.intent !== "object" ||
-    !TASK_INTENTS.has(contract.intent.kind) ||
-    !TASK_INTENT_SOURCES.has(contract.intent.source)
-  )) {
+  if (
+    contract.intent !== undefined &&
+    (typeof contract.intent !== "object" ||
+      !TASK_INTENTS.has(contract.intent.kind) ||
+      !TASK_INTENT_SOURCES.has(contract.intent.source))
+  ) {
     return res.status(400).json({ error: "invalid taskContract.intent" });
   }
   // §7 Advanced controls: server is the validation boundary, not the
@@ -335,7 +402,8 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   if (activeRuns.has(req.params.id)) return res.status(409).json({ error: "already running" });
   const record = await readGatewayRun(req.params.id);
   if (!record) return res.status(404).json({ error: "no task contract for this session id" });
-  if (record.state !== "created") return res.status(409).json({ error: "session has already been started" });
+  if (record.state !== "created")
+    return res.status(409).json({ error: "session has already been started" });
 
   // Mirror the orchestrator's non-negotiable branch boundary before we
   // spawn it. This makes an early rejection synchronous and leaves
@@ -368,31 +436,43 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
       };
     });
   } catch (err: any) {
-    if (err?.message === "already-started") return res.status(409).json({ error: "session has already been started" });
+    if (err?.message === "already-started")
+      return res.status(409).json({ error: "session has already been started" });
     throw err;
   }
 
   const logDir = path.join(gatewayRunLogsDir(), req.params.id);
   await fs.mkdir(logDir, { recursive: true });
   const args = buildArgs(record.contract, record.workspace, req.params.id);
-  const handle = runGlimmer(logDir, CONFIG.glimmerV2Path, ["--engineer", CONFIG.engineerPath, ...args], (code) => {
-    activeRuns.delete(req.params.id);
-    void updateGatewayRun(req.params.id, (current) => ({
-      ...current,
-      state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
-      exitCode: code,
-      completedAt: new Date().toISOString(),
-    }));
-  });
+  const handle = runGlimmer(
+    logDir,
+    CONFIG.glimmerV2Path,
+    ["--engineer", CONFIG.engineerPath, ...args],
+    (code) => {
+      activeRuns.delete(req.params.id);
+      void updateGatewayRun(req.params.id, (current) => ({
+        ...current,
+        state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+        exitCode: code,
+        completedAt: new Date().toISOString(),
+      }));
+    },
+  );
   if (handle.pid <= 1) {
     await updateGatewayRun(req.params.id, (current) => ({
-      ...current, state: "start_failed", error: "orchestrator process did not start",
+      ...current,
+      state: "start_failed",
+      error: "orchestrator process did not start",
       completedAt: new Date().toISOString(),
     }));
     return res.status(500).json({ error: "orchestrator process did not start" });
   }
   activeRuns.set(req.params.id, handle);
-  await updateGatewayRun(req.params.id, (current) => ({ ...current, state: "running", pid: handle.pid }));
+  await updateGatewayRun(req.params.id, (current) => ({
+    ...current,
+    state: "running",
+    pid: handle.pid,
+  }));
   res.json({ started: true, pid: handle.pid });
 });
 
@@ -412,13 +492,17 @@ sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
     // whose live command line proves it belongs to this exact canonical run.
     if (!(await terminateRecordedProcess(record))) {
       await updateGatewayRun(req.params.id, (current) => ({
-        ...current, state: "exited", completedAt: current.completedAt ?? new Date().toISOString(),
+        ...current,
+        state: "exited",
+        completedAt: current.completedAt ?? new Date().toISOString(),
       }));
       return res.status(409).json({ error: "session process is no longer running" });
     }
   }
   await updateGatewayRun(req.params.id, (current) => ({
-    ...current, state: "cancel_requested", completedAt: new Date().toISOString(),
+    ...current,
+    state: "cancel_requested",
+    completedAt: new Date().toISOString(),
   }));
   res.json({ cancelled: true });
 });
@@ -535,7 +619,8 @@ sessionsRouter.get("/sessions/:id/evidence", async (req, res) => {
 // null), not a 404, exactly like /events already returns [] rather than
 // 404ing in that case. An invalid/unsafe id is the only real 404 here.
 sessionsRouter.get("/sessions/:id/context", async (req, res) => {
-  if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
+  if (!isValidSessionId(resolveSessionId(req.params.id)))
+    return res.status(404).json({ error: "not found" });
   try {
     const events = await readSessionEventsBatch(req.params.id);
     const selections = events.filter((e) => e.type === "context_selected");
@@ -576,7 +661,8 @@ async function handleTaskOverride(req: Request, res: Response, action: "skip" | 
     // description onto the override record -- see writeTaskOverride/
     // applyTaskOverrides for why (task ids aren't stable across a replan).
     const record = await writeTaskOverride(req.params.id, req.params.taskId, action, {
-      kind: task.kind, description: task.description,
+      kind: task.kind,
+      description: task.description,
     });
     res.json({ taskId: req.params.taskId, ...record });
   } catch (err: any) {
@@ -584,8 +670,12 @@ async function handleTaskOverride(req: Request, res: Response, action: "skip" | 
   }
 }
 
-sessionsRouter.post("/sessions/:id/tasks/:taskId/skip", (req, res) => handleTaskOverride(req, res, "skip"));
-sessionsRouter.post("/sessions/:id/tasks/:taskId/approve", (req, res) => handleTaskOverride(req, res, "approve"));
+sessionsRouter.post("/sessions/:id/tasks/:taskId/skip", (req, res) =>
+  handleTaskOverride(req, res, "skip"),
+);
+sessionsRouter.post("/sessions/:id/tasks/:taskId/approve", (req, res) =>
+  handleTaskOverride(req, res, "approve"),
+);
 
 // Task 8.3 (V7 §14/§35): human approve/deny for a YELLOW-classified action
 // glimmer-engineer.py is currently blocked waiting on (approvals.json) --
@@ -603,8 +693,10 @@ async function handleApprovalResolution(req: Request, res: Response, action: "ap
     // reflects, with no actor field at all) -- approvedBy is whatever the
     // client sends, defaulting to a generic label when omitted, purely so
     // the sidecar's human-provenance field is never left blank.
-    const approvedBy = typeof req.body?.approvedBy === "string" && req.body.approvedBy.trim()
-      ? req.body.approvedBy.trim() : "control-center-operator";
+    const approvedBy =
+      typeof req.body?.approvedBy === "string" && req.body.approvedBy.trim()
+        ? req.body.approvedBy.trim()
+        : "control-center-operator";
     const record = await resolveApproval(req.params.id, req.params.approvalId, action, approvedBy);
     if (!record) return res.status(404).json({ error: "not found" });
     res.json({ approvalId: req.params.approvalId, ...record });
@@ -613,8 +705,12 @@ async function handleApprovalResolution(req: Request, res: Response, action: "ap
   }
 }
 
-sessionsRouter.post("/sessions/:id/approvals/:approvalId/approve", (req, res) => handleApprovalResolution(req, res, "approve"));
-sessionsRouter.post("/sessions/:id/approvals/:approvalId/deny", (req, res) => handleApprovalResolution(req, res, "deny"));
+sessionsRouter.post("/sessions/:id/approvals/:approvalId/approve", (req, res) =>
+  handleApprovalResolution(req, res, "approve"),
+);
+sessionsRouter.post("/sessions/:id/approvals/:approvalId/deny", (req, res) =>
+  handleApprovalResolution(req, res, "deny"),
+);
 
 // V7 §22.14/§22.16 visual evidence store -- static serving of a session's
 // visual/ artifacts. Same opt-in-artifact-absence convention as /plan,
@@ -651,7 +747,8 @@ function resolveVisualScreenshotPath(visualDir: string, file: string): string | 
   if (!VISUAL_SCREENSHOT_FILENAME_RE.test(file)) return null;
   const resolvedDir = path.resolve(visualDir);
   const resolved = path.resolve(visualDir, file);
-  if (resolved !== path.join(resolvedDir, file) || !resolved.startsWith(resolvedDir + path.sep)) return null;
+  if (resolved !== path.join(resolvedDir, file) || !resolved.startsWith(resolvedDir + path.sep))
+    return null;
   return resolved;
 }
 
@@ -674,13 +771,16 @@ sessionsRouter.get("/sessions/:id/diff", async (req, res) => {
   try {
     const session = await readSession(req.params.id);
     if (!session) return res.status(404).json({ error: "not found" });
-    const diff = await gitDiff(session.workspace, session.changedFiles.map((f) => f.path));
+    const diff = await gitDiff(
+      session.workspace,
+      session.changedFiles.map((f) => f.path),
+    );
     const acceptances = await readHunkAcceptances(req.params.id);
     const hunks = parseGitDiffHunks(diff).map(({ patch: _patch, ...hunk }) => {
       const accepted = acceptances[hunk.id];
       return {
         ...hunk,
-        status: accepted?.path === hunk.path ? "accepted" as const : "pending" as const,
+        status: accepted?.path === hunk.path ? ("accepted" as const) : ("pending" as const),
         ...(accepted?.path === hunk.path ? { acceptedAt: accepted.acceptedAt } : {}),
       };
     });
@@ -701,10 +801,17 @@ sessionsRouter.post("/sessions/:id/hunks/:hunkId/accept", async (req, res) => {
       return res.status(403).json({ error: "path is not in this session's changed files" });
     }
     const current = parseGitDiffHunks(await gitDiff(session.workspace, [targetPath]));
-    const hunk = current.find((candidate) => candidate.path === targetPath && candidate.id === req.params.hunkId);
+    const hunk = current.find(
+      (candidate) => candidate.path === targetPath && candidate.id === req.params.hunkId,
+    );
     if (!hunk) return res.status(409).json({ error: "hunk changed; refresh and review again" });
     const record = await writeHunkAcceptance(req.params.id, hunk.id, hunk.path);
-    res.json({ hunkId: hunk.id, path: hunk.path, decision: "accepted", decidedAt: record.acceptedAt });
+    res.json({
+      hunkId: hunk.id,
+      path: hunk.path,
+      decision: "accepted",
+      decidedAt: record.acceptedAt,
+    });
   } catch (err: any) {
     res.status(500).json({ error: "could not accept hunk" });
   }
@@ -720,7 +827,11 @@ sessionsRouter.post("/sessions/:id/hunks/:hunkId/reject", async (req, res) => {
       return res.status(403).json({ error: "path is not in this session's changed files" });
     }
     const current = parseGitDiffHunks(await gitDiff(session.workspace, [targetPath]));
-    if (!current.some((candidate) => candidate.path === targetPath && candidate.id === req.params.hunkId)) {
+    if (
+      !current.some(
+        (candidate) => candidate.path === targetPath && candidate.id === req.params.hunkId,
+      )
+    ) {
       return res.status(409).json({ error: "hunk changed; refresh and review again" });
     }
     // Clear a prior acceptance before the mutation. If git apply then finds
@@ -741,7 +852,8 @@ sessionsRouter.post("/sessions/:id/hunks/:hunkId/reject", async (req, res) => {
       decidedAt: new Date().toISOString(),
     });
   } catch (err: any) {
-    if (err instanceof GitHunkReviewError) return res.status(err.status).json({ error: err.message });
+    if (err instanceof GitHunkReviewError)
+      return res.status(err.status).json({ error: err.message });
     res.status(500).json({ error: "could not reject hunk" });
   }
 });
@@ -760,7 +872,10 @@ sessionsRouter.post("/sessions/:id/accept", async (req, res) => {
     // same review invariant. Binary-only diffs have no text hunks and retain
     // the existing file-level review fallback.
     if (session.changedFiles.length > 0) {
-      const diff = await gitDiff(session.workspace, session.changedFiles.map((file) => file.path));
+      const diff = await gitDiff(
+        session.workspace,
+        session.changedFiles.map((file) => file.path),
+      );
       const hunks = parseGitDiffHunks(diff);
       const acceptances = await readHunkAcceptances(req.params.id);
       const pending = hunks.filter((hunk) => acceptances[hunk.id]?.path !== hunk.path);
@@ -785,7 +900,12 @@ sessionsRouter.post("/sessions/:id/revert-file", async (req, res) => {
     const targetPath = req.body?.path;
     if (typeof targetPath !== "string") return res.status(400).json({ error: "path required" });
     try {
-      await gitRevertFile(session.workspace, session.changedFiles.map((f) => f.path), targetPath, session.baselineSha);
+      await gitRevertFile(
+        session.workspace,
+        session.changedFiles.map((f) => f.path),
+        targetPath,
+        session.baselineSha,
+      );
       await Promise.all([
         clearHunkAcceptancesForPath(req.params.id, targetPath),
         clearHumanAcceptance(req.params.id),

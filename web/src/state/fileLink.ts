@@ -8,7 +8,8 @@
 export function fileHref(path: string, line?: number, sessionId?: string): string {
   const q = new URLSearchParams({ path });
   // Only a line that was actually known is carried — never a fabricated 1.
-  if (line !== undefined && Number.isFinite(line) && line > 0) q.set("line", String(Math.floor(line)));
+  if (line !== undefined && Number.isFinite(line) && line > 0)
+    q.set("line", String(Math.floor(line)));
   // A diff-originated file keeps the session context that emitted
   // file_changed events. Repo-map/doc-graph links omit it because they do not
   // name a run, and inventing one would make live-refresh provenance false.
@@ -38,11 +39,15 @@ export function absolutePath(workspace: string, relative: string): string {
 // A file can technically sit inside nested known workspaces. The deepest
 // match is the workspace that gives the narrowest, correct relative scope
 // and the right base for session-relative file_changed event paths.
-export function mostSpecificContainingWorkspace(workspaces: string[], target: string): string | undefined {
+export function mostSpecificContainingWorkspace(
+  workspaces: string[],
+  target: string,
+): string | undefined {
   let best: string | undefined;
   for (const workspace of workspaces) {
     const root = workspace.replace(/\/+$/, "") || "/";
-    const contains = root === "/" ? target.startsWith("/") : target === root || target.startsWith(root + "/");
+    const contains =
+      root === "/" ? target.startsWith("/") : target === root || target.startsWith(root + "/");
     if (contains && (!best || root.length > best.length)) best = root;
   }
   return best;

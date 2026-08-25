@@ -4,7 +4,17 @@
 import type { SVGProps } from "react";
 
 function base(props: SVGProps<SVGSVGElement>) {
-  return { width: 16, height: 16, viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: 1.4, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, ...props };
+  return {
+    width: 16,
+    height: 16,
+    viewBox: "0 0 16 16",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.4,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    ...props,
+  };
 }
 
 export function IconDashboard(props: SVGProps<SVGSVGElement>) {
@@ -109,7 +119,13 @@ export function IconSearch(props: SVGProps<SVGSVGElement>) {
 
 export function IconChevron({ open, ...props }: SVGProps<SVGSVGElement> & { open: boolean }) {
   return (
-    <svg {...base(props)} width={11} height={11} viewBox="0 0 16 16" style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 120ms" }}>
+    <svg
+      {...base(props)}
+      width={11}
+      height={11}
+      viewBox="0 0 16 16"
+      style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 120ms" }}
+    >
       <path d="M5 3l6 5-6 5" />
     </svg>
   );
@@ -125,7 +141,14 @@ export function IconClose(props: SVGProps<SVGSVGElement>) {
 
 export function IconSend(props: SVGProps<SVGSVGElement>) {
   return (
-    <svg {...base(props)} width={14} height={14} viewBox="0 0 16 16" fill="currentColor" stroke="none">
+    <svg
+      {...base(props)}
+      width={14}
+      height={14}
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      stroke="none"
+    >
       <path d="M2 2.5 14 8 2 13.5 3.6 8.6 9 8 3.6 7.4 2 2.5Z" />
     </svg>
   );

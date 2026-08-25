@@ -1,4 +1,11 @@
-import type { RepoMap, RepoPackage, ChangedFile, TaskContract, RiskLevel, ScopeGuardResult } from "@glimmer/shared";
+import type {
+  RepoMap,
+  RepoPackage,
+  ChangedFile,
+  TaskContract,
+  RiskLevel,
+  ScopeGuardResult,
+} from "@glimmer/shared";
 
 export interface AreaGuess {
   area: string | null;
@@ -21,7 +28,8 @@ export function inferArea(scope: TaskContract["scope"], repoMap: RepoMap | null)
   }
   if (scope.package === "frontend" || scope.package === "backend") {
     const pkg = repoMap.packages.find(
-      (p) => p.dir.toLowerCase().includes(scope.package) || p.name.toLowerCase().includes(scope.package)
+      (p) =>
+        p.dir.toLowerCase().includes(scope.package) || p.name.toLowerCase().includes(scope.package),
     );
     if (pkg) return { area: pkg.dir, package: pkg };
   }
@@ -32,7 +40,8 @@ export function suggestVerification(pkg: RepoPackage | null): string[] {
   if (!pkg) return [];
   const suggestions: string[] = [];
   if ("typecheck" in pkg.scripts) suggestions.push("frontend-typecheck");
-  if (Object.keys(pkg.scripts).some((s) => s === "test:unit" || s === "test")) suggestions.push("targeted-test");
+  if (Object.keys(pkg.scripts).some((s) => s === "test:unit" || s === "test"))
+    suggestions.push("targeted-test");
   return suggestions;
 }
 
@@ -53,12 +62,19 @@ export const ARCHITECT_RISK_THRESHOLD = 5;
 
 // Same plain-word, exact-token style as glimmer-v2.py's _PROTECTED_AREA_WORDS.
 const PROTECTED_AREA_WORDS = new Set([
-  "auth", "authentication", "payment", "payments", "migration", "migrations", "schema", "security",
+  "auth",
+  "authentication",
+  "payment",
+  "payments",
+  "migration",
+  "migrations",
+  "schema",
+  "security",
 ]);
 
 export function computeArchitectRiskScore(
   scopePackage: string,
-  hints: ArchitectRiskHints
+  hints: ArchitectRiskHints,
 ): { score: number; signals: string[] } {
   let score = 0;
   const signals: string[] = [];
@@ -71,11 +87,17 @@ export function computeArchitectRiskScore(
     score += 2;
     signals.push("multi_package_scope");
   }
-  if (typeof hints.candidateCount === "number" && hints.candidateCount > ARCHITECT_RISK_CANDIDATE_THRESHOLD) {
+  if (
+    typeof hints.candidateCount === "number" &&
+    hints.candidateCount > ARCHITECT_RISK_CANDIDATE_THRESHOLD
+  ) {
     score += 2;
     signals.push("candidate_count_high");
   }
-  const objectiveWords = (hints.objective ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const objectiveWords = (hints.objective ?? "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
   if (objectiveWords.some((w) => PROTECTED_AREA_WORDS.has(w))) {
     score += 3;
     signals.push("protected_area_keyword");
@@ -120,7 +142,7 @@ export function computeRiskScore(changedFiles: ChangedFile[], repoMap: RepoMap |
 
   if (repoMap && repoMap.packages.length > 1) {
     const touched = new Set(
-      paths.map((p) => repoMap.packages.find((pkg) => p.startsWith(pkg.dir))?.dir).filter(Boolean)
+      paths.map((p) => repoMap.packages.find((pkg) => p.startsWith(pkg.dir))?.dir).filter(Boolean),
     );
     if (touched.size > 1) medium = true;
   }
@@ -137,7 +159,9 @@ function expectedPrefixes(scope: TaskContract["scope"], repoMap: RepoMap | null)
   if (scope.package === "frontend" || scope.package === "backend") {
     if (repoMap) {
       const pkg = repoMap.packages.find(
-        (p) => p.dir.toLowerCase().includes(scope.package) || p.name.toLowerCase().includes(scope.package)
+        (p) =>
+          p.dir.toLowerCase().includes(scope.package) ||
+          p.name.toLowerCase().includes(scope.package),
       );
       if (pkg) return [pkg.dir];
     }
@@ -149,7 +173,7 @@ function expectedPrefixes(scope: TaskContract["scope"], repoMap: RepoMap | null)
 export function computeScopeGuard(
   scope: TaskContract["scope"],
   changedFiles: ChangedFile[],
-  repoMap: RepoMap | null
+  repoMap: RepoMap | null,
 ): ScopeGuardResult {
   const expected = expectedPrefixes(scope, repoMap);
   const actual = changedFiles.map((f) => f.path);
@@ -167,7 +191,8 @@ export function computeScopeGuard(
     return { inScope: true, expected, actual, expandedFiles: [] };
   }
   const expandedFiles = actual.filter(
-    (p) => !expected.some((prefix) => p === prefix || p.startsWith(prefix.replace(/\/$/, "") + "/"))
+    (p) =>
+      !expected.some((prefix) => p === prefix || p.startsWith(prefix.replace(/\/$/, "") + "/")),
   );
   return { inScope: expandedFiles.length === 0, expected, actual, expandedFiles };
 }

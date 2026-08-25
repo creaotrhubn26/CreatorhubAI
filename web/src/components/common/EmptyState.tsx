@@ -13,7 +13,9 @@ export function EmptyState({
 }) {
   return (
     <div className="empty-state">
-      <span className="empty-state__icon" aria-hidden="true">{icon}</span>
+      <span className="empty-state__icon" aria-hidden="true">
+        {icon}
+      </span>
       <span className="empty-state__text">{text}</span>
       {action && (
         <button type="button" className="empty-state__action" onClick={action.onAction}>

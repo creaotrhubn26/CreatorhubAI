@@ -1,11 +1,34 @@
 import type {
-  DashboardStatus, ModelStatus, GlimmerSession, RepoMap, WorkspaceInfo, TaskContract, TaskIntelligence, SessionAnalysis,
-  SessionAssistantAnswer, ArchitecturePlan, ArchitectReview, DeliveryReview, DeliveryPacket, GlimmerTask, HumanAcceptance,
+  DashboardStatus,
+  ModelStatus,
+  GlimmerSession,
+  RepoMap,
+  WorkspaceInfo,
+  TaskContract,
+  TaskIntelligence,
+  SessionAnalysis,
+  SessionAssistantAnswer,
+  ArchitecturePlan,
+  ArchitectReview,
+  DeliveryReview,
+  DeliveryPacket,
+  GlimmerTask,
+  HumanAcceptance,
   CreateWorkspaceResult,
-  VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
-  ApprovalRequest, FsListing, FsFile, RepositorySelection,
-  ModelRegistry, ModelRegistryUpdate,
-  SessionDiff, HunkReviewResult,
+  VisualVerification,
+  TaskOverride,
+  EvidenceIndexResponse,
+  EvidenceEntryResponse,
+  DocGraph,
+  DocGraphSource,
+  ApprovalRequest,
+  FsListing,
+  FsFile,
+  RepositorySelection,
+  ModelRegistry,
+  ModelRegistryUpdate,
+  SessionDiff,
+  HunkReviewResult,
   TaskReport,
   CliIntegrationsStatus,
 } from "@glimmer/shared";
@@ -23,7 +46,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // branch). Dropping the JSON body here used to leave the composer with
     // only an opaque status code, even when the server had already explained
     // exactly how to recover.
-    const body = await res.json().catch(() => null) as { error?: unknown } | null;
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
     const detail = typeof body?.error === "string" ? body.error : null;
     throw new Error(detail ?? `${init?.method ?? "GET"} ${path} failed: ${res.status}`);
   }
@@ -128,7 +151,8 @@ export const glimmerApi = {
   getSessionAnalysis: (id: string) => request<SessionAnalysis>(`/api/sessions/${id}/analysis`),
   getArchitecturePlan: (id: string) => request<ArchitecturePlan>(`/api/sessions/${id}/plan`),
   getTaskReport: (id: string) => request<TaskReport>(`/api/sessions/${id}/task-report`),
-  getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
+  getArchitectReviews: (id: string) =>
+    request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),
   // Task 8.2 (V7 §23.16) -- the concise session close-out handoff document.
   getDeliveryPacket: (id: string) => request<DeliveryPacket>(`/api/sessions/${id}/delivery-packet`),
@@ -138,25 +162,33 @@ export const glimmerApi = {
   // route (see server/src/routes/sessions.ts).
   getEvidenceIndex: (id: string) => request<EvidenceIndexResponse>(`/api/sessions/${id}/evidence`),
   getEvidenceEntry: (id: string, evidenceId: string) =>
-    request<EvidenceEntryResponse>(`/api/sessions/${id}/evidence?id=${encodeURIComponent(evidenceId)}`),
+    request<EvidenceEntryResponse>(
+      `/api/sessions/${id}/evidence?id=${encodeURIComponent(evidenceId)}`,
+    ),
   // Task 4.3 — human skip/approve, gateway-owned (see server/src/lib/
   // sessions.ts writeTaskOverride). One-shot: a second click just replaces
   // the prior override, no undo.
   skipTask: (id: string, taskId: string) =>
-    request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/skip`, { method: "POST" }),
+    request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/skip`, {
+      method: "POST",
+    }),
   approveTask: (id: string, taskId: string) =>
-    request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/approve`, { method: "POST" }),
+    request<{ taskId: string } & TaskOverride>(`/api/sessions/${id}/tasks/${taskId}/approve`, {
+      method: "POST",
+    }),
   // Task 8.3 (V7 §14/§35) -- human approve/deny for a YELLOW-classified
   // action glimmer-engineer.py is currently blocked on (approvals.json).
   // One-shot per approvalId: a second click on an already-resolved id is a
   // gateway-side no-op (see resolveApproval), not an error.
   approveApproval: (id: string, approvalId: string) =>
     request<{ approvalId: string } & ApprovalRequest>(
-      `/api/sessions/${id}/approvals/${approvalId}/approve`, { method: "POST" },
+      `/api/sessions/${id}/approvals/${approvalId}/approve`,
+      { method: "POST" },
     ),
   denyApproval: (id: string, approvalId: string) =>
     request<{ approvalId: string } & ApprovalRequest>(
-      `/api/sessions/${id}/approvals/${approvalId}/deny`, { method: "POST" },
+      `/api/sessions/${id}/approvals/${approvalId}/deny`,
+      { method: "POST" },
     ),
   // V7 §22.16 -- bypasses the generic request() helper (which throws on any
   // non-2xx) because 404 here is the honest, common "never ran
@@ -173,15 +205,22 @@ export const glimmerApi = {
   visualScreenshotUrl: (id: string, file: string) =>
     `${API_BASE}/api/sessions/${id}/visual/screenshot/${encodeURIComponent(file)}`,
   askSession: (id: string, question: string) =>
-    request<SessionAssistantAnswer>(`/api/sessions/${id}/ask`, { method: "POST", body: JSON.stringify({ question }) }),
+    request<SessionAssistantAnswer>(`/api/sessions/${id}/ask`, {
+      method: "POST",
+      body: JSON.stringify({ question }),
+    }),
   askSessionStream: (id: string, question: string, onDelta: (delta: string) => void) =>
     streamAssistant(`/api/sessions/${id}/ask?stream=1`, { question }, onDelta),
   askRepository: (selection: RepositorySelection, question: string) =>
     request<SessionAssistantAnswer>("/api/repository/ask", {
-      method: "POST", body: JSON.stringify({ question, selection }),
+      method: "POST",
+      body: JSON.stringify({ question, selection }),
     }),
-  askRepositoryStream: (selection: RepositorySelection, question: string, onDelta: (delta: string) => void) =>
-    streamAssistant("/api/repository/ask?stream=1", { question, selection }, onDelta),
+  askRepositoryStream: (
+    selection: RepositorySelection,
+    question: string,
+    onDelta: (delta: string) => void,
+  ) => streamAssistant("/api/repository/ask?stream=1", { question, selection }, onDelta),
   getRepositoryMap: () => request<RepoMap>("/api/repository/map"),
   // Task 7.5 (V7 "System Explorer") -- bypasses request() the same way
   // getVisualVerification does: 404 (no session's workspace carries a
@@ -212,7 +251,11 @@ export const glimmerApi = {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const detail = [body.error, body.workspace && `workspace: ${body.workspace}`, body.branch && `branch: ${body.branch}`]
+      const detail = [
+        body.error,
+        body.workspace && `workspace: ${body.workspace}`,
+        body.branch && `branch: ${body.branch}`,
+      ]
         .filter(Boolean)
         .join(" — ");
       throw new Error(detail || `POST /api/workspaces failed: ${res.status}`);
@@ -220,22 +263,33 @@ export const glimmerApi = {
     return body as CreateWorkspaceResult;
   },
   createSession: (taskContract: TaskContract, workspace: string) =>
-    request<GlimmerSession>("/api/sessions", { method: "POST", body: JSON.stringify({ taskContract, workspace }) }),
-  runSession: (id: string) => request<{ started: boolean }>(`/api/sessions/${id}/run`, { method: "POST" }),
-  cancelSession: (id: string) => request<{ cancelled: boolean }>(`/api/sessions/${id}/cancel`, { method: "POST" }),
+    request<GlimmerSession>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({ taskContract, workspace }),
+    }),
+  runSession: (id: string) =>
+    request<{ started: boolean }>(`/api/sessions/${id}/run`, { method: "POST" }),
+  cancelSession: (id: string) =>
+    request<{ cancelled: boolean }>(`/api/sessions/${id}/cancel`, { method: "POST" }),
   revertFile: (id: string, path: string) =>
-    request<{ reverted: string }>(`/api/sessions/${id}/revert-file`, { method: "POST", body: JSON.stringify({ path }) }),
+    request<{ reverted: string }>(`/api/sessions/${id}/revert-file`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
   acceptHunk: (id: string, hunkId: string, path: string) =>
     request<HunkReviewResult>(`/api/sessions/${id}/hunks/${hunkId}/accept`, {
-      method: "POST", body: JSON.stringify({ path }),
+      method: "POST",
+      body: JSON.stringify({ path }),
     }),
   rejectHunk: (id: string, hunkId: string, path: string) =>
     request<HunkReviewResult>(`/api/sessions/${id}/hunks/${hunkId}/reject`, {
-      method: "POST", body: JSON.stringify({ path }),
+      method: "POST",
+      body: JSON.stringify({ path }),
     }),
   // §14 Diff Review — human "accept for review", distinct from technical
   // verification. Gateway-owned; see server/src/lib/sessions.ts.
-  acceptSession: (id: string) => request<HumanAcceptance>(`/api/sessions/${id}/accept`, { method: "POST" }),
+  acceptSession: (id: string) =>
+    request<HumanAcceptance>(`/api/sessions/${id}/accept`, { method: "POST" }),
   // Model server process control. Both bypass the generic request() helper:
   // "already running" (409 from start) is an honest current-state answer the
   // screen renders, not an error — the body carries the same ModelStatus
@@ -261,7 +315,8 @@ export const glimmerApi = {
     if (params.mode) query.set("mode", params.mode);
     if (params.objective) query.set("objective", params.objective);
     if (params.verificationLevel) query.set("verificationLevel", params.verificationLevel);
-    if (params.candidateCount !== undefined) query.set("candidateCount", String(params.candidateCount));
+    if (params.candidateCount !== undefined)
+      query.set("candidateCount", String(params.candidateCount));
     return request<TaskIntelligence>(`/api/task-intelligence?${query.toString()}`);
   },
   // Task 4c(2/3): read-only directory listing for the composer's path pickers
@@ -269,7 +324,11 @@ export const glimmerApi = {
   // Bypasses request() for the same reason readFile does: a refusal has a
   // reason ("root must be inside …", "that path is not browsable"), and a
   // status code echoed back with the whole query string is not one.
-  listDirectory: async (params: { path?: string; root?: string; includeFiles?: boolean }): Promise<FsListing> => {
+  listDirectory: async (params: {
+    path?: string;
+    root?: string;
+    includeFiles?: boolean;
+  }): Promise<FsListing> => {
     const query = new URLSearchParams();
     if (params.path) query.set("path", params.path);
     if (params.root) query.set("root", params.root);

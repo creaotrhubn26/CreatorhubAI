@@ -29,7 +29,14 @@ beforeAll(async () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "manifest.json"),
-      JSON.stringify({ task: `task ${status}`, status, workspace: "/ws", branch: "glimmer/x", attempts: [], updatedAt: "2026-08-16T12:00:00Z" })
+      JSON.stringify({
+        task: `task ${status}`,
+        status,
+        workspace: "/ws",
+        branch: "glimmer/x",
+        attempts: [],
+        updatedAt: "2026-08-16T12:00:00Z",
+      }),
     );
   }
 
@@ -61,7 +68,9 @@ describe("GET /api/status", () => {
     expect(res.status).toBe(200);
     expect(res.body.recentSessions.map((s: { id: string }) => s.id)).toContain(repoMapOnlyId);
     expect(res.body.activeSession).toBeNull();
-    const repoMapOnlySession = res.body.recentSessions.find((s: { id: string }) => s.id === repoMapOnlyId);
+    const repoMapOnlySession = res.body.recentSessions.find(
+      (s: { id: string }) => s.id === repoMapOnlyId,
+    );
     expect(repoMapOnlySession.status).not.toBe("preflight");
   });
 });

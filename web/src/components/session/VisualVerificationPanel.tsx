@@ -78,11 +78,13 @@ export function VisualVerificationPanel({ sessionId }: { sessionId: string }) {
       </div>
       {manifest.viewports.map((viewport) => (
         <div key={viewport} style={{ marginBottom: 16 }}>
-          <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 6 }}>{viewport}</p>
+          <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 6 }}>
+            {viewport}
+          </p>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {manifest.states.map((state) => {
               const capture = manifest.captures.find(
-                (c) => c.viewport === viewport && (c.state ?? "initial") === state
+                (c) => c.viewport === viewport && (c.state ?? "initial") === state,
               );
               if (!capture || capture.status !== "captured" || !capture.screenshot) {
                 return (

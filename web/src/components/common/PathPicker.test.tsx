@@ -38,7 +38,9 @@ describe("PathPicker (browser fallback)", () => {
   });
 
   it("navigates into subdirectories and never above the root (no parent link at the root)", async () => {
-    const spy = vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({ ...listing, parent: null });
+    const spy = vi
+      .spyOn(client.glimmerApi, "listDirectory")
+      .mockResolvedValue({ ...listing, parent: null });
     render(withQuery(<PathPicker mode="directory" root="/home/u" onPick={vi.fn()} />));
     fireEvent.click(screen.getByRole("button", { name: "Browse…" }));
 
@@ -47,7 +49,11 @@ describe("PathPicker (browser fallback)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "src/" }));
     await waitFor(() =>
-      expect(spy).toHaveBeenCalledWith({ path: "/home/u/project/src", root: "/home/u", includeFiles: false })
+      expect(spy).toHaveBeenCalledWith({
+        path: "/home/u/project/src",
+        root: "/home/u",
+        includeFiles: false,
+      }),
     );
   });
 
@@ -66,14 +72,20 @@ describe("PathPicker (browser fallback)", () => {
   });
 
   it("surfaces the server's refusal instead of silently showing an empty directory", async () => {
-    vi.spyOn(client.glimmerApi, "listDirectory").mockRejectedValue(new Error("GET /api/fs/dirs failed: 403"));
+    vi.spyOn(client.glimmerApi, "listDirectory").mockRejectedValue(
+      new Error("GET /api/fs/dirs failed: 403"),
+    );
     render(withQuery(<PathPicker mode="directory" root="/home/u" onPick={vi.fn()} />));
     fireEvent.click(screen.getByRole("button", { name: "Browse…" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("403");
   });
 
   it("stays disabled, with a reason, when the caller has nothing to root it at", () => {
-    render(withQuery(<PathPicker mode="directory" disabledReason="Choose a workspace first." onPick={vi.fn()} />));
+    render(
+      withQuery(
+        <PathPicker mode="directory" disabledReason="Choose a workspace first." onPick={vi.fn()} />,
+      ),
+    );
     expect(screen.getByRole("button", { name: "Browse…" })).toBeDisabled();
     expect(screen.getByText("Choose a workspace first.")).toBeInTheDocument();
   });

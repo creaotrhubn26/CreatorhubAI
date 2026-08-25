@@ -38,7 +38,11 @@ function lineNumberForNode(node: Node | null, body: HTMLElement): number | null 
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
-export function fileEventMatches(openPath: string, workspace: string | undefined, eventPath: string): boolean {
+export function fileEventMatches(
+  openPath: string,
+  workspace: string | undefined,
+  eventPath: string,
+): boolean {
   if (eventPath.startsWith("/")) return eventPath === openPath;
   if (!workspace) return false;
   return `${workspace.replace(/\/+$/, "")}/${eventPath.replace(/^\.\//, "")}` === openPath;
@@ -78,9 +82,11 @@ export function CodeViewer({
   const events = useSharedSessionEvents();
   const lastHandledFileEvent = useRef<string | null>(null);
   useEffect(() => {
-    const changed = [...events].reverse().find(
-      (event) => event.type === "file_changed" && fileEventMatches(path, workspace, event.path),
-    );
+    const changed = [...events]
+      .reverse()
+      .find(
+        (event) => event.type === "file_changed" && fileEventMatches(path, workspace, event.path),
+      );
     if (!changed || changed.id === lastHandledFileEvent.current) return;
     lastHandledFileEvent.current = changed.id;
     void refetch();
@@ -108,7 +114,9 @@ export function CodeViewer({
         <p role="alert" className="code-view__status">
           Could not read this file — {(error as Error).message}
         </p>
-        <button type="button" onClick={() => refetch()}>Try again</button>
+        <button type="button" onClick={() => refetch()}>
+          Try again
+        </button>
       </div>
     );
   }
@@ -119,7 +127,9 @@ export function CodeViewer({
   return (
     <div className="code-view">
       <div className="code-view__header">
-        <span className="mono code-view__path" title={path}>{path}</span>
+        <span className="mono code-view__path" title={path}>
+          {path}
+        </span>
         <span className="code-view__meta">
           {data.size.toLocaleString()} bytes · read {new Date(dataUpdatedAt).toLocaleTimeString()}
         </span>
@@ -129,13 +139,16 @@ export function CodeViewer({
       </div>
 
       {data.binary ? (
-        <EmptyState icon="▢" text={`Binary file — not shown (${data.size.toLocaleString()} bytes on disk).`} />
+        <EmptyState
+          icon="▢"
+          text={`Binary file — not shown (${data.size.toLocaleString()} bytes on disk).`}
+        />
       ) : (
         <>
           {data.truncated && (
             <p className="code-view__notice" role="status">
-              Truncated: showing the first {data.bytesReturned.toLocaleString()} of {data.size.toLocaleString()} bytes.
-              The rest of this file was not read.
+              Truncated: showing the first {data.bytesReturned.toLocaleString()} of{" "}
+              {data.size.toLocaleString()} bytes. The rest of this file was not read.
             </p>
           )}
           {data.size === 0 && <p className="code-view__notice">This file is empty (0 bytes).</p>}
@@ -143,21 +156,26 @@ export function CodeViewer({
               silently landing at the top would read as "line N is line 1". */}
           {line !== undefined && line > lines.length && (
             <p className="code-view__notice" role="status">
-              Line {line} is past the {lines.length.toLocaleString()} line{lines.length === 1 ? "" : "s"}
+              Line {line} is past the {lines.length.toLocaleString()} line
+              {lines.length === 1 ? "" : "s"}
               {data.truncated ? " read from this file" : " in this file"} — not shown.
             </p>
           )}
           {lang === "plain" && lines.length > HIGHLIGHT_LINE_CEILING && (
             <p className="code-view__notice">
-              Syntax highlighting is off for files over {HIGHLIGHT_LINE_CEILING.toLocaleString()} lines.
+              Syntax highlighting is off for files over {HIGHLIGHT_LINE_CEILING.toLocaleString()}{" "}
+              lines.
             </p>
           )}
           <div className="code-view__body" onMouseUp={captureSelection}>
             {lines.map((text, i) => {
               const no = i + 1;
               const isCurrent = line === no;
-              const isSelected = selectionStart !== undefined && selectionEnd !== undefined &&
-                no >= selectionStart && no <= selectionEnd;
+              const isSelected =
+                selectionStart !== undefined &&
+                selectionEnd !== undefined &&
+                no >= selectionStart &&
+                no <= selectionEnd;
               return (
                 <div
                   key={i}

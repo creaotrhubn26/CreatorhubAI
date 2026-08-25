@@ -50,7 +50,9 @@ const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 export function localOnlyGuard(req: Request, res: Response, next: NextFunction) {
   const host = (req.headers.host ?? "").replace(/:\d+$/, "").toLowerCase();
   if (!ALLOWED_HOSTS.has(host)) {
-    return res.status(403).json({ error: `request rejected: unexpected Host "${req.headers.host ?? ""}" (loopback only)` });
+    return res.status(403).json({
+      error: `request rejected: unexpected Host "${req.headers.host ?? ""}" (loopback only)`,
+    });
   }
   if (SAFE_METHODS.has(req.method)) return next();
   const origin = req.headers.origin;

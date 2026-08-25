@@ -7,9 +7,17 @@ import { CollapsibleSection } from "../common/CollapsibleSection";
 // V7 "Control Center UX" / "Task graph view": grouped-by-kind list is the
 // default; graph is opt-in for complex sessions. Kind vocabulary matches
 // GlimmerTask.kind (glimmer-v2.py's C3 task graph + O2 documentation tasks).
-const KIND_ORDER: GlimmerTask["kind"][] = ["implementation", "verification", "repair", "documentation"];
+const KIND_ORDER: GlimmerTask["kind"][] = [
+  "implementation",
+  "verification",
+  "repair",
+  "documentation",
+];
 const KIND_LABEL: Record<GlimmerTask["kind"], string> = {
-  implementation: "Implementation", verification: "Verification", repair: "Repair", documentation: "Documentation",
+  implementation: "Implementation",
+  verification: "Verification",
+  repair: "Repair",
+  documentation: "Documentation",
 };
 
 // Deliberately local, not the shared common/StatusBadge's statusColor() --
@@ -18,13 +26,19 @@ const KIND_LABEL: Record<GlimmerTask["kind"], string> = {
 // "in_progress" vs. "complete" need to stay visually distinct from each
 // other, which the shared map's fallback-to-gray does not give them.
 const TASK_STATUS_COLOR: Record<GlimmerTask["status"], string> = {
-  pending: "var(--gray)", in_progress: "var(--blue)", complete: "var(--green)",
-  failed: "var(--red)", skipped: "var(--gray)",
+  pending: "var(--gray)",
+  in_progress: "var(--blue)",
+  complete: "var(--green)",
+  failed: "var(--red)",
+  skipped: "var(--gray)",
 };
 
 function TaskStatusBadge({ status }: { status: GlimmerTask["status"] }) {
   return (
-    <span className="badge-status" style={{ ["--badge-color" as any]: TASK_STATUS_COLOR[status] ?? "var(--gray)" }}>
+    <span
+      className="badge-status"
+      style={{ ["--badge-color" as any]: TASK_STATUS_COLOR[status] ?? "var(--gray)" }}
+    >
       {status}
     </span>
   );
@@ -36,7 +50,12 @@ function TaskStatusBadge({ status }: { status: GlimmerTask["status"] }) {
 // below, but a human is exactly who's expected to act on required tasks in
 // that state).
 const READONLY_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set([
-  "verified", "completed", "no_change", "failed", "blocked", "cancelled",
+  "verified",
+  "completed",
+  "no_change",
+  "failed",
+  "blocked",
+  "cancelled",
 ]);
 
 // Review round 1 (Important 2): every status where glimmer-v2.py's process
@@ -47,7 +66,13 @@ const READONLY_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set
 // whether to show the "takes effect on the next run" note, never to hide
 // the buttons themselves (needs_review must stay actionable).
 const TERMINAL_SESSION_STATUSES: ReadonlySet<GlimmerSession["status"]> = new Set([
-  "verified", "completed", "no_change", "failed", "blocked", "cancelled", "needs_review",
+  "verified",
+  "completed",
+  "no_change",
+  "failed",
+  "blocked",
+  "cancelled",
+  "needs_review",
 ]);
 
 function PriorityBadge({ priority }: { priority?: GlimmerTask["priority"] }) {
@@ -57,15 +82,30 @@ function PriorityBadge({ priority }: { priority?: GlimmerTask["priority"] }) {
   // ever existed before this field).
   const p = priority ?? "required";
   if (p === "required") {
-    return <span className="badge-status" style={{ ["--badge-color" as any]: "var(--red)" }}>required</span>;
+    return (
+      <span className="badge-status" style={{ ["--badge-color" as any]: "var(--red)" }}>
+        required
+      </span>
+    );
   }
   if (p === "recommended") {
-    return <span className="meta-value" style={{ ["--badge-color" as any]: "var(--amber)" }}>recommended</span>;
+    return (
+      <span className="meta-value" style={{ ["--badge-color" as any]: "var(--amber)" }}>
+        recommended
+      </span>
+    );
   }
   return <span style={{ color: "var(--text-muted)" }}>optional</span>;
 }
 
-function TaskCard({ task, canAct, sessionTerminal, onSkip, onApprove, pending }: {
+function TaskCard({
+  task,
+  canAct,
+  sessionTerminal,
+  onSkip,
+  onApprove,
+  pending,
+}: {
   task: GlimmerTask;
   canAct: boolean;
   sessionTerminal: boolean;
@@ -73,7 +113,8 @@ function TaskCard({ task, canAct, sessionTerminal, onSkip, onApprove, pending }:
   onApprove: (taskId: string) => void;
   pending: boolean;
 }) {
-  const showButtons = canAct && !task.override && ["pending", "in_progress", "failed"].includes(task.status);
+  const showButtons =
+    canAct && !task.override && ["pending", "in_progress", "failed"].includes(task.status);
   return (
     <li className="row" style={{ flexDirection: "column", alignItems: "stretch", gap: 4 }}>
       <div>
@@ -81,16 +122,22 @@ function TaskCard({ task, canAct, sessionTerminal, onSkip, onApprove, pending }:
         <strong>{task.kind}</strong> {task.description}
       </div>
       {task.dependsOn.length > 0 && (
-        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>depends on: {task.dependsOn.join(", ")}</div>
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          depends on: {task.dependsOn.join(", ")}
+        </div>
       )}
       {task.blockingReason && (
         <div style={{ fontSize: 12, color: "var(--amber)" }}>{task.blockingReason}</div>
       )}
       {task.affectedFiles && task.affectedFiles.length > 0 && (
-        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>files: {task.affectedFiles.join(", ")}</div>
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          files: {task.affectedFiles.join(", ")}
+        </div>
       )}
       {task.createdBecause && (
-        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>because: {task.createdBecause}</div>
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          because: {task.createdBecause}
+        </div>
       )}
       {task.override && (
         <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
@@ -104,7 +151,9 @@ function TaskCard({ task, canAct, sessionTerminal, onSkip, onApprove, pending }:
           gates. Deterministic, not a guess: shown purely off session
           status. */}
       {task.override && sessionTerminal && (
-        <div style={{ fontSize: 12, color: "var(--amber)" }}>Recorded — takes effect on the next run</div>
+        <div style={{ fontSize: 12, color: "var(--amber)" }}>
+          Recorded — takes effect on the next run
+        </div>
       )}
       {/* Review round 1 (Important 3): task-overrides.json keys by task id,
           but ids can be recycled across a replan (merge_replanned_tasks
@@ -113,14 +162,18 @@ function TaskCard({ task, canAct, sessionTerminal, onSkip, onApprove, pending }:
           longer exists -- ignored, not silently misapplied. */}
       {task.staleOverride && (
         <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
-          A recorded {task.staleOverride.action} override no longer matches this task (its id was reused by a
-          replan) — ignored.
+          A recorded {task.staleOverride.action} override no longer matches this task (its id was
+          reused by a replan) — ignored.
         </div>
       )}
       {showButtons && (
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => onSkip(task.id)} disabled={pending}>Skip</button>
-          <button onClick={() => onApprove(task.id)} disabled={pending}>Approve</button>
+          <button onClick={() => onSkip(task.id)} disabled={pending}>
+            Skip
+          </button>
+          <button onClick={() => onApprove(task.id)} disabled={pending}>
+            Approve
+          </button>
         </div>
       )}
     </li>
@@ -152,7 +205,13 @@ function computeColumns(tasks: GlimmerTask[]): GlimmerTask[][] {
   return columns;
 }
 
-export function TasksPanel({ sessionId, session }: { sessionId: string; session?: GlimmerSession | null }) {
+export function TasksPanel({
+  sessionId,
+  session,
+}: {
+  sessionId: string;
+  session?: GlimmerSession | null;
+}) {
   const [view, setView] = useState<"list" | "graph">("list");
   const queryClient = useQueryClient();
 
@@ -185,9 +244,10 @@ export function TasksPanel({ sessionId, session }: { sessionId: string; session?
   // without this, N/M complete would silently blend orchestrator evidence
   // and a human's manual sign-off into one indistinguishable number.
   const humanApproved = tasks.filter((t) => t.override?.action === "approve").length;
-  const summary = humanApproved > 0
-    ? `${done}/${tasks.length} complete (${humanApproved} human)`
-    : `${done}/${tasks.length} complete`;
+  const summary =
+    humanApproved > 0
+      ? `${done}/${tasks.length} complete (${humanApproved} human)`
+      : `${done}/${tasks.length} complete`;
   // Review round 1 (Minor 8d): wait for the session to actually load before
   // deciding whether actions are allowed -- session===undefined means "not
   // loaded yet", not "no restriction", so buttons don't flash visible then
@@ -202,8 +262,12 @@ export function TasksPanel({ sessionId, session }: { sessionId: string; session?
         Deterministic — evidence-driven task list, not a model guess
       </p>
       <div style={{ display: "flex", gap: 8 }}>
-        <button onClick={() => setView("list")} disabled={view === "list"}>List</button>
-        <button onClick={() => setView("graph")} disabled={view === "graph"}>Graph</button>
+        <button onClick={() => setView("list")} disabled={view === "list"}>
+          List
+        </button>
+        <button onClick={() => setView("graph")} disabled={view === "graph"}>
+          Graph
+        </button>
       </div>
 
       {view === "list" ? (
@@ -211,24 +275,39 @@ export function TasksPanel({ sessionId, session }: { sessionId: string; session?
           <div key={kind}>
             <h4 style={{ margin: "8px 0 4px" }}>{KIND_LABEL[kind]}</h4>
             <ul>
-              {tasks.filter((t) => t.kind === kind).map((t) => (
-                <TaskCard
-                  key={t.id} task={t} canAct={canAct} sessionTerminal={sessionTerminal} pending={anyPending}
-                  onSkip={(id) => skipMutation.mutate(id)} onApprove={(id) => approveMutation.mutate(id)}
-                />
-              ))}
+              {tasks
+                .filter((t) => t.kind === kind)
+                .map((t) => (
+                  <TaskCard
+                    key={t.id}
+                    task={t}
+                    canAct={canAct}
+                    sessionTerminal={sessionTerminal}
+                    pending={anyPending}
+                    onSkip={(id) => skipMutation.mutate(id)}
+                    onApprove={(id) => approveMutation.mutate(id)}
+                  />
+                ))}
             </ul>
           </div>
         ))
       ) : (
         <div style={{ display: "flex", gap: 24, overflowX: "auto" }}>
           {computeColumns(tasks).map((col, idx) => (
-            <div key={idx} style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 180 }}>
+            <div
+              key={idx}
+              style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 180 }}
+            >
               <ul>
                 {col.map((t) => (
                   <TaskCard
-                    key={t.id} task={t} canAct={canAct} sessionTerminal={sessionTerminal} pending={anyPending}
-                    onSkip={(id) => skipMutation.mutate(id)} onApprove={(id) => approveMutation.mutate(id)}
+                    key={t.id}
+                    task={t}
+                    canAct={canAct}
+                    sessionTerminal={sessionTerminal}
+                    pending={anyPending}
+                    onSkip={(id) => skipMutation.mutate(id)}
+                    onApprove={(id) => approveMutation.mutate(id)}
                   />
                 ))}
               </ul>

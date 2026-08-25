@@ -6,7 +6,11 @@ import { EmptyState } from "../common/EmptyState";
 import { isPendingSessionId, relativeTime, sessionTimestamp } from "../../state/sessionListMeta";
 
 export function DashboardScreen() {
-  const { data, isLoading } = useQuery({ queryKey: ["status"], queryFn: glimmerApi.getStatus, refetchInterval: 5000 });
+  const { data, isLoading } = useQuery({
+    queryKey: ["status"],
+    queryFn: glimmerApi.getStatus,
+    refetchInterval: 5000,
+  });
 
   if (isLoading || !data) return <div>Loading dashboard…</div>;
 
@@ -28,7 +32,8 @@ export function DashboardScreen() {
         <h2>Active session</h2>
         {data.activeSession ? (
           <div>
-            <StatusBadge status={data.activeSession.status} /> {data.activeSession.changedFiles.length} changed files
+            <StatusBadge status={data.activeSession.status} />{" "}
+            {data.activeSession.changedFiles.length} changed files
           </div>
         ) : (
           <EmptyState icon="○" text="Unavailable" />
@@ -46,7 +51,11 @@ export function DashboardScreen() {
       </section>
       <section>
         <h2>Verification</h2>
-        {data.verification ? <StatusBadge status={data.verification.overall} /> : <EmptyState icon="○" text="Unavailable" />}
+        {data.verification ? (
+          <StatusBadge status={data.verification.overall} />
+        ) : (
+          <EmptyState icon="○" text="Unavailable" />
+        )}
       </section>
       <section>
         <h2>Recent sessions</h2>

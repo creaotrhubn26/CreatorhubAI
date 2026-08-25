@@ -22,14 +22,22 @@ describe("TaskReportPanel", () => {
       mode: "inspect",
       objective: "Hva kan bli bedre?",
       summary: "One concrete issue was found.",
-      findings: [{
-        severity: "high",
-        category: "correctness",
-        title: "Cancellation state is lost",
-        description: "The process record is memory-only.",
-        evidence: [{ path: "server/src/routes/sessions.ts", line: 31, detail: "activeRuns is an in-memory map" }],
-        recommendedFix: "Persist the process record.",
-      }],
+      findings: [
+        {
+          severity: "high",
+          category: "correctness",
+          title: "Cancellation state is lost",
+          description: "The process record is memory-only.",
+          evidence: [
+            {
+              path: "server/src/routes/sessions.ts",
+              line: 31,
+              detail: "activeRuns is an in-memory map",
+            },
+          ],
+          recommendedFix: "Persist the process record.",
+        },
+      ],
       implementationPlan: ["Persist run state", "Verify ownership before SIGTERM"],
       confidence: "high",
     });

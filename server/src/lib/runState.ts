@@ -10,12 +10,7 @@ const execFileAsync = promisify(execFile);
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
 export type GatewayRunState =
-  | "created"
-  | "starting"
-  | "running"
-  | "cancel_requested"
-  | "exited"
-  | "start_failed";
+  "created" | "starting" | "running" | "cancel_requested" | "exited" | "start_failed";
 
 export interface GatewayRunRecord {
   version: 1;
@@ -77,7 +72,8 @@ export async function readGatewayRun(id: string): Promise<GatewayRunRecord | nul
     const parsed = JSON.parse(await fs.readFile(target, "utf8")) as GatewayRunRecord;
     return parsed?.version === 1 && parsed.id === id ? parsed : null;
   } catch (err: any) {
-    if (err?.code !== "ENOENT") console.warn(`[gateway-runs] unreadable record ${id}: ${err?.message ?? err}`);
+    if (err?.code !== "ENOENT")
+      console.warn(`[gateway-runs] unreadable record ${id}: ${err?.message ?? err}`);
     return null;
   }
 }
@@ -97,13 +93,15 @@ export function updateGatewayRun(
   mutate: (record: GatewayRunRecord) => GatewayRunRecord,
 ): Promise<GatewayRunRecord | null> {
   const previous = updateQueues.get(id) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(async () => {
-    const current = await readGatewayRun(id);
-    if (!current) return null;
-    const updated = mutate(current);
-    await atomicWrite(updated);
-    return updated;
-  });
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const current = await readGatewayRun(id);
+      if (!current) return null;
+      const updated = mutate(current);
+      await atomicWrite(updated);
+      return updated;
+    });
   updateQueues.set(id, next);
   void next.finally(() => {
     if (updateQueues.get(id) === next) updateQueues.delete(id);

@@ -5,9 +5,11 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("glimmerApi", () => {
   it("getStatus calls GET /api/status and returns parsed JSON", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ model: { status: "ONLINE" } }), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ model: { status: "ONLINE" } }), { status: 200 }),
+      );
     const status = await glimmerApi.getStatus();
     expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/status`, expect.anything());
     expect(status.model.status).toBe("ONLINE");
@@ -16,18 +18,34 @@ describe("glimmerApi", () => {
   it("reads and saves the secret-free model registry", async () => {
     const registry = {
       version: 1 as const,
-      models: [{ id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080", modelId: "m", hasApiKey: true }],
+      models: [
+        {
+          id: "local",
+          label: "Local",
+          baseUrl: "http://127.0.0.1:8080",
+          modelId: "m",
+          hasApiKey: true,
+        },
+      ],
       roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
       source: "saved" as const,
     };
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
-      new Response(JSON.stringify(registry), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => new Response(JSON.stringify(registry), { status: 200 }));
     expect(await glimmerApi.getModelRegistry()).toEqual(registry);
     expect(fetchMock).toHaveBeenLastCalledWith(`${API_BASE}/api/models/config`, expect.anything());
 
     const update = {
-      models: [{ id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080", modelId: "m", apiKey: "secret" }],
+      models: [
+        {
+          id: "local",
+          label: "Local",
+          baseUrl: "http://127.0.0.1:8080",
+          modelId: "m",
+          apiKey: "secret",
+        },
+      ],
       roles: registry.roles,
     };
     await glimmerApi.saveModelRegistry(update);
@@ -41,29 +59,42 @@ describe("glimmerApi", () => {
       checkedAt: "now",
       platform: "darwin arm64",
       integrations: [],
-      policy: { automaticSystemInstall: false, externalWritesRequireApproval: true, gitPushAllowed: false },
+      policy: {
+        automaticSystemInstall: false,
+        externalWritesRequireApproval: true,
+        gitPushAllowed: false,
+      },
     };
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify(response), { status: 200 }),
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify(response), { status: 200 }));
     expect(await glimmerApi.getCliIntegrations()).toEqual(response);
     expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/integrations/cli`, expect.anything());
   });
 
   it("createSession POSTs the task contract as JSON", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ id: "s1" }), { status: 201 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: "s1" }), { status: 201 }));
     await glimmerApi.createSession({ objective: "x" } as any, "/ws");
     const [, init] = fetchMock.mock.calls[0];
     expect(init?.method).toBe("POST");
-    expect(JSON.parse(init?.body as string)).toEqual({ taskContract: { objective: "x" }, workspace: "/ws" });
+    expect(JSON.parse(init?.body as string)).toEqual({
+      taskContract: { objective: "x" },
+      workspace: "/ws",
+    });
   });
 
   it("posts hunk accept/reject decisions without sending patch text", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
-      new Response(JSON.stringify({ hunkId: "abc", path: "a.ts", decision: "accepted", decidedAt: "now" }), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({ hunkId: "abc", path: "a.ts", decision: "accepted", decidedAt: "now" }),
+            { status: 200 },
+          ),
+      );
     await glimmerApi.acceptHunk("s1", "abc", "a.ts");
     await glimmerApi.rejectHunk("s1", "abc", "a.ts");
 
@@ -83,10 +114,14 @@ describe("glimmerApi", () => {
   });
 
   it("preserves the gateway's actionable error message on a non-2xx response", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
-      JSON.stringify({ error: "Refusing branch main: create or choose a worktree on a glimmer/* branch." }),
-      { status: 409, headers: { "Content-Type": "application/json" } },
-    ));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: "Refusing branch main: create or choose a worktree on a glimmer/* branch.",
+        }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ),
+    );
     await expect(glimmerApi.runSession("pending-1")).rejects.toThrow(
       "Refusing branch main: create or choose a worktree on a glimmer/* branch.",
     );
@@ -94,7 +129,16 @@ describe("glimmerApi", () => {
 
   it("getTaskIntelligence calls GET /api/task-intelligence with query params", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ likelyArea: "frontend", likelyPackage: "x", suggestedVerification: [], estimatedRisk: null, provenance: "git-derived" }), { status: 200 })
+      new Response(
+        JSON.stringify({
+          likelyArea: "frontend",
+          likelyPackage: "x",
+          suggestedVerification: [],
+          estimatedRisk: null,
+          provenance: "git-derived",
+        }),
+        { status: 200 },
+      ),
     );
     const result = await glimmerApi.getTaskIntelligence({
       scopePackage: "frontend",
@@ -102,7 +146,7 @@ describe("glimmerApi", () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       `${API_BASE}/api/task-intelligence?scopePackage=frontend&scopeArea=${encodeURIComponent("frontend/client/src/dialog")}`,
-      expect.anything()
+      expect.anything(),
     );
     expect(result.likelyArea).toBe("frontend");
   });
@@ -112,7 +156,17 @@ describe("glimmerApi", () => {
   // the wire, and that unset ones are omitted rather than sent as blanks.
   it("getTaskIntelligence forwards workspace and risk hints, omitting the ones not given", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: "HIGH", provenance: "deterministic-backend", repoMapStatus: "unmatched-workspace" }), { status: 200 })
+      new Response(
+        JSON.stringify({
+          likelyArea: null,
+          likelyPackage: null,
+          suggestedVerification: [],
+          estimatedRisk: "HIGH",
+          provenance: "deterministic-backend",
+          repoMapStatus: "unmatched-workspace",
+        }),
+        { status: 200 },
+      ),
     );
     await glimmerApi.getTaskIntelligence({
       scopePackage: "repository",
@@ -132,9 +186,14 @@ describe("glimmerApi", () => {
   });
 
   it("listDirectory calls GET /api/fs/dirs with path/root/includeFiles", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ root: "/ws", path: "/ws", parent: null, entries: [], truncated: false }), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ root: "/ws", path: "/ws", parent: null, entries: [], truncated: false }),
+          { status: 200 },
+        ),
+      );
     await glimmerApi.listDirectory({ path: "/ws/src", root: "/ws", includeFiles: true });
     const url = fetchMock.mock.calls[0][0] as string;
     const query = new URLSearchParams(url.split("?")[1]);
@@ -145,17 +204,24 @@ describe("glimmerApi", () => {
   });
 
   it("getSessionAnalysis calls GET /api/sessions/:id/analysis", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ riskScore: "HIGH", scopeGuard: null }), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ riskScore: "HIGH", scopeGuard: null }), { status: 200 }),
+      );
     const result = await glimmerApi.getSessionAnalysis("s1");
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/analysis`, expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/sessions/s1/analysis`,
+      expect.anything(),
+    );
     expect(result.riskScore).toBe("HIGH");
   });
 
   it("getArchitecturePlan calls GET /api/sessions/:id/plan", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ objective: "Add whisper()", packages: ["p"], risk: "low" }), { status: 200 })
+      new Response(JSON.stringify({ objective: "Add whisper()", packages: ["p"], risk: "low" }), {
+        status: 200,
+      }),
     );
     const result = await glimmerApi.getArchitecturePlan("s1");
     expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/plan`, expect.anything());
@@ -163,31 +229,59 @@ describe("glimmerApi", () => {
   });
 
   it("getArchitecturePlan rejects on a 404 (artifact absent)", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ error: "not found" }), { status: 404 }));
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ error: "not found" }), { status: 404 }),
+    );
     await expect(glimmerApi.getArchitecturePlan("s1")).rejects.toThrow();
   });
 
   it("getArchitectReviews calls GET /api/sessions/:id/architect-reviews and returns an array", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify([{ decision: "APPROVED", confidence: 0.9 }]), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify([{ decision: "APPROVED", confidence: 0.9 }]), { status: 200 }),
+      );
     const result = await glimmerApi.getArchitectReviews("s1");
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/architect-reviews`, expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/sessions/s1/architect-reviews`,
+      expect.anything(),
+    );
     expect(result[0].decision).toBe("APPROVED");
   });
 
   it("getDeliveryReview calls GET /api/sessions/:id/delivery-review", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ summary: "s", customerReadiness: "ready_to_ship", confidence: { level: "high", reason: "r" } }), { status: 200 })
+      new Response(
+        JSON.stringify({
+          summary: "s",
+          customerReadiness: "ready_to_ship",
+          confidence: { level: "high", reason: "r" },
+        }),
+        { status: 200 },
+      ),
     );
     const result = await glimmerApi.getDeliveryReview("s1");
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/delivery-review`, expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/sessions/s1/delivery-review`,
+      expect.anything(),
+    );
     expect(result.customerReadiness).toBe("ready_to_ship");
   });
 
   it("getSessionTasks calls GET /api/sessions/:id/tasks and returns the flat task list", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify([{ id: "t1", description: "d", kind: "implementation", dependsOn: [], status: "pending" }]), { status: 200 })
+      new Response(
+        JSON.stringify([
+          {
+            id: "t1",
+            description: "d",
+            kind: "implementation",
+            dependsOn: [],
+            status: "pending",
+          },
+        ]),
+        { status: 200 },
+      ),
     );
     const result = await glimmerApi.getSessionTasks("s1");
     expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/tasks`, expect.anything());
@@ -196,30 +290,53 @@ describe("glimmerApi", () => {
 
   it("acceptSession POSTs to /api/sessions/:id/accept and returns the acceptance record", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" }), { status: 200 })
+      new Response(JSON.stringify({ accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" }), {
+        status: 200,
+      }),
     );
     const result = await glimmerApi.acceptSession("s1");
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/accept`, expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/sessions/s1/accept`,
+      expect.objectContaining({ method: "POST" }),
+    );
     expect(result).toEqual({ accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" });
   });
 
   it("askSession POSTs the question and returns the model's answer", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ answer: "It owns the parser state.", provenance: "model-output" }), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ answer: "It owns the parser state.", provenance: "model-output" }),
+          { status: 200 },
+        ),
+      );
     const result = await glimmerApi.askSession("s1", "Why was this file chosen?");
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/ask`, expect.objectContaining({ method: "POST" }));
-    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({ question: "Why was this file chosen?" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/sessions/s1/ask`,
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
+      question: "Why was this file chosen?",
+    });
     expect(result.answer).toBe("It owns the parser state.");
   });
 
   it("askRepository POSTs the selected file range without requiring a session", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ answer: "This branch handles retries.", provenance: "model-output" }), { status: 200 })
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ answer: "This branch handles retries.", provenance: "model-output" }),
+          { status: 200 },
+        ),
+      );
     const selection = { path: "/ws/src/retry.ts", startLine: 12, endLine: 18 };
     const result = await glimmerApi.askRepository(selection, "What does this branch do?");
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/repository/ask`, expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/repository/ask`,
+      expect.objectContaining({ method: "POST" }),
+    );
     expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
       question: "What does this branch do?",
       selection,
@@ -239,31 +356,43 @@ describe("glimmerApi", () => {
   }
 
   it("askSessionStream POSTs to the ?stream=1 endpoint, reports each delta, and resolves with the full answer", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      sseResponse([
-        `data: ${JSON.stringify({ delta: "It owns " })}\n\n`,
-        `data: ${JSON.stringify({ delta: "the parser state." })}\n\n`,
-        `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}\n\n`,
-      ])
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        sseResponse([
+          `data: ${JSON.stringify({ delta: "It owns " })}\n\n`,
+          `data: ${JSON.stringify({ delta: "the parser state." })}\n\n`,
+          `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}\n\n`,
+        ]),
+      );
     const deltas: string[] = [];
     const answer = await glimmerApi.askSessionStream("s1", "Why?", (delta) => deltas.push(delta));
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/sessions/s1/ask?stream=1`, expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/sessions/s1/ask?stream=1`,
+      expect.objectContaining({ method: "POST" }),
+    );
     expect(deltas).toEqual(["It owns ", "the parser state."]);
     expect(answer).toBe("It owns the parser state.");
   });
 
   it("askRepositoryStream sends selection evidence to the sessionless streaming endpoint", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      sseResponse([
-        `data: ${JSON.stringify({ delta: "It validates " })}\n\n`,
-        `data: ${JSON.stringify({ done: true, answer: "It validates input." })}\n\n`,
-      ])
-    );
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        sseResponse([
+          `data: ${JSON.stringify({ delta: "It validates " })}\n\n`,
+          `data: ${JSON.stringify({ done: true, answer: "It validates input." })}\n\n`,
+        ]),
+      );
     const selection = { path: "/ws/src/input.ts", startLine: 4, endLine: 7 };
     const deltas: string[] = [];
-    const answer = await glimmerApi.askRepositoryStream(selection, "Explain this.", (delta) => deltas.push(delta));
-    expect(fetchMock).toHaveBeenCalledWith(`${API_BASE}/api/repository/ask?stream=1`, expect.objectContaining({ method: "POST" }));
+    const answer = await glimmerApi.askRepositoryStream(selection, "Explain this.", (delta) =>
+      deltas.push(delta),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/repository/ask?stream=1`,
+      expect.objectContaining({ method: "POST" }),
+    );
     expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
       question: "Explain this.",
       selection,
@@ -273,11 +402,12 @@ describe("glimmerApi", () => {
   });
 
   it("askSessionStream buffers a frame split across chunk boundaries instead of dropping it", async () => {
-    const wholeFrame = `data: ${JSON.stringify({ delta: "It owns the parser state." })}\n\n`
-      + `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}\n\n`;
+    const wholeFrame =
+      `data: ${JSON.stringify({ delta: "It owns the parser state." })}\n\n` +
+      `data: ${JSON.stringify({ done: true, answer: "It owns the parser state." })}\n\n`;
     const splitPoint = Math.floor(wholeFrame.length / 2);
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      sseResponse([wholeFrame.slice(0, splitPoint), wholeFrame.slice(splitPoint)])
+      sseResponse([wholeFrame.slice(0, splitPoint), wholeFrame.slice(splitPoint)]),
     );
     const deltas: string[] = [];
     await glimmerApi.askSessionStream("s1", "Why?", (delta) => deltas.push(delta));
@@ -294,8 +424,13 @@ describe("glimmerApi", () => {
   });
 
   it("askSessionStream rejects when the server sends an error frame, tagged so the caller can skip the fallback", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(sseResponse([`data: ${JSON.stringify({ error: "unavailable" })}\n\n`]));
-    await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toMatchObject({ message: "unavailable", name: "AssistantUpstreamError" });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      sseResponse([`data: ${JSON.stringify({ error: "unavailable" })}\n\n`]),
+    );
+    await expect(glimmerApi.askSessionStream("s1", "Why?", () => {})).rejects.toMatchObject({
+      message: "unavailable",
+      name: "AssistantUpstreamError",
+    });
   });
 
   it("askSessionStream rejects on a non-2xx response instead of hanging", async () => {
@@ -305,10 +440,12 @@ describe("glimmerApi", () => {
 
   it("askSessionStream rejects a stream that ends after deltas but never sends a done frame", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      sseResponse([`data: ${JSON.stringify({ delta: "Partial" })}\n\n`]) // connection just ends here
+      sseResponse([`data: ${JSON.stringify({ delta: "Partial" })}\n\n`]), // connection just ends here
     );
     const deltas: string[] = [];
-    await expect(glimmerApi.askSessionStream("s1", "Why?", (d) => deltas.push(d))).rejects.toThrow(/done frame/);
+    await expect(glimmerApi.askSessionStream("s1", "Why?", (d) => deltas.push(d))).rejects.toThrow(
+      /done frame/,
+    );
     expect(deltas).toEqual(["Partial"]); // the partial output still streamed before the truncation was detected
   });
 });

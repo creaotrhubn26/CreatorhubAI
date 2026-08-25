@@ -16,7 +16,10 @@ export interface SessionEventsState {
   lastEventAt: number | null;
 }
 
-export const SessionEventsContext = createContext<SessionEventsState>({ events: [], lastEventAt: null });
+export const SessionEventsContext = createContext<SessionEventsState>({
+  events: [],
+  lastEventAt: null,
+});
 export function useSharedSessionEvents(): GlimmerEvent[] {
   return useContext(SessionEventsContext).events;
 }
@@ -38,7 +41,9 @@ export function useSessionEvents(sessionId: string): GlimmerEvent[] {
       try {
         const parsed = JSON.parse(ev.data);
         if (isGlimmerEvent(parsed)) setEvents((prev) => [...prev, parsed]);
-      } catch { /* ignore malformed frame */ }
+      } catch {
+        /* ignore malformed frame */
+      }
     };
     return () => source.close();
   }, [sessionId]);

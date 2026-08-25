@@ -31,7 +31,9 @@ function CheckCard({ check }: { check: VerificationCheckResult }) {
       {check.outputTail && (
         <details>
           <summary>Output</summary>
-          <pre className="mono" style={{ whiteSpace: "pre-wrap" }}>{check.outputTail}</pre>
+          <pre className="mono" style={{ whiteSpace: "pre-wrap" }}>
+            {check.outputTail}
+          </pre>
         </details>
       )}
     </fieldset>
@@ -49,7 +51,8 @@ function BaselineSummary({ checks }: { checks: VerificationCheckResult[] }) {
   const newFailureTotal = checks.reduce((sum, c) => sum + c.newErrorSignatures.length, 0);
   return (
     <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
-      {baselineAcceptedCount} pre-existing failure{baselineAcceptedCount === 1 ? "" : "s"} accepted via baseline —{" "}
+      {baselineAcceptedCount} pre-existing failure{baselineAcceptedCount === 1 ? "" : "s"} accepted
+      via baseline —{" "}
       {newFailureTotal === 0
         ? "No new failures introduced"
         : `${newFailureTotal} NEW failure${newFailureTotal === 1 ? "" : "s"} introduced`}
@@ -99,9 +102,16 @@ function finalStatusColor(field: keyof FinalStatus, value: string): string {
 // pattern as GatesRow.
 function FinalStatusRow({ finalStatus }: { finalStatus: FinalStatus }) {
   return (
-    <div className="gates-row" style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "0 0 16px" }}>
+    <div
+      className="gates-row"
+      style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "0 0 16px" }}
+    >
       {FINAL_STATUS_LABELS.map(([key, label]) => (
-        <span key={key} className="meta-value" style={{ ["--badge-color" as any]: finalStatusColor(key, finalStatus[key]) }}>
+        <span
+          key={key}
+          className="meta-value"
+          style={{ ["--badge-color" as any]: finalStatusColor(key, finalStatus[key]) }}
+        >
           {label}: {finalStatus[key]}
         </span>
       ))}
@@ -112,8 +122,12 @@ function FinalStatusRow({ finalStatus }: { finalStatus: FinalStatus }) {
 // Exported so the IDE shell's bottom-panel VERIFICATION tab can re-home this
 // exact body (session-scoped) without re-implementing the check rendering.
 export function VerificationBody({
-  verification, finalStatus,
-}: { verification: VerificationSummary | null | undefined; finalStatus?: FinalStatus }) {
+  verification,
+  finalStatus,
+}: {
+  verification: VerificationSummary | null | undefined;
+  finalStatus?: FinalStatus;
+}) {
   if (!verification) return <EmptyState icon="◌" text="Unavailable" />;
   const checks = verification.checks;
   return (
@@ -138,7 +152,11 @@ export function VerificationCenterScreen() {
   // No :id -> sidebar link's existing behavior: latest global session, via
   // /api/status. With :id -> this specific session's own verification
   // summary, already carried on GlimmerSession — no dedicated endpoint needed.
-  const statusQuery = useQuery({ queryKey: ["status"], queryFn: glimmerApi.getStatus, enabled: !id });
+  const statusQuery = useQuery({
+    queryKey: ["status"],
+    queryFn: glimmerApi.getStatus,
+    enabled: !id,
+  });
   const sessionQuery = useQuery({
     queryKey: ["session", id, "verification"],
     queryFn: () => glimmerApi.getSession(id!),

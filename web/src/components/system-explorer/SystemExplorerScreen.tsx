@@ -12,9 +12,17 @@ import { absolutePath, fileHref, looksLikeDirectoryPath } from "../../state/file
 // EvidencePanel: no separate detail fetch, the whole graph is already one
 // payload so selection is just local state indexing into it.
 function NodeRow({
-  node, edges, workspace, selected, onSelect,
+  node,
+  edges,
+  workspace,
+  selected,
+  onSelect,
 }: {
-  node: DocNode; edges: DocEdge[]; workspace: string; selected: boolean; onSelect(): void;
+  node: DocNode;
+  edges: DocEdge[];
+  workspace: string;
+  selected: boolean;
+  onSelect(): void;
 }) {
   const { in: inEdges, out: outEdges } = edgesForNode(edges, node.id);
   // Task A4: the node's own path opens in the read-only viewer. Only when the
@@ -29,7 +37,13 @@ function NodeRow({
       <button
         type="button"
         onClick={onSelect}
-        style={{ display: "flex", gap: 8, alignItems: "baseline", width: "100%", textAlign: "left" }}
+        style={{
+          display: "flex",
+          gap: 8,
+          alignItems: "baseline",
+          width: "100%",
+          textAlign: "left",
+        }}
       >
         <StatusBadge status={node.status} />
         <span>{str(node.title)}</span>
@@ -63,20 +77,26 @@ function NodeRow({
           ) : (
             <ul>
               {node.provenance.evidence.map((e, i) => (
-                <li key={i} className="mono" style={{ fontSize: 12 }}>{e}</li>
+                <li key={i} className="mono" style={{ fontSize: 12 }}>
+                  {e}
+                </li>
               ))}
             </ul>
           )}
           <p style={{ fontSize: 12, color: "var(--text-muted)" }}>In edges ({inEdges.length})</p>
           <ul>
             {inEdges.map((e, i) => (
-              <li key={i} style={{ fontSize: 12 }}>{e.kind}: {e.from}</li>
+              <li key={i} style={{ fontSize: 12 }}>
+                {e.kind}: {e.from}
+              </li>
             ))}
           </ul>
           <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Out edges ({outEdges.length})</p>
           <ul>
             {outEdges.map((e, i) => (
-              <li key={i} style={{ fontSize: 12 }}>{e.kind}: {e.to}</li>
+              <li key={i} style={{ fontSize: 12 }}>
+                {e.kind}: {e.to}
+              </li>
             ))}
           </ul>
         </div>
@@ -92,7 +112,11 @@ function NodeRow({
 export function SystemExplorerScreen() {
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const { data, isPending, isError } = useQuery({ queryKey: ["doc-graph"], queryFn: glimmerApi.getDocGraph, retry: false });
+  const { data, isPending, isError } = useQuery({
+    queryKey: ["doc-graph"],
+    queryFn: glimmerApi.getDocGraph,
+    retry: false,
+  });
 
   const filtered = useMemo(() => (data ? filterDocNodes(data.nodes, query) : []), [data, query]);
   const groups = useMemo(() => groupDocNodesByType(filtered), [filtered]);
@@ -105,7 +129,10 @@ export function SystemExplorerScreen() {
           case — the two must read differently, not both as "Unavailable". */}
       {isError && <EmptyState icon="○" text="Unavailable" />}
       {!isError && !isPending && data === null && (
-        <EmptyState icon="○" text="No documentation graph in this repository — run --docs-bootstrap" />
+        <EmptyState
+          icon="○"
+          text="No documentation graph in this repository — run --docs-bootstrap"
+        />
       )}
       {!isError && data && (
         <>
@@ -117,8 +144,14 @@ export function SystemExplorerScreen() {
           <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
             Source: {data.source.workspace} (session {data.source.sessionId})
           </p>
-          <input placeholder="Filter nodes…" value={query} onChange={(e) => setQuery(e.target.value)} />
-          {groups.length === 0 && <p style={{ color: "var(--text-muted)" }}>No nodes match "{query}"</p>}
+          <input
+            placeholder="Filter nodes…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          {groups.length === 0 && (
+            <p style={{ color: "var(--text-muted)" }}>No nodes match "{query}"</p>
+          )}
           {groups.map((g) => (
             <div className="session-list-group" key={g.type}>
               <h2 className="session-list-group__label">{g.label}</h2>

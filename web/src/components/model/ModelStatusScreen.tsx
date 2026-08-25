@@ -29,8 +29,14 @@ export function ModelStatusScreen() {
       TRANSITIONAL.has((query.state.data?.runState ?? "OFFLINE") as ModelRunState) ? 2000 : 5000,
   });
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["model-status"] });
-  const startMutation = useMutation({ mutationFn: glimmerApi.startModelServer, onSuccess: invalidate });
-  const stopMutation = useMutation({ mutationFn: glimmerApi.stopModelServer, onSuccess: invalidate });
+  const startMutation = useMutation({
+    mutationFn: glimmerApi.startModelServer,
+    onSuccess: invalidate,
+  });
+  const stopMutation = useMutation({
+    mutationFn: glimmerApi.stopModelServer,
+    onSuccess: invalidate,
+  });
 
   if (!data) return <div>Unavailable</div>;
 
@@ -62,7 +68,10 @@ export function ModelStatusScreen() {
         <button onClick={() => stopMutation.mutate()} disabled={pending || runState === "OFFLINE"}>
           Stop server
         </button>
-        <p>Stop targets whatever holds the model port — including a llama-server you started in a terminal.</p>
+        <p>
+          Stop targets whatever holds the model port — including a llama-server you started in a
+          terminal.
+        </p>
         {failure && <p className="error">{String(failure)}</p>}
         {/* A stop that didn't stop anything says why. Never a silent click. */}
         {lastResult?.detail && <p className="error">Nothing was stopped: {lastResult.detail}.</p>}
@@ -85,7 +94,13 @@ export function ModelStatusScreen() {
         <dt>Model path</dt>
         <dd className="mono">{data.modelPath ?? "Unavailable"}</dd>
         <dt>Speculative decoding</dt>
-        <dd>{data.speculativeDecoding === undefined ? "Unavailable" : data.speculativeDecoding ? "Enabled" : "Disabled"}</dd>
+        <dd>
+          {data.speculativeDecoding === undefined
+            ? "Unavailable"
+            : data.speculativeDecoding
+              ? "Enabled"
+              : "Disabled"}
+        </dd>
         <dt>Draft model</dt>
         <dd>Unavailable</dd>
         <dt>Prompt tokens</dt>

@@ -25,9 +25,14 @@ describe("isGlimmerEvent", () => {
 
   it("accepts model-call provenance without connection or key material", () => {
     const evt = {
-      id: "evt_model_1", sessionId: "s1", timestamp: "2026-08-25T00:00:00Z",
-      type: "model_request_started", requestId: "req-1", role: "architect",
-      providerId: "frontier", modelId: "frontier-1",
+      id: "evt_model_1",
+      sessionId: "s1",
+      timestamp: "2026-08-25T00:00:00Z",
+      type: "model_request_started",
+      requestId: "req-1",
+      role: "architect",
+      providerId: "frontier",
+      modelId: "frontier-1",
     };
     expect(isGlimmerEvent(evt)).toBe(true);
     expect(evt).not.toHaveProperty("apiKey");

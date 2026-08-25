@@ -27,8 +27,10 @@ const GATE_LEG_COLOR: Record<string, string> = {
 };
 
 function statusLegColor(key: keyof Statuses, value: string): string {
-  if (key === "delivery" || key === "overall") return READINESS_COLOR[value as never] ?? "var(--gray)";
-  if (key === "architecture" || key === "documentation") return GATE_LEG_COLOR[value] ?? "var(--gray)";
+  if (key === "delivery" || key === "overall")
+    return READINESS_COLOR[value as never] ?? "var(--gray)";
+  if (key === "architecture" || key === "documentation")
+    return GATE_LEG_COLOR[value] ?? "var(--gray)";
   return statusColor(value);
 }
 
@@ -38,9 +40,16 @@ function statusLegColor(key: keyof Statuses, value: string): string {
 export function StatusesRow({ statuses }: { statuses?: Statuses }) {
   if (!statuses) return null;
   return (
-    <div className="statuses-row" style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "8px 0" }}>
+    <div
+      className="statuses-row"
+      style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "8px 0" }}
+    >
       {STATUS_LABELS.map(([key, label]) => (
-        <span key={key} className="meta-value" style={{ ["--badge-color" as any]: statusLegColor(key, statuses[key]) }}>
+        <span
+          key={key}
+          className="meta-value"
+          style={{ ["--badge-color" as any]: statusLegColor(key, statuses[key]) }}
+        >
           {label} {statuses[key]}
         </span>
       ))}

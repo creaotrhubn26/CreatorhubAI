@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { inferArea, suggestVerification, computeRiskScore, computeScopeGuard } from "./repoAnalysis.js";
+import {
+  inferArea,
+  suggestVerification,
+  computeRiskScore,
+  computeScopeGuard,
+} from "./repoAnalysis.js";
 import type { RepoMap, ChangedFile, TaskContract } from "@glimmer/shared";
 
 const REPO_MAP: RepoMap = {
@@ -9,14 +14,33 @@ const REPO_MAP: RepoMap = {
   head: "abc",
   upstream: null,
   packages: [
-    { path: "frontend/package.json", dir: "frontend", name: "creatorhub-frontend", scripts: { typecheck: "tsc --noEmit", "test:unit": "vitest run" }, frameworks: ["React", "Vite"], engines: null, workspaces: null },
-    { path: "backend/package.json", dir: "backend", name: "creatorhub-backend", scripts: { build: "tsc" }, frameworks: [], engines: null, workspaces: null },
+    {
+      path: "frontend/package.json",
+      dir: "frontend",
+      name: "creatorhub-frontend",
+      scripts: { typecheck: "tsc --noEmit", "test:unit": "vitest run" },
+      frameworks: ["React", "Vite"],
+      engines: null,
+      workspaces: null,
+    },
+    {
+      path: "backend/package.json",
+      dir: "backend",
+      name: "creatorhub-backend",
+      scripts: { build: "tsc" },
+      frameworks: [],
+      engines: null,
+      workspaces: null,
+    },
   ],
 };
 
 describe("inferArea", () => {
   it("matches by explicit scope.area path prefix", () => {
-    const result = inferArea({ package: "directory", area: "frontend/client/src/dialog" }, REPO_MAP);
+    const result = inferArea(
+      { package: "directory", area: "frontend/client/src/dialog" },
+      REPO_MAP,
+    );
     expect(result.area).toBe("frontend");
     expect(result.package?.name).toBe("creatorhub-frontend");
   });
@@ -61,7 +85,9 @@ describe("computeRiskScore", () => {
   });
 
   it("is MEDIUM when the change spans more than one package", () => {
-    expect(computeRiskScore(files("frontend/src/a.tsx", "backend/src/b.ts"), REPO_MAP)).toBe("MEDIUM");
+    expect(computeRiskScore(files("frontend/src/a.tsx", "backend/src/b.ts"), REPO_MAP)).toBe(
+      "MEDIUM",
+    );
   });
 
   it("is HIGH when a lockfile changes", () => {
@@ -77,7 +103,12 @@ describe("computeRiskScore", () => {
   });
 
   it("is CRITICAL when two distinct high-risk signals fire together", () => {
-    expect(computeRiskScore(files("frontend/package-lock.json", "backend/src/auth/session.ts"), REPO_MAP)).toBe("CRITICAL");
+    expect(
+      computeRiskScore(
+        files("frontend/package-lock.json", "backend/src/auth/session.ts"),
+        REPO_MAP,
+      ),
+    ).toBe("CRITICAL");
   });
 
   it("is LOW for an empty change set", () => {
@@ -85,11 +116,18 @@ describe("computeRiskScore", () => {
   });
 });
 
-const CONTRACT_SCOPE_DIR: TaskContract["scope"] = { package: "directory", area: "frontend/client/src/dialog" };
+const CONTRACT_SCOPE_DIR: TaskContract["scope"] = {
+  package: "directory",
+  area: "frontend/client/src/dialog",
+};
 
 describe("computeScopeGuard", () => {
   it("reports in-scope when every changed file is under the expected prefix", () => {
-    const result = computeScopeGuard(CONTRACT_SCOPE_DIR, files("frontend/client/src/dialog/Dialog.tsx"), REPO_MAP);
+    const result = computeScopeGuard(
+      CONTRACT_SCOPE_DIR,
+      files("frontend/client/src/dialog/Dialog.tsx"),
+      REPO_MAP,
+    );
     expect(result.inScope).toBe(true);
     expect(result.expandedFiles).toEqual([]);
   });
@@ -98,14 +136,18 @@ describe("computeScopeGuard", () => {
     const result = computeScopeGuard(
       CONTRACT_SCOPE_DIR,
       files("frontend/client/src/dialog/Dialog.tsx", "backend/src/unrelated.ts"),
-      REPO_MAP
+      REPO_MAP,
     );
     expect(result.inScope).toBe(false);
     expect(result.expandedFiles).toEqual(["backend/src/unrelated.ts"]);
   });
 
   it("has no meaningful boundary for repository-wide scope — always in scope", () => {
-    const result = computeScopeGuard({ package: "repository" }, files("anything/anywhere.ts"), REPO_MAP);
+    const result = computeScopeGuard(
+      { package: "repository" },
+      files("anything/anywhere.ts"),
+      REPO_MAP,
+    );
     expect(result.inScope).toBe(true);
     expect(result.expected).toEqual([]);
   });
@@ -125,19 +167,31 @@ describe("computeScopeGuard", () => {
   // true for this case, even though the gateway can't reconstruct what the
   // real boundary should have been.
   it("does not report inScope: true for a directory scope with no concrete path — unbounded, not honestly-boundaryless", () => {
-    const result = computeScopeGuard({ package: "directory", area: "" }, files("anything/anywhere.ts"), REPO_MAP);
+    const result = computeScopeGuard(
+      { package: "directory", area: "" },
+      files("anything/anywhere.ts"),
+      REPO_MAP,
+    );
     expect(result.inScope).toBe(false);
     expect(result.unbounded).toBe(true);
   });
 
   it("does not report inScope: true for a files scope with no concrete paths", () => {
-    const result = computeScopeGuard({ package: "files", paths: [] }, files("anything/anywhere.ts"), REPO_MAP);
+    const result = computeScopeGuard(
+      { package: "files", paths: [] },
+      files("anything/anywhere.ts"),
+      REPO_MAP,
+    );
     expect(result.inScope).toBe(false);
     expect(result.unbounded).toBe(true);
   });
 
   it("keeps the honest inScope: true, unbounded: undefined for genuinely repository-wide scope", () => {
-    const result = computeScopeGuard({ package: "repository" }, files("anything/anywhere.ts"), REPO_MAP);
+    const result = computeScopeGuard(
+      { package: "repository" },
+      files("anything/anywhere.ts"),
+      REPO_MAP,
+    );
     expect(result.inScope).toBe(true);
     expect(result.unbounded).toBeFalsy();
   });
@@ -151,10 +205,17 @@ describe("computeScopeGuard", () => {
     const scope: TaskContract["scope"] = { package: "directory", area: "frontend/src/dialog" };
     const result = computeScopeGuard(
       scope,
-      files("frontend/src/dialog/Dialog.tsx", "frontend/src/dialog-old/file.ts", "frontend/src/dialog.bak"),
-      REPO_MAP
+      files(
+        "frontend/src/dialog/Dialog.tsx",
+        "frontend/src/dialog-old/file.ts",
+        "frontend/src/dialog.bak",
+      ),
+      REPO_MAP,
     );
     expect(result.inScope).toBe(false);
-    expect(result.expandedFiles).toEqual(["frontend/src/dialog-old/file.ts", "frontend/src/dialog.bak"]);
+    expect(result.expandedFiles).toEqual([
+      "frontend/src/dialog-old/file.ts",
+      "frontend/src/dialog.bak",
+    ]);
   });
 });

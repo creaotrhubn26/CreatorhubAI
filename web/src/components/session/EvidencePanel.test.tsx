@@ -17,7 +17,10 @@ describe("EvidencePanel", () => {
       entries: [
         { id: "sess-1-ev-1", kind: "file", path: "src/greet.js", toolCall: "read_file" },
         {
-          id: "sess-1-ev-2", kind: "test-search", path: "src/greet.js", toolCall: "find_related_tests",
+          id: "sess-1-ev-2",
+          kind: "test-search",
+          path: "src/greet.js",
+          toolCall: "find_related_tests",
           relatesTo: [{ path: "src/greet.test.js", kind: "test" }],
         },
       ],
@@ -37,7 +40,9 @@ describe("EvidencePanel", () => {
       entries: [{ id: "sess-1-ev-1", kind: "file", path: "src/greet.js", toolCall: "read_file" }],
     });
     vi.spyOn(client.glimmerApi, "getEvidenceEntry").mockResolvedValue({
-      id: "sess-1-ev-1", tool: "read_file", arguments: { path: "src/greet.js" },
+      id: "sess-1-ev-1",
+      tool: "read_file",
+      arguments: { path: "src/greet.js" },
       content: "export function greet() {}",
     });
     render(withQuery(<EvidencePanel sessionId="s1" />));
@@ -47,13 +52,17 @@ describe("EvidencePanel", () => {
 
     fireEvent.click(screen.getByText("sess-1-ev-1"));
 
-    await waitFor(() => expect(client.glimmerApi.getEvidenceEntry).toHaveBeenCalledWith("s1", "sess-1-ev-1"));
+    await waitFor(() =>
+      expect(client.glimmerApi.getEvidenceEntry).toHaveBeenCalledWith("s1", "sess-1-ev-1"),
+    );
     await waitFor(() => expect(screen.getByText(/export function greet/)).toBeInTheDocument());
     expect(screen.getByText(/tool: read_file/)).toBeInTheDocument();
   });
 
   it("renders nothing when the evidence index is empty/404s (absence is normal)", async () => {
-    vi.spyOn(client.glimmerApi, "getEvidenceIndex").mockRejectedValue(new Error("GET .../evidence failed: 404"));
+    vi.spyOn(client.glimmerApi, "getEvidenceIndex").mockRejectedValue(
+      new Error("GET .../evidence failed: 404"),
+    );
     const { container } = render(withQuery(<EvidencePanel sessionId="s1" />));
 
     await waitFor(() => expect(client.glimmerApi.getEvidenceIndex).toHaveBeenCalled());

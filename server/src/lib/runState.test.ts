@@ -11,7 +11,13 @@ const CONTRACT: TaskContract = {
   intent: { kind: "improvement-assessment", source: "deterministic-inference" },
   scope: { package: "repository" },
   mode: "inspect",
-  constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+  constraints: {
+    minimalChange: true,
+    noCommit: true,
+    noPush: true,
+    noDeploy: true,
+    noDependencyInstall: true,
+  },
   verification: [],
   repairBudget: 0,
 };
@@ -41,24 +47,46 @@ describe("durable gateway run state", () => {
     vi.resetModules();
     const reloaded = await import("./runState.js");
     expect(await reloaded.readGatewayRun(created.id)).toEqual(created);
-    expect(reloaded.gatewayRunToSession(created).taskContract?.intent?.kind).toBe("improvement-assessment");
+    expect(reloaded.gatewayRunToSession(created).taskContract?.intent?.kind).toBe(
+      "improvement-assessment",
+    );
   });
 
   it("serializes concurrent updates instead of losing the terminal transition", async () => {
     const created = await runState.createGatewayRun(CONTRACT, "/tmp/workspace");
-    const first = runState.updateGatewayRun(created.id, (record) => ({ ...record, state: "running", pid: 123 }));
-    const second = runState.updateGatewayRun(created.id, (record) => ({ ...record, state: "exited", exitCode: 0 }));
+    const first = runState.updateGatewayRun(created.id, (record) => ({
+      ...record,
+      state: "running",
+      pid: 123,
+    }));
+    const second = runState.updateGatewayRun(created.id, (record) => ({
+      ...record,
+      state: "exited",
+      exitCode: 0,
+    }));
     await Promise.all([first, second]);
     expect((await runState.readGatewayRun(created.id))?.state).toBe("exited");
   });
 
   it("recognizes only a live process carrying this exact canonical session id", async () => {
     const created = await runState.createGatewayRun(CONTRACT, "/tmp/workspace");
-    const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__", "fake-glimmer-v2.mjs");
-    child = spawn(process.execPath, [fixture, "--session-id", created.id, "--workspace", "/tmp/workspace"], {
-      env: { ...process.env, GLIMMER_FAKE_REAL_ID: "stay-running", GLIMMER_STATE_ROOT: stateRoot },
-      stdio: "ignore",
-    });
+    const fixture = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "__fixtures__",
+      "fake-glimmer-v2.mjs",
+    );
+    child = spawn(
+      process.execPath,
+      [fixture, "--session-id", created.id, "--workspace", "/tmp/workspace"],
+      {
+        env: {
+          ...process.env,
+          GLIMMER_FAKE_REAL_ID: "stay-running",
+          GLIMMER_STATE_ROOT: stateRoot,
+        },
+        stdio: "ignore",
+      },
+    );
     await new Promise<void>((resolve, reject) => {
       child!.once("spawn", resolve);
       child!.once("error", reject);
@@ -68,11 +96,13 @@ describe("durable gateway run state", () => {
     const command = `${process.execPath} ${fixture} --session-id ${created.id} --workspace /tmp/workspace`;
     expect(runState.commandBelongsToRun(command, created.id)).toBe(true);
     expect(runState.commandBelongsToRun(command, `${created.id}-other`)).toBe(false);
-    expect(runState.commandBelongsToRun(`python3 other.py --session-id ${created.id}`, created.id)).toBe(false);
+    expect(
+      runState.commandBelongsToRun(`python3 other.py --session-id ${created.id}`, created.id),
+    ).toBe(false);
     // The actual /bin/ps probe is allowed to return false in a sandbox that
     // blocks process-list inspection; the pure command ownership boundary
     // above is the part cancellation relies on once ps is available.
-    expect(typeof await runState.isRecordedProcessAlive(record)).toBe("boolean");
+    expect(typeof (await runState.isRecordedProcessAlive(record))).toBe("boolean");
     child.kill("SIGTERM");
     child = undefined;
   });

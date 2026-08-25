@@ -7,8 +7,16 @@
     "web"
   ],
   "scripts": {
-    "build": "npm run build -ws --if-present",
-    "test": "npm run test -ws --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build --workspace @glimmer/shared && npm run typecheck --workspace server --workspace web",
+    "lint": "eslint . --max-warnings=0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
+    "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "rust:check": "npm run rust:fmt && npm run rust:clippy",
+    "quality": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run rust:check",
     "dev:server": "npm run dev -w server",
     "dev:web": "npm run dev -w web",
     "tauri:dev": "npx @tauri-apps/cli dev",
@@ -16,6 +24,12 @@
     "dogfood:e2e": "node scripts/dogfood-session.mjs"
   },
   "devDependencies": {
-    "typescript": "^5.5.4"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.11.0",
+    "prettier": "^3.9.6",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.68.0"
   }
 }

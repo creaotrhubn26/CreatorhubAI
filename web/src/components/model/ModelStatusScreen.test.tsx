@@ -12,8 +12,12 @@ function withQuery(ui: React.ReactElement) {
 describe("ModelStatusScreen", () => {
   it("renders real /props-derived metrics when the backend provides them", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "ONLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend",
-      contextSize: 65536, modelPath: "/models/muse-glimmer-30b.gguf", speculativeDecoding: true,
+      status: "ONLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      contextSize: 65536,
+      modelPath: "/models/muse-glimmer-30b.gguf",
+      speculativeDecoding: true,
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByText("65536")).toBeInTheDocument());
@@ -23,7 +27,9 @@ describe("ModelStatusScreen", () => {
 
   it("shows 'Unavailable' for every /props-derived field when the probe never provided them, never fabricating a value", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "ONLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend",
+      status: "ONLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByText("ONLINE")).toBeInTheDocument());
@@ -33,7 +39,10 @@ describe("ModelStatusScreen", () => {
 
   it("offers Start (not Stop) when the server is OFFLINE", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "OFFLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "OFFLINE",
+      status: "OFFLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "OFFLINE",
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByRole("button", { name: "Start server" })).toBeEnabled());
@@ -42,7 +51,10 @@ describe("ModelStatusScreen", () => {
 
   it("shows STARTING as its own state and refuses a second start — never claims ONLINE from a spawn", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "OFFLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "STARTING",
+      status: "OFFLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "STARTING",
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByText("STARTING")).toBeInTheDocument());
@@ -53,8 +65,11 @@ describe("ModelStatusScreen", () => {
 
   it("distinguishes LOADING (port up, /health not 200 yet) from ONLINE", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "OFFLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend",
-      runState: "LOADING", httpStatus: 503,
+      status: "OFFLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "LOADING",
+      httpStatus: 503,
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByText("LOADING")).toBeInTheDocument());
@@ -63,8 +78,12 @@ describe("ModelStatusScreen", () => {
 
   it("surfaces the exit code and log tail when the process we started failed", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "OFFLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend",
-      runState: "FAILED", exitCode: 1, logTail: "error: failed to load model",
+      status: "OFFLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "FAILED",
+      exitCode: 1,
+      logTail: "error: failed to load model",
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByText("FAILED")).toBeInTheDocument());
@@ -76,29 +95,48 @@ describe("ModelStatusScreen", () => {
 
   it("says why nothing was stopped when the target survived the stop attempt", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "ONLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "ONLINE",
+      status: "ONLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "ONLINE",
     });
     vi.spyOn(client.glimmerApi, "stopModelServer").mockResolvedValue({
-      stopped: false, detail: "something is still listening on the model port (ONLINE)",
-      status: "ONLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "ONLINE",
+      stopped: false,
+      detail: "something is still listening on the model port (ONLINE)",
+      status: "ONLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "ONLINE",
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByRole("button", { name: "Stop server" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Stop server" }));
-    await waitFor(() => expect(screen.getByText(/Nothing was stopped: something is still listening/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Nothing was stopped: something is still listening/),
+      ).toBeInTheDocument(),
+    );
   });
 
   it("reports an already-running server as a no-op rather than a successful start", async () => {
     vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
-      status: "OFFLINE", endpoint: "http://127.0.0.1:8080", provenance: "deterministic-backend", runState: "OFFLINE",
+      status: "OFFLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "OFFLINE",
     });
     vi.spyOn(client.glimmerApi, "startModelServer").mockResolvedValue({
-      started: false, status: "ONLINE", endpoint: "http://127.0.0.1:8080",
-      provenance: "deterministic-backend", runState: "ONLINE",
+      started: false,
+      status: "ONLINE",
+      endpoint: "http://127.0.0.1:8080",
+      provenance: "deterministic-backend",
+      runState: "ONLINE",
     });
     render(withQuery(<ModelStatusScreen />));
     await waitFor(() => expect(screen.getByRole("button", { name: "Start server" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Start server" }));
-    await waitFor(() => expect(screen.getByText(/No change: the server was already ONLINE/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/No change: the server was already ONLINE/)).toBeInTheDocument(),
+    );
   });
 });

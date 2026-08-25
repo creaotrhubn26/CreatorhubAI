@@ -7,7 +7,7 @@ describe("CollapsibleSection", () => {
     render(
       <CollapsibleSection title="Architecture Plan" summary="low risk · 1 candidate file">
         <p>Objective text</p>
-      </CollapsibleSection>
+      </CollapsibleSection>,
     );
     expect(screen.getByText("low risk · 1 candidate file")).toBeInTheDocument();
     expect(screen.getByText("Objective text")).not.toBeVisible();
@@ -17,7 +17,7 @@ describe("CollapsibleSection", () => {
     render(
       <CollapsibleSection title="Risk & Scope">
         <p>Body content</p>
-      </CollapsibleSection>
+      </CollapsibleSection>,
     );
     const header = screen.getByRole("button", { name: /Risk & Scope/ });
     expect(header).toHaveAttribute("aria-expanded", "false");
@@ -35,9 +35,12 @@ describe("CollapsibleSection", () => {
     render(
       <CollapsibleSection title="Risk & Scope" defaultOpen>
         <p>Body content</p>
-      </CollapsibleSection>
+      </CollapsibleSection>,
     );
-    expect(screen.getByRole("button", { name: /Risk & Scope/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Risk & Scope/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
     expect(screen.getByText("Body content")).toBeVisible();
   });
 });

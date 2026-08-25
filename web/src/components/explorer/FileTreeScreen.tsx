@@ -24,7 +24,13 @@ function join(dir: string, name: string): string {
 }
 
 function DirNode({
-  root, dir, label, expanded, onToggle, selectedPath, onOpenFile,
+  root,
+  dir,
+  label,
+  expanded,
+  onToggle,
+  selectedPath,
+  onOpenFile,
 }: {
   root: string;
   dir: string;
@@ -44,7 +50,12 @@ function DirNode({
 
   return (
     <li className="file-tree__node">
-      <button type="button" className="file-tree__row" aria-expanded={isOpen} onClick={() => onToggle(dir)}>
+      <button
+        type="button"
+        className="file-tree__row"
+        aria-expanded={isOpen}
+        onClick={() => onToggle(dir)}
+      >
         <IconChevron open={isOpen} />
         <span className="file-tree__name">{label}</span>
       </button>
@@ -90,7 +101,9 @@ function DirNode({
             </ul>
           )}
           {data?.truncated && (
-            <p className="file-tree__note">Showing the first entries only — this directory has more.</p>
+            <p className="file-tree__note">
+              Showing the first entries only — this directory has more.
+            </p>
           )}
         </>
       )}
@@ -105,11 +118,20 @@ export function FileTreeScreen() {
   const line = Number.isFinite(lineParam) && lineParam > 0 ? lineParam : undefined;
   const startParam = Number(search.get("start"));
   const endParam = Number(search.get("end"));
-  const selectedStart = Number.isInteger(startParam) && Number.isInteger(endParam) &&
-    startParam > 0 && endParam >= startParam ? startParam : undefined;
+  const selectedStart =
+    Number.isInteger(startParam) &&
+    Number.isInteger(endParam) &&
+    startParam > 0 &&
+    endParam >= startParam
+      ? startParam
+      : undefined;
   const selectedEnd = selectedStart === undefined ? undefined : endParam;
 
-  const { data: workspaces, isPending, isError } = useQuery({
+  const {
+    data: workspaces,
+    isPending,
+    isError,
+  } = useQuery({
     queryKey: ["workspaces"],
     queryFn: glimmerApi.listWorkspaces,
     retry: false,
@@ -141,7 +163,8 @@ export function FileTreeScreen() {
   function toggle(dir: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
-      next.has(dir) ? next.delete(dir) : next.add(dir);
+      if (next.has(dir)) next.delete(dir);
+      else next.add(dir);
       return next;
     });
   }
@@ -170,16 +193,28 @@ export function FileTreeScreen() {
     return (
       <div>
         <h1>Files</h1>
-        <EmptyState icon="○" text="Unavailable — could not reach the gateway to find a workspace." />
+        <EmptyState
+          icon="○"
+          text="Unavailable — could not reach the gateway to find a workspace."
+        />
       </div>
     );
   }
-  if (isPending) return <div><h1>Files</h1><p>Loading…</p></div>;
+  if (isPending)
+    return (
+      <div>
+        <h1>Files</h1>
+        <p>Loading…</p>
+      </div>
+    );
   if (!root) {
     return (
       <div>
         <h1>Files</h1>
-        <EmptyState icon="○" text="No workspace yet — a workspace appears here once a session has one." />
+        <EmptyState
+          icon="○"
+          text="No workspace yet — a workspace appears here once a session has one."
+        />
       </div>
     );
   }
@@ -200,7 +235,9 @@ export function FileTreeScreen() {
               }}
             >
               {roots.map((r) => (
-                <option key={r} value={r}>{r}</option>
+                <option key={r} value={r}>
+                  {r}
+                </option>
               ))}
             </select>
           ) : (

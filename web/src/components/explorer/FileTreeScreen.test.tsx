@@ -7,14 +7,22 @@ import * as client from "../../api/client";
 
 function LocationProbe() {
   const location = useLocation();
-  return <div data-testid="location">{location.pathname}{location.search}</div>;
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
+  );
 }
 
 function withProviders(ui: React.ReactElement, entry = "/files") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={[entry]}>{ui}<LocationProbe /></MemoryRouter>
+      <MemoryRouter initialEntries={[entry]}>
+        {ui}
+        <LocationProbe />
+      </MemoryRouter>
     </QueryClientProvider>
   );
 }
@@ -30,7 +38,12 @@ const workspace = {
 
 // One directory listing per absolute path, so lazy expansion is observable.
 const TREE: Record<string, { entries: { name: string; isDir: boolean }[] }> = {
-  "/w": { entries: [{ name: "src", isDir: true }, { name: "README.md", isDir: false }] },
+  "/w": {
+    entries: [
+      { name: "src", isDir: true },
+      { name: "README.md", isDir: false },
+    ],
+  },
   "/w/src": { entries: [{ name: "a.ts", isDir: false }] },
 };
 
@@ -67,7 +80,12 @@ describe("FileTreeScreen", () => {
     mockListing();
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
     const readFile = vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
-      path: "/w/README.md", size: 3, bytesReturned: 3, truncated: false, binary: false, content: "hi\n",
+      path: "/w/README.md",
+      size: 3,
+      bytesReturned: 3,
+      truncated: false,
+      binary: false,
+      content: "hi\n",
     });
     render(withProviders(<FileTreeScreen />));
 
@@ -79,12 +97,16 @@ describe("FileTreeScreen", () => {
     mockListing();
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
-      path: "/w/README.md", size: 3, bytesReturned: 3, truncated: false, binary: false, content: "hi\n",
+      path: "/w/README.md",
+      size: 3,
+      bytesReturned: 3,
+      truncated: false,
+      binary: false,
+      content: "hi\n",
     });
-    const { container } = render(withProviders(
-      <FileTreeScreen />,
-      "/files?path=%2Fw%2FREADME.md&session=s1",
-    ));
+    const { container } = render(
+      withProviders(<FileTreeScreen />, "/files?path=%2Fw%2FREADME.md&session=s1"),
+    );
     await waitFor(() => expect(container.querySelector(".code-view__text")).not.toBeNull());
     const text = container.querySelector<HTMLElement>(".code-view__text")!;
     const range = document.createRange();
@@ -102,7 +124,12 @@ describe("FileTreeScreen", () => {
     const listing = mockListing();
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
     const readFile = vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
-      path: "/w/src/a.ts", size: 3, bytesReturned: 3, truncated: false, binary: false, content: "x\n",
+      path: "/w/src/a.ts",
+      size: 3,
+      bytesReturned: 3,
+      truncated: false,
+      binary: false,
+      content: "x\n",
     });
     render(withProviders(<FileTreeScreen />, "/files?path=%2Fw%2Fsrc%2Fa.ts&line=1"));
 
@@ -119,9 +146,16 @@ describe("FileTreeScreen", () => {
     mockListing();
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
     const readFile = vi.spyOn(client.glimmerApi, "readFile");
-    render(withProviders(<FileTreeScreen />, "/files?path=%2FUsers%2Fu%2F.local%2Fshare%2Fopencode%2Fauth.json"));
+    render(
+      withProviders(
+        <FileTreeScreen />,
+        "/files?path=%2FUsers%2Fu%2F.local%2Fshare%2Fopencode%2Fauth.json",
+      ),
+    );
 
-    expect(await screen.findByText(/not inside any workspace Glimmer knows about/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/not inside any workspace Glimmer knows about/i),
+    ).toBeInTheDocument();
     expect(readFile).not.toHaveBeenCalled();
   });
 
@@ -129,7 +163,9 @@ describe("FileTreeScreen", () => {
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
     vi.spyOn(client.glimmerApi, "listDirectory").mockRejectedValue(new Error("permission denied"));
     render(withProviders(<FileTreeScreen />));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not list this directory — permission denied");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not list this directory — permission denied",
+    );
   });
 
   it("says there is no workspace rather than showing an empty tree", async () => {

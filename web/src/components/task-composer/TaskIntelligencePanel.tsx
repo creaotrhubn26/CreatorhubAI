@@ -37,7 +37,7 @@ function honestField(
   // task, it is merely unknown without a package to read scripts from. So the
   // caller says whether the short-circuit applies rather than the field
   // inferring it from scopePackage.
-  repositoryScopeMakesItMoot: boolean
+  repositoryScopeMakesItMoot: boolean,
 ): { text: string; state: "value" | "not-applicable" | "unknown" } {
   if (value) return { text: value, state: "value" };
   if (repositoryScopeMakesItMoot) return { text: NOT_APPLICABLE, state: "not-applicable" };
@@ -53,7 +53,8 @@ function honestField(
 const REPO_MAP_BASIS: Record<TaskIntelligence["repoMapStatus"], string> = {
   "workspace-matched": "Repository map: from a previous session in this workspace.",
   "unmatched-workspace": "No session has produced a repository map for this workspace yet.",
-  "first-found": "Repository map: first one found across all sessions — choose a workspace above to scope it to your repository.",
+  "first-found":
+    "Repository map: first one found across all sessions — choose a workspace above to scope it to your repository.",
   none: "No repository map exists in any session yet.",
 };
 
@@ -79,7 +80,14 @@ export function TaskIntelligencePanel({
   const debouncedObjective = useDebounced(objective ?? "", OBJECTIVE_DEBOUNCE_MS);
   const { data, error, isFetching } = useQuery({
     queryKey: [
-      "task-intelligence", scopePackage, scopeArea, workspace, mode, debouncedObjective, verificationLevel, candidateCount,
+      "task-intelligence",
+      scopePackage,
+      scopeArea,
+      workspace,
+      mode,
+      debouncedObjective,
+      verificationLevel,
+      candidateCount,
     ],
     queryFn: () =>
       glimmerApi.getTaskIntelligence({
@@ -119,7 +127,7 @@ export function TaskIntelligencePanel({
   const verification = honestField(
     data.suggestedVerification.length ? data.suggestedVerification.join(", ") : null,
     data,
-    false // review MN5: verification is unknown without a package, never "not applicable"
+    false, // review MN5: verification is unknown without a package, never "not applicable"
   );
 
   return (
@@ -128,7 +136,9 @@ export function TaskIntelligencePanel({
       <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
         Deterministic — repository-derived, not a model guess ({data.provenance})
       </p>
-      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>{REPO_MAP_BASIS[data.repoMapStatus]}</p>
+      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        {REPO_MAP_BASIS[data.repoMapStatus]}
+      </p>
       <dl>
         <dt>Likely area</dt>
         <dd data-state={area.state}>{area.text}</dd>

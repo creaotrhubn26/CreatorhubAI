@@ -33,7 +33,10 @@ export interface TaskComposerFormState {
 function scopePaths(form: TaskComposerFormState): { area?: string; paths?: string[] } {
   const raw = form.scopeArea?.trim();
   if (form.scopePackage !== "files" || !raw) return { area: form.scopeArea };
-  const paths = raw.split(/[,\n]/).map((p) => p.trim()).filter(Boolean);
+  const paths = raw
+    .split(/[,\n]/)
+    .map((p) => p.trim())
+    .filter(Boolean);
   return paths.length > 0 ? { paths } : { area: form.scopeArea };
 }
 
@@ -50,12 +53,20 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
     objective: form.objective,
     scope: { package: form.scopePackage, ...scopePaths(form) },
     mode: form.mode,
-    constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+    constraints: {
+      minimalChange: true,
+      noCommit: true,
+      noPush: true,
+      noDeploy: true,
+      noDependencyInstall: true,
+    },
     verification: form.verification,
     repairBudget: Math.min(5, Math.max(0, form.repairBudget)),
     maxTurns: form.maxTurns,
     // Omitted entirely when nothing was touched — orchestrator defaults apply.
-    ...(form.maxChangedFiles !== undefined ? { budgets: { maxChangedFiles: form.maxChangedFiles } } : {}),
+    ...(form.maxChangedFiles !== undefined
+      ? { budgets: { maxChangedFiles: form.maxChangedFiles } }
+      : {}),
     ...(Object.keys(advanced).length > 0 ? { advanced } : {}),
   };
 }

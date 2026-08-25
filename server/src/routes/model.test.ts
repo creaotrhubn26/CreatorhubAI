@@ -21,13 +21,20 @@ vi.mock("node:child_process", () => ({
   execFile: (...args: any[]) => execFileMock(...args),
 }));
 
-type FakeChild = { pid: number; on: (ev: string, fn: (...a: any[]) => void) => void; unref: () => void; emit: (ev: string, ...a: any[]) => void };
+type FakeChild = {
+  pid: number;
+  on: (ev: string, fn: (...a: any[]) => void) => void;
+  unref: () => void;
+  emit: (ev: string, ...a: any[]) => void;
+};
 
 function fakeChild(pid = 4242): FakeChild {
   const handlers: Record<string, (...a: any[]) => void> = {};
   return {
     pid,
-    on: (ev, fn) => { handlers[ev] = fn; },
+    on: (ev, fn) => {
+      handlers[ev] = fn;
+    },
     unref: () => {},
     emit: (ev, ...a) => handlers[ev]?.(...a),
   };
@@ -50,7 +57,9 @@ beforeEach(async () => {
   vi.resetModules();
   spawnMock.mockReset();
   execFileMock.mockReset();
-  execFileMock.mockImplementation((...args: any[]) => args[args.length - 1](null, { stdout: "", stderr: "" }));
+  execFileMock.mockImplementation((...args: any[]) =>
+    args[args.length - 1](null, { stdout: "", stderr: "" }),
+  );
   stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-model-route-root-"));
   process.env.GLIMMER_STATE_ROOT = stateRoot;
   // Real (harmless) files: the routes refuse to spawn anything that isn't an
@@ -89,10 +98,12 @@ describe("GET /api/model/status", () => {
     await listen((req, res) => {
       if (req.url === "/health") return res.writeHead(200).end("ok");
       if (req.url === "/props") {
-        return res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
-          default_generation_settings: { n_ctx: 65536, speculative: true },
-          model_path: "/models/muse-glimmer-30b.gguf",
-        }));
+        return res.writeHead(200, { "content-type": "application/json" }).end(
+          JSON.stringify({
+            default_generation_settings: { n_ctx: 65536, speculative: true },
+            model_path: "/models/muse-glimmer-30b.gguf",
+          }),
+        );
       }
       res.writeHead(404).end();
     });
@@ -126,7 +137,9 @@ describe("GET /api/model/status", () => {
   it("reports LOADING while the port answers but /health isn't 200 yet (llama-server loading the GGUF)", async () => {
     await listen((_req, res) => {
       res.writeHead(503, { "content-type": "application/json" }).end(
-        JSON.stringify({ error: { code: 503, message: "Loading model", type: "unavailable_error" } })
+        JSON.stringify({
+          error: { code: 503, message: "Loading model", type: "unavailable_error" },
+        }),
       );
     });
     const { createApp } = await import("../app.js");
@@ -247,7 +260,9 @@ describe("POST /api/model/stop", () => {
     // A real, detached child of our own so the process-group kill has
     // something true to act on (the port-keyed stop script finds nothing —
     // this process never binds, exactly like llama-server before it binds).
-    const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawn;
+    const realSpawn = (
+      await vi.importActual<typeof import("node:child_process")>("node:child_process")
+    ).spawn;
     const victim = realSpawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
     victim.unref();
     spawnMock.mockReturnValue(fakeChild(victim.pid!));
@@ -288,7 +303,7 @@ describe("POST /api/model/start concurrency", () => {
     const app: Express = createApp();
 
     const results = await Promise.all(
-      [1, 2, 3, 4, 5].map(() => request(app).post("/api/model/start").set("Origin", UI_ORIGIN))
+      [1, 2, 3, 4, 5].map(() => request(app).post("/api/model/start").set("Origin", UI_ORIGIN)),
     );
 
     expect(spawnMock).toHaveBeenCalledTimes(1);

@@ -18,10 +18,25 @@ const FULL_PACKET = {
   orchestratorUpdatedFiles: ["docs/graph.json"],
   verification: { status: "VERIFIED", results: [{ ok: true }] },
   visual: "PASS",
-  statuses: { technical: "VERIFIED", architecture: "approved", documentation: "not_run", visual: "PASS", delivery: "ready_with_known_limitations", overall: "ready_with_known_limitations" },
+  statuses: {
+    technical: "VERIFIED",
+    architecture: "approved",
+    documentation: "not_run",
+    visual: "PASS",
+    delivery: "ready_with_known_limitations",
+    overall: "ready_with_known_limitations",
+  },
   customerReadiness: { value: "ready_with_known_limitations", provenance: "model-output" },
-  limitations: { unresolvedItems: ["recovery feedback is subtle"], intentionallyNotChanged: [], concerns: [], provenance: "model-output" },
-  forwardPlan: { nextSteps: [{ priority: "recommended_next", action: "add progress state" }], provenance: "model-output" },
+  limitations: {
+    unresolvedItems: ["recovery feedback is subtle"],
+    intentionallyNotChanged: [],
+    concerns: [],
+    provenance: "model-output",
+  },
+  forwardPlan: {
+    nextSteps: [{ priority: "recommended_next", action: "add progress state" }],
+    provenance: "model-output",
+  },
   confidence: { level: "high", reason: "well tested", provenance: "model-output" },
   humanReviewStatus: "pending",
 };
@@ -45,10 +60,17 @@ describe("DeliveryPacketPanel", () => {
 
   it("renders honest 'Unavailable' sections when no delivery review ever ran (absent artifact)", async () => {
     const bare = {
-      task: "t", planRef: null, changedFiles: [], orchestratorUpdatedFiles: [],
-      verification: { status: "NOT_RUN", results: null }, visual: "not_run",
+      task: "t",
+      planRef: null,
+      changedFiles: [],
+      orchestratorUpdatedFiles: [],
+      verification: { status: "NOT_RUN", results: null },
+      visual: "not_run",
       statuses: {},
-      customerReadiness: null, limitations: null, forwardPlan: null, confidence: null,
+      customerReadiness: null,
+      limitations: null,
+      forwardPlan: null,
+      confidence: null,
       humanReviewStatus: "pending",
     };
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockResolvedValue(bare as any);
@@ -64,7 +86,9 @@ describe("DeliveryPacketPanel", () => {
   });
 
   it("renders nothing when the delivery-packet artifact 404s (absence is normal)", async () => {
-    vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockRejectedValue(new Error("GET .../delivery-packet failed: 404"));
+    vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockRejectedValue(
+      new Error("GET .../delivery-packet failed: 404"),
+    );
     const { container } = render(withQuery(<DeliveryPacketPanel sessionId="s1" />));
 
     await waitFor(() => expect(client.glimmerApi.getDeliveryPacket).toHaveBeenCalled());

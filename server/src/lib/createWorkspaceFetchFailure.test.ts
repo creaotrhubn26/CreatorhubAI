@@ -21,10 +21,14 @@ beforeAll(async () => {
   await fs.writeFile(path.join(brokenSource, "a.txt"), "one\n");
   await exec("git", ["add", "a.txt"], { cwd: brokenSource });
   await exec("git", ["commit", "-q", "-m", "init"], { cwd: brokenSource });
-  await exec("git", ["remote", "add", "origin", "/nonexistent/does-not-exist"], { cwd: brokenSource });
+  await exec("git", ["remote", "add", "origin", "/nonexistent/does-not-exist"], {
+    cwd: brokenSource,
+  });
 
   process.env.GLIMMER_SOURCE_REPO = brokenSource;
-  process.env.GLIMMER_WORKTREE_ROOT = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-wc-broken-worktrees-"));
+  process.env.GLIMMER_WORKTREE_ROOT = await fs.mkdtemp(
+    path.join(os.tmpdir(), "glimmer-wc-broken-worktrees-"),
+  );
 });
 
 afterAll(async () => {

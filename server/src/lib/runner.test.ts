@@ -12,7 +12,13 @@ const CONTRACT = {
   objective: "Fix dialog state restoration",
   scope: { package: "frontend" as const, area: "role-room" },
   mode: "implement" as const,
-  constraints: { minimalChange: true, noCommit: true as const, noPush: true as const, noDeploy: true as const, noDependencyInstall: true as const },
+  constraints: {
+    minimalChange: true,
+    noCommit: true as const,
+    noPush: true as const,
+    noDeploy: true as const,
+    noDependencyInstall: true as const,
+  },
   verification: ["frontend-typecheck"],
   repairBudget: 2,
 };
@@ -37,7 +43,10 @@ describe("buildArgs", () => {
     const contract = {
       ...CONTRACT,
       objective: "Hva kan bli bedre?",
-      intent: { kind: "improvement-assessment" as const, source: "deterministic-inference" as const },
+      intent: {
+        kind: "improvement-assessment" as const,
+        source: "deterministic-inference" as const,
+      },
     };
     const args = buildArgs(contract, "/tmp/ws", "20260825-173500-abcdef123456");
     expect(args[args.indexOf("--session-id") + 1]).toBe("20260825-173500-abcdef123456");
@@ -71,7 +80,10 @@ describe("buildArgs", () => {
   });
 
   it("maps symbolic verification names to the real allowlisted commands", () => {
-    const args = buildArgs({ ...CONTRACT, verification: ["frontend-typecheck", "targeted-test"] }, "/tmp/ws");
+    const args = buildArgs(
+      { ...CONTRACT, verification: ["frontend-typecheck", "targeted-test"] },
+      "/tmp/ws",
+    );
     expect(args).toContain("--verify");
     expect(args).toContain("npm --prefix frontend run typecheck");
     expect(args).toContain("npm --prefix frontend run test:unit");
@@ -80,7 +92,10 @@ describe("buildArgs", () => {
 
   it("drops unrecognized verification values instead of forwarding them to shlex.split", () => {
     const evil = "git push origin main";
-    const args = buildArgs({ ...CONTRACT, verification: [evil, "rm -rf /", "frontend-typecheck"] }, "/tmp/ws");
+    const args = buildArgs(
+      { ...CONTRACT, verification: [evil, "rm -rf /", "frontend-typecheck"] },
+      "/tmp/ws",
+    );
     // glimmer-v2.py executes every --verify value verbatim: nothing outside the
     // allowlist may appear anywhere in argv.
     expect(args.some((a) => a.includes(evil))).toBe(false);
@@ -104,7 +119,10 @@ describe("buildArgs", () => {
     });
 
     it("maps advanced.modelReadinessUrl to --model-readiness-url as a single argv element", () => {
-      const args = buildArgs({ ...CONTRACT, advanced: { modelReadinessUrl: "http://127.0.0.1:8080/health" } }, "/tmp/ws");
+      const args = buildArgs(
+        { ...CONTRACT, advanced: { modelReadinessUrl: "http://127.0.0.1:8080/health" } },
+        "/tmp/ws",
+      );
       const flagIndex = args.indexOf("--model-readiness-url");
       expect(flagIndex).toBeGreaterThanOrEqual(0);
       expect(args[flagIndex + 1]).toBe("http://127.0.0.1:8080/health");
@@ -116,30 +134,46 @@ describe("buildArgs", () => {
     });
 
     it("omits --architect-first when false or absent", () => {
-      expect(buildArgs({ ...CONTRACT, advanced: { architectFirst: false } }, "/tmp/ws")).not.toContain("--architect-first");
+      expect(
+        buildArgs({ ...CONTRACT, advanced: { architectFirst: false } }, "/tmp/ws"),
+      ).not.toContain("--architect-first");
       expect(buildArgs(CONTRACT, "/tmp/ws")).not.toContain("--architect-first");
     });
 
     it("emits none of the advanced flags when advanced is omitted entirely (zero behavior change when untouched)", () => {
       const args = buildArgs(CONTRACT, "/tmp/ws");
-      for (const flag of ["--timeout", "--toolchain-mode", "--model-readiness-url", "--architect-first"]) {
+      for (const flag of [
+        "--timeout",
+        "--toolchain-mode",
+        "--model-readiness-url",
+        "--architect-first",
+      ]) {
         expect(args).not.toContain(flag);
       }
     });
 
     it("silently drops an unparseable modelReadinessUrl instead of forwarding it (defense in depth beyond route validation)", () => {
-      const args = buildArgs({ ...CONTRACT, advanced: { modelReadinessUrl: "http://x; rm -rf /" } }, "/tmp/ws");
+      const args = buildArgs(
+        { ...CONTRACT, advanced: { modelReadinessUrl: "http://x; rm -rf /" } },
+        "/tmp/ws",
+      );
       expect(args).not.toContain("--model-readiness-url");
       expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
     });
 
     it("silently drops a non-http(s) modelReadinessUrl scheme", () => {
-      const args = buildArgs({ ...CONTRACT, advanced: { modelReadinessUrl: "javascript:alert(1)" } }, "/tmp/ws");
+      const args = buildArgs(
+        { ...CONTRACT, advanced: { modelReadinessUrl: "javascript:alert(1)" } },
+        "/tmp/ws",
+      );
       expect(args).not.toContain("--model-readiness-url");
     });
 
     it("silently drops a toolchainMode value outside the closed enum", () => {
-      const args = buildArgs({ ...CONTRACT, advanced: { toolchainMode: "rm -rf /" as any } }, "/tmp/ws");
+      const args = buildArgs(
+        { ...CONTRACT, advanced: { toolchainMode: "rm -rf /" as any } },
+        "/tmp/ws",
+      );
       expect(args).not.toContain("--toolchain-mode");
       expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
     });
@@ -149,9 +183,14 @@ describe("buildArgs", () => {
         {
           ...CONTRACT,
           maxTurns: 10,
-          advanced: { timeoutSeconds: 120, toolchainMode: "none", modelReadinessUrl: "https://model.local/ready", architectFirst: true },
+          advanced: {
+            timeoutSeconds: 120,
+            toolchainMode: "none",
+            modelReadinessUrl: "https://model.local/ready",
+            architectFirst: true,
+          },
         },
-        "/tmp/ws"
+        "/tmp/ws",
       );
       expect(args[args.length - 2]).toBe("--");
       expect(args[args.length - 1]).toBe(CONTRACT.objective);
@@ -180,7 +219,10 @@ describe("budgets.maxChangedFiles", () => {
   });
 
   it("cannot be flag-injected via a non-numeric value", () => {
-    const args = buildArgs({ ...CONTRACT, budgets: { maxChangedFiles: "10; rm -rf /" as any } }, "/tmp/ws");
+    const args = buildArgs(
+      { ...CONTRACT, budgets: { maxChangedFiles: "10; rm -rf /" as any } },
+      "/tmp/ws",
+    );
     expect(args).not.toContain("--max-changed-files");
     expect(args.some((a) => a.includes("rm -rf"))).toBe(false);
   });
@@ -217,10 +259,13 @@ describe("scope passthrough", () => {
   it("repeats --scope-paths once per path (glimmer-v2.py's --scope-paths is action=append)", () => {
     const args = buildArgs(
       { ...CONTRACT, scope: { package: "files" as const, paths: ["src/a.ts", "src/b.ts"] } },
-      "/tmp/ws"
+      "/tmp/ws",
     );
     expect(args[args.indexOf("--scope-package") + 1]).toBe("files");
-    const pathFlags = args.reduce<string[]>((acc, a, i) => (a === "--scope-paths" ? [...acc, args[i + 1]] : acc), []);
+    const pathFlags = args.reduce<string[]>(
+      (acc, a, i) => (a === "--scope-paths" ? [...acc, args[i + 1]] : acc),
+      [],
+    );
     expect(pathFlags).toEqual(["src/a.ts", "src/b.ts"]);
     expect(args).not.toContain("--scope-area");
   });
@@ -235,14 +280,17 @@ describe("scope passthrough", () => {
   it("drops a blank area/path instead of guarding against an empty prefix", () => {
     const args = buildArgs(
       { ...CONTRACT, scope: { package: "directory" as const, area: "   ", paths: ["", "  "] } },
-      "/tmp/ws"
+      "/tmp/ws",
     );
     expect(args).not.toContain("--scope-area");
     expect(args).not.toContain("--scope-paths");
   });
 
   it("drops a scope.package outside the closed set (defense in depth beyond route validation)", () => {
-    const args = buildArgs({ ...CONTRACT, scope: { package: "--engineer=evil" as any } }, "/tmp/ws");
+    const args = buildArgs(
+      { ...CONTRACT, scope: { package: "--engineer=evil" as any } },
+      "/tmp/ws",
+    );
     expect(args).not.toContain("--scope-package");
     expect(args.some((a) => a.includes("--engineer"))).toBe(false);
   });
@@ -250,7 +298,7 @@ describe("scope passthrough", () => {
   it("keeps the objective last, after --, with every scope flag set", () => {
     const args = buildArgs(
       { ...CONTRACT, scope: { package: "files" as const, area: "src", paths: ["src/a.ts"] } },
-      "/tmp/ws"
+      "/tmp/ws",
     );
     expect(args[args.length - 2]).toBe("--");
     expect(args[args.length - 1]).toBe(CONTRACT.objective);
@@ -280,13 +328,16 @@ describe("mode passthrough", () => {
 // Task 8.1 (V7 §23.10): qualityGates.
 describe("qualityGates", () => {
   it("maps customerReadinessRequired: true to a bare --customer-readiness-required flag", () => {
-    const args = buildArgs({ ...CONTRACT, qualityGates: { customerReadinessRequired: true } }, "/tmp/ws");
+    const args = buildArgs(
+      { ...CONTRACT, qualityGates: { customerReadinessRequired: true } },
+      "/tmp/ws",
+    );
     expect(args).toContain("--customer-readiness-required");
   });
 
   it("omits --customer-readiness-required when false or absent", () => {
     expect(
-      buildArgs({ ...CONTRACT, qualityGates: { customerReadinessRequired: false } }, "/tmp/ws")
+      buildArgs({ ...CONTRACT, qualityGates: { customerReadinessRequired: false } }, "/tmp/ws"),
     ).not.toContain("--customer-readiness-required");
     expect(buildArgs(CONTRACT, "/tmp/ws")).not.toContain("--customer-readiness-required");
   });
@@ -294,7 +345,7 @@ describe("qualityGates", () => {
   it("maps minimumCustomerReadiness to --minimum-customer-readiness", () => {
     const args = buildArgs(
       { ...CONTRACT, qualityGates: { minimumCustomerReadiness: "needs_polish" } },
-      "/tmp/ws"
+      "/tmp/ws",
     );
     expect(args).toContain("--minimum-customer-readiness");
     expect(args[args.indexOf("--minimum-customer-readiness") + 1]).toBe("needs_polish");
@@ -309,15 +360,21 @@ describe("qualityGates", () => {
   it("silently drops an unrecognized minimumCustomerReadiness instead of forwarding it (defense in depth beyond route validation)", () => {
     const args = buildArgs(
       { ...CONTRACT, qualityGates: { minimumCustomerReadiness: "extremely_ready" as any } },
-      "/tmp/ws"
+      "/tmp/ws",
     );
     expect(args).not.toContain("--minimum-customer-readiness");
   });
 
   it("keeps '--' as the second-to-last element and the objective last, even with qualityGates set", () => {
     const args = buildArgs(
-      { ...CONTRACT, qualityGates: { customerReadinessRequired: true, minimumCustomerReadiness: "ready_to_ship" } },
-      "/tmp/ws"
+      {
+        ...CONTRACT,
+        qualityGates: {
+          customerReadinessRequired: true,
+          minimumCustomerReadiness: "ready_to_ship",
+        },
+      },
+      "/tmp/ws",
     );
     expect(args[args.length - 2]).toBe("--");
     expect(args[args.length - 1]).toBe(CONTRACT.objective);
@@ -329,26 +386,37 @@ describe("qualityGates", () => {
 
   it("accepts each closed-enum minimumCustomerReadiness value", () => {
     for (const value of [
-      "ready_to_ship", "ready_with_known_limitations", "needs_polish", "needs_rework", "not_customer_ready",
+      "ready_to_ship",
+      "ready_with_known_limitations",
+      "needs_polish",
+      "needs_rework",
+      "not_customer_ready",
     ] as const) {
-      expect(validateAdvanced({ ...CONTRACT, qualityGates: { minimumCustomerReadiness: value } })).toBeNull();
+      expect(
+        validateAdvanced({ ...CONTRACT, qualityGates: { minimumCustomerReadiness: value } }),
+      ).toBeNull();
     }
   });
 
   it("rejects a minimumCustomerReadiness outside the closed enum (fail closed, never guessed)", () => {
     expect(
-      validateAdvanced({ ...CONTRACT, qualityGates: { minimumCustomerReadiness: "extremely_ready" as any } })
+      validateAdvanced({
+        ...CONTRACT,
+        qualityGates: { minimumCustomerReadiness: "extremely_ready" as any },
+      }),
     ).not.toBeNull();
   });
 
   it("rejects a non-boolean customerReadinessRequired", () => {
     expect(
-      validateAdvanced({ ...CONTRACT, qualityGates: { customerReadinessRequired: "yes" as any } })
+      validateAdvanced({ ...CONTRACT, qualityGates: { customerReadinessRequired: "yes" as any } }),
     ).not.toBeNull();
   });
 
   it("accepts customerReadinessRequired: true with no minimum given", () => {
-    expect(validateAdvanced({ ...CONTRACT, qualityGates: { customerReadinessRequired: true } })).toBeNull();
+    expect(
+      validateAdvanced({ ...CONTRACT, qualityGates: { customerReadinessRequired: true } }),
+    ).toBeNull();
   });
 });
 
@@ -379,7 +447,9 @@ describe("validateAdvanced", () => {
   });
 
   it("rejects a toolchainMode outside the closed enum", () => {
-    expect(validateAdvanced({ ...CONTRACT, advanced: { toolchainMode: "rm -rf /" as any } })).not.toBeNull();
+    expect(
+      validateAdvanced({ ...CONTRACT, advanced: { toolchainMode: "rm -rf /" as any } }),
+    ).not.toBeNull();
   });
 
   it("accepts each closed-enum toolchainMode value", () => {
@@ -389,17 +459,33 @@ describe("validateAdvanced", () => {
   });
 
   it("rejects an unparseable modelReadinessUrl", () => {
-    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "http://x; rm -rf /" } })).not.toBeNull();
+    expect(
+      validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "http://x; rm -rf /" } }),
+    ).not.toBeNull();
   });
 
   it("rejects a non-http(s) modelReadinessUrl scheme", () => {
-    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "javascript:alert(1)" } })).not.toBeNull();
-    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "ftp://x.com" } })).not.toBeNull();
+    expect(
+      validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "javascript:alert(1)" } }),
+    ).not.toBeNull();
+    expect(
+      validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "ftp://x.com" } }),
+    ).not.toBeNull();
   });
 
   it("accepts a well-formed http/https modelReadinessUrl", () => {
-    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "http://127.0.0.1:8080/health" } })).toBeNull();
-    expect(validateAdvanced({ ...CONTRACT, advanced: { modelReadinessUrl: "https://model.local/ready" } })).toBeNull();
+    expect(
+      validateAdvanced({
+        ...CONTRACT,
+        advanced: { modelReadinessUrl: "http://127.0.0.1:8080/health" },
+      }),
+    ).toBeNull();
+    expect(
+      validateAdvanced({
+        ...CONTRACT,
+        advanced: { modelReadinessUrl: "https://model.local/ready" },
+      }),
+    ).toBeNull();
   });
 });
 

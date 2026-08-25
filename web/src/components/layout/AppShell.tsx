@@ -10,7 +10,13 @@ import { AgentTimeline } from "../session/AgentTimeline";
 import { TasksPanel } from "../session/TasksPanel";
 import { SessionAssistant } from "../session/SessionAssistant";
 import { VerificationBody } from "../verification/VerificationCenterScreen";
-import { groupSessionsByDay, isPendingSessionId, relativeTime, sessionTimestamp, shortSessionId } from "../../state/sessionListMeta";
+import {
+  groupSessionsByDay,
+  isPendingSessionId,
+  relativeTime,
+  sessionTimestamp,
+  shortSessionId,
+} from "../../state/sessionListMeta";
 import { buildCommands, type PaletteMode } from "../../state/paletteCommands";
 import { CommandPalette } from "../common/CommandPalette";
 import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
@@ -18,8 +24,19 @@ import { sendCompletionNotification } from "../../state/desktopNotify";
 import { mostSpecificContainingWorkspace } from "../../state/fileLink";
 import { STATES as RUNNING_STATES } from "../session/AgentStateStepper";
 import {
-  IconBack, IconChevron, IconClose, IconDashboard, IconFiles, IconForward, IconModel,
-  IconNewTask, IconRepository, IconSearch, IconSessions, IconSettings, IconVerification,
+  IconBack,
+  IconChevron,
+  IconClose,
+  IconDashboard,
+  IconFiles,
+  IconForward,
+  IconModel,
+  IconNewTask,
+  IconRepository,
+  IconSearch,
+  IconSessions,
+  IconSettings,
+  IconVerification,
 } from "../common/Icons";
 
 export interface RepoContext {
@@ -45,9 +62,23 @@ function isRunningStatus(status: GlimmerSession["status"]): boolean {
   return RUNNING_STATES.includes(status);
 }
 
-type ActivityKey = "dashboard" | "sessions" | "new-task" | "verification" | "files" | "repository" | "system-explorer" | "model" | "settings";
+type ActivityKey =
+  | "dashboard"
+  | "sessions"
+  | "new-task"
+  | "verification"
+  | "files"
+  | "repository"
+  | "system-explorer"
+  | "model"
+  | "settings";
 
-const ACTIVITY_ITEMS: Array<{ key: ActivityKey; label: string; to: string; Icon: typeof IconDashboard }> = [
+const ACTIVITY_ITEMS: Array<{
+  key: ActivityKey;
+  label: string;
+  to: string;
+  Icon: typeof IconDashboard;
+}> = [
   { key: "dashboard", label: "Dashboard", to: "/", Icon: IconDashboard },
   { key: "sessions", label: "Sessions", to: "/sessions", Icon: IconSessions },
   { key: "new-task", label: "New Task", to: "/tasks/new", Icon: IconNewTask },
@@ -59,7 +90,12 @@ const ACTIVITY_ITEMS: Array<{ key: ActivityKey; label: string; to: string; Icon:
   { key: "system-explorer", label: "System Explorer", to: "/system-explorer", Icon: IconSearch },
   { key: "model", label: "Model", to: "/model", Icon: IconModel },
 ];
-const SETTINGS_ITEM = { key: "settings" as const, label: "Settings", to: "/settings", Icon: IconSettings };
+const SETTINGS_ITEM = {
+  key: "settings" as const,
+  label: "Settings",
+  to: "/settings",
+  Icon: IconSettings,
+};
 
 function activePageOf(pathname: string): ActivityKey {
   if (pathname === "/settings") return "settings";
@@ -75,12 +111,16 @@ function activePageOf(pathname: string): ActivityKey {
 }
 
 function EventsRawList({ events }: { events: GlimmerEvent[] }) {
-  if (!events.length) return <div className="ide-bottompanel__empty">No events recorded yet for this session.</div>;
+  if (!events.length)
+    return <div className="ide-bottompanel__empty">No events recorded yet for this session.</div>;
   return (
     <ul>
       {events.map((e) => (
         <li key={e.id} className="row mono" style={{ fontSize: 12 }}>
-          <span style={{ color: "var(--text-muted)" }}>{new Date(e.timestamp).toLocaleTimeString()}</span> {e.type}
+          <span style={{ color: "var(--text-muted)" }}>
+            {new Date(e.timestamp).toLocaleTimeString()}
+          </span>{" "}
+          {e.type}
         </li>
       ))}
     </ul>
@@ -88,8 +128,18 @@ function EventsRawList({ events }: { events: GlimmerEvent[] }) {
 }
 
 function Section({
-  title, collapsed, onToggle, children, footer,
-}: { title: string; collapsed: boolean; onToggle: () => void; children: ReactNode; footer?: ReactNode }) {
+  title,
+  collapsed,
+  onToggle,
+  children,
+  footer,
+}: {
+  title: string;
+  collapsed: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+  footer?: ReactNode;
+}) {
   return (
     <div className="ide-section">
       <button className="ide-section__header" onClick={onToggle} aria-expanded={!collapsed}>
@@ -105,7 +155,13 @@ function Section({
   );
 }
 
-export function AppShell({ repoContext, children }: { repoContext: RepoContext | null; children: ReactNode }) {
+export function AppShell({
+  repoContext,
+  children,
+}: {
+  repoContext: RepoContext | null;
+  children: ReactNode;
+}) {
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -115,30 +171,51 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   // The Files route can retain the real session it came from so the one
   // shared SSE stream stays alive. Reject slash-bearing/empty URL input here
   // rather than opening a reconnecting stream to a path-shaped id.
-  const contextualFileSessionId = fileSessionId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(fileSessionId)
-    ? fileSessionId
-    : undefined;
+  const contextualFileSessionId =
+    fileSessionId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(fileSessionId)
+      ? fileSessionId
+      : undefined;
   const activeSessionId = sessionMatch?.[1] ?? contextualFileSessionId;
   const selectionStart = Number(fileQuery.get("start"));
   const selectionEnd = Number(fileQuery.get("end"));
   const selectionPath = location.pathname === "/files" ? fileQuery.get("path") : null;
-  const repositorySelection: RepositorySelection | null = selectionPath &&
-    Number.isInteger(selectionStart) && Number.isInteger(selectionEnd) &&
-    selectionStart > 0 && selectionEnd >= selectionStart
-    ? { path: selectionPath, startLine: selectionStart, endLine: selectionEnd }
-    : null;
+  const repositorySelection: RepositorySelection | null =
+    selectionPath &&
+    Number.isInteger(selectionStart) &&
+    Number.isInteger(selectionEnd) &&
+    selectionStart > 0 &&
+    selectionEnd >= selectionStart
+      ? { path: selectionPath, startLine: selectionStart, endLine: selectionEnd }
+      : null;
   const activePage = activePageOf(location.pathname);
   // Status bar's session-status/verification items: the open session's own
   // verification view, or the Verification Center when nothing is open.
-  const verificationTarget = activeSessionId ? `/sessions/${activeSessionId}/verification` : "/verification";
+  const verificationTarget = activeSessionId
+    ? `/sessions/${activeSessionId}/verification`
+    : "/verification";
 
-  const { data: rawSessions } = useQuery({ queryKey: ["sessions"], queryFn: glimmerApi.listSessions, refetchInterval: 5000 });
-  const { data: workspaces } = useQuery({ queryKey: ["workspaces"], queryFn: glimmerApi.listWorkspaces, refetchInterval: 5000 });
+  const { data: rawSessions } = useQuery({
+    queryKey: ["sessions"],
+    queryFn: glimmerApi.listSessions,
+    refetchInterval: 5000,
+  });
+  const { data: workspaces } = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: glimmerApi.listWorkspaces,
+    refetchInterval: 5000,
+  });
   // pending-* rows are transient adopted-workspace placeholders — once the
   // real session id shows up they're a duplicate, not a second session, so
   // they never belong in any session-browsing list.
-  const sessions = useMemo(() => (rawSessions ?? []).filter((s) => !isPendingSessionId(s.id)), [rawSessions]);
-  const { data: modelStatus } = useQuery({ queryKey: ["model-status"], queryFn: glimmerApi.getModelStatus, refetchInterval: 5000 });
+  const sessions = useMemo(
+    () => (rawSessions ?? []).filter((s) => !isPendingSessionId(s.id)),
+    [rawSessions],
+  );
+  const { data: modelStatus } = useQuery({
+    queryKey: ["model-status"],
+    queryFn: glimmerApi.getModelStatus,
+    refetchInterval: 5000,
+  });
   const { data: activeSession } = useQuery({
     queryKey: ["session", activeSessionId],
     queryFn: () => glimmerApi.getSession(activeSessionId!),
@@ -146,7 +223,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     refetchInterval: 4000,
   });
   const selectionWorkspace = repositorySelection
-    ? mostSpecificContainingWorkspace((workspaces ?? []).map((workspace) => workspace.path), repositorySelection.path)
+    ? mostSpecificContainingWorkspace(
+        (workspaces ?? []).map((workspace) => workspace.path),
+        repositorySelection.path,
+      )
     : undefined;
   const events = useSessionEvents(activeSessionId ?? "");
   // lastEventAt must be the max of the events' own `timestamp` field, not
@@ -197,26 +277,28 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   }, [activeSessionId]);
 
   function closeTab(id: string) {
-    setOpenTabs((prev) => {
-      const next = prev.filter((t) => t !== id);
-      if (id === activeSessionId) {
-        const fallback = next[next.length - 1];
-        navigate(fallback ? `/sessions/${fallback}` : "/");
-      }
-      return next;
-    });
+    const next = openTabs.filter((tabId) => tabId !== id);
+    setOpenTabs(next);
+
+    if (id === activeSessionId) {
+      const fallback = next[next.length - 1];
+      navigate(fallback ? `/sessions/${fallback}` : "/");
+    }
   }
 
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set());
   function toggleSection(key: string) {
     setCollapsedSections((prev) => {
       const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   }
 
-  const [bottomTab, setBottomTab] = useState<"timeline" | "verification" | "tasks" | "events">("timeline");
+  const [bottomTab, setBottomTab] = useState<"timeline" | "verification" | "tasks" | "events">(
+    "timeline",
+  );
   const [bottomCollapsed, setBottomCollapsed] = useState(false);
 
   // Sidebar collapses the same way the assistant panel does (below) —
@@ -260,7 +342,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   // contenteditable. The bare `[`/`]` (and Escape) ARE plain keys, so they
   // stay guarded: ignored while typing in a field, except the palette's own
   // input (marked with data-palette-input so Escape still reaches it there).
-  const [palette, setPalette] = useState<{ open: boolean; mode: PaletteMode }>({ open: false, mode: "command" });
+  const [palette, setPalette] = useState<{ open: boolean; mode: PaletteMode }>({
+    open: false,
+    mode: "command",
+  });
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       // Palette invocation: Ctrl+K/Ctrl+P are Cocoa text-editing bindings on
@@ -284,7 +369,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
       const target = e.target instanceof HTMLElement ? e.target : null;
       const isPaletteInput = target?.dataset.paletteInput === "true";
-      const isTypingElsewhere = !!target && !isPaletteInput &&
+      const isTypingElsewhere =
+        !!target &&
+        !isPaletteInput &&
         (/^(input|textarea)$/i.test(target.tagName) || target.isContentEditable);
       // The palette-input exemption only ever covers Escape (so the palette
       // can close itself while focused) — typing a literal `[`/`]` into the
@@ -313,14 +400,15 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   }, []);
 
   const paletteCommands = useMemo(
-    () => buildCommands({
-      mode: palette.mode,
-      sessions,
-      navigate,
-      toggleLeftPanel: () => setLeftPanelCollapsed((c) => !c),
-      toggleAssistantPanel: () => setRightPanelCollapsed((c) => !c),
-    }),
-    [palette.mode, sessions, navigate]
+    () =>
+      buildCommands({
+        mode: palette.mode,
+        sessions,
+        navigate,
+        toggleLeftPanel: () => setLeftPanelCollapsed((c) => !c),
+        toggleAssistantPanel: () => setRightPanelCollapsed((c) => !c),
+      }),
+    [palette.mode, sessions, navigate],
   );
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -328,7 +416,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   const matches = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return [];
-    return (sessions ?? []).filter((s) => s.task.toLowerCase().includes(q) || s.id.toLowerCase().includes(q)).slice(0, 8);
+    return (sessions ?? [])
+      .filter((s) => s.task.toLowerCase().includes(q) || s.id.toLowerCase().includes(q))
+      .slice(0, 8);
   }, [searchQuery, sessions]);
 
   function openSession(id: string) {
@@ -353,8 +443,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
   // Restore the real page title on unmount — this component may have left
   // it rewritten with a "(N) " unseen-completion badge.
   useEffect(() => {
+    const baseTitle = baseTitleRef.current;
     return () => {
-      document.title = baseTitleRef.current;
+      document.title = baseTitle;
     };
   }, []);
 
@@ -368,7 +459,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
     // One gate — isUnseenCompletion — drives both the title badge and the
     // system notification, so a session finishing while its own tab is
     // open and the window is focused triggers neither.
-    const unseen = completed.filter((id) => isUnseenCompletion(id, activeSessionId, document.hidden));
+    const unseen = completed.filter((id) =>
+      isUnseenCompletion(id, activeSessionId, document.hidden),
+    );
     if (unseen.length === 0) return;
 
     for (const id of unseen) {
@@ -412,8 +505,12 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
       <header className="ide-topbar">
         <div className="ide-topbar__traffic-inset" />
         <div className="ide-topbar__nav">
-          <button aria-label="Back" onClick={() => navigate(-1)}><IconBack /></button>
-          <button aria-label="Forward" onClick={() => navigate(1)}><IconForward /></button>
+          <button aria-label="Back" onClick={() => navigate(-1)}>
+            <IconBack />
+          </button>
+          <button aria-label="Forward" onClick={() => navigate(1)}>
+            <IconForward />
+          </button>
         </div>
         <div className="ide-topbar__search">
           <div className="ide-topbar__search-pill">
@@ -446,8 +543,12 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           )}
         </div>
         <div className="ide-topbar__right">
-          <button className="btn-primary" onClick={() => navigate("/tasks/new")}>New Task</button>
-          <Link className="ide-topbar__gear" to="/settings" aria-label="Settings"><IconSettings /></Link>
+          <button className="btn-primary" onClick={() => navigate("/tasks/new")}>
+            New Task
+          </button>
+          <Link className="ide-topbar__gear" to="/settings" aria-label="Settings">
+            <IconSettings />
+          </Link>
         </div>
       </header>
 
@@ -479,14 +580,20 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
         <aside className={`ide-leftpanel${leftPanelCollapsed ? " is-collapsed" : ""}`}>
           {leftPanelCollapsed ? (
-            <button className="ide-leftpanel__reopen" aria-label="Expand sidebar" onClick={() => setLeftPanelCollapsed(false)}>
+            <button
+              className="ide-leftpanel__reopen"
+              aria-label="Expand sidebar"
+              onClick={() => setLeftPanelCollapsed(false)}
+            >
               ›
             </button>
           ) : (
             <>
               <div className="ide-leftpanel__header">
                 GLIMMER
-                <span className="ide-leftpanel__workspace">{repoContext?.repository ?? "Not connected"}</span>
+                <span className="ide-leftpanel__workspace">
+                  {repoContext?.repository ?? "Not connected"}
+                </span>
                 <button
                   className="ide-leftpanel__collapse"
                   aria-label="Collapse sidebar"
@@ -496,8 +603,16 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                 </button>
               </div>
               <div className="ide-leftpanel__body">
-                <Section title="Sessions" collapsed={collapsedSections.has("sessions")} onToggle={() => toggleSection("sessions")}>
-                  {visibleSessions.length === 0 && <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>Unavailable</div>}
+                <Section
+                  title="Sessions"
+                  collapsed={collapsedSections.has("sessions")}
+                  onToggle={() => toggleSection("sessions")}
+                >
+                  {visibleSessions.length === 0 && (
+                    <div className="ide-section__link" style={{ color: "var(--text-muted)" }}>
+                      Unavailable
+                    </div>
+                  )}
                   {sidebarGroups.map((group) => (
                     <div key={group.label}>
                       <div className="ide-session-daygroup">{group.label}</div>
@@ -513,38 +628,64 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                           />
                           <span className="ide-session-row__main">
                             <span className="ide-session-row__task">{s.task}</span>
-                            <span className="ide-session-row__meta">{s.status} · {relativeTime(sessionTimestamp(s))}</span>
+                            <span className="ide-session-row__meta">
+                              {s.status} · {relativeTime(sessionTimestamp(s))}
+                            </span>
                           </span>
                         </button>
                       ))}
                     </div>
                   ))}
                   {sessions.length > visibleSessions.length && (
-                    <Link className="ide-section__link" to="/sessions">View all sessions →</Link>
+                    <Link className="ide-section__link" to="/sessions">
+                      View all sessions →
+                    </Link>
                   )}
                 </Section>
 
-                <Section title="Model" collapsed={collapsedSections.has("model")} onToggle={() => toggleSection("model")}>
+                <Section
+                  title="Model"
+                  collapsed={collapsedSections.has("model")}
+                  onToggle={() => toggleSection("model")}
+                >
                   <div className="ide-model-row">
-                    <span className="ide-status-dot" style={{ color: statusColor(modelStatus?.status ?? "UNKNOWN") }} />
+                    <span
+                      className="ide-status-dot"
+                      style={{ color: statusColor(modelStatus?.status ?? "UNKNOWN") }}
+                    />
                     <span className="ide-model-row__name">Muse Glimmer</span>
-                    {modelStatus && <span className="mono" style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}>{modelStatus.status}</span>}
+                    {modelStatus && (
+                      <span
+                        className="mono"
+                        style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}
+                      >
+                        {modelStatus.status}
+                      </span>
+                    )}
                   </div>
                   {modelStatus?.contextSize && (
-                    <div className="ide-model-row" style={{ color: "var(--text-muted)", fontSize: "var(--fs-xs)" }}>
+                    <div
+                      className="ide-model-row"
+                      style={{ color: "var(--text-muted)", fontSize: "var(--fs-xs)" }}
+                    >
                       {modelStatus.contextSize.toLocaleString()} ctx
                     </div>
                   )}
-                  <Link className="ide-section__link" to="/model">Model Settings</Link>
+                  <Link className="ide-section__link" to="/model">
+                    Model Settings
+                  </Link>
                 </Section>
               </div>
 
               <div className="ide-leftpanel__repo">
                 {repoContext ? (
                   <dl>
-                    <dt>Worktree</dt><dd className="mono">{repoContext.worktree}</dd>
-                    <dt>Baseline</dt><dd className="mono">{repoContext.baseline}</dd>
-                    <dt>Status</dt><dd>{repoContext.status}</dd>
+                    <dt>Worktree</dt>
+                    <dd className="mono">{repoContext.worktree}</dd>
+                    <dt>Baseline</dt>
+                    <dd className="mono">{repoContext.baseline}</dd>
+                    <dt>Status</dt>
+                    <dd>{repoContext.status}</dd>
                   </dl>
                 ) : (
                   <div>Not connected</div>
@@ -568,7 +709,11 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                     />
                     <span className="mono">{shortSessionId(id)}</span>
                   </button>
-                  <button className="ide-tab__close" aria-label={`Close ${shortSessionId(id)}`} onClick={() => closeTab(id)}>
+                  <button
+                    className="ide-tab__close"
+                    aria-label={`Close ${shortSessionId(id)}`}
+                    onClick={() => closeTab(id)}
+                  >
                     <IconClose />
                   </button>
                 </div>
@@ -591,7 +736,9 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
           )}
 
           <div className="ide-content">
-            <SessionEventsContext.Provider value={sessionEventsValue}>{children}</SessionEventsContext.Provider>
+            <SessionEventsContext.Provider value={sessionEventsValue}>
+              {children}
+            </SessionEventsContext.Provider>
           </div>
 
           <div className="ide-bottompanel">
@@ -600,7 +747,10 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                 <button
                   key={t}
                   className={`ide-bottompanel__tab${bottomTab === t ? " is-active" : ""}`}
-                  onClick={() => { setBottomTab(t); setBottomCollapsed(false); }}
+                  onClick={() => {
+                    setBottomTab(t);
+                    setBottomCollapsed(false);
+                  }}
                 >
                   {t}
                 </button>
@@ -615,12 +765,19 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
             </div>
             {!bottomCollapsed && (
               <div className="ide-bottompanel__body">
-                {!activeSessionId && <EmptyState icon="▤" text={`Open a session to see its ${bottomTab}.`} />}
+                {!activeSessionId && (
+                  <EmptyState icon="▤" text={`Open a session to see its ${bottomTab}.`} />
+                )}
                 {activeSessionId && bottomTab === "timeline" && <AgentTimeline events={events} />}
                 {activeSessionId && bottomTab === "verification" && (
-                  <VerificationBody verification={activeSession?.verification} finalStatus={activeSession?.finalStatus} />
+                  <VerificationBody
+                    verification={activeSession?.verification}
+                    finalStatus={activeSession?.finalStatus}
+                  />
                 )}
-                {activeSessionId && bottomTab === "tasks" && <TasksPanel sessionId={activeSessionId} session={activeSession} />}
+                {activeSessionId && bottomTab === "tasks" && (
+                  <TasksPanel sessionId={activeSessionId} session={activeSession} />
+                )}
                 {activeSessionId && bottomTab === "events" && <EventsRawList events={events} />}
               </div>
             )}
@@ -629,7 +786,11 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
 
         <aside className={`ide-rightpanel${rightPanelCollapsed ? " is-collapsed" : ""}`}>
           {rightPanelCollapsed ? (
-            <button className="ide-rightpanel__reopen" aria-label="Expand AI Assistant" onClick={() => setRightPanelCollapsed(false)}>
+            <button
+              className="ide-rightpanel__reopen"
+              aria-label="Expand AI Assistant"
+              onClick={() => setRightPanelCollapsed(false)}
+            >
               ‹
             </button>
           ) : (
@@ -648,17 +809,22 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
                 {repositorySelection ? (
                   <SessionAssistant
                     selection={repositorySelection}
-                    onDraftTask={selectionWorkspace ? (objective) => navigate("/tasks/new", {
-                      state: {
-                        selectionDraft: {
-                          objective,
-                          workspace: selectionWorkspace,
-                          path: repositorySelection.path,
-                          startLine: repositorySelection.startLine,
-                          endLine: repositorySelection.endLine,
-                        },
-                      },
-                    }) : undefined}
+                    onDraftTask={
+                      selectionWorkspace
+                        ? (objective) =>
+                            navigate("/tasks/new", {
+                              state: {
+                                selectionDraft: {
+                                  objective,
+                                  workspace: selectionWorkspace,
+                                  path: repositorySelection.path,
+                                  startLine: repositorySelection.startLine,
+                                  endLine: repositorySelection.endLine,
+                                },
+                              },
+                            })
+                        : undefined
+                    }
                   />
                 ) : activeSessionId ? (
                   <SessionAssistant sessionId={activeSessionId} session={activeSession} />
@@ -677,17 +843,26 @@ export function AppShell({ repoContext, children }: { repoContext: RepoContext |
             ⎇ {repoContext?.worktree ?? "no branch"}
           </button>
           {activeSession && (
-            <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>{activeSession.status}</button>
+            <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>
+              {activeSession.status}
+            </button>
           )}
           {activeSession?.gates && (
             <span>
-              gate: {activeSession.gates.architectureApproved === true ? "approved" : activeSession.gates.architectureApproved === false ? "rejected" : "not reviewed"}
+              gate:{" "}
+              {activeSession.gates.architectureApproved === true
+                ? "approved"
+                : activeSession.gates.architectureApproved === false
+                  ? "rejected"
+                  : "not reviewed"}
             </span>
           )}
         </div>
         <div className="ide-statusbar__spacer" />
         <div className="ide-statusbar__group">
-          <button className="statusbar-item" onClick={() => navigate("/model")}>model: {modelStatus?.status ?? "UNKNOWN"}</button>
+          <button className="statusbar-item" onClick={() => navigate("/model")}>
+            model: {modelStatus?.status ?? "UNKNOWN"}
+          </button>
           <button className="statusbar-item" onClick={() => navigate(verificationTarget)}>
             verification: {activeSession?.verification.overall ?? "—"}
           </button>

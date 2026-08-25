@@ -2,10 +2,13 @@ import { describe, it, expect } from "vitest";
 import { highlightLine, langFromPath, type Lang } from "./highlight";
 
 const NASTY_FIXTURES: Array<{ line: string; lang: Lang }> = [
-  { line: 'const url = "http://example.com"; // not a line comment marker inside the string', lang: "ts" },
-  { line: "const s = \"unterminated string that never closes", lang: "ts" },
+  {
+    line: 'const url = "http://example.com"; // not a line comment marker inside the string',
+    lang: "ts",
+  },
+  { line: 'const s = "unterminated string that never closes', lang: "ts" },
   { line: "\t\tconst\ttabbed = 1;\t// trailing tab\t", lang: "ts" },
-  { line: "const emoji = \"café 😀 unicode\";", lang: "ts" },
+  { line: 'const emoji = "café 😀 unicode";', lang: "ts" },
   { line: "/* unterminated block comment starts here", lang: "ts" },
   { line: "const x = /* inline */ 5;", lang: "ts" },
   { line: "", lang: "ts" },

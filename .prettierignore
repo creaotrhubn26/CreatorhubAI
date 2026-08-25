@@ -1,0 +1,11 @@
+node_modules/
+**/dist/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/gen/
+src-tauri/resources/
+.vite/
+.playwright-mcp/
+package-lock.json
+src-tauri/scripts/gateway-package-lock.json
+docs/superpowers/

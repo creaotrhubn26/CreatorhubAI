@@ -52,7 +52,11 @@ export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
         </div>
         <div>
           <dt>Confidence</dt>
-          <dd>{packet.confidence ? `${packet.confidence.level} — ${packet.confidence.reason}` : "Unavailable"}</dd>
+          <dd>
+            {packet.confidence
+              ? `${packet.confidence.level} — ${packet.confidence.reason}`
+              : "Unavailable"}
+          </dd>
         </div>
         <div>
           <dt>Human review status</dt>
@@ -62,7 +66,13 @@ export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
 
       <h3>Changed files ({packet.changedFiles.length})</h3>
       {packet.changedFiles.length ? (
-        <ul>{packet.changedFiles.map((f) => <li key={f}><code>{f}</code></li>)}</ul>
+        <ul>
+          {packet.changedFiles.map((f) => (
+            <li key={f}>
+              <code>{f}</code>
+            </li>
+          ))}
+        </ul>
       ) : (
         <p>none</p>
       )}
@@ -70,7 +80,13 @@ export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
       {!!packet.orchestratorUpdatedFiles.length && (
         <>
           <h3>Orchestrator-updated files</h3>
-          <ul>{packet.orchestratorUpdatedFiles.map((f) => <li key={f}><code>{f}</code></li>)}</ul>
+          <ul>
+            {packet.orchestratorUpdatedFiles.map((f) => (
+              <li key={f}>
+                <code>{f}</code>
+              </li>
+            ))}
+          </ul>
         </>
       )}
 
@@ -79,7 +95,11 @@ export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
           {!!packet.limitations.unresolvedItems.length && (
             <>
               <h3>Known limitations</h3>
-              <ul>{packet.limitations.unresolvedItems.map((s, i) => <li key={i}>{s}</li>)}</ul>
+              <ul>
+                {packet.limitations.unresolvedItems.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ul>
             </>
           )}
         </>
@@ -90,7 +110,11 @@ export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
       {packet.forwardPlan?.nextSteps.length ? (
         <>
           <h3>Plan forward</h3>
-          <ul>{packet.forwardPlan.nextSteps.map((s, i) => <li key={i}>{s.action}</li>)}</ul>
+          <ul>
+            {packet.forwardPlan.nextSteps.map((s, i) => (
+              <li key={i}>{s.action}</li>
+            ))}
+          </ul>
         </>
       ) : (
         <p style={{ color: "var(--text-muted)" }}>Plan forward: Unavailable</p>

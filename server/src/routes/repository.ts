@@ -31,7 +31,7 @@ export async function findRepoMap(): Promise<RepoMap | null> {
 // than falling back to anything else -- "no repo map for this workspace yet"
 // is an honest, common answer (the workspace has simply never been run).
 export async function findRepoMapForWorkspace(
-  workspace: string
+  workspace: string,
 ): Promise<{ map: RepoMap; sessionId: string } | null> {
   const target = path.resolve(workspace);
   for (const id of await listSessionIds()) {
@@ -49,7 +49,8 @@ export async function findRepoMapForWorkspace(
     } catch {
       continue; // torn manifest (glimmer-v2.py rewrites it non-atomically) — skip, don't fail the panel
     }
-    if (typeof manifestWorkspace !== "string" || path.resolve(manifestWorkspace) !== target) continue;
+    if (typeof manifestWorkspace !== "string" || path.resolve(manifestWorkspace) !== target)
+      continue;
     try {
       const raw = await fs.readFile(path.join(sessionsDir(), id, "repo-map.json"), "utf-8");
       return { map: JSON.parse(raw) as RepoMap, sessionId: id };
@@ -73,7 +74,12 @@ repositoryRouter.get("/repository/map", async (_req, res) => {
 });
 
 function isDocGraphShape(v: unknown): v is DocGraph {
-  return !!v && typeof v === "object" && Array.isArray((v as any).nodes) && Array.isArray((v as any).edges);
+  return (
+    !!v &&
+    typeof v === "object" &&
+    Array.isArray((v as any).nodes) &&
+    Array.isArray((v as any).edges)
+  );
 }
 
 // Task 7.5 (V7 "System Explorer"): unlike repo-map.json (a gateway-written
@@ -99,7 +105,9 @@ export async function findDocGraph(): Promise<{ graph: DocGraph; source: DocGrap
     if (!isValidSessionId(id)) continue;
     let workspace: unknown;
     try {
-      const raw = JSON.parse(await fs.readFile(path.join(sessionsDir(), id, "manifest.json"), "utf-8"));
+      const raw = JSON.parse(
+        await fs.readFile(path.join(sessionsDir(), id, "manifest.json"), "utf-8"),
+      );
       workspace = raw?.workspace;
     } catch (err: any) {
       if (err.code !== "ENOENT") throw err;
@@ -127,7 +135,8 @@ export async function findDocGraph(): Promise<{ graph: DocGraph; source: DocGrap
 repositoryRouter.get("/repository/doc-graph", async (_req, res) => {
   try {
     const found = await findDocGraph();
-    if (!found) return res.status(404).json({ error: "no docs/graph.json found in any session workspace" });
+    if (!found)
+      return res.status(404).json({ error: "no docs/graph.json found in any session workspace" });
     res.json({ ...found.graph, source: found.source });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

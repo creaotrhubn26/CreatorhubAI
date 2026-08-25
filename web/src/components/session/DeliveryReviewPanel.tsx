@@ -15,7 +15,11 @@ export const READINESS_COLOR: Record<DeliveryReviewCustomerReadiness, string> = 
   not_customer_ready: "var(--red)",
 };
 
-const PRIORITY_ORDER: NextStepPriority[] = ["required_before_ship", "recommended_next", "future_opportunity"];
+const PRIORITY_ORDER: NextStepPriority[] = [
+  "required_before_ship",
+  "recommended_next",
+  "future_opportunity",
+];
 const PRIORITY_LABEL: Record<NextStepPriority, string> = {
   required_before_ship: "Required before ship",
   recommended_next: "Recommended next",
@@ -38,7 +42,10 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
   if (review.reviewFailed) {
     return (
       <CollapsibleSection title="Delivery Review" summary="failed to generate">
-        <p>Delivery review failed to generate{review.reviewFailureReason ? `: ${review.reviewFailureReason}` : "."}</p>
+        <p>
+          Delivery review failed to generate
+          {review.reviewFailureReason ? `: ${review.reviewFailureReason}` : "."}
+        </p>
       </CollapsibleSection>
     );
   }
@@ -56,24 +63,36 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
         <div>
           <dt>Customer readiness</dt>
           <dd>
-            <span className="meta-value" style={{ ["--badge-color" as any]: color }}>{review.customerReadiness}</span>
+            <span className="meta-value" style={{ ["--badge-color" as any]: color }}>
+              {review.customerReadiness}
+            </span>
           </dd>
         </div>
         <div className="kv-wide">
           <dt>Confidence</dt>
-          <dd>{review.confidence.level} — {review.confidence.reason}</dd>
+          <dd>
+            {review.confidence.level} — {review.confidence.reason}
+          </dd>
         </div>
       </dl>
       {!!review.approachRationale?.length && (
         <>
           <h3>Approach rationale</h3>
-          <ul>{review.approachRationale.map((s, i) => <li key={i}>{s}</li>)}</ul>
+          <ul>
+            {review.approachRationale.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
         </>
       )}
       {!!review.strengths?.length && (
         <>
           <h3>Strengths</h3>
-          <ul>{review.strengths.map((s, i) => <li key={i}>{s}</li>)}</ul>
+          <ul>
+            {review.strengths.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
         </>
       )}
       {!!review.concerns?.length && (
@@ -81,7 +100,9 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
           <h3>Concerns</h3>
           <ul>
             {review.concerns.map((c, i) => (
-              <li key={i}>[{c.severity}] {c.category}: {c.description}</li>
+              <li key={i}>
+                [{c.severity}] {c.category}: {c.description}
+              </li>
             ))}
           </ul>
         </>
@@ -89,38 +110,50 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
       {!!review.unresolvedItems?.length && (
         <>
           <h3>Unresolved items</h3>
-          <ul>{review.unresolvedItems.map((s, i) => <li key={i}>{s}</li>)}</ul>
+          <ul>
+            {review.unresolvedItems.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
         </>
       )}
       {!!review.intentionallyNotChanged?.length && (
         <>
           <h3>Intentionally not changed</h3>
-          <ul>{review.intentionallyNotChanged.map((s, i) => <li key={i}>{s}</li>)}</ul>
+          <ul>
+            {review.intentionallyNotChanged.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
         </>
       )}
       {!!review.nextSteps?.length && (
         <>
           <h3>Next steps</h3>
-          {PRIORITY_ORDER.filter((p) => review.nextSteps!.some((s) => s.priority === p)).map((p) => (
-            <div key={p}>
-              <strong>{PRIORITY_LABEL[p]}</strong>
-              <ul>
-                {review.nextSteps!.filter((s) => s.priority === p).map((s, i) => (
-                  <li key={i} style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
-                    <span>{s.action}</span>
-                    <button
-                      type="button"
-                      style={{ fontSize: 12 }}
-                      title="Convert this next step into a new task (opens the composer, prefilled — nothing runs automatically)"
-                      onClick={() => navigate("/tasks/new", { state: { objective: s.action } })}
-                    >
-                      Convert to task
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
+          {PRIORITY_ORDER.filter((p) => review.nextSteps!.some((s) => s.priority === p)).map(
+            (p) => (
+              <div key={p}>
+                <strong>{PRIORITY_LABEL[p]}</strong>
+                <ul>
+                  {review
+                    .nextSteps!.filter((s) => s.priority === p)
+                    .map((s, i) => (
+                      <li key={i} style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
+                        <span>{s.action}</span>
+                        <button
+                          type="button"
+                          style={{ fontSize: 12 }}
+                          title="Convert this next step into a new task (opens the composer, prefilled — nothing runs automatically)"
+                          onClick={() => navigate("/tasks/new", { state: { objective: s.action } })}
+                        >
+                          Convert to task
+                        </button>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            ),
+          )}
         </>
       )}
       {review.architectEscalation && (
@@ -131,11 +164,16 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
           </p>
           {review.architectEscalation.consultationFailed ? (
             <p>
-              Consultation failed{review.architectEscalation.reason ? `: ${review.architectEscalation.reason}` : "."}
+              Consultation failed
+              {review.architectEscalation.reason ? `: ${review.architectEscalation.reason}` : "."}
             </p>
           ) : (
             <>
-              {review.architectEscalation.question && <p><strong>Question:</strong> {review.architectEscalation.question}</p>}
+              {review.architectEscalation.question && (
+                <p>
+                  <strong>Question:</strong> {review.architectEscalation.question}
+                </p>
+              )}
               {review.architectEscalation.answer && <p>{review.architectEscalation.answer}</p>}
             </>
           )}

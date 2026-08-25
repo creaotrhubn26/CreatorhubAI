@@ -42,10 +42,28 @@ const SPECS: Array<{
   agentAccess: CliAgentAccess;
 }> = [
   { id: "git", name: "Git", executable: "git", required: true, agentAccess: "read_only" },
-  { id: "python", name: "Python", executable: "python3", required: true, agentAccess: "validation_only" },
+  {
+    id: "python",
+    name: "Python",
+    executable: "python3",
+    required: true,
+    agentAccess: "validation_only",
+  },
   { id: "npm", name: "npm", executable: "npm", required: false, agentAccess: "approval_required" },
-  { id: "github_cli", name: "GitHub CLI", executable: "gh", required: false, agentAccess: "read_only" },
-  { id: "cargo", name: "Cargo", executable: "cargo", required: false, agentAccess: "validation_only" },
+  {
+    id: "github_cli",
+    name: "GitHub CLI",
+    executable: "gh",
+    required: false,
+    agentAccess: "read_only",
+  },
+  {
+    id: "cargo",
+    name: "Cargo",
+    executable: "cargo",
+    required: false,
+    agentAccess: "validation_only",
+  },
   { id: "pnpm", name: "pnpm", executable: "pnpm", required: false, agentAccess: "blocked" },
   { id: "yarn", name: "Yarn", executable: "yarn", required: false, agentAccess: "blocked" },
   { id: "homebrew", name: "Homebrew", executable: "brew", required: false, agentAccess: "blocked" },
@@ -53,21 +71,29 @@ const SPECS: Array<{
 
 async function defaultRunner(file: string, args: string[]): Promise<CommandResult> {
   return new Promise((resolve) => {
-    execFile(file, args, {
-      timeout: 5_000,
-      maxBuffer: 64 * 1024,
-      env: { ...process.env, GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
-    }, (error: any, stdout, stderr) => {
-      resolve({
-        code: typeof error?.code === "number" ? error.code : error ? null : 0,
-        stdout: String(stdout ?? ""),
-        stderr: String(stderr ?? ""),
-      });
-    });
+    execFile(
+      file,
+      args,
+      {
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+        env: { ...process.env, GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
+      },
+      (error: any, stdout, stderr) => {
+        resolve({
+          code: typeof error?.code === "number" ? error.code : error ? null : 0,
+          stdout: String(stdout ?? ""),
+          stderr: String(stderr ?? ""),
+        });
+      },
+    );
   });
 }
 
-export async function findExecutable(executable: string, pathValue: string): Promise<string | null> {
+export async function findExecutable(
+  executable: string,
+  pathValue: string,
+): Promise<string | null> {
   for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
     const candidate = path.join(directory, executable);
     try {
@@ -84,33 +110,52 @@ export async function findExecutable(executable: string, pathValue: string): Pro
 }
 
 function firstOutputLine(result: CommandResult): string | undefined {
-  return `${result.stdout}\n${result.stderr}`.split("\n").map((line) => line.trim()).find(Boolean);
+  return `${result.stdout}\n${result.stderr}`
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean);
 }
 
 function installCommand(id: CliIntegrationId, platform: NodeJS.Platform): string | undefined {
   if (platform !== "darwin") return undefined;
   switch (id) {
-    case "github_cli": return "brew install gh";
-    case "git": return "xcode-select --install";
-    case "npm": return "brew install node";
-    case "python": return "brew install python";
-    case "cargo": return "brew install rust";
-    case "pnpm": return "corepack enable pnpm";
-    case "yarn": return "corepack enable yarn";
-    default: return undefined;
+    case "github_cli":
+      return "brew install gh";
+    case "git":
+      return "xcode-select --install";
+    case "npm":
+      return "brew install node";
+    case "python":
+      return "brew install python";
+    case "cargo":
+      return "brew install rust";
+    case "pnpm":
+      return "corepack enable pnpm";
+    case "yarn":
+      return "corepack enable yarn";
+    default:
+      return undefined;
   }
 }
 
 function readyDetail(id: CliIntegrationId): string {
   switch (id) {
-    case "git": return "Read-only status, diff, log and show commands are available. Commit, merge and push remain blocked.";
-    case "python": return "Available for the orchestrator and bounded syntax checks.";
-    case "npm": return "Validation scripts are allowed. Dependency installation pauses for explicit human approval.";
-    case "cargo": return "Cargo check and test are allowed when a Rust workspace needs them.";
-    case "pnpm": return "Detected, but agent execution is not allowlisted yet.";
-    case "yarn": return "Detected, but agent execution is not allowlisted yet.";
-    case "homebrew": return "Available for commands you choose to run manually; agents cannot invoke Homebrew.";
-    default: return "Available.";
+    case "git":
+      return "Read-only status, diff, log and show commands are available. Commit, merge and push remain blocked.";
+    case "python":
+      return "Available for the orchestrator and bounded syntax checks.";
+    case "npm":
+      return "Validation scripts are allowed. Dependency installation pauses for explicit human approval.";
+    case "cargo":
+      return "Cargo check and test are allowed when a Rust workspace needs them.";
+    case "pnpm":
+      return "Detected, but agent execution is not allowlisted yet.";
+    case "yarn":
+      return "Detected, but agent execution is not allowlisted yet.";
+    case "homebrew":
+      return "Available for commands you choose to run manually; agents cannot invoke Homebrew.";
+    default:
+      return "Available.";
   }
 }
 
@@ -124,7 +169,9 @@ async function fileReadable(file: string): Promise<boolean> {
   }
 }
 
-export async function probeCliIntegrations(options: CliProbeOptions = {}): Promise<CliIntegrationsStatus> {
+export async function probeCliIntegrations(
+  options: CliProbeOptions = {},
+): Promise<CliIntegrationsStatus> {
   const pathValue = options.pathValue ?? process.env.PATH ?? "";
   const platform = options.platform ?? process.platform;
   const runner = options.runner ?? defaultRunner;
@@ -133,48 +180,54 @@ export async function probeCliIntegrations(options: CliProbeOptions = {}): Promi
   const glimmerV2Path = options.glimmerV2Path ?? CONFIG.glimmerV2Path;
   const engineerPath = options.engineerPath ?? CONFIG.engineerPath;
 
-  const commandIntegrations = await Promise.all(SPECS.map(async (spec): Promise<CliIntegration> => {
-    const executablePath = await findExecutable(spec.executable, pathValue);
-    if (!executablePath) {
-      return {
+  const commandIntegrations = await Promise.all(
+    SPECS.map(async (spec): Promise<CliIntegration> => {
+      const executablePath = await findExecutable(spec.executable, pathValue);
+      if (!executablePath) {
+        return {
+          ...spec,
+          state: "missing",
+          installed: false,
+          source: "path",
+          detail: `${spec.name} was not found on the app's resolved Terminal PATH.`,
+          installCommand: installCommand(spec.id, platform),
+        };
+      }
+
+      const versionResult = await runner(executablePath, VERSION_ARGS[spec.id] ?? ["--version"]);
+      const base: CliIntegration = {
         ...spec,
-        state: "missing",
-        installed: false,
+        state:
+          spec.agentAccess === "blocked" && (spec.id === "pnpm" || spec.id === "yarn")
+            ? "blocked"
+            : "ready",
+        installed: true,
+        version: firstOutputLine(versionResult),
+        path: executablePath,
         source: "path",
-        detail: `${spec.name} was not found on the app's resolved Terminal PATH.`,
-        installCommand: installCommand(spec.id, platform),
+        detail: readyDetail(spec.id),
       };
-    }
 
-    const versionResult = await runner(executablePath, VERSION_ARGS[spec.id] ?? ["--version"]);
-    const base: CliIntegration = {
-      ...spec,
-      state: spec.agentAccess === "blocked" && (spec.id === "pnpm" || spec.id === "yarn") ? "blocked" : "ready",
-      installed: true,
-      version: firstOutputLine(versionResult),
-      path: executablePath,
-      source: "path",
-      detail: readyDetail(spec.id),
-    };
+      if (spec.id !== "github_cli") return base;
+      const auth = await runner(executablePath, ["auth", "status", "--hostname", "github.com"]);
+      const output = `${auth.stdout}\n${auth.stderr}`.toLowerCase();
+      const authenticated = auth.code === 0;
+      return {
+        ...base,
+        state: authenticated ? "ready" : "authentication_required",
+        authenticated,
+        authCommand: "gh auth login -h github.com -p https -w",
+        detail: authenticated
+          ? "Authenticated. Agents may only use allowlisted read-only GitHub commands in the current repository."
+          : output.includes("invalid")
+            ? "GitHub credentials are invalid or expired. Re-authenticate in Terminal."
+            : "GitHub CLI is installed but not authenticated for github.com.",
+      };
+    }),
+  );
 
-    if (spec.id !== "github_cli") return base;
-    const auth = await runner(executablePath, ["auth", "status", "--hostname", "github.com"]);
-    const output = `${auth.stdout}\n${auth.stderr}`.toLowerCase();
-    const authenticated = auth.code === 0;
-    return {
-      ...base,
-      state: authenticated ? "ready" : "authentication_required",
-      authenticated,
-      authCommand: "gh auth login -h github.com -p https -w",
-      detail: authenticated
-        ? "Authenticated. Agents may only use allowlisted read-only GitHub commands in the current repository."
-        : output.includes("invalid")
-          ? "GitHub credentials are invalid or expired. Re-authenticate in Terminal."
-          : "GitHub CLI is installed but not authenticated for github.com.",
-    };
-  }));
-
-  const orchestratorReady = await fileReadable(glimmerV2Path) && await fileReadable(engineerPath);
+  const orchestratorReady =
+    (await fileReadable(glimmerV2Path)) && (await fileReadable(engineerPath));
   const orchestrator: CliIntegration = {
     id: "orchestrator",
     name: "Muse Glimmer orchestrator",

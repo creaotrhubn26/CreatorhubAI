@@ -4,7 +4,12 @@ import { edgesForNode, filterDocNodes, groupDocNodesByType } from "./docGraph";
 
 function node(overrides: Partial<DocNode>): DocNode {
   return {
-    id: "n1", type: "service", path: "server/src", title: "Gateway", status: "CURRENT", confidence: "high",
+    id: "n1",
+    type: "service",
+    path: "server/src",
+    title: "Gateway",
+    status: "CURRENT",
+    confidence: "high",
     provenance: { evidence: [], sha: null },
     ...overrides,
   };
@@ -42,7 +47,12 @@ describe("docGraph", () => {
   // compile-time fiction over unvalidated JSON; a real graph.json missing
   // one must not throw (was: TypeError on `.toLowerCase()` of undefined).
   it("does not throw on a v2-valid node missing title/path", () => {
-    const sparse = { id: "a", type: "doc", status: "CURRENT", confidence: "unknown" } as unknown as DocNode;
+    const sparse = {
+      id: "a",
+      type: "doc",
+      status: "CURRENT",
+      confidence: "unknown",
+    } as unknown as DocNode;
     expect(() => filterDocNodes([sparse], "x")).not.toThrow();
     expect(filterDocNodes([sparse], "x")).toEqual([]);
     // Still matches on the field it does have (id).
@@ -56,7 +66,10 @@ describe("docGraph", () => {
       { from: "c", to: "b", kind: "documents" },
     ];
     const { in: inEdges, out: outEdges } = edgesForNode(edges, "b");
-    expect(inEdges).toEqual([{ from: "a", to: "b", kind: "calls" }, { from: "c", to: "b", kind: "documents" }]);
+    expect(inEdges).toEqual([
+      { from: "a", to: "b", kind: "calls" },
+      { from: "c", to: "b", kind: "documents" },
+    ]);
     expect(outEdges).toEqual([{ from: "b", to: "c", kind: "calls" }]);
   });
 });

@@ -4,15 +4,28 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { taskModeAllowsWrites, type TaskIntelligence } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
-import { computeArchitectRisk, deriveVerificationLevel, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
+import {
+  computeArchitectRisk,
+  deriveVerificationLevel,
+  ARCHITECT_RISK_THRESHOLD,
+} from "../../state/architectRisk";
 import { interpretObjectiveIntent } from "../../state/objectiveIntent";
 import { PathPicker } from "../common/PathPicker";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
-  objective: "", scopePackage: "repository", scopeArea: "", mode: "implement",
-  verification: [], repairBudget: 2, maxTurns: undefined, maxChangedFiles: undefined,
-  timeoutSeconds: undefined, toolchainMode: "path", modelReadinessUrl: "", architectFirst: false,
+  objective: "",
+  scopePackage: "repository",
+  scopeArea: "",
+  mode: "implement",
+  verification: [],
+  repairBudget: 2,
+  maxTurns: undefined,
+  maxChangedFiles: undefined,
+  timeoutSeconds: undefined,
+  toolchainMode: "path",
+  modelReadinessUrl: "",
+  architectFirst: false,
 };
 
 const PATH_SCOPED_PACKAGES = new Set(["directory", "files"]);
@@ -41,12 +54,14 @@ interface ComposerRouteState {
 // Pre-run summary line: one sentence stating exactly what will run, derived
 // live from the real form state — never fabricated, updates as the user types.
 function buildSummaryLine(form: TaskComposerFormState): string {
-  const scope = PATH_SCOPED_PACKAGES.has(form.scopePackage) && form.scopeArea?.trim()
-    ? `${SCOPE_LABEL[form.scopePackage]} (${form.scopeArea.trim()})`
-    : SCOPE_LABEL[form.scopePackage];
-  const verification = form.verification.length === 0
-    ? "no verification checks"
-    : `${form.verification.length} verification check${form.verification.length === 1 ? "" : "s"}`;
+  const scope =
+    PATH_SCOPED_PACKAGES.has(form.scopePackage) && form.scopeArea?.trim()
+      ? `${SCOPE_LABEL[form.scopePackage]} (${form.scopeArea.trim()})`
+      : SCOPE_LABEL[form.scopePackage];
+  const verification =
+    form.verification.length === 0
+      ? "no verification checks"
+      : `${form.verification.length} verification check${form.verification.length === 1 ? "" : "s"}`;
   const repairs = `${form.repairBudget} repair${form.repairBudget === 1 ? "" : "s"}`;
   return `${form.mode} · ${scope} · ${verification} · ${repairs}`;
 }
@@ -90,52 +105,57 @@ export function NewTaskScreen() {
   // (e.g. clicking "New Task" again) does not fight the user's own typing.
   const routeState = location.state as ComposerRouteState | null;
   const rawSelectionDraft = routeState?.selectionDraft;
-  const selectionDraft = rawSelectionDraft &&
+  const selectionDraft =
+    rawSelectionDraft &&
     typeof rawSelectionDraft.objective === "string" &&
     typeof rawSelectionDraft.workspace === "string" &&
     typeof rawSelectionDraft.path === "string" &&
     Number.isInteger(rawSelectionDraft.startLine) &&
     Number.isInteger(rawSelectionDraft.endLine)
-    ? rawSelectionDraft
-    : undefined;
+      ? rawSelectionDraft
+      : undefined;
   const prefillObjective = selectionDraft?.objective ?? routeState?.objective;
   const selectionScopePath = selectionDraft
     ? toWorkspaceRelative(selectionDraft.workspace, selectionDraft.path)
     : null;
-  const [form, setForm] = useState<TaskComposerFormState>(() => selectionDraft
-    ? {
-        ...DEFAULT_FORM,
-        objective: selectionDraft.objective,
-        scopePackage: "files",
-        scopeArea: selectionScopePath ?? "",
-      }
-    : prefillObjective
-      ? { ...DEFAULT_FORM, objective: prefillObjective }
-      : DEFAULT_FORM
+  const [form, setForm] = useState<TaskComposerFormState>(() =>
+    selectionDraft
+      ? {
+          ...DEFAULT_FORM,
+          objective: selectionDraft.objective,
+          scopePackage: "files",
+          scopeArea: selectionScopePath ?? "",
+        }
+      : prefillObjective
+        ? { ...DEFAULT_FORM, objective: prefillObjective }
+        : DEFAULT_FORM,
   );
   const [workspace, setWorkspace] = useState(selectionDraft?.workspace ?? "");
   const [newTaskName, setNewTaskName] = useState("");
   const [scopePickError, setScopePickError] = useState<string | null>(null);
   const navigate = useNavigate();
   const selectionDefaultsApplied = useRef(false);
-  const applySelectionIntelligence = useCallback((data: TaskIntelligence) => {
-    if (!selectionDraft || selectionDefaultsApplied.current) return;
-    selectionDefaultsApplied.current = true;
-    setForm((current) => {
-      // The async suggestion is a DEFAULT, never an overwrite: if the human
-      // changed the draft's objective/scope or picked verification while the
-      // repository lookup was in flight, their review wins.
-      if (
-        current.objective !== selectionDraft.objective ||
-        current.scopePackage !== "files" ||
-        current.scopeArea !== (selectionScopePath ?? "") ||
-        current.verification.length > 0
-      ) {
-        return current;
-      }
-      return { ...current, verification: data.suggestedVerification };
-    });
-  }, [selectionDraft, selectionScopePath]);
+  const applySelectionIntelligence = useCallback(
+    (data: TaskIntelligence) => {
+      if (!selectionDraft || selectionDefaultsApplied.current) return;
+      selectionDefaultsApplied.current = true;
+      setForm((current) => {
+        // The async suggestion is a DEFAULT, never an overwrite: if the human
+        // changed the draft's objective/scope or picked verification while the
+        // repository lookup was in flight, their review wins.
+        if (
+          current.objective !== selectionDraft.objective ||
+          current.scopePackage !== "files" ||
+          current.scopeArea !== (selectionScopePath ?? "") ||
+          current.verification.length > 0
+        ) {
+          return current;
+        }
+        return { ...current, verification: data.suggestedVerification };
+      });
+    },
+    [selectionDraft, selectionScopePath],
+  );
 
   // Task 4c(2): quick-pick of workspaces the gateway already knows about
   // (the same GET /api/workspaces list the Workspaces screen shows) — the
@@ -184,8 +204,9 @@ export function NewTaskScreen() {
         <h1>What should Glimmer work on?</h1>
         {selectionDraft && (
           <p role="status" className="composer__selection-draft">
-            Drafted from <span className="mono">{selectionDraft.path}</span>, lines {selectionDraft.startLine}-{selectionDraft.endLine}.
-            Review the contract below; nothing has started yet.
+            Drafted from <span className="mono">{selectionDraft.path}</span>, lines{" "}
+            {selectionDraft.startLine}-{selectionDraft.endLine}. Review the contract below; nothing
+            has started yet.
           </p>
         )}
         <div className="composer__columns">
@@ -208,7 +229,11 @@ export function NewTaskScreen() {
                 Finder dialog in the desktop app, the gateway's read-only
                 directory browser in a plain browser. The text input above
                 still works for pasting a path. */}
-            <PathPicker mode="directory" buttonLabel="Choose workspace…" onPick={(paths) => setWorkspace(paths[0])} />
+            <PathPicker
+              mode="directory"
+              buttonLabel="Choose workspace…"
+              onPick={(paths) => setWorkspace(paths[0])}
+            />
             {recentWorkspaces.data && recentWorkspaces.data.length > 0 && (
               <div className="composer__recent">
                 <span>Recent workspaces</span>
@@ -245,7 +270,10 @@ export function NewTaskScreen() {
 
             <fieldset>
               <legend>Scope</legend>
-              <select value={form.scopePackage} onChange={(e) => setForm({ ...form, scopePackage: e.target.value as any })}>
+              <select
+                value={form.scopePackage}
+                onChange={(e) => setForm({ ...form, scopePackage: e.target.value as any })}
+              >
                 <option value="repository">Entire repository</option>
                 <option value="frontend">Frontend</option>
                 <option value="backend">Backend</option>
@@ -258,9 +286,13 @@ export function NewTaskScreen() {
                   <input
                     value={form.scopeArea ?? ""}
                     onChange={(e) => setForm({ ...form, scopeArea: e.target.value })}
-                    placeholder={form.scopePackage === "files" ? "e.g. src/foo.ts" : "e.g. frontend/src/dialog"}
+                    placeholder={
+                      form.scopePackage === "files" ? "e.g. src/foo.ts" : "e.g. frontend/src/dialog"
+                    }
                   />
-                  {scopePathMissing && <span role="alert"> A path is required for this scope.</span>}
+                  {scopePathMissing && (
+                    <span role="alert"> A path is required for this scope.</span>
+                  )}
                 </label>
               )}
               {/* Task 4c(3): same picker as the workspace field, but rooted at
@@ -270,12 +302,16 @@ export function NewTaskScreen() {
                 <PathPicker
                   mode={form.scopePackage === "files" ? "files" : "directory"}
                   root={workspace.trim() || undefined}
-                  buttonLabel={form.scopePackage === "files" ? "Choose files…" : "Choose directory…"}
+                  buttonLabel={
+                    form.scopePackage === "files" ? "Choose files…" : "Choose directory…"
+                  }
                   disabledReason={workspace.trim() ? undefined : "Choose a workspace first."}
                   onPick={(paths) => {
                     const relative = paths.map((p) => toWorkspaceRelative(workspace, p));
                     if (relative.some((p) => p === null)) {
-                      setScopePickError("That path is outside the chosen workspace — scope paths must be inside it.");
+                      setScopePickError(
+                        "That path is outside the chosen workspace — scope paths must be inside it.",
+                      );
                       return;
                     }
                     setScopePickError(null);
@@ -288,10 +324,17 @@ export function NewTaskScreen() {
 
             <fieldset>
               <legend>Mode</legend>
-              <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as any })}>
-                {["inspect", "plan", "implement", "debug", "test", "review", "refactor"].map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
+              <select
+                value={form.mode}
+                onChange={(e) => setForm({ ...form, mode: e.target.value as any })}
+              >
+                {["inspect", "plan", "implement", "debug", "test", "review", "refactor"].map(
+                  (m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ),
+                )}
               </select>
             </fieldset>
 
@@ -350,19 +393,37 @@ export function NewTaskScreen() {
 
             <fieldset>
               <legend>Permissions</legend>
-              <label><input type="checkbox" checked readOnly /> Read repository</label>
-              <label><input type="checkbox" checked readOnly /> Search repository</label>
-              <label><input type="checkbox" checked={taskModeAllowsWrites(form.mode)} readOnly /> Modify files</label>
-              <label><input type="checkbox" checked={false} disabled /> Commit</label>
-              <label><input type="checkbox" checked={false} disabled /> Push</label>
-              <label><input type="checkbox" checked={false} disabled /> Deploy</label>
-              <label><input type="checkbox" checked={false} disabled /> Install dependencies</label>
+              <label>
+                <input type="checkbox" checked readOnly /> Read repository
+              </label>
+              <label>
+                <input type="checkbox" checked readOnly /> Search repository
+              </label>
+              <label>
+                <input type="checkbox" checked={taskModeAllowsWrites(form.mode)} readOnly /> Modify
+                files
+              </label>
+              <label>
+                <input type="checkbox" checked={false} disabled /> Commit
+              </label>
+              <label>
+                <input type="checkbox" checked={false} disabled /> Push
+              </label>
+              <label>
+                <input type="checkbox" checked={false} disabled /> Deploy
+              </label>
+              <label>
+                <input type="checkbox" checked={false} disabled /> Install dependencies
+              </label>
             </fieldset>
 
             <fieldset>
               <legend>Repair budget</legend>
               <input
-                type="range" min={0} max={5} value={form.repairBudget}
+                type="range"
+                min={0}
+                max={5}
+                value={form.repairBudget}
                 onChange={(e) => setForm({ ...form, repairBudget: Number(e.target.value) })}
               />
               <span>{form.repairBudget}</span>
@@ -373,33 +434,59 @@ export function NewTaskScreen() {
               <label>
                 Max turns
                 <input
-                  type="number" min={1} max={64}
+                  type="number"
+                  min={1}
+                  max={64}
                   value={form.maxTurns ?? ""}
-                  onChange={(e) => setForm({ ...form, maxTurns: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      maxTurns: e.target.value === "" ? undefined : Number(e.target.value),
+                    })
+                  }
                 />
               </label>
               <label>
                 Max changed files
                 <input
-                  type="number" min={1} max={500}
+                  type="number"
+                  min={1}
+                  max={500}
                   value={form.maxChangedFiles ?? ""}
-                  onChange={(e) => setForm({ ...form, maxChangedFiles: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      maxChangedFiles: e.target.value === "" ? undefined : Number(e.target.value),
+                    })
+                  }
                   placeholder="unlimited"
                 />
               </label>
               <label>
                 Timeout (seconds)
                 <input
-                  type="number" min={60} max={3600}
+                  type="number"
+                  min={60}
+                  max={3600}
                   value={form.timeoutSeconds ?? ""}
-                  onChange={(e) => setForm({ ...form, timeoutSeconds: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      timeoutSeconds: e.target.value === "" ? undefined : Number(e.target.value),
+                    })
+                  }
                 />
               </label>
               <label>
                 Toolchain mode
                 <select
                   value={form.toolchainMode}
-                  onChange={(e) => setForm({ ...form, toolchainMode: e.target.value as TaskComposerFormState["toolchainMode"] })}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      toolchainMode: e.target.value as TaskComposerFormState["toolchainMode"],
+                    })
+                  }
                 >
                   <option value="path">path</option>
                   <option value="linked">linked</option>

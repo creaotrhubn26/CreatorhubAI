@@ -21,7 +21,9 @@ describe("SessionAssistant", () => {
       return "It owns the parser state.";
     });
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText("It owns the parser state.")).toBeInTheDocument());
     expect(screen.getByText(/model/i)).toBeInTheDocument();
@@ -33,27 +35,40 @@ describe("SessionAssistant", () => {
       return "It owns the parser state.";
     });
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why was this file chosen?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why was this file chosen?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText("It owns the parser state.")).toBeInTheDocument());
     expect(screen.getByText(/model/i)).toBeInTheDocument();
   });
 
   it("falls back once to the non-streaming endpoint when the stream fails at connection time (no deltas emitted)", async () => {
-    vi.spyOn(client.glimmerApi, "askSessionStream").mockRejectedValue(new Error("connection refused"));
-    vi.spyOn(client.glimmerApi, "askSession").mockResolvedValue({ answer: "It owns the parser state.", provenance: "model-output" });
+    vi.spyOn(client.glimmerApi, "askSessionStream").mockRejectedValue(
+      new Error("connection refused"),
+    );
+    vi.spyOn(client.glimmerApi, "askSession").mockResolvedValue({
+      answer: "It owns the parser state.",
+      provenance: "model-output",
+    });
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText("It owns the parser state.")).toBeInTheDocument());
     expect(client.glimmerApi.askSession).toHaveBeenCalledTimes(1);
   });
 
   it("shows the Unavailable copy, not a fabricated answer, when both streaming and the fallback fail", async () => {
-    vi.spyOn(client.glimmerApi, "askSessionStream").mockRejectedValue(new Error("connection refused"));
+    vi.spyOn(client.glimmerApi, "askSessionStream").mockRejectedValue(
+      new Error("connection refused"),
+    );
     vi.spyOn(client.glimmerApi, "askSession").mockRejectedValue(new Error("model unreachable"));
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
   });
@@ -65,7 +80,9 @@ describe("SessionAssistant", () => {
     });
     const askSessionSpy = vi.spyOn(client.glimmerApi, "askSession");
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
     expect(askSessionSpy).not.toHaveBeenCalled();
@@ -73,11 +90,21 @@ describe("SessionAssistant", () => {
 
   it("renders no write-action controls anywhere in the panel", () => {
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    expect(screen.queryByRole("button", { name: /commit|push|deploy|revert|cancel/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /commit|push|deploy|revert|cancel/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("loads persisted turns for this session on mount", () => {
-    saveTurns("s1", [{ id: 1, question: "Old question?", askedAt: "2026-08-22T00:00:00.000Z", answer: "Old answer.", answeredAt: "2026-08-22T00:00:01.000Z" }]);
+    saveTurns("s1", [
+      {
+        id: 1,
+        question: "Old question?",
+        askedAt: "2026-08-22T00:00:00.000Z",
+        answer: "Old answer.",
+        answeredAt: "2026-08-22T00:00:01.000Z",
+      },
+    ]);
     render(withQuery(<SessionAssistant sessionId="s1" />));
     expect(screen.getByText("Old question?")).toBeInTheDocument();
     expect(screen.getByText("Old answer.")).toBeInTheDocument();
@@ -89,7 +116,9 @@ describe("SessionAssistant", () => {
       return "Answer.";
     });
     render(withQuery(<SessionAssistant sessionId="s2" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText("Answer.")).toBeInTheDocument());
     const persisted = loadTurns("s2");
@@ -98,26 +127,41 @@ describe("SessionAssistant", () => {
   });
 
   it("resolves a stale pending turn (no answer, no error) to the Unavailable copy on load, instead of a permanent Asking…", () => {
-    saveTurns("s1", [{ id: 1, question: "Orphaned mid-reload?", askedAt: "2026-08-22T00:00:00.000Z" }]);
+    saveTurns("s1", [
+      { id: 1, question: "Orphaned mid-reload?", askedAt: "2026-08-22T00:00:00.000Z" },
+    ]);
     render(withQuery(<SessionAssistant sessionId="s1" />));
     expect(screen.getByText(/unavailable/i)).toBeInTheDocument();
     expect(screen.queryByText(/^Asking…$/)).not.toBeInTheDocument();
     // And the resolved state is itself persisted, not left stale on disk.
-    expect(loadTurns("s1")[0]).toMatchObject({ error: "Unavailable — the assistant could not answer that." });
+    expect(loadTurns("s1")[0]).toMatchObject({
+      error: "Unavailable — the assistant could not answer that.",
+    });
   });
 
   it("does not write session A's turns under session B's storage key on a fast session switch mid-question", async () => {
     let resolveStream!: (answer: string) => void;
     vi.spyOn(client.glimmerApi, "askSessionStream").mockImplementation(
-      (_id, _q, onDelta) => new Promise<string>((resolve) => {
-        onDelta("A's partial answer");
-        resolveStream = resolve;
-      })
+      (_id, _q, onDelta) =>
+        new Promise<string>((resolve) => {
+          onDelta("A's partial answer");
+          resolveStream = resolve;
+        }),
     );
-    saveTurns("s2", [{ id: 99, question: "B's own old question", askedAt: "2026-08-22T00:00:00.000Z", answer: "B's own old answer", answeredAt: "2026-08-22T00:00:01.000Z" }]);
+    saveTurns("s2", [
+      {
+        id: 99,
+        question: "B's own old question",
+        askedAt: "2026-08-22T00:00:00.000Z",
+        answer: "B's own old answer",
+        answeredAt: "2026-08-22T00:00:01.000Z",
+      },
+    ]);
 
     const { rerender } = render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "A's question" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "A's question" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText(/A's partial answer/)).toBeInTheDocument());
 
@@ -126,10 +170,20 @@ describe("SessionAssistant", () => {
     await waitFor(() => expect(screen.getByText("B's own old question")).toBeInTheDocument());
 
     // Resolve A's stream after the switch — must not land in B's state/storage.
-    await act(async () => { resolveStream("A's full answer"); });
+    await act(async () => {
+      resolveStream("A's full answer");
+    });
 
     expect(screen.queryByText(/A's (partial|full) answer/)).not.toBeInTheDocument();
-    expect(loadTurns("s2")).toEqual([{ id: 99, question: "B's own old question", askedAt: "2026-08-22T00:00:00.000Z", answer: "B's own old answer", answeredAt: "2026-08-22T00:00:01.000Z" }]);
+    expect(loadTurns("s2")).toEqual([
+      {
+        id: 99,
+        question: "B's own old question",
+        askedAt: "2026-08-22T00:00:00.000Z",
+        answer: "B's own old answer",
+        answeredAt: "2026-08-22T00:00:01.000Z",
+      },
+    ]);
     const sA = loadTurns("s1");
     expect(sA.some((t) => t.question === "A's question")).toBe(true); // A's own question was still saved under A's own key before the switch
     expect(sA.some((t) => t.answer?.includes("A's full answer"))).toBe(false); // but the post-switch resolution was dropped, not merged in
@@ -143,7 +197,9 @@ describe("SessionAssistant", () => {
     });
     const askSessionSpy = vi.spyOn(client.glimmerApi, "askSession");
     render(withQuery(<SessionAssistant sessionId="s1" />));
-    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), { target: { value: "Why?" } });
+    fireEvent.change(screen.getByPlaceholderText(/ask about this session/i), {
+      target: { value: "Why?" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /ask/i }));
     await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
     expect(askSessionSpy).not.toHaveBeenCalled();
@@ -151,12 +207,12 @@ describe("SessionAssistant", () => {
 
   it("asks from a repository selection without requiring a session", async () => {
     const selection = { path: "/w/src/a.ts", startLine: 3, endLine: 5 };
-    const ask = vi.spyOn(client.glimmerApi, "askRepositoryStream").mockImplementation(
-      async (_selection, _question, onDelta) => {
+    const ask = vi
+      .spyOn(client.glimmerApi, "askRepositoryStream")
+      .mockImplementation(async (_selection, _question, onDelta) => {
         onDelta("This range validates input.");
         return "This range validates input.";
-      }
-    );
+      });
     render(withQuery(<SessionAssistant selection={selection} />));
     expect(screen.getByText(/lines 3-5/i)).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText(/ask, or describe a change/i), {
@@ -164,19 +220,23 @@ describe("SessionAssistant", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Ask" }));
 
-    await waitFor(() => expect(screen.getByText("This range validates input.")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText("This range validates input.")).toBeInTheDocument(),
+    );
     expect(ask).toHaveBeenCalledWith(selection, "What does this do?", expect.any(Function));
   });
 
   it("turns one sentence about a selection into a draft callback without starting a session", () => {
     const onDraftTask = vi.fn();
     const ask = vi.spyOn(client.glimmerApi, "askRepositoryStream");
-    render(withQuery(
-      <SessionAssistant
-        selection={{ path: "/w/src/a.ts", startLine: 3, endLine: 5 }}
-        onDraftTask={onDraftTask}
-      />
-    ));
+    render(
+      withQuery(
+        <SessionAssistant
+          selection={{ path: "/w/src/a.ts", startLine: 3, endLine: 5 }}
+          onDraftTask={onDraftTask}
+        />,
+      ),
+    );
     fireEvent.change(screen.getByPlaceholderText(/ask, or describe a change/i), {
       target: { value: "Extract this validation into a helper" },
     });

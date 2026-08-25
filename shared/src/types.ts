@@ -1,4 +1,3 @@
-
 export type DataProvenance =
   | "deterministic-backend"
   | "git-derived"
@@ -62,13 +61,7 @@ export interface VerificationCheckResult {
 }
 
 export type VerificationOverall =
-  | "VERIFIED"
-  | "FAILED"
-  | "BLOCKED"
-  | "PARTIAL"
-  | "NOT_RUN"
-  | "BASELINE_FAILURE"
-  | "NEEDS_REVIEW";
+  "VERIFIED" | "FAILED" | "BLOCKED" | "PARTIAL" | "NOT_RUN" | "BASELINE_FAILURE" | "NEEDS_REVIEW";
 
 export interface VerificationSummary {
   overall: VerificationOverall;
@@ -538,7 +531,11 @@ export interface DeliveryPacket {
   verification: { status: "VERIFIED" | "FAILED" | "NOT_RUN"; results: unknown };
   visual: VisualFindingsStatus | "not_run";
   statuses: GlimmerSession["statuses"];
-  customerReadiness: { value: DeliveryReviewCustomerReadiness | null; provenance: DataProvenance; reviewFailed?: true } | null;
+  customerReadiness: {
+    value: DeliveryReviewCustomerReadiness | null;
+    provenance: DataProvenance;
+    reviewFailed?: true;
+  } | null;
   limitations: {
     unresolvedItems: string[];
     intentionallyNotChanged: string[];
@@ -546,16 +543,23 @@ export interface DeliveryPacket {
     provenance: DataProvenance;
     reviewFailed?: true;
   } | null;
-  forwardPlan: { nextSteps: DeliveryNextStep[]; provenance: DataProvenance; reviewFailed?: true } | null;
-  confidence: { level: "low" | "medium" | "high"; reason: string; provenance: DataProvenance; reviewFailed?: true } | null;
+  forwardPlan: {
+    nextSteps: DeliveryNextStep[];
+    provenance: DataProvenance;
+    reviewFailed?: true;
+  } | null;
+  confidence: {
+    level: "low" | "medium" | "high";
+    reason: string;
+    provenance: DataProvenance;
+    reviewFailed?: true;
+  } | null;
   humanReviewStatus: string;
   // Round-8 re-review NEW-MN2/NEW-MN1: written by glimmer-v2.py since
   // MJ4/MN1 fixes -- optional so pre-fix packets still parse.
   blockedGates?: string[];
   architectEscalation?:
-    | { question: string; answer: string }
-    | { consultationFailed: true; reason: string }
-    | null;
+    { question: string; answer: string } | { consultationFailed: true; reason: string } | null;
 }
 
 // V7 §22.14 visual evidence store — these mirror glimmer-visual.py's real
@@ -1075,21 +1079,44 @@ export type GlimmerEvent =
   | DeliveryPacketCreatedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
-  "tool_started", "tool_completed", "tool_blocked", "file_changed",
-  "verification_started", "verification_completed", "agent_state_changed",
-  "candidate_selected", "scope_expanded", "repair_started",
-  "parser_recovery", "session_completed",
-  "session_created", "skill_loaded", "model_retry", "model_request_started", "context_selected",
-  "architect_planning_started", "architect_plan_created",
-  "architect_review_requested", "architect_review_completed",
-  "architect_replan_started", "architect_autotriggered",
-  "task_created", "task_status_changed", "task_list_completed", "task_override_applied",
-  "visual_verification_started", "visual_finding_detected",
+  "tool_started",
+  "tool_completed",
+  "tool_blocked",
+  "file_changed",
+  "verification_started",
+  "verification_completed",
+  "agent_state_changed",
+  "candidate_selected",
+  "scope_expanded",
+  "repair_started",
+  "parser_recovery",
+  "session_completed",
+  "session_created",
+  "skill_loaded",
+  "model_retry",
+  "model_request_started",
+  "context_selected",
+  "architect_planning_started",
+  "architect_plan_created",
+  "architect_review_requested",
+  "architect_review_completed",
+  "architect_replan_started",
+  "architect_autotriggered",
+  "task_created",
+  "task_status_changed",
+  "task_list_completed",
+  "task_override_applied",
+  "visual_verification_started",
+  "visual_finding_detected",
   "visual_verification_completed",
-  "delivery_review_started", "delivery_review_completed",
-  "architect_consult_advised", "architect_consulted",
-  "approval_requested", "delivery_packet_created",
-  "documentation_impact_detected", "documentation_stale_detected",
+  "delivery_review_started",
+  "delivery_review_completed",
+  "architect_consult_advised",
+  "architect_consulted",
+  "approval_requested",
+  "delivery_packet_created",
+  "documentation_impact_detected",
+  "documentation_stale_detected",
   "documentation_verified",
 ]);
 
@@ -1131,7 +1158,8 @@ export interface RepoMap {
 // orchestrator actually wrote (id/status/confidence/provenance), never a
 // fabricated title or status.
 export type DocNodeType = "system" | "service" | "route" | "schema" | "config" | "doc";
-export type DocNodeStatus = "CURRENT" | "STALE" | "UNVERIFIED" | "MISSING" | "DEPRECATED" | "GENERATED";
+export type DocNodeStatus =
+  "CURRENT" | "STALE" | "UNVERIFIED" | "MISSING" | "DEPRECATED" | "GENERATED";
 // glimmer-v2.py's verify_doc_nodes/build_docs_bootstrap_graph never write a
 // numeric confidence -- always one of these three strings (see DOC_STATUS_*
 // -> confidence mapping in glimmer-v2.py). `string` (not a narrower union)
@@ -1219,18 +1247,10 @@ export type CliIntegrationId =
   | "homebrew"
   | "orchestrator";
 
-export type CliIntegrationState =
-  | "ready"
-  | "authentication_required"
-  | "missing"
-  | "blocked";
+export type CliIntegrationState = "ready" | "authentication_required" | "missing" | "blocked";
 
 export type CliAgentAccess =
-  | "runtime"
-  | "read_only"
-  | "validation_only"
-  | "approval_required"
-  | "blocked";
+  "runtime" | "read_only" | "validation_only" | "approval_required" | "blocked";
 
 export interface CliIntegration {
   id: CliIntegrationId;
@@ -1341,7 +1361,9 @@ export interface DashboardStatus {
   model: ModelStatus;
   activeSession: Pick<GlimmerSession, "id" | "status" | "changedFiles"> | null;
   latestSession: Pick<GlimmerSession, "id" | "task" | "status" | "completedAt"> | null;
-  recentSessions: Array<Pick<GlimmerSession, "id" | "task" | "status" | "changedFiles" | "completedAt">>;
+  recentSessions: Array<
+    Pick<GlimmerSession, "id" | "task" | "status" | "changedFiles" | "completedAt">
+  >;
   verification: VerificationSummary | null;
 }
 
@@ -1422,7 +1444,9 @@ const OPEN_ENDED_IMPROVEMENT_PATTERNS = [
 /** Narrow deterministic inference shared by every TaskContract producer. */
 export function inferTaskIntent(objective: string): TaskIntent {
   const normalized = objective.normalize("NFKC").trim().replace(/\s+/g, " ");
-  const improvementAssessment = normalized.length > 0 && normalized.length <= 240 &&
+  const improvementAssessment =
+    normalized.length > 0 &&
+    normalized.length <= 240 &&
     OPEN_ENDED_IMPROVEMENT_PATTERNS.some((pattern) => pattern.test(normalized));
   return {
     kind: improvementAssessment ? "improvement-assessment" : "direct",
