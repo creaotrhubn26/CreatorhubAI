@@ -5,6 +5,7 @@ import { glimmerApi } from "../../api/client";
 import { langFromPath, type Lang } from "../../state/highlight";
 import { HighlightedText } from "../common/HighlightedText";
 import { absolutePath, fileHref } from "../../state/fileLink";
+import type { DiffReviewHunk } from "@glimmer/shared";
 
 type DiffLineKind = "add" | "del" | "context" | "hunk" | "file";
 interface DiffLine {
@@ -12,6 +13,7 @@ interface DiffLine {
   text: string;
   oldNo?: number;
   newNo?: number;
+  reviewIndex?: number;
 }
 
 // Presentational parsing of a unified diff we already fetch verbatim from
@@ -22,6 +24,7 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
   const out: DiffLine[] = [];
   let oldNo = 1;
   let newNo = 1;
+  let reviewIndex = -1;
   for (const raw of lines) {
     if (
       raw.startsWith("diff --git") || raw.startsWith("index ") || raw.startsWith("--- ") || raw.startsWith("+++ ") ||
@@ -37,7 +40,7 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
     if (hunk) {
       oldNo = Number(hunk[1]);
       newNo = Number(hunk[2]);
-      out.push({ kind: "hunk", text: raw });
+      out.push({ kind: "hunk", text: raw, reviewIndex: ++reviewIndex });
       continue;
     }
     if (raw.startsWith("+")) {
@@ -95,9 +98,55 @@ function groupLinesByFile(lines: DiffLine[]): DiffFileGroup[] {
   return groups;
 }
 
-function UnifiedLine({ l, lang }: { l: DiffLine; lang: Lang }) {
+function HunkHeader({
+  line, hunk, busy, onAccept, onReject,
+}: {
+  line: DiffLine;
+  hunk?: DiffReviewHunk;
+  busy: boolean;
+  onAccept: (hunk: DiffReviewHunk) => void;
+  onReject: (hunk: DiffReviewHunk) => void;
+}) {
+  if (!hunk) return <div className="diff-view__hunk">{line.text}</div>;
+  return (
+    <div className={`diff-view__hunk${hunk.status === "accepted" ? " accepted" : ""}`}>
+      <span>{line.text}</span>
+      <span className="diff-view__hunk-stats">+{hunk.added} -{hunk.removed}</span>
+      <span className="diff-view__hunk-status">{hunk.status === "accepted" ? "Accepted" : "Pending review"}</span>
+      <button
+        type="button"
+        aria-label={`Accept hunk in ${hunk.path}: ${hunk.header}`}
+        disabled={busy || hunk.status === "accepted"}
+        onClick={() => onAccept(hunk)}
+      >
+        Accept hunk
+      </button>
+      <button
+        type="button"
+        aria-label={`Reject hunk in ${hunk.path}: ${hunk.header}`}
+        disabled={busy}
+        onClick={() => onReject(hunk)}
+      >
+        Reject hunk
+      </button>
+    </div>
+  );
+}
+
+function UnifiedLine({
+  l, lang, hunk, busy = false, onAccept = () => {}, onReject = () => {},
+}: {
+  l: DiffLine;
+  lang: Lang;
+  hunk?: DiffReviewHunk;
+  busy?: boolean;
+  onAccept?: (hunk: DiffReviewHunk) => void;
+  onReject?: (hunk: DiffReviewHunk) => void;
+}) {
   if (l.kind === "file") return <div className="diff-view__file">{l.text}</div>;
-  if (l.kind === "hunk") return <div className="diff-view__hunk">{l.text}</div>;
+  if (l.kind === "hunk") return (
+    <HunkHeader line={l} hunk={hunk} busy={busy} onAccept={onAccept} onReject={onReject} />
+  );
   const marker = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
   return (
     <div className={`diff-view__line${l.kind !== "context" ? ` ${l.kind}` : ""}`}>
@@ -162,12 +211,16 @@ function firstChangedLine(lines: DiffLine[]): number | undefined {
   return undefined;
 }
 
-function DiffView({ diff, mode, wrap, workspace, sessionId }: {
+function DiffView({ diff, hunks, mode, wrap, workspace, sessionId, hunkBusy, onAcceptHunk, onRejectHunk }: {
   diff: string;
+  hunks: DiffReviewHunk[];
   mode: "unified" | "split";
   wrap: boolean;
   workspace?: string;
   sessionId?: string;
+  hunkBusy: boolean;
+  onAcceptHunk: (hunk: DiffReviewHunk) => void;
+  onRejectHunk: (hunk: DiffReviewHunk) => void;
 }) {
   if (!diff) return <div>Unavailable</div>;
   const groups = groupLinesByFile(parseUnifiedDiff(diff));
@@ -196,10 +249,28 @@ function DiffView({ diff, mode, wrap, workspace, sessionId }: {
               <span className="diff-view__stat-del">-{g.removed}</span>
             </div>
             {mode === "unified"
-              ? g.lines.map((l, i) => <UnifiedLine l={l} lang={lang} key={i} />)
+              ? g.lines.map((l, i) => (
+                  <UnifiedLine
+                    l={l}
+                    lang={lang}
+                    hunk={l.reviewIndex === undefined ? undefined : hunks[l.reviewIndex]}
+                    busy={hunkBusy}
+                    onAccept={onAcceptHunk}
+                    onReject={onRejectHunk}
+                    key={i}
+                  />
+                ))
               : buildSplitRows(g.lines).map((r, i) =>
                   r.type === "full" ? (
-                    <UnifiedLine l={r.line} lang={lang} key={i} />
+                    <UnifiedLine
+                      l={r.line}
+                      lang={lang}
+                      hunk={r.line.reviewIndex === undefined ? undefined : hunks[r.line.reviewIndex]}
+                      busy={hunkBusy}
+                      onAccept={onAcceptHunk}
+                      onReject={onRejectHunk}
+                      key={i}
+                    />
                   ) : (
                     <div className="diff-view__split-row" key={i}>
                       <SplitCell line={r.left} side="del" lang={lang} />
@@ -220,7 +291,9 @@ export function DiffReviewScreen() {
   const [mode, setMode] = useState<"unified" | "split">("unified");
   const [wrap, setWrap] = useState(false);
   const { data: session } = useQuery({ queryKey: ["session", id], queryFn: () => glimmerApi.getSession(id!), enabled: !!id });
-  const { data: diffResult } = useQuery({ queryKey: ["diff", id], queryFn: () => glimmerApi.getSessionDiff(id!), enabled: !!id });
+  const { data: diffResult, isPending: diffPending } = useQuery({
+    queryKey: ["diff", id], queryFn: () => glimmerApi.getSessionDiff(id!), enabled: !!id,
+  });
   const revertMutation = useMutation({
     mutationFn: (path: string) => glimmerApi.revertFile(id!, path),
     onSuccess: () => {
@@ -236,7 +309,22 @@ export function DiffReviewScreen() {
     mutationFn: () => glimmerApi.acceptSession(id!),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", id] }),
   });
+  const acceptHunkMutation = useMutation({
+    mutationFn: (hunk: DiffReviewHunk) => glimmerApi.acceptHunk(id!, hunk.id, hunk.path),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["diff", id] }),
+  });
+  const rejectHunkMutation = useMutation({
+    mutationFn: (hunk: DiffReviewHunk) => glimmerApi.rejectHunk(id!, hunk.id, hunk.path),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["session", id] });
+      queryClient.invalidateQueries({ queryKey: ["diff", id] });
+      queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
+    },
+  });
   const humanAcceptance = session?.humanAcceptance;
+  const reviewHunks = diffResult?.hunks ?? [];
+  const pendingHunks = reviewHunks.filter((hunk) => hunk.status !== "accepted").length;
+  const hunkBusy = acceptHunkMutation.isPending || rejectHunkMutation.isPending;
 
   return (
     <div>
@@ -248,22 +336,30 @@ export function DiffReviewScreen() {
           : "Not yet accepted"}
       </p>
       {!humanAcceptance?.accepted && (
-        <button className="btn-primary" onClick={() => acceptMutation.mutate()} disabled={acceptMutation.isPending}>
+        <button
+          className="btn-primary"
+          onClick={() => acceptMutation.mutate()}
+          disabled={acceptMutation.isPending || diffPending || pendingHunks > 0}
+          title={diffPending ? "Loading diff review state" : pendingHunks > 0 ? `${pendingHunks} hunk(s) still need a decision` : undefined}
+        >
           Accept for review
         </button>
       )}
+      {pendingHunks > 0 && <p role="status">Review each hunk before accepting the complete diff — {pendingHunks} pending.</p>}
       {acceptMutation.isError && <div>Unavailable — could not accept this session.</div>}
       <ul>
         {session?.changedFiles.map((f) => (
           <li key={f.path} className="row">
             M {f.path}{" "}
-            <button onClick={() => revertMutation.mutate(f.path)} disabled={revertMutation.isPending}>
-              Revert
+            <button onClick={() => revertMutation.mutate(f.path)} disabled={revertMutation.isPending || hunkBusy}>
+              Revert file
             </button>
           </li>
         )) ?? <li>Unavailable</li>}
       </ul>
       {revertMutation.isError && <div>Unavailable — could not revert this file.</div>}
+      {acceptHunkMutation.isError && <div>Unavailable — could not accept this hunk. Refresh and review again.</div>}
+      {rejectHunkMutation.isError && <div>Unavailable — could not reject this hunk. Refresh and review again.</div>}
       <div className="toolbar">
         <div role="tablist" aria-label="Diff view mode">
           {(["unified", "split"] as const).map((m) => (
@@ -278,10 +374,14 @@ export function DiffReviewScreen() {
       </div>
       <DiffView
         diff={diffResult?.diff ?? ""}
+        hunks={reviewHunks}
         mode={mode}
         wrap={wrap}
         workspace={session?.workspace}
         sessionId={id}
+        hunkBusy={hunkBusy}
+        onAcceptHunk={(hunk) => acceptHunkMutation.mutate(hunk)}
+        onRejectHunk={(hunk) => rejectHunkMutation.mutate(hunk)}
       />
     </div>
   );

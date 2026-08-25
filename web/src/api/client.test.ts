@@ -46,6 +46,23 @@ describe("glimmerApi", () => {
     expect(JSON.parse(init?.body as string)).toEqual({ taskContract: { objective: "x" }, workspace: "/ws" });
   });
 
+  it("posts hunk accept/reject decisions without sending patch text", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({ hunkId: "abc", path: "a.ts", decision: "accepted", decidedAt: "now" }), { status: 200 })
+    );
+    await glimmerApi.acceptHunk("s1", "abc", "a.ts");
+    await glimmerApi.rejectHunk("s1", "abc", "a.ts");
+
+    const [acceptUrl, acceptInit] = fetchMock.mock.calls[0];
+    const [rejectUrl, rejectInit] = fetchMock.mock.calls[1];
+    expect(acceptUrl).toBe(`${API_BASE}/api/sessions/s1/hunks/abc/accept`);
+    expect(rejectUrl).toBe(`${API_BASE}/api/sessions/s1/hunks/abc/reject`);
+    expect(JSON.parse(acceptInit?.body as string)).toEqual({ path: "a.ts" });
+    expect(JSON.parse(rejectInit?.body as string)).toEqual({ path: "a.ts" });
+    expect(acceptInit?.body).not.toContain("@@");
+    expect(rejectInit?.body).not.toContain("@@");
+  });
+
   it("throws on a non-2xx response", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 500 }));
     await expect(glimmerApi.getStatus()).rejects.toThrow();

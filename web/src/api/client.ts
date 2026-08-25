@@ -5,6 +5,7 @@ import type {
   VisualVerification, TaskOverride, EvidenceIndexResponse, EvidenceEntryResponse, DocGraph, DocGraphSource,
   ApprovalRequest, FsListing, FsFile, RepositorySelection,
   ModelRegistry, ModelRegistryUpdate,
+  SessionDiff, HunkReviewResult,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -111,7 +112,7 @@ export const glimmerApi = {
     request<ModelRegistry>("/api/models/config", { method: "PUT", body: JSON.stringify(registry) }),
   listSessions: () => request<GlimmerSession[]>("/api/sessions"),
   getSession: (id: string) => request<GlimmerSession>(`/api/sessions/${id}`),
-  getSessionDiff: (id: string) => request<{ diff: string }>(`/api/sessions/${id}/diff`),
+  getSessionDiff: (id: string) => request<SessionDiff>(`/api/sessions/${id}/diff`),
   getSessionAnalysis: (id: string) => request<SessionAnalysis>(`/api/sessions/${id}/analysis`),
   getArchitecturePlan: (id: string) => request<ArchitecturePlan>(`/api/sessions/${id}/plan`),
   getArchitectReviews: (id: string) => request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
@@ -211,6 +212,14 @@ export const glimmerApi = {
   cancelSession: (id: string) => request<{ cancelled: boolean }>(`/api/sessions/${id}/cancel`, { method: "POST" }),
   revertFile: (id: string, path: string) =>
     request<{ reverted: string }>(`/api/sessions/${id}/revert-file`, { method: "POST", body: JSON.stringify({ path }) }),
+  acceptHunk: (id: string, hunkId: string, path: string) =>
+    request<HunkReviewResult>(`/api/sessions/${id}/hunks/${hunkId}/accept`, {
+      method: "POST", body: JSON.stringify({ path }),
+    }),
+  rejectHunk: (id: string, hunkId: string, path: string) =>
+    request<HunkReviewResult>(`/api/sessions/${id}/hunks/${hunkId}/reject`, {
+      method: "POST", body: JSON.stringify({ path }),
+    }),
   // §14 Diff Review — human "accept for review", distinct from technical
   // verification. Gateway-owned; see server/src/lib/sessions.ts.
   acceptSession: (id: string) => request<HumanAcceptance>(`/api/sessions/${id}/accept`, { method: "POST" }),

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import request from "supertest";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
@@ -74,6 +74,153 @@ describe("GET /api/sessions/:id/diff", () => {
     const res = await request(app).get(`/api/sessions/${sessionId}/diff`);
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("per-hunk diff review routes", () => {
+  const id = "20260825-000001-glimmer-hunk-review";
+  let hunkWorkspace: string;
+  let baseline: string;
+
+  beforeAll(async () => {
+    hunkWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-route-hunks-"));
+    await execGit("git", ["init", "-q"], { cwd: hunkWorkspace });
+    await execGit("git", ["config", "user.email", "t@t.com"], { cwd: hunkWorkspace });
+    await execGit("git", ["config", "user.name", "t"], { cwd: hunkWorkspace });
+    await fs.writeFile(
+      path.join(hunkWorkspace, "review.txt"),
+      Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n") + "\n",
+    );
+    await execGit("git", ["add", "review.txt"], { cwd: hunkWorkspace });
+    await execGit("git", ["commit", "-q", "-m", "baseline"], { cwd: hunkWorkspace });
+    baseline = (await execGit("git", ["rev-parse", "HEAD"], { cwd: hunkWorkspace })).stdout.trim();
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
+      task: "hunk review", status: "verified", workspace: hunkWorkspace, branch: "main",
+      baseline, finalChangedFiles: ["review.txt"], attempts: [],
+    }));
+  });
+
+  beforeEach(async () => {
+    await execGit("git", ["checkout", baseline, "--", "review.txt"], { cwd: hunkWorkspace });
+    const lines = (await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8")).trimEnd().split("\n");
+    lines[1] = "line 2 changed";
+    lines[24] = "line 25 changed";
+    await fs.writeFile(path.join(hunkWorkspace, "review.txt"), lines.join("\n") + "\n");
+    await fs.rm(path.join(stateRoot, "sessions", id, "hunk-acceptances.json"), { force: true });
+    await fs.rm(path.join(stateRoot, "sessions", id, "human-acceptance.json"), { force: true });
+  });
+
+  afterAll(async () => {
+    await fs.rm(hunkWorkspace, { recursive: true, force: true });
+  });
+
+  it("returns server-derived hunk ids without exposing raw patch payloads", async () => {
+    const res = await request(app).get(`/api/sessions/${id}/diff`);
+    expect(res.status).toBe(200);
+    expect(res.body.hunks).toHaveLength(2);
+    expect(res.body.hunks[0]).toMatchObject({ path: "review.txt", status: "pending" });
+    expect(res.body.hunks[0].id).toMatch(/^[a-f0-9]{64}$/);
+    expect(res.body.hunks[0]).not.toHaveProperty("patch");
+  });
+
+  it("persists hunk acceptance and returns it on the next diff read", async () => {
+    const initial = await request(app).get(`/api/sessions/${id}/diff`);
+    const hunk = initial.body.hunks[0];
+    const accepted = await request(app)
+      .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+      .send({ path: "review.txt" });
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({ hunkId: hunk.id, path: "review.txt", decision: "accepted" });
+
+    const reread = await request(app).get(`/api/sessions/${id}/diff`);
+    expect(reread.body.hunks[0].status).toBe("accepted");
+    expect(typeof reread.body.hunks[0].acceptedAt).toBe("string");
+  });
+
+  it("rejects only the selected canonical hunk and ignores client patch text", async () => {
+    const initial = await request(app).get(`/api/sessions/${id}/diff`);
+    const hunk = initial.body.hunks[1];
+    const rejected = await request(app)
+      .post(`/api/sessions/${id}/hunks/${hunk.id}/reject`).set("Origin", UI_ORIGIN)
+      .send({ path: "review.txt", patch: "malicious client patch is never consumed" });
+    expect(rejected.status).toBe(200);
+    expect(rejected.body).toMatchObject({ hunkId: hunk.id, path: "review.txt", decision: "rejected" });
+
+    const content = await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8");
+    expect(content).toContain("line 2 changed");
+    expect(content).not.toContain("line 25 changed");
+    const reread = await request(app).get(`/api/sessions/${id}/diff`);
+    expect(reread.body.hunks).toHaveLength(1);
+  });
+
+  it("returns 409 for a stale id and 403 for an unscoped path without changing the file", async () => {
+    const before = await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8");
+    const stale = await request(app)
+      .post(`/api/sessions/${id}/hunks/${"0".repeat(64)}/reject`).set("Origin", UI_ORIGIN)
+      .send({ path: "review.txt" });
+    expect(stale.status).toBe(409);
+    const unscoped = await request(app)
+      .post(`/api/sessions/${id}/hunks/${"0".repeat(64)}/reject`).set("Origin", UI_ORIGIN)
+      .send({ path: "../outside.txt" });
+    expect(unscoped.status).toBe(403);
+    expect(await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8")).toBe(before);
+  });
+
+  it("refuses whole-session acceptance until every current text hunk is accepted", async () => {
+    const initial = await request(app).get(`/api/sessions/${id}/diff`);
+
+    const premature = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
+    expect(premature.status).toBe(409);
+    expect(premature.body).toMatchObject({ pendingHunks: 2 });
+
+    for (const hunk of initial.body.hunks) {
+      const accepted = await request(app)
+        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+        .send({ path: "review.txt" });
+      expect(accepted.status).toBe(200);
+    }
+
+    const complete = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
+    expect(complete.status).toBe(200);
+    expect(complete.body.accepted).toBe(true);
+  });
+
+  it("clears whole-session acceptance after an accepted hunk is rejected", async () => {
+    const initial = await request(app).get(`/api/sessions/${id}/diff`);
+    for (const hunk of initial.body.hunks) {
+      await request(app)
+        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+        .send({ path: "review.txt" });
+    }
+    expect((await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN)).status).toBe(200);
+
+    const rejected = await request(app)
+      .post(`/api/sessions/${id}/hunks/${initial.body.hunks[1].id}/reject`).set("Origin", UI_ORIGIN)
+      .send({ path: "review.txt" });
+    expect(rejected.status).toBe(200);
+
+    const session = await request(app).get(`/api/sessions/${id}`);
+    expect(session.body).not.toHaveProperty("humanAcceptance");
+  });
+
+  it("clears whole-session acceptance after a file-level revert", async () => {
+    const initial = await request(app).get(`/api/sessions/${id}/diff`);
+    for (const hunk of initial.body.hunks) {
+      await request(app)
+        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+        .send({ path: "review.txt" });
+    }
+    expect((await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN)).status).toBe(200);
+
+    const reverted = await request(app)
+      .post(`/api/sessions/${id}/revert-file`).set("Origin", UI_ORIGIN)
+      .send({ path: "review.txt" });
+    expect(reverted.status).toBe(200);
+
+    const session = await request(app).get(`/api/sessions/${id}`);
+    expect(session.body).not.toHaveProperty("humanAcceptance");
   });
 });
 

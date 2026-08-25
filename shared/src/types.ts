@@ -287,6 +287,36 @@ export interface HumanAcceptance {
   acceptedAt: string;
 }
 
+// C2 per-hunk review. Hunk ids are derived by the gateway from the current
+// canonical git diff; the browser never supplies patch text to a write route.
+export interface DiffReviewHunk {
+  id: string;
+  path: string;
+  header: string;
+  added: number;
+  removed: number;
+  status: "pending" | "accepted";
+  acceptedAt?: string;
+}
+
+export interface SessionDiff {
+  diff: string;
+  hunks: DiffReviewHunk[];
+}
+
+export interface HunkAcceptance {
+  hunkId: string;
+  path: string;
+  acceptedAt: string;
+}
+
+export interface HunkReviewResult {
+  hunkId: string;
+  path: string;
+  decision: "accepted" | "rejected";
+  decidedAt: string;
+}
+
 // Task 8.3 (V7 §14/§35) -- YELLOW human-approval boundary. Written by
 // glimmer-engineer.py (request_approval_and_wait) the moment a YELLOW-
 // classified action (classify_yellow: dependency install, migration
