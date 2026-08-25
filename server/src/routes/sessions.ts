@@ -367,10 +367,16 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
 
 sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
   if (!isValidSessionId(resolveSessionId(req.params.id))) return res.status(404).json({ error: "not found" });
-  const run = activeRuns.get(req.params.id);
-  if (!run) return res.status(404).json({ error: "no active run for this session id" });
+  // activeRuns is keyed by the pending id created by POST /sessions, while
+  // the sidebar/history link uses the real orchestrator id after adoption.
+  // Treat those aliases as the same active run so cancellation works from
+  // either route, not only from the original post-create tab.
+  const resolved = resolveSessionId(req.params.id);
+  const active = [...activeRuns.entries()].find(([key]) => resolveSessionId(key) === resolved);
+  if (!active) return res.status(404).json({ error: "no active run for this session id" });
+  const [activeKey, run] = active;
   run.cancel();
-  activeRuns.delete(req.params.id);
+  activeRuns.delete(activeKey);
   res.json({ cancelled: true });
 });
 

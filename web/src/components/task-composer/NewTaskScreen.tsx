@@ -5,6 +5,7 @@ import type { TaskIntelligence } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
 import { computeArchitectRisk, deriveVerificationLevel, ARCHITECT_RISK_THRESHOLD } from "../../state/architectRisk";
+import { interpretObjectiveIntent } from "../../state/objectiveIntent";
 import { PathPicker } from "../common/PathPicker";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
@@ -160,11 +161,19 @@ export function NewTaskScreen() {
   // state is now rare, not the default outcome of picking these scope types.
   const needsScopePath = PATH_SCOPED_PACKAGES.has(form.scopePackage);
   const scopePathMissing = needsScopePath && !form.scopeArea?.trim();
+  const objectiveInterpretation = interpretObjectiveIntent(form.objective, form.mode);
+  // Keep the human's wording in the editable field while sending the engine a
+  // precise semantic objective. This makes the interpretation visible and
+  // reversible (editing the task or mode recomputes it immediately) without
+  // letting an open-ended question become a literal repository text search.
+  const effectiveForm = objectiveInterpretation
+    ? { ...form, objective: objectiveInterpretation.effectiveObjective }
+    : form;
+  const effectiveContract = buildTaskContract(effectiveForm);
 
   const runMutation = useMutation({
     mutationFn: async () => {
-      const contract = buildTaskContract(form);
-      const session = await glimmerApi.createSession(contract, workspace);
+      const session = await glimmerApi.createSession(effectiveContract, workspace);
       await glimmerApi.runSession(session.id);
       return session;
     },
@@ -188,6 +197,11 @@ export function NewTaskScreen() {
               onChange={(e) => setForm({ ...form, objective: e.target.value })}
               placeholder="What should Glimmer work on?"
             />
+            {objectiveInterpretation && (
+              <p role="status" className="composer__intent">
+                {objectiveInterpretation.explanation}
+              </p>
+            )}
             <label>
               Workspace path
               <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
@@ -330,9 +344,9 @@ export function NewTaskScreen() {
               scopeArea={form.scopeArea || undefined}
               workspace={workspace.trim() || undefined}
               mode={form.mode}
-              objective={form.objective}
-              verificationLevel={deriveVerificationLevel(buildTaskContract(form))}
-              candidateCount={buildTaskContract(form).scope.paths?.length}
+              objective={effectiveContract.objective}
+              verificationLevel={deriveVerificationLevel(effectiveContract)}
+              candidateCount={effectiveContract.scope.paths?.length}
               onIntelligence={selectionDraft ? applySelectionIntelligence : undefined}
             />
 
@@ -419,8 +433,8 @@ export function NewTaskScreen() {
 
       <div className="composer__runbar">
         <p className="composer__summary">{buildSummaryLine(form)}</p>
-        {buildArchitectRiskLine(form) && (
-          <p className="composer__architect-risk">{buildArchitectRiskLine(form)}</p>
+        {buildArchitectRiskLine(effectiveForm) && (
+          <p className="composer__architect-risk">{buildArchitectRiskLine(effectiveForm)}</p>
         )}
         {runMutation.isError && (
           <p role="alert" style={{ color: "var(--red)" }}>

@@ -225,11 +225,18 @@ export function ActiveSessionScreen() {
       <div className="toolbar">
         <Link to={`/sessions/${id}/diff`}>View diff</Link>
         <Link to={`/sessions/${id}/verification`}>Verification Center</Link>
-        <button onClick={() => cancelMutation.mutate()} disabled={cancelMutation.isPending}>
-          Cancel
-        </button>
+        {isRunning && (
+          <button
+            onClick={() => cancelMutation.mutate()}
+            disabled={cancelMutation.isPending || cancelMutation.isSuccess}
+          >
+            {cancelMutation.isPending || cancelMutation.isSuccess ? "Cancelling…" : "Cancel"}
+          </button>
+        )}
       </div>
-      {cancelMutation.isError && <div>Unavailable — could not cancel this session.</div>}
+      {isRunning && cancelMutation.isError && (
+        <div>Could not send the cancellation request. Refresh the session; it may already have stopped.</div>
+      )}
       <AgentStateStepper current={state} />
       <dl>
         <dt>Changed files</dt>

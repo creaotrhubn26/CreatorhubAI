@@ -74,6 +74,50 @@ describe("NewTaskScreen", () => {
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
   });
 
+  it("turns an open-ended improvement question into an evidence-first implementation task", async () => {
+    const createSpy = vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "s-improve" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Hva kan bli bedre?" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+
+    expect(screen.getByRole("status")).toHaveTextContent(/not search for those words/i);
+    expect((screen.getByText("Mode").closest("fieldset")!.querySelector("select") as HTMLSelectElement).value).toBe("implement");
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+    const [contract] = createSpy.mock.calls[0];
+    expect(contract.mode).toBe("implement");
+    expect(contract.objective).toContain("evidence-backed defects and improvement opportunities");
+    expect(contract.objective).toContain("Do not search the repository for words or phrases");
+    expect(contract.objective).toContain("implement it, and verify the change");
+    expect(contract.objective).not.toContain("Hva kan bli bedre");
+  });
+
+  it("respects a manually selected review mode when interpreting an improvement question", async () => {
+    const createSpy = vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "s-review" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Hva som kan bli bedre?" },
+    });
+    fireEvent.change(screen.getByText("Mode").closest("fieldset")!.querySelector("select")!, {
+      target: { value: "review" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
+    const [contract] = createSpy.mock.calls[0];
+    expect(contract.mode).toBe("review");
+    expect(contract.objective).toContain("Do not modify files");
+    expect(contract.objective).toContain("prioritized review");
+  });
+
   it("lets the user toggle a verification checkbox on", () => {
     render(withQuery(<NewTaskScreen />));
     const box = screen.getByLabelText("Frontend typecheck") as HTMLInputElement;

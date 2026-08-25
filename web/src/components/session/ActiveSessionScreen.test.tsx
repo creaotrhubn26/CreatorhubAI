@@ -91,6 +91,7 @@ describe("ActiveSessionScreen", () => {
     await waitFor(() => screen.getByRole("button", { name: /cancel/i }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
     await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith("s1"));
+    expect(screen.getByRole("button", { name: /cancelling/i })).toBeDisabled();
     expect(screen.getByRole("link", { name: /diff/i })).toHaveAttribute("href", "/sessions/s1/diff");
   });
 
@@ -115,7 +116,7 @@ describe("ActiveSessionScreen", () => {
 
     await waitFor(() => screen.getByRole("button", { name: /cancel/i }));
     fireEvent.click(screen.getByRole("button", { name: /cancel/i }));
-    await waitFor(() => expect(screen.getByText(/unavailable/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/could not send the cancellation request/i)).toBeInTheDocument());
   });
 
   it("polls session-analysis on the same 4000ms cadence as the session query, so it never goes stale while live", async () => {
@@ -238,6 +239,7 @@ describe("ActiveSessionScreen", () => {
     expect(title).toBeInTheDocument();
     const banner = title.closest(".failure-banner") as HTMLElement;
     expect(banner.style.getPropertyValue("--badge-color")).toBe("var(--gray)");
+    expect(screen.queryByRole("button", { name: /^cancel$/i })).not.toBeInTheDocument();
   });
 
   it("falls back to the session id's embedded timestamp for elapsed when startedAt is absent", async () => {

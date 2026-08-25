@@ -469,6 +469,37 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     expect(run.body.error).toContain("Git worktree");
   });
 
+  it("cancels an adopted active run when the UI addresses it by its real session id", async () => {
+    const realId = "20260825-170000-glimmer-cancellable-fixture";
+    process.env.GLIMMER_FAKE_REAL_ID = realId;
+    try {
+      const created = await request(app)
+        .post("/api/sessions").set("Origin", UI_ORIGIN)
+        .send({ taskContract: validContract, workspace: runWorkspace });
+      expect((await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN)).status).toBe(200);
+
+      // Wait until the gateway has adopted the fixture's real directory;
+      // without that alias the regression (activeRuns keyed by pending id,
+      // UI sending the real id) cannot be exercised.
+      let adopted = false;
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const current = await request(app).get(`/api/sessions/${created.body.id}`);
+        if (current.status === 200 && current.body.id === realId) {
+          adopted = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(adopted).toBe(true);
+
+      const cancelled = await request(app).post(`/api/sessions/${realId}/cancel`).set("Origin", UI_ORIGIN);
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body).toEqual({ cancelled: true });
+    } finally {
+      delete process.env.GLIMMER_FAKE_REAL_ID;
+    }
+  });
+
   it("a second /run call for the same id does not spawn a second process", async () => {
     const createRes = await request(app)
       .post("/api/sessions").set("Origin", UI_ORIGIN)

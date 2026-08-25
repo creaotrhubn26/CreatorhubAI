@@ -735,6 +735,7 @@ pre {
   padding-top: var(--space-3); box-shadow: inset 0 1px 0 var(--border);
 }
 .composer__summary { font-size: var(--fs-xs); color: var(--text-muted); margin: 0; flex: 1; min-width: 0; }
+.composer__intent { font-size: var(--fs-xs); color: var(--text-muted); margin: 0; }
 @media (max-width: 900px) {
   .composer__columns { grid-template-columns: 1fr; }
 }
