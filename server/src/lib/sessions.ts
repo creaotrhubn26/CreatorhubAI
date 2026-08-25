@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
 import { computeDiffHash } from "./git.js";
@@ -8,7 +9,7 @@ import type {
   ArchitecturePlan, ArchitectReview, DeliveryReview, ArchitectEscalation, DeliveryPacket,
   GlimmerTask, HumanAcceptance,
   FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
-  EvidenceIndexEntry, EvidenceEntryResponse, ApprovalRequest,
+  EvidenceIndexEntry, EvidenceEntryResponse, ApprovalRequest, HunkAcceptance,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -645,6 +646,73 @@ export async function writeHumanAcceptance(id: string): Promise<HumanAcceptance>
   const record: HumanAcceptance = { accepted: true, acceptedAt: new Date().toISOString() };
   await fs.writeFile(path.join(sessionsDir(), real, "human-acceptance.json"), JSON.stringify(record), "utf-8");
   return record;
+}
+
+// Any content mutation after the human's click invalidates that judgment.
+// Removing the gateway-owned sidecar makes readSession report the honest
+// state again without changing the orchestrator's independent verification.
+export async function clearHumanAcceptance(id: string): Promise<void> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
+  await fs.rm(path.join(sessionsDir(), real, "human-acceptance.json"), { force: true });
+}
+
+// --- per-hunk acceptance (C2 Diff Review) ---------------------------------
+// Only accepted hunks need persistence: rejecting a hunk removes it from the
+// working-tree diff. IDs come from the canonical server-side git diff, so an
+// edit to that hunk naturally makes an older acceptance irrelevant.
+interface HunkAcceptanceFile {
+  version: 1;
+  acceptances: Record<string, HunkAcceptance>;
+}
+
+const HUNK_ID_RE = /^[a-f0-9]{64}$/;
+
+export async function readHunkAcceptances(id: string): Promise<Record<string, HunkAcceptance>> {
+  const raw = await readSessionJsonFile<Partial<HunkAcceptanceFile>>(id, "hunk-acceptances.json");
+  if (!raw || raw.version !== 1 || !raw.acceptances || typeof raw.acceptances !== "object") return {};
+  const valid: Record<string, HunkAcceptance> = {};
+  for (const [hunkId, record] of Object.entries(raw.acceptances)) {
+    if (
+      HUNK_ID_RE.test(hunkId) && record && record.hunkId === hunkId &&
+      typeof record.path === "string" && typeof record.acceptedAt === "string"
+    ) valid[hunkId] = record;
+  }
+  return valid;
+}
+
+async function writeHunkAcceptances(id: string, acceptances: Record<string, HunkAcceptance>): Promise<void> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
+  const finalPath = path.join(sessionsDir(), real, "hunk-acceptances.json");
+  const tempPath = `${finalPath}.${randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify({ version: 1, acceptances }), { encoding: "utf8", mode: 0o600 });
+  await fs.rename(tempPath, finalPath);
+}
+
+export async function writeHunkAcceptance(id: string, hunkId: string, filePath: string): Promise<HunkAcceptance> {
+  if (!HUNK_ID_RE.test(hunkId) || !filePath) throw new Error("invalid hunk acceptance");
+  const existing = await readHunkAcceptances(id);
+  const prior = existing[hunkId];
+  if (prior?.path === filePath) return prior;
+  const record: HunkAcceptance = { hunkId, path: filePath, acceptedAt: new Date().toISOString() };
+  await writeHunkAcceptances(id, { ...existing, [hunkId]: record });
+  return record;
+}
+
+export async function clearHunkAcceptance(id: string, hunkId: string): Promise<void> {
+  const existing = await readHunkAcceptances(id);
+  if (!Object.prototype.hasOwnProperty.call(existing, hunkId)) return;
+  const next = { ...existing };
+  delete next[hunkId];
+  await writeHunkAcceptances(id, next);
+}
+
+export async function clearHunkAcceptancesForPath(id: string, filePath: string): Promise<void> {
+  const existing = await readHunkAcceptances(id);
+  const next = Object.fromEntries(Object.entries(existing).filter(([, record]) => record.path !== filePath));
+  if (Object.keys(next).length === Object.keys(existing).length) return;
+  await writeHunkAcceptances(id, next);
 }
 
 async function copyGatewayContract(fromId: string, toId: string): Promise<void> {

@@ -12,7 +12,7 @@ import { SystemExplorerScreen } from "./system-explorer/SystemExplorerScreen";
 import * as client from "../api/client";
 
 vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({ changedFiles: [] } as any);
-vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({ diff: "" });
+vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({ diff: "", hunks: [] });
 vi.spyOn(client.glimmerApi, "getStatus").mockResolvedValue({ verification: null } as any);
 vi.spyOn(client.glimmerApi, "getRepositoryMap").mockRejectedValue(new Error("404"));
 vi.spyOn(client.glimmerApi, "getDocGraph").mockResolvedValue(null);

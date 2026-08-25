@@ -4,7 +4,9 @@ import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gitStatus, gitDiff, gitRevertFile, computeDiffHash } from "./git.js";
+import {
+  gitStatus, gitDiff, gitRevertFile, computeDiffHash, parseGitDiffHunks, gitRejectHunk, GitHunkReviewError,
+} from "./git.js";
 
 const exec = promisify(execFile);
 let repo: string;
@@ -58,6 +60,93 @@ describe("gitDiff with an untracked (new) file", () => {
     expect(diff).toContain("-one"); // a.txt tracked modification (set up in beforeAll)
     expect(diff).toContain("+two");
     expect(diff).toContain("+untracked content");
+  });
+});
+
+describe("per-hunk diff review", () => {
+  async function hunkRepo(): Promise<string> {
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-hunk-git-"));
+    await exec("git", ["init", "-q"], { cwd: ws });
+    await exec("git", ["config", "user.email", "t@t.com"], { cwd: ws });
+    await exec("git", ["config", "user.name", "t"], { cwd: ws });
+    await fs.writeFile(path.join(ws, "review.txt"), Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n") + "\n");
+    await exec("git", ["add", "review.txt"], { cwd: ws });
+    await exec("git", ["commit", "-q", "-m", "baseline"], { cwd: ws });
+    return ws;
+  }
+
+  it("parses and reverse-applies only the selected canonical hunk", async () => {
+    const ws = await hunkRepo();
+    try {
+      const lines = (await fs.readFile(path.join(ws, "review.txt"), "utf8")).trimEnd().split("\n");
+      lines[1] = "line 2 changed";
+      lines[24] = "line 25 changed";
+      await fs.writeFile(path.join(ws, "review.txt"), lines.join("\n") + "\n");
+      const hunks = parseGitDiffHunks(await gitDiff(ws, ["review.txt"]));
+      expect(hunks).toHaveLength(2);
+      expect(hunks.every((hunk) => hunk.path === "review.txt")).toBe(true);
+
+      await gitRejectHunk(ws, ["review.txt"], "review.txt", hunks[1].id);
+
+      const content = await fs.readFile(path.join(ws, "review.txt"), "utf8");
+      expect(content).toContain("line 2 changed");
+      expect(content).toContain("line 25\n");
+      expect(content).not.toContain("line 25 changed");
+      expect(parseGitDiffHunks(await gitDiff(ws, ["review.txt"]))).toHaveLength(1);
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a later hunk id stable when an earlier insertion is rejected", async () => {
+    const ws = await hunkRepo();
+    try {
+      const lines = (await fs.readFile(path.join(ws, "review.txt"), "utf8")).trimEnd().split("\n");
+      lines.splice(1, 0, "inserted near start");
+      lines[25] = "line 25 changed";
+      await fs.writeFile(path.join(ws, "review.txt"), lines.join("\n") + "\n");
+      const before = parseGitDiffHunks(await gitDiff(ws, ["review.txt"]));
+      expect(before).toHaveLength(2);
+
+      await gitRejectHunk(ws, ["review.txt"], "review.txt", before[0].id);
+
+      const after = parseGitDiffHunks(await gitDiff(ws, ["review.txt"]));
+      expect(after).toHaveLength(1);
+      expect(after[0].id).toBe(before[1].id);
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an untracked file hunk by removing only that new file", async () => {
+    const ws = await hunkRepo();
+    try {
+      await fs.writeFile(path.join(ws, "brand new.txt"), "first\nsecond\n");
+      const hunks = parseGitDiffHunks(await gitDiff(ws, ["brand new.txt"]));
+      expect(hunks).toHaveLength(1);
+      expect(hunks[0].path).toBe("brand new.txt");
+
+      await gitRejectHunk(ws, ["brand new.txt"], "brand new.txt", hunks[0].id);
+
+      await expect(fs.stat(path.join(ws, "brand new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a stale or unscoped hunk id without changing the file", async () => {
+    const ws = await hunkRepo();
+    try {
+      await fs.writeFile(path.join(ws, "review.txt"), "changed\n");
+      const before = await fs.readFile(path.join(ws, "review.txt"), "utf8");
+      await expect(gitRejectHunk(ws, ["review.txt"], "review.txt", "0".repeat(64)))
+        .rejects.toMatchObject<Partial<GitHunkReviewError>>({ status: 409 });
+      await expect(gitRejectHunk(ws, ["other.txt"], "review.txt", "0".repeat(64)))
+        .rejects.toMatchObject<Partial<GitHunkReviewError>>({ status: 403 });
+      expect(await fs.readFile(path.join(ws, "review.txt"), "utf8")).toBe(before);
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
   });
 });
 

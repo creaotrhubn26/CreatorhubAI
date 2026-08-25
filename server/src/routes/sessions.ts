@@ -7,11 +7,12 @@ import {
   listSessionIds, readSession, readManifestRaw, isValidSessionId,
   resolveSessionId, adoptRealSessionDir, writeGatewayContract,
   readArchitecturePlan, readArchitectReviews, readDeliveryReview, readDeliveryPacket, readSessionTasks,
-  writeHumanAcceptance, readVisualManifest, readVisualFindings,
+  writeHumanAcceptance, clearHumanAcceptance, readVisualManifest, readVisualFindings,
   readTaskOverrides, writeTaskOverride, applyTaskOverrides,
   readEvidenceIndex, readEvidenceEntry, resolveApproval,
+  readHunkAcceptances, writeHunkAcceptance, clearHunkAcceptance, clearHunkAcceptancesForPath,
 } from "../lib/sessions.js";
-import { gitDiff, gitRevertFile } from "../lib/git.js";
+import { gitDiff, gitRevertFile, gitRejectHunk, parseGitDiffHunks, GitHunkReviewError } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
@@ -21,7 +22,7 @@ import {
 import { readWorkspaceFile } from "./workspaces.js";
 import {
   isGlimmerEvent, type TaskContract, type GlimmerSession, type SessionAnalysis, type GlimmerEvent, type RepoMap,
-  type VisualVerification, type RepositorySelection,
+  type VisualVerification, type RepositorySelection, type SessionDiff,
 } from "@glimmer/shared";
 
 export const sessionsRouter = Router();
@@ -593,9 +594,74 @@ sessionsRouter.get("/sessions/:id/diff", async (req, res) => {
     const session = await readSession(req.params.id);
     if (!session) return res.status(404).json({ error: "not found" });
     const diff = await gitDiff(session.workspace, session.changedFiles.map((f) => f.path));
-    res.json({ diff });
+    const acceptances = await readHunkAcceptances(req.params.id);
+    const hunks = parseGitDiffHunks(diff).map(({ patch: _patch, ...hunk }) => {
+      const accepted = acceptances[hunk.id];
+      return {
+        ...hunk,
+        status: accepted?.path === hunk.path ? "accepted" as const : "pending" as const,
+        ...(accepted?.path === hunk.path ? { acceptedAt: accepted.acceptedAt } : {}),
+      };
+    });
+    const body: SessionDiff = { diff, hunks };
+    res.json(body);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.post("/sessions/:id/hunks/:hunkId/accept", async (req, res) => {
+  try {
+    const session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    const targetPath = req.body?.path;
+    if (typeof targetPath !== "string") return res.status(400).json({ error: "path required" });
+    if (!session.changedFiles.some((file) => file.path === targetPath)) {
+      return res.status(403).json({ error: "path is not in this session's changed files" });
+    }
+    const current = parseGitDiffHunks(await gitDiff(session.workspace, [targetPath]));
+    const hunk = current.find((candidate) => candidate.path === targetPath && candidate.id === req.params.hunkId);
+    if (!hunk) return res.status(409).json({ error: "hunk changed; refresh and review again" });
+    const record = await writeHunkAcceptance(req.params.id, hunk.id, hunk.path);
+    res.json({ hunkId: hunk.id, path: hunk.path, decision: "accepted", decidedAt: record.acceptedAt });
+  } catch (err: any) {
+    res.status(500).json({ error: "could not accept hunk" });
+  }
+});
+
+sessionsRouter.post("/sessions/:id/hunks/:hunkId/reject", async (req, res) => {
+  try {
+    const session = await readSession(req.params.id);
+    if (!session) return res.status(404).json({ error: "not found" });
+    const targetPath = req.body?.path;
+    if (typeof targetPath !== "string") return res.status(400).json({ error: "path required" });
+    if (!session.changedFiles.some((file) => file.path === targetPath)) {
+      return res.status(403).json({ error: "path is not in this session's changed files" });
+    }
+    const current = parseGitDiffHunks(await gitDiff(session.workspace, [targetPath]));
+    if (!current.some((candidate) => candidate.path === targetPath && candidate.id === req.params.hunkId)) {
+      return res.status(409).json({ error: "hunk changed; refresh and review again" });
+    }
+    // Clear a prior acceptance before the mutation. If git apply then finds
+    // a race after the canonical check above, the safe outcome is pending
+    // review rather than retaining an acceptance they attempted to reject.
+    await clearHunkAcceptance(req.params.id, req.params.hunkId);
+    const hunk = await gitRejectHunk(
+      session.workspace,
+      session.changedFiles.map((file) => file.path),
+      targetPath,
+      req.params.hunkId,
+    );
+    await clearHumanAcceptance(req.params.id);
+    res.json({
+      hunkId: hunk.id,
+      path: hunk.path,
+      decision: "rejected",
+      decidedAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    if (err instanceof GitHunkReviewError) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: "could not reject hunk" });
   }
 });
 
@@ -608,6 +674,22 @@ sessionsRouter.post("/sessions/:id/accept", async (req, res) => {
   try {
     const session = await readSession(req.params.id);
     if (!session) return res.status(404).json({ error: "not found" });
+    // The UI disables this action while text hunks remain pending, but the
+    // server is the trust boundary: a direct HTTP caller must not bypass the
+    // same review invariant. Binary-only diffs have no text hunks and retain
+    // the existing file-level review fallback.
+    if (session.changedFiles.length > 0) {
+      const diff = await gitDiff(session.workspace, session.changedFiles.map((file) => file.path));
+      const hunks = parseGitDiffHunks(diff);
+      const acceptances = await readHunkAcceptances(req.params.id);
+      const pending = hunks.filter((hunk) => acceptances[hunk.id]?.path !== hunk.path);
+      if (pending.length > 0) {
+        return res.status(409).json({
+          error: "all current text hunks must be accepted first",
+          pendingHunks: pending.length,
+        });
+      }
+    }
     const record = await writeHumanAcceptance(req.params.id);
     res.json(record);
   } catch (err: any) {
@@ -623,6 +705,10 @@ sessionsRouter.post("/sessions/:id/revert-file", async (req, res) => {
     if (typeof targetPath !== "string") return res.status(400).json({ error: "path required" });
     try {
       await gitRevertFile(session.workspace, session.changedFiles.map((f) => f.path), targetPath, session.baselineSha);
+      await Promise.all([
+        clearHunkAcceptancesForPath(req.params.id, targetPath),
+        clearHumanAcceptance(req.params.id),
+      ]);
       res.json({ reverted: targetPath });
     } catch (err: any) {
       res.status(403).json({ error: err.message });

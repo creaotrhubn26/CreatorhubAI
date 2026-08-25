@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import type { ChangedFile, CreateWorkspaceResult } from "@glimmer/shared";
 import { CONFIG } from "../config.js";
@@ -79,6 +80,131 @@ export async function gitDiff(workspace: string, paths: string[] = []): Promise<
   if (tracked.length > 0) parts.push(await git(workspace, ["diff", "--no-color", "--", ...tracked]));
   for (const p of untracked) parts.push(await gitDiffUntrackedFile(workspace, p));
   return parts.filter(Boolean).join("");
+}
+
+export interface ParsedGitDiffHunk {
+  id: string;
+  path: string;
+  header: string;
+  added: number;
+  removed: number;
+  patch: string;
+}
+
+function diffPath(fileHeader: string[]): string | null {
+  for (const line of fileHeader) {
+    if (!line.startsWith("+++ ")) continue;
+    const value = line.slice(4).trim();
+    if (value !== "/dev/null") return value.replace(/^b\//, "");
+  }
+  for (const line of fileHeader) {
+    if (!line.startsWith("--- ")) continue;
+    const value = line.slice(4).trim();
+    if (value !== "/dev/null") return value.replace(/^a\//, "");
+  }
+  return null;
+}
+
+function hunkId(filePath: string, hunkLines: string[]): string {
+  // oldStart is anchored in the baseline side of the diff, so rejecting an
+  // earlier hunk does not renumber a later accepted hunk. The body makes two
+  // changes at the same baseline position distinct.
+  const oldStart = hunkLines[0]?.match(/^@@ -(\d+)/)?.[1] ?? "unknown";
+  return createHash("sha256")
+    .update(filePath)
+    .update("\0")
+    .update(oldStart)
+    .update("\0")
+    .update(hunkLines.slice(1).join("\n"))
+    .digest("hex");
+}
+
+/** Split a canonical git diff into independently reviewable text hunks. */
+export function parseGitDiffHunks(diff: string): ParsedGitDiffHunk[] {
+  if (!diff) return [];
+  const lines = diff.replace(/\n$/, "").split("\n");
+  const hunks: ParsedGitDiffHunk[] = [];
+  let fileHeader: string[] = [];
+  let hunkLines: string[] | null = null;
+
+  function flushHunk() {
+    if (!hunkLines) return;
+    const filePath = diffPath(fileHeader);
+    if (filePath && hunkLines[0]?.startsWith("@@ ")) {
+      const body = hunkLines.slice(1);
+      hunks.push({
+        id: hunkId(filePath, hunkLines),
+        path: filePath,
+        header: hunkLines[0],
+        added: body.filter((line) => line.startsWith("+")).length,
+        removed: body.filter((line) => line.startsWith("-")).length,
+        patch: [...fileHeader, ...hunkLines].join("\n") + "\n",
+      });
+    }
+    hunkLines = null;
+  }
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      flushHunk();
+      fileHeader = [line];
+      continue;
+    }
+    if (line.startsWith("@@ ")) {
+      flushHunk();
+      hunkLines = [line];
+      continue;
+    }
+    if (hunkLines) hunkLines.push(line);
+    else if (fileHeader.length) fileHeader.push(line);
+  }
+  flushHunk();
+  return hunks;
+}
+
+export class GitHunkReviewError extends Error {
+  constructor(message: string, readonly status: 403 | 409) {
+    super(message);
+  }
+}
+
+/** Reverse exactly one hunk from the server's current diff, never client patch text. */
+export async function gitRejectHunk(
+  workspace: string,
+  allowedPaths: string[],
+  targetPath: string,
+  targetHunkId: string,
+): Promise<ParsedGitDiffHunk> {
+  if (!allowedPaths.includes(targetPath)) {
+    throw new GitHunkReviewError(`Refusing to reject a hunk in ${targetPath}: not in this session's changed files`, 403);
+  }
+  const resolved = path.resolve(workspace, targetPath);
+  if (!resolved.startsWith(path.resolve(workspace) + path.sep)) {
+    throw new GitHunkReviewError(`Refusing to reject a hunk in ${targetPath}: resolves outside workspace`, 403);
+  }
+
+  const currentDiff = await gitDiff(workspace, [targetPath]);
+  const hunk = parseGitDiffHunks(currentDiff).find(
+    (candidate) => candidate.path === targetPath && candidate.id === targetHunkId,
+  );
+  if (!hunk) {
+    throw new GitHunkReviewError("This hunk is no longer present in the current diff; refresh and review again", 409);
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-hunk-review-"));
+  const patchFile = path.join(tempDir, `${randomUUID()}.patch`);
+  try {
+    await fs.writeFile(patchFile, hunk.patch, { encoding: "utf8", mode: 0o600 });
+    try {
+      await git(workspace, ["apply", "--reverse", "--recount", "--whitespace=nowarn", "--check", patchFile]);
+      await git(workspace, ["apply", "--reverse", "--recount", "--whitespace=nowarn", patchFile]);
+    } catch {
+      throw new GitHunkReviewError("This hunk no longer applies cleanly; refresh and review again", 409);
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+  return hunk;
 }
 
 // V7 §20 session-level verification freeze — CROSS-LANGUAGE CONTRACT, must

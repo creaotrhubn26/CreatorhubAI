@@ -474,7 +474,19 @@ pre {
 /* ---- diff view: line numbers, mono, +/- tinting ---- */
 .diff-view { font-family: var(--mono); font-size: var(--fs-sm); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border); border-radius: var(--radius); overflow-x: auto; }
 .diff-view__file { padding: var(--space-2) var(--space-3); color: var(--text-secondary); box-shadow: inset 0 -1px 0 var(--border); font-weight: 600; }
-.diff-view__hunk { padding: 2px var(--space-3); color: var(--accent-strong); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.diff-view__hunk {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  white-space: normal;
+}
+.diff-view__hunk > span:first-child { flex: 1; min-width: 0; }
+.diff-view__hunk.accepted { background: color-mix(in srgb, var(--green) 10%, transparent); }
+.diff-view__hunk-stats, .diff-view__hunk-status { color: var(--text-secondary); font-size: var(--fs-xs); }
+.diff-view__hunk button { padding: 3px 8px; font-size: var(--fs-xs); }
 .diff-view__line { display: flex; white-space: pre; }
 .diff-view__line.add { background: color-mix(in srgb, var(--green) 16%, transparent); }
 .diff-view__line.del { background: color-mix(in srgb, var(--red) 16%, transparent); }
