@@ -176,9 +176,9 @@ API_BASE = os.environ.get(
     "http://127.0.0.1:8080",
 )
 
-API_KEY_FILE = (
-    Path.home()
-    / "AI/muse-glimmer/config/api-key.txt"
+API_KEY_FILE = Path(
+    os.environ.get("GLIMMER_API_KEY_FILE")
+    or (Path.home() / "AI/muse-glimmer/config/api-key.txt")
 )
 
 MAX_TOOL_RESULT = 28000
