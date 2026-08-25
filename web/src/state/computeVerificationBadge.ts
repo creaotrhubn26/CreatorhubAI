@@ -1,8 +1,9 @@
 import type { VerificationCheckResult } from "@glimmer/shared";
 
-export function computeVerificationBadge(
-  check: VerificationCheckResult
-): { label: string; tone: "pass" | "fail" | "baseline-ok" | "not-run" } {
+export function computeVerificationBadge(check: VerificationCheckResult): {
+  label: string;
+  tone: "pass" | "fail" | "baseline-ok" | "not-run";
+} {
   // A check that never ran is neither a pass nor a failure — must never fall
   // through to the ok:false -> FAIL branch below, or "didn't run" reads as
   // "ran and failed".

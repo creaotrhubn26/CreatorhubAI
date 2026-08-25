@@ -22,7 +22,15 @@ const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
 // contract said. Closed set, same defense-in-depth posture as
 // TOOLCHAIN_MODES -- an out-of-range string from a raw API client is
 // dropped, never forwarded.
-const MODES = new Set(["inspect", "plan", "implement", "debug", "test", "review", "refactor"] as const);
+const MODES = new Set([
+  "inspect",
+  "plan",
+  "implement",
+  "debug",
+  "test",
+  "review",
+  "refactor",
+] as const);
 // Review MJ4: TaskContract.scope was never forwarded either -- buildArgs
 // emitted no --scope-* flag at all, so glimmer-v2.py's argparse default
 // (scope-package=repository, no area, no paths) applied to EVERY
@@ -33,7 +41,13 @@ const MODES = new Set(["inspect", "plan", "implement", "debug", "test", "review"
 // the user picked are never named in its prompt. Same closed-set posture as
 // MODES/TOOLCHAIN_MODES -- mirrors glimmer-v2.py's own --scope-package
 // choices, and a value outside it is dropped rather than forwarded.
-const SCOPE_PACKAGES = new Set(["repository", "frontend", "backend", "directory", "files"] as const);
+const SCOPE_PACKAGES = new Set([
+  "repository",
+  "frontend",
+  "backend",
+  "directory",
+  "files",
+] as const);
 const MAX_TURNS_RANGE = { min: 1, max: 64 };
 const TIMEOUT_RANGE = { min: 60, max: 3600 };
 // Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles closed range.
@@ -43,8 +57,11 @@ const MAX_CHANGED_FILES_RANGE = { min: 1, max: 500 };
 // glimmer-v2.py's CUSTOMER_READINESS_ORDER -- a membership check only, the
 // ORDER itself lives in glimmer-v2.py's own compare_customer_readiness.
 const CUSTOMER_READINESS_VALUES = new Set([
-  "ready_to_ship", "ready_with_known_limitations", "needs_polish",
-  "needs_rework", "not_customer_ready",
+  "ready_to_ship",
+  "ready_with_known_limitations",
+  "needs_polish",
+  "needs_rework",
+  "not_customer_ready",
 ]);
 
 function isValidModelReadinessUrl(value: string): boolean {
@@ -80,12 +97,16 @@ export function validateAdvanced(contract: TaskContract): string | null {
   // above), not nested under `advanced`, so it must never be skipped when a
   // request carries qualityGates but no advanced controls at all.
   const qualityGates = contract.qualityGates;
-  if (qualityGates?.customerReadinessRequired !== undefined
-      && typeof qualityGates.customerReadinessRequired !== "boolean") {
+  if (
+    qualityGates?.customerReadinessRequired !== undefined &&
+    typeof qualityGates.customerReadinessRequired !== "boolean"
+  ) {
     return "qualityGates.customerReadinessRequired must be a boolean";
   }
-  if (qualityGates?.minimumCustomerReadiness !== undefined
-      && !CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)) {
+  if (
+    qualityGates?.minimumCustomerReadiness !== undefined &&
+    !CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)
+  ) {
     return `qualityGates.minimumCustomerReadiness must be one of ${[...CUSTOMER_READINESS_VALUES].join(", ")}`;
   }
   const advanced = contract.advanced;
@@ -96,7 +117,10 @@ export function validateAdvanced(contract: TaskContract): string | null {
   if (advanced.toolchainMode !== undefined && !TOOLCHAIN_MODES.has(advanced.toolchainMode)) {
     return `toolchainMode must be one of ${[...TOOLCHAIN_MODES].join(", ")}`;
   }
-  if (advanced.modelReadinessUrl !== undefined && !isValidModelReadinessUrl(advanced.modelReadinessUrl)) {
+  if (
+    advanced.modelReadinessUrl !== undefined &&
+    !isValidModelReadinessUrl(advanced.modelReadinessUrl)
+  ) {
     return "modelReadinessUrl must be a valid http(s) URL";
   }
   if (advanced.architectFirst !== undefined && typeof advanced.architectFirst !== "boolean") {
@@ -134,7 +158,10 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   }
   if (contract.intent?.kind === "improvement-assessment" || contract.intent?.kind === "direct") {
     args.push("--intent", contract.intent.kind);
-    if (contract.intent.source === "explicit" || contract.intent.source === "deterministic-inference") {
+    if (
+      contract.intent.source === "explicit" ||
+      contract.intent.source === "deterministic-inference"
+    ) {
       args.push("--intent-source", contract.intent.source);
     }
   }
@@ -174,7 +201,10 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   if (advanced?.toolchainMode !== undefined && TOOLCHAIN_MODES.has(advanced.toolchainMode)) {
     args.push("--toolchain-mode", advanced.toolchainMode);
   }
-  if (advanced?.modelReadinessUrl !== undefined && isValidModelReadinessUrl(advanced.modelReadinessUrl)) {
+  if (
+    advanced?.modelReadinessUrl !== undefined &&
+    isValidModelReadinessUrl(advanced.modelReadinessUrl)
+  ) {
     args.push("--model-readiness-url", advanced.modelReadinessUrl);
   }
   if (advanced?.architectFirst === true) {
@@ -188,8 +218,10 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   if (qualityGates?.customerReadinessRequired === true) {
     args.push("--customer-readiness-required");
   }
-  if (qualityGates?.minimumCustomerReadiness !== undefined
-      && CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)) {
+  if (
+    qualityGates?.minimumCustomerReadiness !== undefined &&
+    CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)
+  ) {
     args.push("--minimum-customer-readiness", qualityGates.minimumCustomerReadiness);
   }
 
@@ -213,13 +245,15 @@ export function runGlimmer(
   sessionDir: string,
   engineerScriptPath: string,
   args: string[],
-  onExit: (code: number | null) => void
+  onExit: (code: number | null) => void,
 ) {
   const logPath = path.join(sessionDir, "engineer-00.log");
   const log = createWriteStream(logPath, { flags: "a" });
   const isNodeFixture = engineerScriptPath.endsWith(".mjs");
   const child = isNodeFixture
-    ? spawn(process.execPath, [engineerScriptPath, ...args], { detached: process.platform !== "win32" })
+    ? spawn(process.execPath, [engineerScriptPath, ...args], {
+        detached: process.platform !== "win32",
+      })
     : spawn("python3", [engineerScriptPath, ...args], { detached: process.platform !== "win32" });
 
   let settled = false;

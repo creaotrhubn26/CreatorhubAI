@@ -19,7 +19,10 @@ export function completionTitle(base: string, unseenCount: number): string {
 // running in `prev` and are no longer running in `next`. An id with no
 // entry in `prev` (new to this poll) can't have "transitioned", so it's
 // skipped rather than treated as a completion.
-export function newlyCompleted(prev: Record<string, string>, next: Record<string, string>): string[] {
+export function newlyCompleted(
+  prev: Record<string, string>,
+  next: Record<string, string>,
+): string[] {
   const ids: string[] = [];
   for (const [id, status] of Object.entries(next)) {
     const prevStatus = prev[id];
@@ -31,6 +34,10 @@ export function newlyCompleted(prev: Record<string, string>, next: Record<string
 // Single gate for "does this completion count as unseen" — shared by both
 // the title badge and the system notification, so a session finishing
 // while its own tab is open and the window is focused triggers neither.
-export function isUnseenCompletion(id: string, activeSessionId: string | undefined, hidden: boolean): boolean {
+export function isUnseenCompletion(
+  id: string,
+  activeSessionId: string | undefined,
+  hidden: boolean,
+): boolean {
   return id !== activeSessionId || hidden;
 }

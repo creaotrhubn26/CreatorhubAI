@@ -11,7 +11,9 @@ let notARepo: string;
 beforeAll(async () => {
   notARepo = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-wc-notrepo-"));
   process.env.GLIMMER_SOURCE_REPO = notARepo;
-  process.env.GLIMMER_WORKTREE_ROOT = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-wc-notrepo-worktrees-"));
+  process.env.GLIMMER_WORKTREE_ROOT = await fs.mkdtemp(
+    path.join(os.tmpdir(), "glimmer-wc-notrepo-worktrees-"),
+  );
 });
 
 afterAll(async () => {

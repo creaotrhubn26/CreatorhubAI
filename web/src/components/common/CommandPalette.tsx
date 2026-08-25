@@ -2,8 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { filterCommands, type PaletteCommand } from "../../state/paletteCommands";
 
 export function CommandPalette({
-  commands, placeholder = "Type a command…", onClose,
-}: { commands: PaletteCommand[]; placeholder?: string; onClose: () => void }) {
+  commands,
+  placeholder = "Type a command…",
+  onClose,
+}: {
+  commands: PaletteCommand[];
+  placeholder?: string;
+  onClose: () => void;
+}) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -38,7 +44,12 @@ export function CommandPalette({
 
   return (
     <div className="ide-palette-overlay" onMouseDown={onClose}>
-      <div className="ide-palette" role="dialog" aria-modal="true" onMouseDown={(e) => e.stopPropagation()}>
+      <div
+        className="ide-palette"
+        role="dialog"
+        aria-modal="true"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         <input
           ref={inputRef}
           className="ide-palette__input"
@@ -52,14 +63,29 @@ export function CommandPalette({
           data-palette-input="true"
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "ArrowDown") { e.preventDefault(); setSelected((s) => Math.min(s + 1, filtered.length - 1)); }
-            else if (e.key === "ArrowUp") { e.preventDefault(); setSelected((s) => Math.max(s - 1, 0)); }
-            else if (e.key === "Enter") { e.preventDefault(); run(selected); }
-            else if (e.key === "Escape") { e.preventDefault(); onClose(); }
-            else if (e.key === "Tab") { e.preventDefault(); }
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              setSelected((s) => Math.min(s + 1, filtered.length - 1));
+            } else if (e.key === "ArrowUp") {
+              e.preventDefault();
+              setSelected((s) => Math.max(s - 1, 0));
+            } else if (e.key === "Enter") {
+              e.preventDefault();
+              run(selected);
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              onClose();
+            } else if (e.key === "Tab") {
+              e.preventDefault();
+            }
           }}
         />
-        <ul id="ide-palette-listbox" className="ide-palette__list" role="listbox" aria-label="Commands">
+        <ul
+          id="ide-palette-listbox"
+          className="ide-palette__list"
+          role="listbox"
+          aria-label="Commands"
+        >
           {filtered.length === 0 && <li className="ide-palette__empty">No matches</li>}
           {filtered.map((c, i) => (
             <li

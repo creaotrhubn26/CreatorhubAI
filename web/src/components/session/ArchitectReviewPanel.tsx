@@ -11,7 +11,13 @@ const DECISION_COLOR: Record<ArchitectReviewDecision, string> = {
   HUMAN_REVIEW_REQUIRED: "var(--red)",
 };
 
-export function ArchitectReviewPanel({ sessionId, gates }: { sessionId: string; gates?: GlimmerSession["gates"] }) {
+export function ArchitectReviewPanel({
+  sessionId,
+  gates,
+}: {
+  sessionId: string;
+  gates?: GlimmerSession["gates"];
+}) {
   // Reviews are opt-in artifacts written once per round, not a live stream —
   // fetch once, same as the architecture plan.
   const { data: reviews } = useQuery({
@@ -27,7 +33,11 @@ export function ArchitectReviewPanel({ sessionId, gates }: { sessionId: string; 
   if (!gates && !reviews?.length) return null;
 
   const gateText = gates
-    ? gates.architectureApproved === true ? "approved" : gates.architectureApproved === false ? "rejected" : "not reviewed"
+    ? gates.architectureApproved === true
+      ? "approved"
+      : gates.architectureApproved === false
+        ? "rejected"
+        : "not reviewed"
     : null;
 
   const latest = reviews?.[0];
@@ -59,17 +69,30 @@ export function ArchitectReviewPanel({ sessionId, gates }: { sessionId: string; 
                   {review.decision}
                 </span>{" "}
                 <span>Confidence: {review.confidence}</span>
-                {review.reviewFailed && <p>Review failed to generate{review.reviewFailureReason ? `: ${review.reviewFailureReason}` : "."}</p>}
+                {review.reviewFailed && (
+                  <p>
+                    Review failed to generate
+                    {review.reviewFailureReason ? `: ${review.reviewFailureReason}` : "."}
+                  </p>
+                )}
                 {!!review.findings?.length && (
                   <>
                     <h4>Findings</h4>
-                    <ul>{review.findings.map((f, j) => <li key={j}>{f}</li>)}</ul>
+                    <ul>
+                      {review.findings.map((f, j) => (
+                        <li key={j}>{f}</li>
+                      ))}
+                    </ul>
                   </>
                 )}
                 {!!review.requiredChanges?.length && (
                   <>
                     <h4>Required changes</h4>
-                    <ul>{review.requiredChanges.map((c, j) => <li key={j}>{c}</li>)}</ul>
+                    <ul>
+                      {review.requiredChanges.map((c, j) => (
+                        <li key={j}>{c}</li>
+                      ))}
+                    </ul>
                   </>
                 )}
               </div>

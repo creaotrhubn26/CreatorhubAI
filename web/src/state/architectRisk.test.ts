@@ -10,7 +10,13 @@ const BASE: TaskContract = {
   objective: "add a dashboard widget",
   scope: { package: "frontend" },
   mode: "implement",
-  constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+  constraints: {
+    minimalChange: true,
+    noCommit: true,
+    noPush: true,
+    noDeploy: true,
+    noDependencyInstall: true,
+  },
   verification: [],
   repairBudget: 2,
 };
@@ -58,7 +64,9 @@ describe("computeArchitectRisk", () => {
   });
 
   it("protected_area_keyword is exact-token, not substring (author must not match auth)", () => {
-    expect(computeArchitectRisk({ ...BASE, objective: "credit the author of this module" })).toEqual({
+    expect(
+      computeArchitectRisk({ ...BASE, objective: "credit the author of this module" }),
+    ).toEqual({
       score: 0,
       signals: [],
     });
@@ -87,10 +95,12 @@ describe("computeArchitectRisk", () => {
   });
 
   it("any single signal alone stays below the threshold", () => {
-    expect(computeArchitectRisk({ ...BASE, mode: "refactor" }).score).toBeLessThan(ARCHITECT_RISK_THRESHOLD);
-    expect(computeArchitectRisk({ ...BASE, objective: "migrate the payment schema" }).score).toBeLessThan(
-      ARCHITECT_RISK_THRESHOLD
+    expect(computeArchitectRisk({ ...BASE, mode: "refactor" }).score).toBeLessThan(
+      ARCHITECT_RISK_THRESHOLD,
     );
+    expect(
+      computeArchitectRisk({ ...BASE, objective: "migrate the payment schema" }).score,
+    ).toBeLessThan(ARCHITECT_RISK_THRESHOLD);
   });
 
   it("stacks every reachable signal additively, in table order", () => {
@@ -103,7 +113,12 @@ describe("computeArchitectRisk", () => {
     });
     expect(result).toEqual({
       score: 10,
-      signals: ["mode_refactor", "multi_package_scope", "candidate_count_high", "protected_area_keyword"],
+      signals: [
+        "mode_refactor",
+        "multi_package_scope",
+        "candidate_count_high",
+        "protected_area_keyword",
+      ],
     });
   });
 });

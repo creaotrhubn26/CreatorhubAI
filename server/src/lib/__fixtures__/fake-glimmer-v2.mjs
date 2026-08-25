@@ -18,14 +18,25 @@ if (shouldStayRunning && stateRoot && canonicalId) {
   const manifestPath = path.join(dir, "manifest.json");
   const startedAt = new Date().toISOString();
   const manifest = {
-    sessionId: canonicalId, task: "cancellable fixture", status: "initialized", workspace,
-    branch: "glimmer/cancellable-fixture", baseline: null, attempts: [], startedAt,
+    sessionId: canonicalId,
+    task: "cancellable fixture",
+    status: "initialized",
+    workspace,
+    branch: "glimmer/cancellable-fixture",
+    baseline: null,
+    attempts: [],
+    startedAt,
   };
   writeFileSync(manifestPath, JSON.stringify(manifest));
   process.on("SIGTERM", () => {
-    writeFileSync(manifestPath, JSON.stringify({
-      ...manifest, status: "cancelled-sigterm", updatedAt: new Date().toISOString(),
-    }));
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        ...manifest,
+        status: "cancelled-sigterm",
+        updatedAt: new Date().toISOString(),
+      }),
+    );
     process.exit(0);
   });
   setInterval(() => {}, 1_000);

@@ -22,8 +22,20 @@ function openPanel() {
 describe("TasksPanel", () => {
   it("renders the flat task list with id, kind, description, and status", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },
-      { id: "t6", description: "Manual smoke test", kind: "verification", dependsOn: ["t4"], status: "pending" },
+      {
+        id: "t1",
+        description: "Inspect src/greet.js",
+        kind: "implementation",
+        dependsOn: [],
+        status: "complete",
+      },
+      {
+        id: "t6",
+        description: "Manual smoke test",
+        kind: "verification",
+        dependsOn: ["t4"],
+        status: "pending",
+      },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" />));
 
@@ -44,12 +56,16 @@ describe("TasksPanel", () => {
     render(withQuery(<TasksPanel sessionId="s1" />));
 
     await waitFor(() => expect(screen.getByText("pending")).toBeInTheDocument());
-    const styles = ["pending", "in_progress", "complete", "failed"].map((s) => screen.getByText(s).getAttribute("style"));
+    const styles = ["pending", "in_progress", "complete", "failed"].map((s) =>
+      screen.getByText(s).getAttribute("style"),
+    );
     expect(new Set(styles).size).toBe(4);
   });
 
   it("renders nothing when the tasks artifact 404s (absence is normal)", async () => {
-    vi.spyOn(client.glimmerApi, "getSessionTasks").mockRejectedValue(new Error("GET .../tasks failed: 404"));
+    vi.spyOn(client.glimmerApi, "getSessionTasks").mockRejectedValue(
+      new Error("GET .../tasks failed: 404"),
+    );
     const { container } = render(withQuery(<TasksPanel sessionId="s1" />));
 
     await waitFor(() => expect(client.glimmerApi.getSessionTasks).toHaveBeenCalled());
@@ -58,10 +74,34 @@ describe("TasksPanel", () => {
 
   it("groups tasks by kind, in implementation/verification/repair/documentation order", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t4", description: "Doc impact", kind: "documentation", dependsOn: [], status: "pending" },
-      { id: "t3", description: "Fix regression", kind: "repair", dependsOn: [], status: "in_progress" },
-      { id: "t2", description: "Run tests", kind: "verification", dependsOn: [], status: "pending" },
-      { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "complete" },
+      {
+        id: "t4",
+        description: "Doc impact",
+        kind: "documentation",
+        dependsOn: [],
+        status: "pending",
+      },
+      {
+        id: "t3",
+        description: "Fix regression",
+        kind: "repair",
+        dependsOn: [],
+        status: "in_progress",
+      },
+      {
+        id: "t2",
+        description: "Run tests",
+        kind: "verification",
+        dependsOn: [],
+        status: "pending",
+      },
+      {
+        id: "t1",
+        description: "Add hook",
+        kind: "implementation",
+        dependsOn: [],
+        status: "complete",
+      },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" />));
     await waitFor(() => expect(screen.getByText("Add hook")).toBeInTheDocument());
@@ -73,9 +113,30 @@ describe("TasksPanel", () => {
 
   it("shows priority badges: required filled, recommended text, optional muted", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t1", description: "a", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
-      { id: "t2", description: "b", kind: "implementation", dependsOn: [], status: "pending", priority: "recommended" },
-      { id: "t3", description: "c", kind: "implementation", dependsOn: [], status: "pending", priority: "optional" },
+      {
+        id: "t1",
+        description: "a",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        priority: "required",
+      },
+      {
+        id: "t2",
+        description: "b",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        priority: "recommended",
+      },
+      {
+        id: "t3",
+        description: "c",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        priority: "optional",
+      },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" />));
     await waitFor(() => expect(screen.getByText("required")).toBeInTheDocument());
@@ -88,8 +149,13 @@ describe("TasksPanel", () => {
   it("renders blockingReason, affectedFiles, and createdBecause", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
       {
-        id: "t1", description: "Fix login", kind: "repair", dependsOn: [], status: "in_progress",
-        blockingReason: "check failed: npm test", affectedFiles: ["src/a.ts", "src/b.ts"],
+        id: "t1",
+        description: "Fix login",
+        kind: "repair",
+        dependsOn: [],
+        status: "in_progress",
+        blockingReason: "check failed: npm test",
+        affectedFiles: ["src/a.ts", "src/b.ts"],
         createdBecause: "npm test",
       },
     ]);
@@ -101,8 +167,20 @@ describe("TasksPanel", () => {
 
   it("toggles between list (grouped) and graph (dependency columns) views", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "complete" },
-      { id: "t2", description: "Run tests", kind: "verification", dependsOn: ["t1"], status: "pending" },
+      {
+        id: "t1",
+        description: "Add hook",
+        kind: "implementation",
+        dependsOn: [],
+        status: "complete",
+      },
+      {
+        id: "t2",
+        description: "Run tests",
+        kind: "verification",
+        dependsOn: ["t1"],
+        status: "pending",
+      },
     ]);
     const { container } = render(withQuery(<TasksPanel sessionId="s1" />));
     await waitFor(() => expect(screen.getByText("Add hook")).toBeInTheDocument());
@@ -122,9 +200,18 @@ describe("TasksPanel", () => {
 
   it("fires skip/approve mutations and shows the recorded human override instead of buttons", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t1", description: "Optional cleanup", kind: "implementation", dependsOn: [], status: "pending", priority: "optional" },
+      {
+        id: "t1",
+        description: "Optional cleanup",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        priority: "optional",
+      },
     ]);
-    const skipSpy = vi.spyOn(client.glimmerApi, "skipTask").mockResolvedValue({ taskId: "t1", action: "skip", at: "2026-01-01T00:00:00Z" });
+    const skipSpy = vi
+      .spyOn(client.glimmerApi, "skipTask")
+      .mockResolvedValue({ taskId: "t1", action: "skip", at: "2026-01-01T00:00:00Z" });
     render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
     await waitFor(() => expect(screen.getByText("Optional cleanup")).toBeInTheDocument());
     openPanel();
@@ -136,8 +223,13 @@ describe("TasksPanel", () => {
   it("hides Skip/Approve buttons once a task already carries a human override", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
       {
-        id: "t1", description: "Already skipped", kind: "implementation", dependsOn: [], status: "skipped",
-        priority: "optional", override: { action: "skip", at: "2026-01-01T00:00:00Z" },
+        id: "t1",
+        description: "Already skipped",
+        kind: "implementation",
+        dependsOn: [],
+        status: "skipped",
+        priority: "optional",
+        override: { action: "skip", at: "2026-01-01T00:00:00Z" },
       },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
@@ -151,7 +243,14 @@ describe("TasksPanel", () => {
 
   it("hides Skip/Approve buttons when the session is terminal (verified/failed/blocked/cancelled)", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
+      {
+        id: "t1",
+        description: "Add hook",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        priority: "required",
+      },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" session={{ status: "verified" } as any} />));
     await waitFor(() => expect(screen.getByText("Add hook")).toBeInTheDocument());
@@ -165,7 +264,14 @@ describe("TasksPanel", () => {
   // Approve visible only to hide them once the real status arrives.
   it("hides Skip/Approve buttons while the session hasn't loaded yet (no button flash)", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
-      { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
+      {
+        id: "t1",
+        description: "Add hook",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        priority: "required",
+      },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" />)); // no session prop at all -- "still loading"
     await waitFor(() => expect(screen.getByText("Add hook")).toBeInTheDocument());
@@ -181,8 +287,13 @@ describe("TasksPanel", () => {
   it("shows 'takes effect on the next run' once an override is recorded on an already-terminal session", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
       {
-        id: "t1", description: "Needs a human call", kind: "verification", dependsOn: [], status: "skipped",
-        priority: "optional", override: { action: "skip", at: "2026-01-01T00:00:00Z" },
+        id: "t1",
+        description: "Needs a human call",
+        kind: "verification",
+        dependsOn: [],
+        status: "skipped",
+        priority: "optional",
+        override: { action: "skip", at: "2026-01-01T00:00:00Z" },
       },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" session={{ status: "needs_review" } as any} />));
@@ -195,8 +306,13 @@ describe("TasksPanel", () => {
   it("does NOT show the 'takes effect on the next run' note while the session is still live", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
       {
-        id: "t1", description: "Mid-run call", kind: "verification", dependsOn: [], status: "skipped",
-        priority: "optional", override: { action: "skip", at: "2026-01-01T00:00:00Z" },
+        id: "t1",
+        description: "Mid-run call",
+        kind: "verification",
+        dependsOn: [],
+        status: "skipped",
+        priority: "optional",
+        override: { action: "skip", at: "2026-01-01T00:00:00Z" },
       },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
@@ -213,7 +329,11 @@ describe("TasksPanel", () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
       { id: "t1", description: "a", kind: "implementation", dependsOn: [], status: "complete" },
       {
-        id: "t2", description: "b", kind: "implementation", dependsOn: [], status: "complete",
+        id: "t2",
+        description: "b",
+        kind: "implementation",
+        dependsOn: [],
+        status: "complete",
         override: { action: "approve", at: "2026-01-01T00:00:00Z" },
       },
     ]);
@@ -235,12 +355,23 @@ describe("TasksPanel", () => {
   it("shows an honest note and leaves the task unchanged when its override no longer matches (stale/id-recycled)", async () => {
     vi.spyOn(client.glimmerApi, "getSessionTasks").mockResolvedValue([
       {
-        id: "t1", description: "Add telemetry for the new flow", kind: "implementation", dependsOn: [], status: "pending",
-        staleOverride: { action: "skip", at: "2026-01-01T00:00:00Z", kind: "verification", description: "Run the old tests" },
+        id: "t1",
+        description: "Add telemetry for the new flow",
+        kind: "implementation",
+        dependsOn: [],
+        status: "pending",
+        staleOverride: {
+          action: "skip",
+          at: "2026-01-01T00:00:00Z",
+          kind: "verification",
+          description: "Run the old tests",
+        },
       },
     ]);
     render(withQuery(<TasksPanel sessionId="s1" session={{ status: "implementing" } as any} />));
-    await waitFor(() => expect(screen.getByText("Add telemetry for the new flow")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText("Add telemetry for the new flow")).toBeInTheDocument(),
+    );
     openPanel();
 
     expect(screen.getByText("pending")).toBeInTheDocument();

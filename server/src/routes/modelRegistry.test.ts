@@ -58,7 +58,10 @@ describe("model registry API", () => {
     expect(res.body.source).toBe("default");
     expect(res.body.models).toHaveLength(1);
     expect(res.body.roles).toEqual({
-      engineer: "local", architect: "local", consult: "local", vision: "local",
+      engineer: "local",
+      architect: "local",
+      consult: "local",
+      vision: "local",
     });
     expect(JSON.stringify(res.body)).not.toContain("apiKeyFile");
     expect(res.body.models[0]).toHaveProperty("hasApiKey");
@@ -94,7 +97,10 @@ describe("model registry API", () => {
   });
 
   it("preserves a stored key when the update leaves the key blank", async () => {
-    await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(registryUpdate("first-key"));
+    await request(app)
+      .put("/api/models/config")
+      .set("Origin", UI_ORIGIN)
+      .send(registryUpdate("first-key"));
 
     const saved = await request(app)
       .put("/api/models/config")
@@ -108,11 +114,17 @@ describe("model registry API", () => {
   });
 
   it("clears only the gateway-owned key file when requested", async () => {
-    await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(registryUpdate("remove-me"));
+    await request(app)
+      .put("/api/models/config")
+      .set("Origin", UI_ORIGIN)
+      .send(registryUpdate("remove-me"));
     const update = registryUpdate() as any;
     update.models[1].clearApiKey = true;
 
-    const saved = await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(update);
+    const saved = await request(app)
+      .put("/api/models/config")
+      .set("Origin", UI_ORIGIN)
+      .send(update);
 
     expect(saved.status).toBe(200);
     expect(saved.body.models.find((model: any) => model.id === "frontier").hasApiKey).toBe(false);
@@ -122,23 +134,39 @@ describe("model registry API", () => {
   it("detaches but never deletes a manually managed key path", async () => {
     const manualKey = path.join(stateRoot, "manually-managed.key");
     await fs.writeFile(manualKey, "keep-me\n", { mode: 0o600 });
-    await fs.writeFile(path.join(stateRoot, "models.json"), JSON.stringify({
-      version: 1,
-      models: [{
-        id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080",
-        modelId: "local-model", apiKeyFile: manualKey,
-      }],
-      roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
-    }));
+    await fs.writeFile(
+      path.join(stateRoot, "models.json"),
+      JSON.stringify({
+        version: 1,
+        models: [
+          {
+            id: "local",
+            label: "Local",
+            baseUrl: "http://127.0.0.1:8080",
+            modelId: "local-model",
+            apiKeyFile: manualKey,
+          },
+        ],
+        roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
+      }),
+    );
 
     const update = {
-      models: [{
-        id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080",
-        modelId: "local-model", clearApiKey: true,
-      }],
+      models: [
+        {
+          id: "local",
+          label: "Local",
+          baseUrl: "http://127.0.0.1:8080",
+          modelId: "local-model",
+          clearApiKey: true,
+        },
+      ],
       roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
     };
-    const saved = await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(update);
+    const saved = await request(app)
+      .put("/api/models/config")
+      .set("Origin", UI_ORIGIN)
+      .send(update);
 
     expect(saved.status).toBe(200);
     expect(saved.body.models[0].hasApiKey).toBe(false);
@@ -148,12 +176,27 @@ describe("model registry API", () => {
   it("keeps case-distinct registry ids in distinct key files on macOS", async () => {
     const update = {
       models: [
-        { id: "Cloud", label: "Upper", baseUrl: "https://upper.example.test/v1", modelId: "upper", apiKey: "upper-key" },
-        { id: "cloud", label: "Lower", baseUrl: "https://lower.example.test/v1", modelId: "lower", apiKey: "lower-key" },
+        {
+          id: "Cloud",
+          label: "Upper",
+          baseUrl: "https://upper.example.test/v1",
+          modelId: "upper",
+          apiKey: "upper-key",
+        },
+        {
+          id: "cloud",
+          label: "Lower",
+          baseUrl: "https://lower.example.test/v1",
+          modelId: "lower",
+          apiKey: "lower-key",
+        },
       ],
       roles: { engineer: "Cloud", architect: "cloud", consult: "Cloud", vision: "cloud" },
     };
-    const saved = await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(update);
+    const saved = await request(app)
+      .put("/api/models/config")
+      .set("Origin", UI_ORIGIN)
+      .send(update);
     expect(saved.status).toBe(200);
 
     const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "models.json"), "utf8"));
@@ -166,15 +209,25 @@ describe("model registry API", () => {
   it("rejects duplicate ids, unsafe URLs, and roles that reference unknown models", async () => {
     const duplicate = registryUpdate();
     duplicate.models[1].id = "local";
-    expect((await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(duplicate)).status).toBe(400);
+    expect(
+      (await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(duplicate))
+        .status,
+    ).toBe(400);
 
     const unsafe = registryUpdate();
     unsafe.models[1].baseUrl = "https://user:pass@models.example.test/v1";
-    expect((await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(unsafe)).status).toBe(400);
+    expect(
+      (await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(unsafe)).status,
+    ).toBe(400);
 
     const unknownRole = registryUpdate() as any;
     unknownRole.roles.architect = "missing";
-    expect((await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(unknownRole)).status).toBe(400);
-    await expect(fs.stat(path.join(stateRoot, "models.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      (await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(unknownRole))
+        .status,
+    ).toBe(400);
+    await expect(fs.stat(path.join(stateRoot, "models.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });

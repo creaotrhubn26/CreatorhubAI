@@ -4,7 +4,11 @@ import { glimmerApi } from "../../api/client";
 import { absolutePath, fileHref } from "../../state/fileLink";
 
 export function RepositoryMapScreen() {
-  const { data, isError } = useQuery({ queryKey: ["repo-map"], queryFn: glimmerApi.getRepositoryMap, retry: false });
+  const { data, isError } = useQuery({
+    queryKey: ["repo-map"],
+    queryFn: glimmerApi.getRepositoryMap,
+    retry: false,
+  });
 
   if (isError || !data) return <div>Unavailable</div>;
 

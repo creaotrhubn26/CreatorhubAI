@@ -105,7 +105,12 @@ async function doStart(): Promise<{ pid: number } | { error: string }> {
   const fd = openSync(logPath(), "a");
   try {
     const child = spawn(script, [], { stdio: ["ignore", fd, fd], detached: true });
-    const record: Spawned = { pid: child.pid ?? -1, startedAt: new Date().toISOString(), alive: true, exitCode: null };
+    const record: Spawned = {
+      pid: child.pid ?? -1,
+      startedAt: new Date().toISOString(),
+      alive: true,
+      exitCode: null,
+    };
     spawned = record;
     child.on("exit", (code) => {
       record.alive = false;
@@ -141,7 +146,10 @@ export async function stopModelServer(): Promise<{ error?: string; pidStillAlive
   const script = CONFIG.modelStopScript;
   const pid = spawned && processAlive(spawned.pid) ? spawned.pid : null;
   if (!(await executable(script))) {
-    return { error: `model stop script not found or not executable: ${script}`, pidStillAlive: pid !== null };
+    return {
+      error: `model stop script not found or not executable: ${script}`,
+      pidStillAlive: pid !== null,
+    };
   }
 
   let error: string | undefined;
@@ -179,7 +187,7 @@ export function forgetSpawned(): void {
 }
 
 export async function describeRunState(
-  probe: ModelStatus
+  probe: ModelStatus,
 ): Promise<Pick<ModelStatus, "runState" | "exitCode" | "logTail">> {
   // /health answered 200 (or 401/403 — up, just auth-gated). Only this is ONLINE.
   if (probe.status === "ONLINE" || probe.status === "REACHABLE_AUTH") return { runState: "ONLINE" };
@@ -188,6 +196,7 @@ export async function describeRunState(
   if (probe.httpStatus !== undefined) return { runState: "LOADING" };
   // Port down from here on.
   if (spawned?.alive) return { runState: "STARTING" };
-  if (spawned) return { runState: "FAILED", exitCode: spawned.exitCode, logTail: await readLogTail() };
+  if (spawned)
+    return { runState: "FAILED", exitCode: spawned.exitCode, logTail: await readLogTail() };
   return { runState: "OFFLINE" };
 }

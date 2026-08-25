@@ -12,8 +12,11 @@ function withQuery(ui: React.ReactElement) {
 describe("TaskIntelligencePanel", () => {
   it("renders deterministic area/package/verification with provenance, never a fabricated risk", async () => {
     vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: "frontend", likelyPackage: "creatorhub-frontend",
-      suggestedVerification: ["frontend-typecheck"], estimatedRisk: null, provenance: "git-derived",
+      likelyArea: "frontend",
+      likelyPackage: "creatorhub-frontend",
+      suggestedVerification: ["frontend-typecheck"],
+      estimatedRisk: null,
+      provenance: "git-derived",
       repoMapStatus: "workspace-matched",
     });
     render(withQuery(<TaskIntelligencePanel scopePackage="frontend" scopeArea={undefined} />));
@@ -25,8 +28,11 @@ describe("TaskIntelligencePanel", () => {
 
   it("reads the provenance field into the caption instead of a fully static string", async () => {
     vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: "frontend", likelyPackage: "creatorhub-frontend",
-      suggestedVerification: ["frontend-typecheck"], estimatedRisk: null, provenance: "git-derived",
+      likelyArea: "frontend",
+      likelyPackage: "creatorhub-frontend",
+      suggestedVerification: ["frontend-typecheck"],
+      estimatedRisk: null,
+      provenance: "git-derived",
       repoMapStatus: "workspace-matched",
     });
     render(withQuery(<TaskIntelligencePanel scopePackage="frontend" scopeArea={undefined} />));
@@ -38,8 +44,12 @@ describe("TaskIntelligencePanel", () => {
   describe("the three honest empty states", () => {
     it("says 'not applicable' for repository-wide scope, which has no single area by definition", async () => {
       vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-        likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: "MEDIUM",
-        provenance: "git-derived", repoMapStatus: "workspace-matched",
+        likelyArea: null,
+        likelyPackage: null,
+        suggestedVerification: [],
+        estimatedRisk: "MEDIUM",
+        provenance: "git-derived",
+        repoMapStatus: "workspace-matched",
       });
       render(withQuery(<TaskIntelligencePanel scopePackage="repository" mode="implement" />));
       // Review MN5: area and package genuinely have no single value for a
@@ -52,18 +62,38 @@ describe("TaskIntelligencePanel", () => {
 
     it("says no repository map exists yet when the chosen workspace has never been run", async () => {
       vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-        likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: "LOW",
-        provenance: "deterministic-backend", repoMapStatus: "unmatched-workspace",
+        likelyArea: null,
+        likelyPackage: null,
+        suggestedVerification: [],
+        estimatedRisk: "LOW",
+        provenance: "deterministic-backend",
+        repoMapStatus: "unmatched-workspace",
       });
-      render(withQuery(<TaskIntelligencePanel scopePackage="frontend" workspace="/tmp/fresh-ws" mode="implement" />));
-      await waitFor(() => expect(screen.getAllByText(/no repository map for this workspace yet/i).length).toBe(3));
-      expect(screen.getByText(/No session has produced a repository map for this workspace yet/i)).toBeInTheDocument();
+      render(
+        withQuery(
+          <TaskIntelligencePanel
+            scopePackage="frontend"
+            workspace="/tmp/fresh-ws"
+            mode="implement"
+          />,
+        ),
+      );
+      await waitFor(() =>
+        expect(screen.getAllByText(/no repository map for this workspace yet/i).length).toBe(3),
+      );
+      expect(
+        screen.getByText(/No session has produced a repository map for this workspace yet/i),
+      ).toBeInTheDocument();
     });
 
     it("keeps a plain 'Unavailable' for a genuinely unknown field when a map does exist", async () => {
       vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-        likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: null,
-        provenance: "git-derived", repoMapStatus: "workspace-matched",
+        likelyArea: null,
+        likelyPackage: null,
+        suggestedVerification: [],
+        estimatedRisk: null,
+        provenance: "git-derived",
+        repoMapStatus: "workspace-matched",
       });
       render(withQuery(<TaskIntelligencePanel scopePackage="frontend" workspace="/tmp/ws" />));
       await waitFor(() => expect(screen.getAllByText("Unavailable").length).toBe(4));
@@ -71,11 +101,17 @@ describe("TaskIntelligencePanel", () => {
 
     it("labels an unlabeled first-found map instead of implying it is the user's repository", async () => {
       vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-        likelyArea: "frontend", likelyPackage: "creatorhub-frontend", suggestedVerification: [], estimatedRisk: null,
-        provenance: "git-derived", repoMapStatus: "first-found",
+        likelyArea: "frontend",
+        likelyPackage: "creatorhub-frontend",
+        suggestedVerification: [],
+        estimatedRisk: null,
+        provenance: "git-derived",
+        repoMapStatus: "first-found",
       });
       render(withQuery(<TaskIntelligencePanel scopePackage="frontend" />));
-      await waitFor(() => expect(screen.getByText(/first one found across all sessions/i)).toBeInTheDocument());
+      await waitFor(() =>
+        expect(screen.getByText(/first one found across all sessions/i)).toBeInTheDocument(),
+      );
     });
   });
 
@@ -84,7 +120,7 @@ describe("TaskIntelligencePanel", () => {
   // disappearing-data problem the honest empty states exist to prevent.
   it("says the request failed instead of silently disappearing", async () => {
     vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockRejectedValue(
-      new Error("GET /api/task-intelligence failed: 431")
+      new Error("GET /api/task-intelligence failed: 431"),
     );
     render(withQuery(<TaskIntelligencePanel scopePackage="frontend" mode="implement" />));
     expect(await screen.findByRole("alert")).toHaveTextContent("431");
@@ -95,8 +131,12 @@ describe("TaskIntelligencePanel", () => {
   // actually send them.
   it("forwards the composer's workspace and risk hints to the endpoint", async () => {
     const spy = vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: "HIGH",
-      provenance: "deterministic-backend", repoMapStatus: "unmatched-workspace",
+      likelyArea: null,
+      likelyPackage: null,
+      suggestedVerification: [],
+      estimatedRisk: "HIGH",
+      provenance: "deterministic-backend",
+      repoMapStatus: "unmatched-workspace",
     });
     render(
       withQuery(
@@ -106,20 +146,28 @@ describe("TaskIntelligencePanel", () => {
           mode="refactor"
           verificationLevel="standard"
           candidateCount={7}
-        />
-      )
+        />,
+      ),
     );
     await waitFor(() => expect(spy).toHaveBeenCalled());
     expect(spy.mock.calls[0][0]).toMatchObject({
-      scopePackage: "repository", workspace: "/tmp/ws", mode: "refactor", verificationLevel: "standard", candidateCount: 7,
+      scopePackage: "repository",
+      workspace: "/tmp/ws",
+      mode: "refactor",
+      verificationLevel: "standard",
+      candidateCount: 7,
     });
   });
 
   it("debounces the objective instead of requesting on every keystroke", async () => {
     vi.useFakeTimers();
     const spy = vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: "LOW",
-      provenance: "deterministic-backend", repoMapStatus: "none",
+      likelyArea: null,
+      likelyPackage: null,
+      suggestedVerification: [],
+      estimatedRisk: "LOW",
+      provenance: "deterministic-backend",
+      repoMapStatus: "none",
     });
     // One stable QueryClient across rerenders: a fresh client per render would
     // refetch for reasons that have nothing to do with the debounce.

@@ -8,8 +8,7 @@ export const CONFIG = {
   modelConfigPath: process.env.GLIMMER_MODEL_CONFIG ?? path.join(stateRoot, "models.json"),
   modelKeysDir: path.join(stateRoot, "model-keys"),
   glimmerV2Path:
-    process.env.GLIMMER_V2_PATH ??
-    path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-v2.py"),
+    process.env.GLIMMER_V2_PATH ?? path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-v2.py"),
   engineerPath:
     process.env.GLIMMER_ENGINEER_PATH ??
     path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-engineer.py"),

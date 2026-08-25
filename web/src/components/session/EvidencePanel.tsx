@@ -37,14 +37,23 @@ export function EvidencePanel({ sessionId }: { sessionId: string }) {
   if (!entries?.length) return null;
 
   return (
-    <CollapsibleSection title="Evidence" summary={`${entries.length} entr${entries.length === 1 ? "y" : "ies"}`}>
+    <CollapsibleSection
+      title="Evidence"
+      summary={`${entries.length} entr${entries.length === 1 ? "y" : "ies"}`}
+    >
       <ul className="evidence-list" style={{ listStyle: "none", padding: 0, margin: 0 }}>
         {entries.map((e) => (
           <li key={e.id} style={{ marginBottom: 4 }}>
             <button
               type="button"
               onClick={() => setSelectedId(e.id === selectedId ? null : e.id)}
-              style={{ display: "flex", gap: 8, alignItems: "baseline", width: "100%", textAlign: "left" }}
+              style={{
+                display: "flex",
+                gap: 8,
+                alignItems: "baseline",
+                width: "100%",
+                textAlign: "left",
+              }}
             >
               <span className="meta-value">{e.kind}</span>
               <code style={{ fontSize: 12 }}>{e.id}</code>
@@ -57,17 +66,25 @@ export function EvidencePanel({ sessionId }: { sessionId: string }) {
             </button>
             {selectedId === e.id && (
               <div style={{ marginTop: 4, marginLeft: 12 }}>
-                {entryLoading && <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Loading…</p>}
+                {entryLoading && (
+                  <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Loading…</p>
+                )}
                 {entry && (
                   <>
-                    {entry.tool && <p style={{ fontSize: 12, color: "var(--text-muted)" }}>tool: {entry.tool}</p>}
-                    {entry.content && <pre style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{entry.content}</pre>}
+                    {entry.tool && (
+                      <p style={{ fontSize: 12, color: "var(--text-muted)" }}>tool: {entry.tool}</p>
+                    )}
+                    {entry.content && (
+                      <pre style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{entry.content}</pre>
+                    )}
                   </>
                 )}
                 {!!e.relatesTo?.length && (
                   <ul>
                     {e.relatesTo.map((r, i) => (
-                      <li key={i} style={{ fontSize: 12 }}>{r.kind}: {r.path}</li>
+                      <li key={i} style={{ fontSize: 12 }}>
+                        {r.kind}: {r.path}
+                      </li>
                     ))}
                   </ul>
                 )}

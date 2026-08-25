@@ -24,7 +24,9 @@ describe("ArchitecturePlanPanel", () => {
     });
     render(withQuery(<ArchitecturePlanPanel sessionId="s1" />));
 
-    await waitFor(() => expect(screen.getByText(/Add a whisper\(name\) function/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/Add a whisper\(name\) function/)).toBeInTheDocument(),
+    );
     expect(screen.getByText("low")).toBeInTheDocument();
     expect(screen.getByText("glimmer-smoke-test")).toBeInTheDocument();
     expect(screen.getByText(/src\/greet\.js — contains greet/)).toBeInTheDocument();
@@ -35,7 +37,9 @@ describe("ArchitecturePlanPanel", () => {
   });
 
   it("renders nothing when the plan artifact 404s (absence is normal)", async () => {
-    vi.spyOn(client.glimmerApi, "getArchitecturePlan").mockRejectedValue(new Error("GET /api/sessions/s1/plan failed: 404"));
+    vi.spyOn(client.glimmerApi, "getArchitecturePlan").mockRejectedValue(
+      new Error("GET /api/sessions/s1/plan failed: 404"),
+    );
     const { container } = render(withQuery(<ArchitecturePlanPanel sessionId="s1" />));
 
     await waitFor(() => expect(client.glimmerApi.getArchitecturePlan).toHaveBeenCalled());
@@ -44,7 +48,9 @@ describe("ArchitecturePlanPanel", () => {
 
   it("only renders optional sections that are present", async () => {
     vi.spyOn(client.glimmerApi, "getArchitecturePlan").mockResolvedValue({
-      objective: "Minimal plan", packages: ["p"], risk: "medium",
+      objective: "Minimal plan",
+      packages: ["p"],
+      risk: "medium",
     });
     render(withQuery(<ArchitecturePlanPanel sessionId="s1" />));
 

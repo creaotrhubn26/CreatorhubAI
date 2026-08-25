@@ -5,18 +5,20 @@ vi.mock("../lib/cliIntegrations.js", () => ({
   probeCliIntegrations: vi.fn().mockResolvedValue({
     checkedAt: "2026-08-25T00:00:00.000Z",
     platform: "darwin arm64",
-    integrations: [{
-      id: "github_cli",
-      name: "GitHub CLI",
-      executable: "gh",
-      required: false,
-      state: "ready",
-      installed: true,
-      authenticated: true,
-      source: "path",
-      agentAccess: "read_only",
-      detail: "Authenticated.",
-    }],
+    integrations: [
+      {
+        id: "github_cli",
+        name: "GitHub CLI",
+        executable: "gh",
+        required: false,
+        state: "ready",
+        installed: true,
+        authenticated: true,
+        source: "path",
+        agentAccess: "read_only",
+        detail: "Authenticated.",
+      },
+    ],
     policy: {
       automaticSystemInstall: false,
       externalWritesRequireApproval: true,

@@ -10,24 +10,38 @@ function renderScreen() {
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/sessions/s1/diff"]}>
-        <Routes><Route path="/sessions/:id/diff" element={<DiffReviewScreen />} /></Routes>
+        <Routes>
+          <Route path="/sessions/:id/diff" element={<DiffReviewScreen />} />
+        </Routes>
       </MemoryRouter>
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
 }
 
 describe("DiffReviewScreen", () => {
   beforeEach(() => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
-      id: "s1", task: "x", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc",
+      id: "s1",
+      task: "x",
+      status: "verified",
+      workspace: "/ws",
+      branch: "glimmer/x",
+      baselineSha: "abc",
       changedFiles: [{ path: "a.ts", status: "modified" }],
-      verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2,
+      verification: { overall: "VERIFIED", checks: [] },
+      repairsUsed: 0,
+      repairBudget: 2,
     } as any);
-    vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({ diff: "--- a\n+++ b\n", hunks: [] });
+    vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
+      diff: "--- a\n+++ b\n",
+      hunks: [],
+    });
   });
 
   it("renders a Revert button per changed file that calls revertFile with the real path", async () => {
-    const revertSpy = vi.spyOn(client.glimmerApi, "revertFile").mockResolvedValue({ reverted: "a.ts" });
+    const revertSpy = vi
+      .spyOn(client.glimmerApi, "revertFile")
+      .mockResolvedValue({ reverted: "a.ts" });
     renderScreen();
     await waitFor(() => screen.getByRole("button", { name: /revert/i }));
     fireEvent.click(screen.getByRole("button", { name: /revert/i }));
@@ -49,14 +63,16 @@ describe("DiffReviewScreen", () => {
     render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/sessions/s1/diff"]}>
-          <Routes><Route path="/sessions/:id/diff" element={<DiffReviewScreen />} /></Routes>
+          <Routes>
+            <Route path="/sessions/:id/diff" element={<DiffReviewScreen />} />
+          </Routes>
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
     await waitFor(() => screen.getByRole("button", { name: /revert/i }));
     fireEvent.click(screen.getByRole("button", { name: /revert/i }));
     await waitFor(() =>
-      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session-analysis", "s1"] })
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session-analysis", "s1"] }),
     );
   });
 
@@ -71,11 +87,12 @@ describe("DiffReviewScreen", () => {
 
   it("clicking Accept for review calls acceptSession with the session id", async () => {
     const acceptSpy = vi.spyOn(client.glimmerApi, "acceptSession").mockResolvedValue({
-      accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z",
+      accepted: true,
+      acceptedAt: "2026-08-21T00:00:00.000Z",
     });
     renderScreen();
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /accept for review/i })).toBeEnabled()
+      expect(screen.getByRole("button", { name: /accept for review/i })).toBeEnabled(),
     );
     fireEvent.click(screen.getByRole("button", { name: /accept for review/i }));
     await waitFor(() => expect(acceptSpy).toHaveBeenCalledWith("s1"));
@@ -83,9 +100,16 @@ describe("DiffReviewScreen", () => {
 
   it("shows the accepted timestamp and hides the button once the session is human-accepted", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
-      id: "s1", task: "x", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc",
+      id: "s1",
+      task: "x",
+      status: "verified",
+      workspace: "/ws",
+      branch: "glimmer/x",
+      baselineSha: "abc",
       changedFiles: [{ path: "a.ts", status: "modified" }],
-      verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2,
+      verification: { overall: "VERIFIED", checks: [] },
+      repairsUsed: 0,
+      repairBudget: 2,
       humanAcceptance: { accepted: true, acceptedAt: "2026-08-21T00:00:00.000Z" },
     } as any);
     renderScreen();
@@ -97,7 +121,7 @@ describe("DiffReviewScreen", () => {
     vi.spyOn(client.glimmerApi, "acceptSession").mockRejectedValue(new Error("boom"));
     renderScreen();
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /accept for review/i })).toBeEnabled()
+      expect(screen.getByRole("button", { name: /accept for review/i })).toBeEnabled(),
     );
     fireEvent.click(screen.getByRole("button", { name: /accept for review/i }));
     await waitFor(() => expect(screen.getByText(/could not accept/i)).toBeInTheDocument());
@@ -137,12 +161,22 @@ describe("DiffReviewScreen", () => {
     const hunkId = "a".repeat(64);
     vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
       diff: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n",
-      hunks: [{
-        id: hunkId, path: "a.ts", header: "@@ -1 +1 @@", added: 1, removed: 1, status: "pending",
-      }],
+      hunks: [
+        {
+          id: hunkId,
+          path: "a.ts",
+          header: "@@ -1 +1 @@",
+          added: 1,
+          removed: 1,
+          status: "pending",
+        },
+      ],
     });
     const acceptHunk = vi.spyOn(client.glimmerApi, "acceptHunk").mockResolvedValue({
-      hunkId, path: "a.ts", decision: "accepted", decidedAt: "2026-08-25T00:00:00Z",
+      hunkId,
+      path: "a.ts",
+      decision: "accepted",
+      decidedAt: "2026-08-25T00:00:00Z",
     });
     renderScreen();
 
@@ -156,10 +190,17 @@ describe("DiffReviewScreen", () => {
   it("renders persisted hunk acceptance and enables complete-diff acceptance", async () => {
     vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
       diff: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n",
-      hunks: [{
-        id: "b".repeat(64), path: "a.ts", header: "@@ -1 +1 @@", added: 1, removed: 1,
-        status: "accepted", acceptedAt: "2026-08-25T00:00:00Z",
-      }],
+      hunks: [
+        {
+          id: "b".repeat(64),
+          path: "a.ts",
+          header: "@@ -1 +1 @@",
+          added: 1,
+          removed: 1,
+          status: "accepted",
+          acceptedAt: "2026-08-25T00:00:00Z",
+        },
+      ],
     });
     renderScreen();
 
@@ -172,19 +213,33 @@ describe("DiffReviewScreen", () => {
     const hunkId = "c".repeat(64);
     vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
       diff: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n",
-      hunks: [{ id: hunkId, path: "a.ts", header: "@@ -1 +1 @@", added: 1, removed: 1, status: "pending" }],
+      hunks: [
+        {
+          id: hunkId,
+          path: "a.ts",
+          header: "@@ -1 +1 @@",
+          added: 1,
+          removed: 1,
+          status: "pending",
+        },
+      ],
     });
     const rejectHunk = vi.spyOn(client.glimmerApi, "rejectHunk").mockResolvedValue({
-      hunkId, path: "a.ts", decision: "rejected", decidedAt: "2026-08-25T00:00:00Z",
+      hunkId,
+      path: "a.ts",
+      decision: "rejected",
+      decidedAt: "2026-08-25T00:00:00Z",
     });
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const invalidateSpy = vi.spyOn(qc, "invalidateQueries");
     render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/sessions/s1/diff"]}>
-          <Routes><Route path="/sessions/:id/diff" element={<DiffReviewScreen />} /></Routes>
+          <Routes>
+            <Route path="/sessions/:id/diff" element={<DiffReviewScreen />} />
+          </Routes>
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     fireEvent.click(await screen.findByRole("button", { name: /reject hunk in a\.ts/i }));

@@ -38,7 +38,13 @@ beforeAll(async () => {
   process.env.GLIMMER_STATE_ROOT = stateRoot;
   // Point the "real orchestrator" path at the fake fixture so run/replay tests
   // never spawn python3 or the actual glimmer-v2.py.
-  process.env.GLIMMER_V2_PATH = path.join(__dirname, "..", "lib", "__fixtures__", "fake-glimmer-v2.mjs");
+  process.env.GLIMMER_V2_PATH = path.join(
+    __dirname,
+    "..",
+    "lib",
+    "__fixtures__",
+    "fake-glimmer-v2.mjs",
+  );
 
   const { createApp } = await import("../app.js");
   app = createApp();
@@ -60,7 +66,7 @@ beforeAll(async () => {
       branch: "main",
       baseline: null,
       attempts: [],
-    })
+    }),
   );
 });
 
@@ -96,15 +102,25 @@ describe("per-hunk diff review routes", () => {
     baseline = (await execGit("git", ["rev-parse", "HEAD"], { cwd: hunkWorkspace })).stdout.trim();
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "hunk review", status: "verified", workspace: hunkWorkspace, branch: "main",
-      baseline, finalChangedFiles: ["review.txt"], attempts: [],
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "hunk review",
+        status: "verified",
+        workspace: hunkWorkspace,
+        branch: "main",
+        baseline,
+        finalChangedFiles: ["review.txt"],
+        attempts: [],
+      }),
+    );
   });
 
   beforeEach(async () => {
     await execGit("git", ["checkout", baseline, "--", "review.txt"], { cwd: hunkWorkspace });
-    const lines = (await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8")).trimEnd().split("\n");
+    const lines = (await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8"))
+      .trimEnd()
+      .split("\n");
     lines[1] = "line 2 changed";
     lines[24] = "line 25 changed";
     await fs.writeFile(path.join(hunkWorkspace, "review.txt"), lines.join("\n") + "\n");
@@ -129,10 +145,15 @@ describe("per-hunk diff review routes", () => {
     const initial = await request(app).get(`/api/sessions/${id}/diff`);
     const hunk = initial.body.hunks[0];
     const accepted = await request(app)
-      .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+      .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`)
+      .set("Origin", UI_ORIGIN)
       .send({ path: "review.txt" });
     expect(accepted.status).toBe(200);
-    expect(accepted.body).toMatchObject({ hunkId: hunk.id, path: "review.txt", decision: "accepted" });
+    expect(accepted.body).toMatchObject({
+      hunkId: hunk.id,
+      path: "review.txt",
+      decision: "accepted",
+    });
 
     const reread = await request(app).get(`/api/sessions/${id}/diff`);
     expect(reread.body.hunks[0].status).toBe("accepted");
@@ -143,10 +164,15 @@ describe("per-hunk diff review routes", () => {
     const initial = await request(app).get(`/api/sessions/${id}/diff`);
     const hunk = initial.body.hunks[1];
     const rejected = await request(app)
-      .post(`/api/sessions/${id}/hunks/${hunk.id}/reject`).set("Origin", UI_ORIGIN)
+      .post(`/api/sessions/${id}/hunks/${hunk.id}/reject`)
+      .set("Origin", UI_ORIGIN)
       .send({ path: "review.txt", patch: "malicious client patch is never consumed" });
     expect(rejected.status).toBe(200);
-    expect(rejected.body).toMatchObject({ hunkId: hunk.id, path: "review.txt", decision: "rejected" });
+    expect(rejected.body).toMatchObject({
+      hunkId: hunk.id,
+      path: "review.txt",
+      decision: "rejected",
+    });
 
     const content = await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8");
     expect(content).toContain("line 2 changed");
@@ -159,11 +185,13 @@ describe("per-hunk diff review routes", () => {
   it("returns 409 for a stale id and 403 for an unscoped path without changing the file", async () => {
     const before = await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8");
     const stale = await request(app)
-      .post(`/api/sessions/${id}/hunks/${"0".repeat(64)}/reject`).set("Origin", UI_ORIGIN)
+      .post(`/api/sessions/${id}/hunks/${"0".repeat(64)}/reject`)
+      .set("Origin", UI_ORIGIN)
       .send({ path: "review.txt" });
     expect(stale.status).toBe(409);
     const unscoped = await request(app)
-      .post(`/api/sessions/${id}/hunks/${"0".repeat(64)}/reject`).set("Origin", UI_ORIGIN)
+      .post(`/api/sessions/${id}/hunks/${"0".repeat(64)}/reject`)
+      .set("Origin", UI_ORIGIN)
       .send({ path: "../outside.txt" });
     expect(unscoped.status).toBe(403);
     expect(await fs.readFile(path.join(hunkWorkspace, "review.txt"), "utf8")).toBe(before);
@@ -172,13 +200,16 @@ describe("per-hunk diff review routes", () => {
   it("refuses whole-session acceptance until every current text hunk is accepted", async () => {
     const initial = await request(app).get(`/api/sessions/${id}/diff`);
 
-    const premature = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
+    const premature = await request(app)
+      .post(`/api/sessions/${id}/accept`)
+      .set("Origin", UI_ORIGIN);
     expect(premature.status).toBe(409);
     expect(premature.body).toMatchObject({ pendingHunks: 2 });
 
     for (const hunk of initial.body.hunks) {
       const accepted = await request(app)
-        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`)
+        .set("Origin", UI_ORIGIN)
         .send({ path: "review.txt" });
       expect(accepted.status).toBe(200);
     }
@@ -192,13 +223,17 @@ describe("per-hunk diff review routes", () => {
     const initial = await request(app).get(`/api/sessions/${id}/diff`);
     for (const hunk of initial.body.hunks) {
       await request(app)
-        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`)
+        .set("Origin", UI_ORIGIN)
         .send({ path: "review.txt" });
     }
-    expect((await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN)).status).toBe(200);
+    expect(
+      (await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN)).status,
+    ).toBe(200);
 
     const rejected = await request(app)
-      .post(`/api/sessions/${id}/hunks/${initial.body.hunks[1].id}/reject`).set("Origin", UI_ORIGIN)
+      .post(`/api/sessions/${id}/hunks/${initial.body.hunks[1].id}/reject`)
+      .set("Origin", UI_ORIGIN)
       .send({ path: "review.txt" });
     expect(rejected.status).toBe(200);
 
@@ -210,13 +245,17 @@ describe("per-hunk diff review routes", () => {
     const initial = await request(app).get(`/api/sessions/${id}/diff`);
     for (const hunk of initial.body.hunks) {
       await request(app)
-        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`).set("Origin", UI_ORIGIN)
+        .post(`/api/sessions/${id}/hunks/${hunk.id}/accept`)
+        .set("Origin", UI_ORIGIN)
         .send({ path: "review.txt" });
     }
-    expect((await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN)).status).toBe(200);
+    expect(
+      (await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN)).status,
+    ).toBe(200);
 
     const reverted = await request(app)
-      .post(`/api/sessions/${id}/revert-file`).set("Origin", UI_ORIGIN)
+      .post(`/api/sessions/${id}/revert-file`)
+      .set("Origin", UI_ORIGIN)
       .send({ path: "review.txt" });
     expect(reverted.status).toBe(200);
 
@@ -247,13 +286,21 @@ describe("readSessionEventsBatch", () => {
     await fs.mkdir(dir, { recursive: true });
     const lines = [
       JSON.stringify({
-        id: "evt_1", sessionId: id, timestamp: "2026-08-17T00:00:00.000Z",
-        type: "tool_started", tool: "read_file", args: { path: "a.ts" },
+        id: "evt_1",
+        sessionId: id,
+        timestamp: "2026-08-17T00:00:00.000Z",
+        type: "tool_started",
+        tool: "read_file",
+        args: { path: "a.ts" },
       }),
       "not valid json at all {{{", // torn/malformed line — must be skipped, not crash the batch
       JSON.stringify({
-        id: "evt_2", sessionId: id, timestamp: "2026-08-17T00:00:01.000Z",
-        type: "tool_completed", tool: "read_file", resultSummary: "ok",
+        id: "evt_2",
+        sessionId: id,
+        timestamp: "2026-08-17T00:00:01.000Z",
+        type: "tool_completed",
+        tool: "read_file",
+        resultSummary: "ok",
       }),
     ];
     await fs.writeFile(path.join(dir, "events.jsonl"), lines.join("\n") + "\n");
@@ -275,7 +322,8 @@ describe("readSessionEventsBatch", () => {
 describe("POST /api/sessions/:id/revert-file", () => {
   it("returns 404 for a path-traversal session id instead of touching the filesystem", async () => {
     const res = await request(app)
-      .post("/api/sessions/..%2F..%2Fevil/revert-file").set("Origin", UI_ORIGIN)
+      .post("/api/sessions/..%2F..%2Fevil/revert-file")
+      .set("Origin", UI_ORIGIN)
       .send({ path: "a.txt" });
     expect(res.status).toBe(404);
   });
@@ -286,7 +334,9 @@ describe("POST /api/sessions/:id/revert-file", () => {
 // idempotent, 404 for an unknown session.
 describe("POST /api/sessions/:id/accept", () => {
   it("returns 404 for an unknown session", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/accept").set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post("/api/sessions/does-not-exist/accept")
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -296,7 +346,14 @@ describe("POST /api/sessions/:id/accept", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "manifest.json"),
-      JSON.stringify({ task: "test", status: "verified", workspace, branch: "main", baseline: null, attempts: [] })
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace,
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
     );
 
     const res = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
@@ -317,7 +374,14 @@ describe("POST /api/sessions/:id/accept", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "manifest.json"),
-      JSON.stringify({ task: "test", status: "verified", workspace, branch: "main", baseline: null, attempts: [] })
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace,
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
     );
 
     const first = await request(app).post(`/api/sessions/${id}/accept`).set("Origin", UI_ORIGIN);
@@ -329,7 +393,8 @@ describe("POST /api/sessions/:id/accept", () => {
 describe("POST /api/sessions", () => {
   it("rejects a taskContract missing verification/repairBudget instead of accepting it", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({ taskContract: { objective: "x" }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
     expect(res.body).toHaveProperty("error");
@@ -337,13 +402,20 @@ describe("POST /api/sessions", () => {
 
   it("accepts a well-formed taskContract", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({
         taskContract: {
           objective: "Fix a thing",
           scope: { package: "frontend" },
           mode: "implement",
-          constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+          constraints: {
+            minimalChange: true,
+            noCommit: true,
+            noPush: true,
+            noDeploy: true,
+            noDependencyInstall: true,
+          },
           verification: [],
           repairBudget: 1,
         },
@@ -356,13 +428,20 @@ describe("POST /api/sessions", () => {
   it("preserves the exact objective and adds deterministic improvement intent", async () => {
     const objective = "Hva kan bli bedre?";
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({
         taskContract: {
           objective,
           scope: { package: "repository" },
           mode: "inspect",
-          constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+          constraints: {
+            minimalChange: true,
+            noCommit: true,
+            noPush: true,
+            noDeploy: true,
+            noDependencyInstall: true,
+          },
           verification: [],
           repairBudget: 0,
         },
@@ -389,14 +468,22 @@ describe("GET /api/sessions/:id/task-report", () => {
       mode: "inspect",
       objective: "Hva kan bli bedre?",
       summary: "Two focused improvements were identified.",
-      findings: [{
-        severity: "medium",
-        category: "reliability",
-        title: "Persist run ownership",
-        description: "In-memory ownership disappears on restart.",
-        evidence: [{ path: "server/src/routes/sessions.ts", line: 1, detail: "Run state was process-local." }],
-        recommendedFix: "Persist the canonical run record.",
-      }],
+      findings: [
+        {
+          severity: "medium",
+          category: "reliability",
+          title: "Persist run ownership",
+          description: "In-memory ownership disappears on restart.",
+          evidence: [
+            {
+              path: "server/src/routes/sessions.ts",
+              line: 1,
+              detail: "Run state was process-local.",
+            },
+          ],
+          recommendedFix: "Persist the canonical run record.",
+        },
+      ],
       implementationPlan: ["Persist the run record atomically."],
       confidence: "high",
     };
@@ -406,7 +493,9 @@ describe("GET /api/sessions/:id/task-report", () => {
     const res = await request(app).get(`/api/sessions/${id}/task-report`);
     expect(res.status).toBe(200);
     expect(res.body).toEqual(report);
-    expect((await request(app).get("/api/sessions/missing-task-report/task-report")).status).toBe(404);
+    expect((await request(app).get("/api/sessions/missing-task-report/task-report")).status).toBe(
+      404,
+    );
   });
 });
 
@@ -415,14 +504,21 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
     objective: "Fix a thing",
     scope: { package: "frontend" },
     mode: "implement",
-    constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+    constraints: {
+      minimalChange: true,
+      noCommit: true,
+      noPush: true,
+      noDeploy: true,
+      noDependencyInstall: true,
+    },
     verification: [],
     repairBudget: 1,
   };
 
   it("rejects maxTurns out of 1..64 range with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({ taskContract: { ...validBase, maxTurns: 100 }, workspace: "/tmp/ws" });
     expect(res.status).toBe(400);
     expect(res.body).toHaveProperty("error");
@@ -430,41 +526,65 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
 
   it("rejects timeoutSeconds out of 60..3600 range with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: { ...validBase, advanced: { timeoutSeconds: 5 } }, workspace: "/tmp/ws" });
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: { ...validBase, advanced: { timeoutSeconds: 5 } },
+        workspace: "/tmp/ws",
+      });
     expect(res.status).toBe(400);
   });
 
   it("rejects a toolchainMode outside the closed enum with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: { ...validBase, advanced: { toolchainMode: "rm -rf /" } }, workspace: "/tmp/ws" });
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: { ...validBase, advanced: { toolchainMode: "rm -rf /" } },
+        workspace: "/tmp/ws",
+      });
     expect(res.status).toBe(400);
   });
 
   it("rejects an unparseable/injection-attempt modelReadinessUrl with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: { ...validBase, advanced: { modelReadinessUrl: "http://x; rm -rf /" } }, workspace: "/tmp/ws" });
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: { ...validBase, advanced: { modelReadinessUrl: "http://x; rm -rf /" } },
+        workspace: "/tmp/ws",
+      });
     expect(res.status).toBe(400);
   });
 
   it("rejects a non-http(s) modelReadinessUrl scheme with 400", async () => {
     const res = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
-      .send({ taskContract: { ...validBase, advanced: { modelReadinessUrl: "javascript:alert(1)" } }, workspace: "/tmp/ws" });
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: { ...validBase, advanced: { modelReadinessUrl: "javascript:alert(1)" } },
+        workspace: "/tmp/ws",
+      });
     expect(res.status).toBe(400);
   });
 
   it("accepts a well-formed advanced block", async () => {
-    const res = await request(app).post("/api/sessions").set("Origin", UI_ORIGIN).send({
-      taskContract: {
-        ...validBase,
-        maxTurns: 20,
-        advanced: { timeoutSeconds: 600, toolchainMode: "linked", modelReadinessUrl: "https://model.local/ready", architectFirst: true },
-      },
-      workspace: "/tmp/ws",
-    });
+    const res = await request(app)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: {
+          ...validBase,
+          maxTurns: 20,
+          advanced: {
+            timeoutSeconds: 600,
+            toolchainMode: "linked",
+            modelReadinessUrl: "https://model.local/ready",
+            architectFirst: true,
+          },
+        },
+        workspace: "/tmp/ws",
+      });
     expect(res.status).toBe(201);
   });
 });
@@ -497,30 +617,44 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     objective: "Fix a thing",
     scope: { package: "frontend" },
     mode: "implement",
-    constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
+    constraints: {
+      minimalChange: true,
+      noCommit: true,
+      noPush: true,
+      noDeploy: true,
+      noDependencyInstall: true,
+    },
     verification: [],
     repairBudget: 1,
   };
 
   it("rejects a non-glimmer branch synchronously with a recovery instruction", async () => {
     const created = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({ taskContract: validContract, workspace: mainWorkspace });
 
-    const run = await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN);
+    const run = await request(app)
+      .post(`/api/sessions/${created.body.id}/run`)
+      .set("Origin", UI_ORIGIN);
 
     expect(run.status).toBe(409);
     expect(run.body.error).toContain("branch main");
     expect(run.body.error).toContain("glimmer/*");
-    await expect(fs.stat(path.join(stateRoot, "sessions", created.body.id))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(path.join(stateRoot, "sessions", created.body.id))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("rejects a non-Git workspace before spawning the orchestrator", async () => {
     const created = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({ taskContract: validContract, workspace });
 
-    const run = await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN);
+    const run = await request(app)
+      .post(`/api/sessions/${created.body.id}/run`)
+      .set("Origin", UI_ORIGIN);
 
     expect(run.status).toBe(400);
     expect(run.body.error).toContain("Git worktree");
@@ -530,15 +664,23 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     process.env.GLIMMER_FAKE_REAL_ID = "stay-running";
     try {
       const created = await request(app)
-        .post("/api/sessions").set("Origin", UI_ORIGIN)
+        .post("/api/sessions")
+        .set("Origin", UI_ORIGIN)
         .send({ taskContract: validContract, workspace: runWorkspace });
-      expect((await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN)).status).toBe(200);
+      expect(
+        (await request(app).post(`/api/sessions/${created.body.id}/run`).set("Origin", UI_ORIGIN))
+          .status,
+      ).toBe(200);
       expect(created.body.id).not.toMatch(/^pending-/);
 
       let manifestVisible = false;
       for (let attempt = 0; attempt < 30; attempt += 1) {
         const current = await request(app).get(`/api/sessions/${created.body.id}`);
-        if (current.status === 200 && current.body.id === created.body.id && current.body.task === "cancellable fixture") {
+        if (
+          current.status === 200 &&
+          current.body.id === created.body.id &&
+          current.body.task === "cancellable fixture"
+        ) {
           manifestVisible = true;
           break;
         }
@@ -546,7 +688,9 @@ describe("POST /api/sessions/:id/run replay protection", () => {
       }
       expect(manifestVisible).toBe(true);
 
-      const cancelled = await request(app).post(`/api/sessions/${created.body.id}/cancel`).set("Origin", UI_ORIGIN);
+      const cancelled = await request(app)
+        .post(`/api/sessions/${created.body.id}/cancel`)
+        .set("Origin", UI_ORIGIN);
       expect(cancelled.status).toBe(200);
       expect(cancelled.body).toEqual({ cancelled: true });
     } finally {
@@ -561,7 +705,11 @@ describe("POST /api/sessions/:id/run replay protection", () => {
     try {
       orphan = spawn(process.execPath, [fixture, "--session-id", id, "--workspace", runWorkspace], {
         detached: process.platform !== "win32",
-        env: { ...process.env, GLIMMER_FAKE_REAL_ID: "stay-running", GLIMMER_STATE_ROOT: stateRoot },
+        env: {
+          ...process.env,
+          GLIMMER_FAKE_REAL_ID: "stay-running",
+          GLIMMER_STATE_ROOT: stateRoot,
+        },
         stdio: "ignore",
       });
       await new Promise<void>((resolve, reject) => {
@@ -569,26 +717,33 @@ describe("POST /api/sessions/:id/run replay protection", () => {
         orphan!.once("error", reject);
       });
       await fs.mkdir(path.join(stateRoot, "gateway-runs"), { recursive: true });
-      await fs.writeFile(path.join(stateRoot, "gateway-runs", `${id}.json`), JSON.stringify({
-        version: 1,
-        id,
-        contract: validContract,
-        workspace: runWorkspace,
-        state: "running",
-        createdAt: new Date().toISOString(),
-        startedAt: new Date().toISOString(),
-        pid: orphan.pid,
-      }));
+      await fs.writeFile(
+        path.join(stateRoot, "gateway-runs", `${id}.json`),
+        JSON.stringify({
+          version: 1,
+          id,
+          contract: validContract,
+          workspace: runWorkspace,
+          state: "running",
+          createdAt: new Date().toISOString(),
+          startedAt: new Date().toISOString(),
+          pid: orphan.pid,
+        }),
+      );
       await new Promise((resolve) => setTimeout(resolve, 75));
 
       const exited = new Promise<void>((resolve) => orphan!.once("exit", () => resolve()));
-      const cancelled = await request(app).post(`/api/sessions/${id}/cancel`).set("Origin", UI_ORIGIN);
+      const cancelled = await request(app)
+        .post(`/api/sessions/${id}/cancel`)
+        .set("Origin", UI_ORIGIN);
       expect(cancelled.status).toBe(200);
       expect(cancelled.body).toEqual({ cancelled: true });
       await exited;
       orphan = undefined;
 
-      const record = JSON.parse(await fs.readFile(path.join(stateRoot, "gateway-runs", `${id}.json`), "utf8"));
+      const record = JSON.parse(
+        await fs.readFile(path.join(stateRoot, "gateway-runs", `${id}.json`), "utf8"),
+      );
       expect(record.state).toBe("cancel_requested");
       expect(typeof record.completedAt).toBe("string");
     } finally {
@@ -598,7 +753,8 @@ describe("POST /api/sessions/:id/run replay protection", () => {
 
   it("a second /run call for the same id does not spawn a second process", async () => {
     const createRes = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({ taskContract: validContract, workspace: runWorkspace });
     const id = createRes.body.id as string;
 
@@ -614,7 +770,8 @@ describe("POST /api/sessions/:id/run replay protection", () => {
 
   it("POST /sessions persists the task contract before the run starts", async () => {
     const created = await request(app)
-      .post("/api/sessions").set("Origin", UI_ORIGIN)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
       .send({ taskContract: validContract, workspace: runWorkspace });
     const id = created.body.id;
     const recordPath = path.join(stateRoot, "gateway-runs", `${id}.json`);
@@ -629,15 +786,35 @@ describe("GET /api/sessions/:id/analysis", () => {
     const id = "20260817-000010-glimmer-analysis-test";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-      finalChangedFiles: ["frontend/client/src/dialog/Dialog.tsx", "backend/src/unrelated.ts"],
-    }));
-    await fs.writeFile(path.join(dir, "gateway-contract.json"), JSON.stringify({
-      objective: "x", scope: { package: "directory", area: "frontend/client/src/dialog" }, mode: "implement",
-      constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
-      verification: [], repairBudget: 0,
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+        finalChangedFiles: ["frontend/client/src/dialog/Dialog.tsx", "backend/src/unrelated.ts"],
+      }),
+    );
+    await fs.writeFile(
+      path.join(dir, "gateway-contract.json"),
+      JSON.stringify({
+        objective: "x",
+        scope: { package: "directory", area: "frontend/client/src/dialog" },
+        mode: "implement",
+        constraints: {
+          minimalChange: true,
+          noCommit: true,
+          noPush: true,
+          noDeploy: true,
+          noDependencyInstall: true,
+        },
+        verification: [],
+        repairBudget: 0,
+      }),
+    );
 
     const res = await request(app).get(`/api/sessions/${id}/analysis`);
     expect(res.status).toBe(200);
@@ -650,9 +827,17 @@ describe("GET /api/sessions/:id/analysis", () => {
     const id = "20260817-000011-glimmer-nocontract-analysis";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
+    );
 
     const res = await request(app).get(`/api/sessions/${id}/analysis`);
     expect(res.status).toBe(200);
@@ -666,7 +851,13 @@ describe("GET /api/sessions/:id/analysis", () => {
 
   it("scores against THIS session's own repo-map.json, not the newest session's", async () => {
     const repoPackage = (dir: string) => ({
-      path: dir, dir, name: dir, scripts: {}, frameworks: [], engines: {}, workspaces: {},
+      path: dir,
+      dir,
+      name: dir,
+      scripts: {},
+      frameworks: [],
+      engines: {},
+      workspaces: {},
     });
 
     // Older id, analyzed by this test — its own repo-map says its backend
@@ -674,19 +865,46 @@ describe("GET /api/sessions/:id/analysis", () => {
     const olderId = "20260817-000012-glimmer-own-repo-map-a";
     const olderDir = path.join(stateRoot, "sessions", olderId);
     await fs.mkdir(olderDir, { recursive: true });
-    await fs.writeFile(path.join(olderDir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-      finalChangedFiles: ["backend-a/file.ts"],
-    }));
-    await fs.writeFile(path.join(olderDir, "gateway-contract.json"), JSON.stringify({
-      objective: "x", scope: { package: "backend" }, mode: "implement",
-      constraints: { minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true },
-      verification: [], repairBudget: 0,
-    }));
-    await fs.writeFile(path.join(olderDir, "repo-map.json"), JSON.stringify({
-      generatedAt: "x", workspace: "/tmp/ws", branch: "main", head: "x", upstream: null,
-      packages: [repoPackage("backend-a")],
-    }));
+    await fs.writeFile(
+      path.join(olderDir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+        finalChangedFiles: ["backend-a/file.ts"],
+      }),
+    );
+    await fs.writeFile(
+      path.join(olderDir, "gateway-contract.json"),
+      JSON.stringify({
+        objective: "x",
+        scope: { package: "backend" },
+        mode: "implement",
+        constraints: {
+          minimalChange: true,
+          noCommit: true,
+          noPush: true,
+          noDeploy: true,
+          noDependencyInstall: true,
+        },
+        verification: [],
+        repairBudget: 0,
+      }),
+    );
+    await fs.writeFile(
+      path.join(olderDir, "repo-map.json"),
+      JSON.stringify({
+        generatedAt: "x",
+        workspace: "/tmp/ws",
+        branch: "main",
+        head: "x",
+        upstream: null,
+        packages: [repoPackage("backend-a")],
+      }),
+    );
 
     // Newer id (lexicographically later => listSessionIds() sorts it first),
     // with a DIFFERENT repo-map. Before the fix, findRepoMap() would return
@@ -694,14 +912,29 @@ describe("GET /api/sessions/:id/analysis", () => {
     const newerId = "20260817-000013-glimmer-own-repo-map-b";
     const newerDir = path.join(stateRoot, "sessions", newerId);
     await fs.mkdir(newerDir, { recursive: true });
-    await fs.writeFile(path.join(newerDir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-      finalChangedFiles: ["backend-b/file.ts"],
-    }));
-    await fs.writeFile(path.join(newerDir, "repo-map.json"), JSON.stringify({
-      generatedAt: "x", workspace: "/tmp/ws", branch: "main", head: "x", upstream: null,
-      packages: [repoPackage("backend-b")],
-    }));
+    await fs.writeFile(
+      path.join(newerDir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+        finalChangedFiles: ["backend-b/file.ts"],
+      }),
+    );
+    await fs.writeFile(
+      path.join(newerDir, "repo-map.json"),
+      JSON.stringify({
+        generatedAt: "x",
+        workspace: "/tmp/ws",
+        branch: "main",
+        head: "x",
+        upstream: null,
+        packages: [repoPackage("backend-b")],
+      }),
+    );
 
     const res = await request(app).get(`/api/sessions/${olderId}/analysis`);
     expect(res.status).toBe(200);
@@ -716,9 +949,17 @@ describe("GET /api/sessions/:id/analysis", () => {
     const id = "20260817-000014-glimmer-provenance-test";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
+    );
 
     const res = await request(app).get(`/api/sessions/${id}/analysis`);
     expect(res.status).toBe(200);
@@ -783,7 +1024,10 @@ describe("GET /api/sessions/:id/architect-reviews", () => {
     const id = "20260818-000005-glimmer-reviews-found";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "architect-review-00-02.json"), JSON.stringify({ ...review, decision: "REVISE_IMPLEMENTATION" }));
+    await fs.writeFile(
+      path.join(dir, "architect-review-00-02.json"),
+      JSON.stringify({ ...review, decision: "REVISE_IMPLEMENTATION" }),
+    );
     await fs.writeFile(path.join(dir, "architect-review-00-01.json"), JSON.stringify(review));
 
     const res = await request(app).get(`/api/sessions/${id}/architect-reviews`);
@@ -877,7 +1121,7 @@ describe("GET /api/sessions/:id/delivery-review", () => {
     await fs.writeFile(path.join(dir, "delivery-review.json"), JSON.stringify(deliveryReview));
     await fs.writeFile(
       path.join(dir, "architect-escalation.json"),
-      JSON.stringify({ consultationFailed: true, reason: "architect model unreachable" })
+      JSON.stringify({ consultationFailed: true, reason: "architect model unreachable" }),
     );
 
     const res = await request(app).get(`/api/sessions/${id}/delivery-review`);
@@ -891,10 +1135,24 @@ describe("GET /api/sessions/:id/delivery-review", () => {
 
 describe("GET /api/sessions/:id/delivery-packet", () => {
   const packet = {
-    task: "add widget", planRef: null, changedFiles: ["src/widget.ts"], orchestratorUpdatedFiles: [],
-    verification: { status: "VERIFIED", results: null }, visual: "not_run",
-    statuses: { technical: "VERIFIED", architecture: "not_run", documentation: "not_run", visual: "not_run", delivery: "not_run", overall: "not_run" },
-    customerReadiness: null, limitations: null, forwardPlan: null, confidence: null,
+    task: "add widget",
+    planRef: null,
+    changedFiles: ["src/widget.ts"],
+    orchestratorUpdatedFiles: [],
+    verification: { status: "VERIFIED", results: null },
+    visual: "not_run",
+    statuses: {
+      technical: "VERIFIED",
+      architecture: "not_run",
+      documentation: "not_run",
+      visual: "not_run",
+      delivery: "not_run",
+      overall: "not_run",
+    },
+    customerReadiness: null,
+    limitations: null,
+    forwardPlan: null,
+    confidence: null,
     humanReviewStatus: "pending",
   };
 
@@ -933,7 +1191,10 @@ describe("GET /api/sessions/:id/evidence", () => {
   const indexEntries = [
     { id: "sess-1-ev-1", kind: "file", path: "src/greet.js", toolCall: "read_file" },
     {
-      id: "sess-1-ev-2", kind: "test-search", path: "src/greet.js", toolCall: "find_related_tests",
+      id: "sess-1-ev-2",
+      kind: "test-search",
+      path: "src/greet.js",
+      toolCall: "find_related_tests",
       relatesTo: [{ path: "src/greet.test.js", kind: "test" }],
     },
   ];
@@ -965,12 +1226,18 @@ describe("GET /api/sessions/:id/evidence", () => {
     await fs.writeFile(
       path.join(dir, "evidence-00.jsonl"),
       JSON.stringify({
-        id: "sess-1-ev-1", sessionId: "sess-1", timestamp: "t", tool: "read_file",
-        arguments: { path: "src/greet.js" }, content: bigContent,
-      }) + "\n"
-      // A tool_envelope-kind line has no top-level "id" -- must never be
-      // mistaken for the entry being looked up.
-      + JSON.stringify({ kind: "tool_envelope", ok: true, tool: "read_file", data: "x" }) + "\n"
+        id: "sess-1-ev-1",
+        sessionId: "sess-1",
+        timestamp: "t",
+        tool: "read_file",
+        arguments: { path: "src/greet.js" },
+        content: bigContent,
+      }) +
+        "\n" +
+        // A tool_envelope-kind line has no top-level "id" -- must never be
+        // mistaken for the entry being looked up.
+        JSON.stringify({ kind: "tool_envelope", ok: true, tool: "read_file", data: "x" }) +
+        "\n",
     );
 
     const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
@@ -990,10 +1257,11 @@ describe("GET /api/sessions/:id/evidence", () => {
     await fs.writeFile(
       path.join(dir, "evidence-00.jsonl"),
       JSON.stringify({
-        id: "sess-1-ev-1", tool: "write_file",
+        id: "sess-1-ev-1",
+        tool: "write_file",
         arguments: { path: "src/big.ts", content: wholeFileContent },
         content: "wrote src/big.ts",
-      }) + "\n"
+      }) + "\n",
     );
 
     const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
@@ -1010,9 +1278,11 @@ describe("GET /api/sessions/:id/evidence", () => {
     await fs.writeFile(
       path.join(dir, "evidence-00.jsonl"),
       JSON.stringify({
-        id: "sess-1-ev-1", tool: "grep_search",
-        arguments: { pattern: hugePattern }, content: "no matches",
-      }) + "\n"
+        id: "sess-1-ev-1",
+        tool: "grep_search",
+        arguments: { pattern: hugePattern },
+        content: "no matches",
+      }) + "\n",
     );
 
     const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-1`);
@@ -1028,7 +1298,7 @@ describe("GET /api/sessions/:id/evidence", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "evidence-00.jsonl"),
-      JSON.stringify({ id: "sess-1-ev-1", tool: "read_file", arguments: {}, content: "x" }) + "\n"
+      JSON.stringify({ id: "sess-1-ev-1", tool: "read_file", arguments: {}, content: "x" }) + "\n",
     );
 
     const res = await request(app).get(`/api/sessions/${id}/evidence?id=sess-1-ev-999`);
@@ -1054,22 +1324,41 @@ describe("GET /api/sessions/:id/context", () => {
     await fs.mkdir(dir, { recursive: true });
     const events = [
       {
-        id: "evt_1", sessionId: id, timestamp: "2026-08-23T00:00:00.000Z",
-        type: "context_selected", tier0Chars: 1000, tier1Chars: 0, tier2Refs: 0, tier3Note: "cold: n/a",
+        id: "evt_1",
+        sessionId: id,
+        timestamp: "2026-08-23T00:00:00.000Z",
+        type: "context_selected",
+        tier0Chars: 1000,
+        tier1Chars: 0,
+        tier2Refs: 0,
+        tier3Note: "cold: n/a",
       },
       {
-        id: "evt_2", sessionId: id, timestamp: "2026-08-23T00:00:01.000Z",
-        type: "tool_started", tool: "read_file", args: { path: "a.ts" },
+        id: "evt_2",
+        sessionId: id,
+        timestamp: "2026-08-23T00:00:01.000Z",
+        type: "tool_started",
+        tool: "read_file",
+        args: { path: "a.ts" },
       },
       {
-        id: "evt_3", sessionId: id, timestamp: "2026-08-23T00:00:02.000Z",
-        type: "context_selected", tier0Chars: 1000, tier1Chars: 400, tier2Refs: 1, tier3Note: "cold: n/a",
+        id: "evt_3",
+        sessionId: id,
+        timestamp: "2026-08-23T00:00:02.000Z",
+        type: "context_selected",
+        tier0Chars: 1000,
+        tier1Chars: 400,
+        tier2Refs: 1,
+        tier3Note: "cold: n/a",
       },
     ];
-    await fs.writeFile(dir + "/events.jsonl", events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    await fs.writeFile(
+      dir + "/events.jsonl",
+      events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
     await fs.writeFile(
       path.join(dir, "evidence-index.json"),
-      JSON.stringify([{ id: "e1", kind: "file", path: "a.ts", toolCall: "read_file" }])
+      JSON.stringify([{ id: "e1", kind: "file", path: "a.ts", toolCall: "read_file" }]),
     );
 
     const res = await request(app).get(`/api/sessions/${id}/context`);
@@ -1106,7 +1395,13 @@ describe("GET /api/sessions/:id/context", () => {
 
 describe("GET /api/sessions/:id/tasks", () => {
   const tasks = [
-    { id: "t1", description: "Inspect src/greet.js", kind: "implementation", dependsOn: [], status: "complete" },
+    {
+      id: "t1",
+      description: "Inspect src/greet.js",
+      kind: "implementation",
+      dependsOn: [],
+      status: "complete",
+    },
   ];
 
   it("returns the parsed tasks.json when present", async () => {
@@ -1166,8 +1461,22 @@ describe("GET /api/sessions/:id/tasks", () => {
 // never touch tasks.json itself.
 describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
   const tasks = [
-    { id: "t1", description: "Add hook", kind: "implementation", dependsOn: [], status: "pending", priority: "required" },
-    { id: "t2", description: "Run tests", kind: "verification", dependsOn: ["t1"], status: "pending", priority: "required" },
+    {
+      id: "t1",
+      description: "Add hook",
+      kind: "implementation",
+      dependsOn: [],
+      status: "pending",
+      priority: "required",
+    },
+    {
+      id: "t2",
+      description: "Run tests",
+      kind: "verification",
+      dependsOn: ["t1"],
+      status: "pending",
+      priority: "required",
+    },
   ];
 
   it("writes task-overrides.json on skip and reflects it on a re-read", async () => {
@@ -1176,7 +1485,9 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    const res = await request(app).post(`/api/sessions/${id}/tasks/t1/skip`).set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post(`/api/sessions/${id}/tasks/t1/skip`)
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ taskId: "t1", action: "skip" });
     expect(typeof res.body.at).toBe("string");
@@ -1194,7 +1505,9 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
     await request(app).post(`/api/sessions/${id}/tasks/t1/skip`).set("Origin", UI_ORIGIN);
-    const res = await request(app).post(`/api/sessions/${id}/tasks/t2/approve`).set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post(`/api/sessions/${id}/tasks/t2/approve`)
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ taskId: "t2", action: "approve" });
 
@@ -1204,7 +1517,9 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
   });
 
   it("404s for an unknown session id", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/tasks/t1/skip").set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post("/api/sessions/does-not-exist/tasks/t1/skip")
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -1214,7 +1529,9 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    const res = await request(app).post(`/api/sessions/${id}/tasks/does-not-exist/skip`).set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post(`/api/sessions/${id}/tasks/does-not-exist/skip`)
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
 
     // And the sidecar must not have been written for the rejected call.
@@ -1251,13 +1568,22 @@ describe("POST /api/sessions/:id/tasks/:taskId/skip and /approve", () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(tasks));
 
-    const skipRes = await request(app).post(`/api/sessions/${id}/tasks/t2/skip`).set("Origin", UI_ORIGIN);
+    const skipRes = await request(app)
+      .post(`/api/sessions/${id}/tasks/t2/skip`)
+      .set("Origin", UI_ORIGIN);
     expect(skipRes.body).toMatchObject({ taskId: "t2", action: "skip" });
 
     // Simulate a replan: t2 now names a completely different task.
     const replannedTasks = [
       tasks[0],
-      { id: "t2", description: "Add telemetry for the new flow", kind: "implementation", dependsOn: ["t1"], status: "pending", priority: "required" },
+      {
+        id: "t2",
+        description: "Add telemetry for the new flow",
+        kind: "implementation",
+        dependsOn: ["t1"],
+        status: "pending",
+        priority: "required",
+      },
     ];
     await fs.writeFile(path.join(dir, "tasks.json"), JSON.stringify(replannedTasks));
 
@@ -1286,11 +1612,21 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     const id = "20260823-000001-glimmer-approval-approve";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+    await fs.writeFile(
+      path.join(dir, "approvals.json"),
+      JSON.stringify({ "appr-1": pendingApproval }),
+    );
 
-    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).set("Origin", UI_ORIGIN).send({ approvedBy: "daniel" });
+    const res = await request(app)
+      .post(`/api/sessions/${id}/approvals/appr-1/approve`)
+      .set("Origin", UI_ORIGIN)
+      .send({ approvedBy: "daniel" });
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ approvalId: "appr-1", status: "approved", approvedBy: "daniel" });
+    expect(res.body).toMatchObject({
+      approvalId: "appr-1",
+      status: "approved",
+      approvedBy: "daniel",
+    });
     expect(typeof res.body.resolvedAt).toBe("string");
 
     const onDisk = JSON.parse(await fs.readFile(path.join(dir, "approvals.json"), "utf-8"));
@@ -1301,9 +1637,14 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     const id = "20260823-000002-glimmer-approval-deny";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-2": pendingApproval }));
+    await fs.writeFile(
+      path.join(dir, "approvals.json"),
+      JSON.stringify({ "appr-2": pendingApproval }),
+    );
 
-    const res = await request(app).post(`/api/sessions/${id}/approvals/appr-2/deny`).set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post(`/api/sessions/${id}/approvals/appr-2/deny`)
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ approvalId: "appr-2", status: "denied" });
     expect(typeof res.body.approvedBy).toBe("string");
@@ -1311,7 +1652,9 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
   });
 
   it("404s for an unknown session id", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/approvals/appr-1/approve").set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post("/api/sessions/does-not-exist/approvals/appr-1/approve")
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -1319,9 +1662,14 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     const id = "20260823-000003-glimmer-approval-bad-id";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+    await fs.writeFile(
+      path.join(dir, "approvals.json"),
+      JSON.stringify({ "appr-1": pendingApproval }),
+    );
 
-    const res = await request(app).post(`/api/sessions/${id}/approvals/does-not-exist/approve`).set("Origin", UI_ORIGIN);
+    const res = await request(app)
+      .post(`/api/sessions/${id}/approvals/does-not-exist/approve`)
+      .set("Origin", UI_ORIGIN);
     expect(res.status).toBe(404);
   });
 
@@ -1329,16 +1677,27 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     const id = "20260823-000004-glimmer-approval-double";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "approvals.json"), JSON.stringify({ "appr-1": pendingApproval }));
+    await fs.writeFile(
+      path.join(dir, "approvals.json"),
+      JSON.stringify({ "appr-1": pendingApproval }),
+    );
 
-    const first = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).set("Origin", UI_ORIGIN).send({ approvedBy: "daniel" });
+    const first = await request(app)
+      .post(`/api/sessions/${id}/approvals/appr-1/approve`)
+      .set("Origin", UI_ORIGIN)
+      .send({ approvedBy: "daniel" });
     expect(first.status).toBe(200);
-    const second = await request(app).post(`/api/sessions/${id}/approvals/appr-1/approve`).set("Origin", UI_ORIGIN).send({ approvedBy: "someone-else" });
+    const second = await request(app)
+      .post(`/api/sessions/${id}/approvals/appr-1/approve`)
+      .set("Origin", UI_ORIGIN)
+      .send({ approvedBy: "someone-else" });
     expect(second.status).toBe(200);
     expect(second.body).toEqual(first.body); // unchanged -- not re-resolved to "someone-else"/a new timestamp
 
     // A denial after an approval is already recorded is equally a no-op.
-    const third = await request(app).post(`/api/sessions/${id}/approvals/appr-1/deny`).set("Origin", UI_ORIGIN);
+    const third = await request(app)
+      .post(`/api/sessions/${id}/approvals/appr-1/deny`)
+      .set("Origin", UI_ORIGIN);
     expect(third.body).toEqual(first.body);
   });
 
@@ -1346,16 +1705,27 @@ describe("POST /api/sessions/:id/approvals/:approvalId/approve and /deny", () =>
     const id = "20260823-000005-glimmer-approval-session";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      status: "waiting-for-approval", workspace: "/tmp/ws", branch: "main", baseline: "abc123",
-      task: "add widget", attempts: [], updatedAt: "2026-08-23T00:00:00.000Z",
-      pendingApproval: { approvalId: "appr-1", ...pendingApproval },
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        status: "waiting-for-approval",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: "abc123",
+        task: "add widget",
+        attempts: [],
+        updatedAt: "2026-08-23T00:00:00.000Z",
+        pendingApproval: { approvalId: "appr-1", ...pendingApproval },
+      }),
+    );
 
     const res = await request(app).get(`/api/sessions/${id}`);
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("waiting_for_approval");
-    expect(res.body.pendingApproval).toMatchObject({ approvalId: "appr-1", action: "modify_dependencies" });
+    expect(res.body.pendingApproval).toMatchObject({
+      approvalId: "appr-1",
+      action: "modify_dependencies",
+    });
   });
 });
 
@@ -1365,7 +1735,9 @@ describe("GET /api/sessions/:id/visual/manifest", () => {
     viewports: ["1440x900"],
     states: ["initial"],
     status: "pass",
-    captures: [{ viewport: "1440x900", screenshot: "1440x900.png", status: "captured", error: null }],
+    captures: [
+      { viewport: "1440x900", screenshot: "1440x900.png", status: "captured", error: null },
+    ],
   };
   const findings = { status: "PASS", viewport: "multi", viewports: ["1440x900"], findings: [] };
 
@@ -1442,7 +1814,9 @@ describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
   });
 
   it("returns 404 for an unknown/path-traversal session id before ever touching the filename", async () => {
-    const res = await request(app).get("/api/sessions/..%2F..%2Fevil/visual/screenshot/1440x900.png");
+    const res = await request(app).get(
+      "/api/sessions/..%2F..%2Fevil/visual/screenshot/1440x900.png",
+    );
     expect(res.status).toBe(404);
   });
 
@@ -1480,18 +1854,24 @@ describe("opt-in artifact routes reject path-traversal ids", () => {
     async (routeName) => {
       const res = await request(app).get(`/api/sessions/..%2F..%2Fevil/${routeName}`);
       expect(res.status).toBe(404);
-    }
+    },
   );
 });
 
 describe("POST /api/sessions/:id/ask", () => {
   it("returns 400 without a question", async () => {
-    const res = await request(app).post("/api/sessions/some-id/ask").set("Origin", UI_ORIGIN).send({});
+    const res = await request(app)
+      .post("/api/sessions/some-id/ask")
+      .set("Origin", UI_ORIGIN)
+      .send({});
     expect(res.status).toBe(400);
   });
 
   it("returns 404 for an unknown session", async () => {
-    const res = await request(app).post("/api/sessions/does-not-exist/ask").set("Origin", UI_ORIGIN).send({ question: "why?" });
+    const res = await request(app)
+      .post("/api/sessions/does-not-exist/ask")
+      .set("Origin", UI_ORIGIN)
+      .send({ question: "why?" });
     expect(res.status).toBe(404);
   });
 
@@ -1499,9 +1879,17 @@ describe("POST /api/sessions/:id/ask", () => {
     const id = "20260817-000020-glimmer-ask-test";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
+    );
     // Isolate this test's CONFIG.modelBaseUrl from the rest of the file:
     // CONFIG is a module-level const read at import time, so mutating the env
     // var alone would not affect the already-imported `app`. Reset the module
@@ -1511,7 +1899,10 @@ describe("POST /api/sessions/:id/ask", () => {
     vi.resetModules();
     const { createApp: createAppFresh } = await import("../app.js");
     const appFresh = createAppFresh();
-    const res = await request(appFresh).post(`/api/sessions/${id}/ask`).set("Origin", UI_ORIGIN).send({ question: "why?" });
+    const res = await request(appFresh)
+      .post(`/api/sessions/${id}/ask`)
+      .set("Origin", UI_ORIGIN)
+      .send({ question: "why?" });
     expect(res.status).toBe(502);
   });
 
@@ -1519,15 +1910,26 @@ describe("POST /api/sessions/:id/ask", () => {
     const id = "20260817-000021-glimmer-ask-fs-fault";
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
+    );
     // A directory named events.jsonl, not a file: fs.readFile on it fails
     // with EISDIR before askSessionAssistant (and therefore the model) is
     // ever reached — this must not be reported as "model unreachable" (502).
     await fs.mkdir(path.join(dir, "events.jsonl"));
 
-    const res = await request(app).post(`/api/sessions/${id}/ask`).set("Origin", UI_ORIGIN).send({ question: "why?" });
+    const res = await request(app)
+      .post(`/api/sessions/${id}/ask`)
+      .set("Origin", UI_ORIGIN)
+      .send({ question: "why?" });
     expect(res.status).toBe(500);
   });
 });
@@ -1536,15 +1938,25 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
   async function makeSession(id: string): Promise<void> {
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "manifest.json"), JSON.stringify({
-      task: "test", status: "verified", workspace: "/tmp/ws", branch: "main", baseline: null, attempts: [],
-    }));
+    await fs.writeFile(
+      path.join(dir, "manifest.json"),
+      JSON.stringify({
+        task: "test",
+        status: "verified",
+        workspace: "/tmp/ws",
+        branch: "main",
+        baseline: null,
+        attempts: [],
+      }),
+    );
   }
 
   // Isolate CONFIG.modelBaseUrl per test the same way the 502 test above
   // does: it's a module-level const read at import time, so the fake
   // upstream's URL must be set before `app.js` is (re-)imported.
-  async function appWithUpstream(handler: http.RequestListener): Promise<{ app: Express; server: http.Server }> {
+  async function appWithUpstream(
+    handler: http.RequestListener,
+  ): Promise<{ app: Express; server: http.Server }> {
     const server = http.createServer(handler);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const addr = server.address();
@@ -1561,15 +1973,23 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
     const { app: streamApp, server } = await appWithUpstream((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "It owns " } }] })}\n\n`);
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "the parser state." } }] })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "the parser state." } }] })}\n\n`,
+      );
       res.write("data: [DONE]\n\n");
       res.end();
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).set("Origin", UI_ORIGIN).send({ question: "why?" });
+      const res = await request(streamApp)
+        .post(`/api/sessions/${id}/ask?stream=1`)
+        .set("Origin", UI_ORIGIN)
+        .send({ question: "why?" });
       expect(res.status).toBe(200);
       expect(res.headers["content-type"]).toContain("text/event-stream");
-      const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
+      const frames = res.text
+        .trim()
+        .split("\n\n")
+        .map((f) => JSON.parse(f.replace(/^data: /, "")));
       expect(frames).toEqual([
         { delta: "It owns " },
         { delta: "the parser state." },
@@ -1593,9 +2013,15 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       setTimeout(() => res.destroy(), 20);
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).set("Origin", UI_ORIGIN).send({ question: "why?" });
+      const res = await request(streamApp)
+        .post(`/api/sessions/${id}/ask?stream=1`)
+        .set("Origin", UI_ORIGIN)
+        .send({ question: "why?" });
       expect(res.status).toBe(200);
-      const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
+      const frames = res.text
+        .trim()
+        .split("\n\n")
+        .map((f) => JSON.parse(f.replace(/^data: /, "")));
       expect(frames[0]).toEqual({ delta: "Partial" });
       expect(frames[frames.length - 1]).toEqual({ error: "unavailable" });
     } finally {
@@ -1604,7 +2030,10 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
   });
 
   it("returns 400 without a question, same as the non-streaming path, before ever writing SSE headers", async () => {
-    const res = await request(app).post("/api/sessions/some-id/ask?stream=1").set("Origin", UI_ORIGIN).send({});
+    const res = await request(app)
+      .post("/api/sessions/some-id/ask?stream=1")
+      .set("Origin", UI_ORIGIN)
+      .send({});
     expect(res.status).toBe(400);
   });
 
@@ -1616,9 +2045,15 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       res.end("data: [DONE]\n\n");
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask?stream=1`).set("Origin", UI_ORIGIN).send({ question: "why?" });
+      const res = await request(streamApp)
+        .post(`/api/sessions/${id}/ask?stream=1`)
+        .set("Origin", UI_ORIGIN)
+        .send({ question: "why?" });
       expect(res.status).toBe(200);
-      const frames = res.text.trim().split("\n\n").map((f) => JSON.parse(f.replace(/^data: /, "")));
+      const frames = res.text
+        .trim()
+        .split("\n\n")
+        .map((f) => JSON.parse(f.replace(/^data: /, "")));
       expect(frames).toEqual([{ error: "unavailable" }]);
       expect(frames.some((f: any) => f.done)).toBe(false); // never a done frame for an empty answer
     } finally {
@@ -1633,7 +2068,9 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
     const { app: streamApp, server: upstreamServer } = await appWithUpstream((req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`);
-      req.on("close", () => { upstreamGotClose = true; });
+      req.on("close", () => {
+        upstreamGotClose = true;
+      });
       // Deliberately never ends on its own — only the gateway aborting on
       // client disconnect (or the test's own cleanup) ends this.
     });
@@ -1647,7 +2084,10 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
         const body = JSON.stringify({ question: "why?" });
         const clientReq = http.request(
           {
-            hostname: "127.0.0.1", port, path: `/api/sessions/${id}/ask?stream=1`, method: "POST",
+            hostname: "127.0.0.1",
+            port,
+            path: `/api/sessions/${id}/ask?stream=1`,
+            method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Content-Length": Buffer.byteLength(body),
@@ -1656,7 +2096,7 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
           },
           (res) => {
             res.once("data", () => clientReq.destroy()); // simulate the browser tab closing mid-stream
-          }
+          },
         );
         clientReq.on("error", () => resolve()); // destroying our own socket surfaces as a local error here — expected
         clientReq.on("close", () => resolve());
@@ -1682,7 +2122,10 @@ describe("POST /api/sessions/:id/ask?stream=1", () => {
       res.end(JSON.stringify({ choices: [{ message: { content: "It owns the parser state." } }] }));
     });
     try {
-      const res = await request(streamApp).post(`/api/sessions/${id}/ask`).set("Origin", UI_ORIGIN).send({ question: "why?" });
+      const res = await request(streamApp)
+        .post(`/api/sessions/${id}/ask`)
+        .set("Origin", UI_ORIGIN)
+        .send({ question: "why?" });
       expect(res.status).toBe(200);
       expect(res.headers["content-type"]).toContain("application/json");
       expect(res.body).toEqual({ answer: "It owns the parser state.", provenance: "model-output" });
@@ -1716,7 +2159,9 @@ describe("stale verified-session detection (V7 §20)", () => {
     await fs.writeFile(path.join(staleWorkspace, "a.txt"), "one\n");
     await execGit("git", ["add", "a.txt"], { cwd: staleWorkspace });
     await execGit("git", ["commit", "-q", "-m", "init"], { cwd: staleWorkspace });
-    baselineSha = (await execGit("git", ["rev-parse", "HEAD"], { cwd: staleWorkspace })).stdout.trim();
+    baselineSha = (
+      await execGit("git", ["rev-parse", "HEAD"], { cwd: staleWorkspace })
+    ).stdout.trim();
 
     // Model collapse()'s end state: HEAD stays at baselineSha, working tree
     // holds the uncommitted diff -- finalDiffHash below is the real
@@ -1737,10 +2182,15 @@ describe("stale verified-session detection (V7 §20)", () => {
     await fs.writeFile(
       path.join(dir, "manifest.json"),
       JSON.stringify({
-        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
-        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
-        baseline: baselineSha, attempts: [],
-      })
+        task: "test",
+        status: "verified",
+        verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash,
+        workspace: staleWorkspace,
+        branch: "main",
+        baseline: baselineSha,
+        attempts: [],
+      }),
     );
 
     const res = await request(app).get(`/api/sessions/${id}`);
@@ -1756,10 +2206,15 @@ describe("stale verified-session detection (V7 §20)", () => {
     await fs.writeFile(
       path.join(dir, "manifest.json"),
       JSON.stringify({
-        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
-        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
-        baseline: baselineSha, attempts: [],
-      })
+        task: "test",
+        status: "verified",
+        verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash,
+        workspace: staleWorkspace,
+        branch: "main",
+        baseline: baselineSha,
+        attempts: [],
+      }),
     );
 
     const res = await request(app).get(`/api/sessions/${id}`);
@@ -1777,10 +2232,15 @@ describe("stale verified-session detection (V7 §20)", () => {
     await fs.writeFile(
       path.join(dir, "manifest.json"),
       JSON.stringify({
-        task: "test", status: "verified", verifiedAt: "2026-08-21T00:00:00.000Z",
-        finalDiffHash: postCollapseHash, workspace: staleWorkspace, branch: "main",
-        baseline: baselineSha, attempts: [],
-      })
+        task: "test",
+        status: "verified",
+        verifiedAt: "2026-08-21T00:00:00.000Z",
+        finalDiffHash: postCollapseHash,
+        workspace: staleWorkspace,
+        branch: "main",
+        baseline: baselineSha,
+        attempts: [],
+      }),
     );
 
     const res = await request(app).get("/api/sessions");

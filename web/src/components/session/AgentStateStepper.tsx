@@ -7,8 +7,15 @@ import { StatusBadge } from "../common/StatusBadge";
 // single source of truth for "is this session running/active" (liveness
 // line, pulsing status dot) so that check can't drift from the stepper.
 export const STATES: GlimmerSessionStatus[] = [
-  "created", "preflight", "understanding", "discovery", "candidate_selection",
-  "implementing", "verifying", "repairing", "waiting_for_approval",
+  "created",
+  "preflight",
+  "understanding",
+  "discovery",
+  "candidate_selection",
+  "implementing",
+  "verifying",
+  "repairing",
+  "waiting_for_approval",
 ];
 
 export function AgentStateStepper({ current }: { current: GlimmerSessionStatus }) {

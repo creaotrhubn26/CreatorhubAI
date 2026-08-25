@@ -1,8 +1,17 @@
 import { Router } from "express";
 import { probeModel, probeModelProps } from "../lib/modelStatus.js";
-import { describeRunState, forgetSpawned, startModelServer, stopModelServer } from "../lib/modelServer.js";
+import {
+  describeRunState,
+  forgetSpawned,
+  startModelServer,
+  stopModelServer,
+} from "../lib/modelServer.js";
 import { CONFIG } from "../config.js";
-import { ModelRegistryValidationError, readModelRegistry, saveModelRegistry } from "../lib/modelRegistry.js";
+import {
+  ModelRegistryValidationError,
+  readModelRegistry,
+  saveModelRegistry,
+} from "../lib/modelRegistry.js";
 
 export const modelRouter = Router();
 
@@ -20,7 +29,9 @@ modelRouter.put("/models/config", async (req, res) => {
   } catch (err: any) {
     const message = String(err?.message ?? err);
     const clientError = err instanceof ModelRegistryValidationError;
-    res.status(clientError ? 400 : 500).json({ error: clientError ? message : "could not save model registry" });
+    res
+      .status(clientError ? 400 : 500)
+      .json({ error: clientError ? message : "could not save model registry" });
   }
 });
 
@@ -51,7 +62,9 @@ modelRouter.post("/model/start", async (_req, res) => {
 
   const result = await startModelServer();
   if ("error" in result) {
-    return res.status(500).json({ started: false, error: result.error, ...probe, runState: "OFFLINE" });
+    return res
+      .status(500)
+      .json({ started: false, error: result.error, ...probe, runState: "OFFLINE" });
   }
   // 202, not 200: the process exists, the model does not answer yet. The next
   // GET /model/status poll reports STARTING -> LOADING -> ONLINE on its own.

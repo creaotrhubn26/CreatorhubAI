@@ -29,7 +29,9 @@ function timeLabel(iso: string): string {
 // it to the same Unavailable copy as any other failure rather than leaving
 // a permanent "Asking…" ghost.
 function resolveStaleTurns(turns: Turn[]): Turn[] {
-  return turns.map((t) => (t.answer === undefined && t.error === undefined ? { ...t, error: UNAVAILABLE_MESSAGE } : t));
+  return turns.map((t) =>
+    t.answer === undefined && t.error === undefined ? { ...t, error: UNAVAILABLE_MESSAGE } : t,
+  );
 }
 
 interface AssistantState {
@@ -46,7 +48,11 @@ function loadState(sessionId: string): AssistantState {
 // after the user has switched to viewing a different session, and must not
 // write that stale content into the now-current session's state (which would
 // then get saved under the wrong sessionStorage key).
-function applyToSession(prev: AssistantState, forSession: string, fn: (turns: Turn[]) => Turn[]): AssistantState {
+function applyToSession(
+  prev: AssistantState,
+  forSession: string,
+  fn: (turns: Turn[]) => Turn[],
+): AssistantState {
   return prev.sid === forSession ? { sid: prev.sid, turns: fn(prev.turns) } : prev;
 }
 
@@ -67,7 +73,7 @@ export function SessionAssistant({
   // session switch.
   const contextId = selection
     ? `selection:${selection.path}:${selection.startLine}-${selection.endLine}`
-    : sessionId ?? "unavailable";
+    : (sessionId ?? "unavailable");
   const [question, setQuestion] = useState("");
   const [chatState, setChatState] = useState<AssistantState>(() => loadState(contextId));
   const [pending, setPending] = useState(false);
@@ -101,7 +107,12 @@ export function SessionAssistant({
     const forContext = contextId;
     const selected = selection;
     const sid = sessionId;
-    setChatState((prev) => applyToSession(prev, forContext, (turns) => [...turns, { id, question: q, askedAt: new Date().toISOString() }]));
+    setChatState((prev) =>
+      applyToSession(prev, forContext, (turns) => [
+        ...turns,
+        { id, question: q, askedAt: new Date().toISOString() },
+      ]),
+    );
     setQuestion("");
     setPending(true);
     let streamedAnyDelta = false;
@@ -111,13 +122,19 @@ export function SessionAssistant({
         : glimmerApi.askSessionStream(sid!, q, onDelta));
       function onDelta(delta: string) {
         streamedAnyDelta = true;
-        setChatState((prev) => applyToSession(prev, forContext, (turns) =>
-          turns.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t))
-        ));
+        setChatState((prev) =>
+          applyToSession(prev, forContext, (turns) =>
+            turns.map((t) => (t.id === id ? { ...t, answer: (t.answer ?? "") + delta } : t)),
+          ),
+        );
       }
-      setChatState((prev) => applyToSession(prev, forContext, (turns) =>
-        turns.map((t) => (t.id === id ? { ...t, answer, answeredAt: new Date().toISOString() } : t))
-      ));
+      setChatState((prev) =>
+        applyToSession(prev, forContext, (turns) =>
+          turns.map((t) =>
+            t.id === id ? { ...t, answer, answeredAt: new Date().toISOString() } : t,
+          ),
+        ),
+      );
     } catch (streamErr: any) {
       // The server tags "upstream already reported dead" errors distinctly
       // (a mid-stream or immediate error frame) — retrying via the
@@ -126,21 +143,33 @@ export function SessionAssistant({
       // server at all) is worth a fallback attempt.
       const upstreamReportedDead = streamErr?.name === "AssistantUpstreamError";
       if (streamedAnyDelta || upstreamReportedDead) {
-        setChatState((prev) => applyToSession(prev, forContext, (turns) =>
-          turns.map((t) => (t.id === id ? { ...t, answer: undefined, error: UNAVAILABLE_MESSAGE } : t))
-        ));
+        setChatState((prev) =>
+          applyToSession(prev, forContext, (turns) =>
+            turns.map((t) =>
+              t.id === id ? { ...t, answer: undefined, error: UNAVAILABLE_MESSAGE } : t,
+            ),
+          ),
+        );
       } else {
         try {
           const data = selected
             ? await glimmerApi.askRepository(selected, q)
             : await glimmerApi.askSession(sid!, q);
-          setChatState((prev) => applyToSession(prev, forContext, (turns) =>
-            turns.map((t) => (t.id === id ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() } : t))
-          ));
+          setChatState((prev) =>
+            applyToSession(prev, forContext, (turns) =>
+              turns.map((t) =>
+                t.id === id
+                  ? { ...t, answer: data.answer, answeredAt: new Date().toISOString() }
+                  : t,
+              ),
+            ),
+          );
         } catch {
-          setChatState((prev) => applyToSession(prev, forContext, (turns) =>
-            turns.map((t) => (t.id === id ? { ...t, error: UNAVAILABLE_MESSAGE } : t))
-          ));
+          setChatState((prev) =>
+            applyToSession(prev, forContext, (turns) =>
+              turns.map((t) => (t.id === id ? { ...t, error: UNAVAILABLE_MESSAGE } : t)),
+            ),
+          );
         }
       }
     } finally {
@@ -155,8 +184,11 @@ export function SessionAssistant({
   // populates them today — showing "+0 -0" when they're simply absent would
   // read as "no lines changed" rather than "unknown", so only render the
   // stat once at least one file actually carries it.
-  const hasLineStats = !!session?.changedFiles.some((f) => f.insertions !== undefined || f.deletions !== undefined);
-  const totalInsertions = session?.changedFiles.reduce((sum, f) => sum + (f.insertions ?? 0), 0) ?? 0;
+  const hasLineStats = !!session?.changedFiles.some(
+    (f) => f.insertions !== undefined || f.deletions !== undefined,
+  );
+  const totalInsertions =
+    session?.changedFiles.reduce((sum, f) => sum + (f.insertions ?? 0), 0) ?? 0;
   const totalDeletions = session?.changedFiles.reduce((sum, f) => sum + (f.deletions ?? 0), 0) ?? 0;
 
   return (
@@ -175,7 +207,9 @@ export function SessionAssistant({
       {selection && (
         <div className="chat-filecard">
           <span className="mono chat-filecard__path">{selection.path}</span>
-          <span className="mono">lines {selection.startLine}-{selection.endLine}</span>
+          <span className="mono">
+            lines {selection.startLine}-{selection.endLine}
+          </span>
         </div>
       )}
 
@@ -190,7 +224,10 @@ export function SessionAssistant({
 
       {hasChanges && (
         <div className="chat-filecard" style={{ marginTop: "var(--space-3)" }}>
-          <span className="mono chat-filecard__path">{session!.changedFiles[0].path}{session!.changedFiles.length > 1 ? ` +${session!.changedFiles.length - 1} more` : ""}</span>
+          <span className="mono chat-filecard__path">
+            {session!.changedFiles[0].path}
+            {session!.changedFiles.length > 1 ? ` +${session!.changedFiles.length - 1} more` : ""}
+          </span>
           {hasLineStats && (
             <>
               <span className="mono chat-filecard__stat-add">+{totalInsertions}</span>
@@ -205,7 +242,9 @@ export function SessionAssistant({
         {turns.map((t) => (
           <div key={t.id}>
             <div className="chat-bubble-row from-user">
-              <div className="chat-bubble-meta">You <span>{timeLabel(t.askedAt)}</span></div>
+              <div className="chat-bubble-meta">
+                You <span>{timeLabel(t.askedAt)}</span>
+              </div>
               <div className="chat-bubble from-user">{t.question}</div>
             </div>
             <div className="chat-bubble-row from-assistant">
@@ -216,7 +255,9 @@ export function SessionAssistant({
               {t.answer && (
                 <div className="chat-bubble from-assistant">
                   {t.answer}
-                  <span className="chat-bubble__provenance">Model output — not a deterministic fact</span>
+                  <span className="chat-bubble__provenance">
+                    Model output — not a deterministic fact
+                  </span>
                 </div>
               )}
               {t.error && <div className="chat-bubble from-assistant">{t.error}</div>}
@@ -231,13 +272,18 @@ export function SessionAssistant({
           placeholder={selection ? "Ask, or describe a change…" : "Ask about this session…"}
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") ask(question); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") ask(question);
+          }}
         />
         <button onClick={() => ask(question)} disabled={!question || pending} aria-label="Ask">
           {pending ? "Asking…" : "Ask"}
         </button>
         {selection && onDraftTask && (
-          <button onClick={() => onDraftTask(question.trim())} disabled={!question.trim() || pending}>
+          <button
+            onClick={() => onDraftTask(question.trim())}
+            disabled={!question.trim() || pending}
+          >
             Draft task
           </button>
         )}

@@ -2,7 +2,10 @@ import type { RiskLevel, SessionAnalysis } from "@glimmer/shared";
 import { CollapsibleSection } from "../common/CollapsibleSection";
 
 const RISK_COLOR: Record<RiskLevel, string> = {
-  LOW: "var(--green)", MEDIUM: "var(--amber)", HIGH: "var(--red)", CRITICAL: "var(--red)",
+  LOW: "var(--green)",
+  MEDIUM: "var(--amber)",
+  HIGH: "var(--red)",
+  CRITICAL: "var(--red)",
 };
 const SEVERE_RISK: ReadonlySet<RiskLevel> = new Set(["HIGH", "CRITICAL"]);
 
@@ -43,10 +46,20 @@ export function RiskAndScopeSummary({ analysis }: { analysis: SessionAnalysis })
         <p>Scope guard: Unavailable — no task contract on record for this session.</p>
       )}
       {analysis.scopeGuard?.unbounded && (
-        <p>Scope guard: Unbounded — this task's scope had no concrete path set, so scope could not be verified.</p>
+        <p>
+          Scope guard: Unbounded — this task's scope had no concrete path set, so scope could not be
+          verified.
+        </p>
       )}
       {analysis.scopeGuard && !analysis.scopeGuard.unbounded && !analysis.scopeGuard.inScope && (
-        <div style={{ border: "1px solid var(--red)", borderRadius: "var(--radius)", padding: 8, marginTop: 8 }}>
+        <div
+          style={{
+            border: "1px solid var(--red)",
+            borderRadius: "var(--radius)",
+            padding: 8,
+            marginTop: 8,
+          }}
+        >
           <strong style={{ color: "var(--red)" }}>SCOPE EXPANSION</strong>
           <dl>
             <dt>Expected</dt>

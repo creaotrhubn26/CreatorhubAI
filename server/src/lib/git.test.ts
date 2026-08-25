@@ -5,7 +5,13 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  gitStatus, gitDiff, gitRevertFile, computeDiffHash, parseGitDiffHunks, gitRejectHunk, GitHunkReviewError,
+  gitStatus,
+  gitDiff,
+  gitRevertFile,
+  computeDiffHash,
+  parseGitDiffHunks,
+  gitRejectHunk,
+  GitHunkReviewError,
 } from "./git.js";
 
 const exec = promisify(execFile);
@@ -22,7 +28,9 @@ beforeAll(async () => {
   await fs.writeFile(path.join(repo, "a.txt"), "two\n");
 });
 
-afterAll(async () => { await fs.rm(repo, { recursive: true, force: true }); });
+afterAll(async () => {
+  await fs.rm(repo, { recursive: true, force: true });
+});
 
 describe("gitStatus", () => {
   it("reports branch, head, dirty, and changed files", async () => {
@@ -69,7 +77,10 @@ describe("per-hunk diff review", () => {
     await exec("git", ["init", "-q"], { cwd: ws });
     await exec("git", ["config", "user.email", "t@t.com"], { cwd: ws });
     await exec("git", ["config", "user.name", "t"], { cwd: ws });
-    await fs.writeFile(path.join(ws, "review.txt"), Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n") + "\n");
+    await fs.writeFile(
+      path.join(ws, "review.txt"),
+      Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n") + "\n",
+    );
     await exec("git", ["add", "review.txt"], { cwd: ws });
     await exec("git", ["commit", "-q", "-m", "baseline"], { cwd: ws });
     return ws;
@@ -128,7 +139,9 @@ describe("per-hunk diff review", () => {
 
       await gitRejectHunk(ws, ["brand new.txt"], "brand new.txt", hunks[0].id);
 
-      await expect(fs.stat(path.join(ws, "brand new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(ws, "brand new.txt"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     } finally {
       await fs.rm(ws, { recursive: true, force: true });
     }
@@ -139,10 +152,12 @@ describe("per-hunk diff review", () => {
     try {
       await fs.writeFile(path.join(ws, "review.txt"), "changed\n");
       const before = await fs.readFile(path.join(ws, "review.txt"), "utf8");
-      await expect(gitRejectHunk(ws, ["review.txt"], "review.txt", "0".repeat(64)))
-        .rejects.toMatchObject<Partial<GitHunkReviewError>>({ status: 409 });
-      await expect(gitRejectHunk(ws, ["other.txt"], "review.txt", "0".repeat(64)))
-        .rejects.toMatchObject<Partial<GitHunkReviewError>>({ status: 403 });
+      await expect(
+        gitRejectHunk(ws, ["review.txt"], "review.txt", "0".repeat(64)),
+      ).rejects.toMatchObject<Partial<GitHunkReviewError>>({ status: 409 });
+      await expect(
+        gitRejectHunk(ws, ["other.txt"], "review.txt", "0".repeat(64)),
+      ).rejects.toMatchObject<Partial<GitHunkReviewError>>({ status: 403 });
       expect(await fs.readFile(path.join(ws, "review.txt"), "utf8")).toBe(before);
     } finally {
       await fs.rm(ws, { recursive: true, force: true });
@@ -223,7 +238,9 @@ describe("gitRevertFile", () => {
 
   it("refuses a path-traversal attempt", async () => {
     const baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
-    await expect(gitRevertFile(repo, ["../secret.txt"], "../secret.txt", baselineSha)).rejects.toThrow();
+    await expect(
+      gitRevertFile(repo, ["../secret.txt"], "../secret.txt", baselineSha),
+    ).rejects.toThrow();
   });
 
   it("refuses to revert when no baseline commit is known, instead of silently trusting HEAD", async () => {
@@ -245,7 +262,9 @@ describe("gitRevertFile", () => {
       await fs.writeFile(path.join(isolated, "b.txt"), "baseline-content\n");
       await exec("git", ["add", "b.txt"], { cwd: isolated });
       await exec("git", ["commit", "-q", "-m", "baseline"], { cwd: isolated });
-      const baselineSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: isolated })).stdout.trim();
+      const baselineSha = (
+        await exec("git", ["rev-parse", "HEAD"], { cwd: isolated })
+      ).stdout.trim();
 
       // A commit lands AFTER the session's baseline (e.g. someone else pushed,
       // or the orchestrator committed something) — HEAD is now ahead of

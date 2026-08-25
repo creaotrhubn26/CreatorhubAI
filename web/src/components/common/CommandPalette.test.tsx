@@ -22,7 +22,9 @@ describe("CommandPalette", () => {
 
   it("filters the list as the user types", () => {
     render(<CommandPalette commands={commands()} onClose={vi.fn()} />);
-    fireEvent.change(screen.getByRole("combobox", { name: "Command palette" }), { target: { value: "dash" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Command palette" }), {
+      target: { value: "dash" },
+    });
     expect(screen.getAllByRole("option")).toHaveLength(1);
     expect(screen.getByText("Go to Dashboard")).toBeInTheDocument();
   });

@@ -31,7 +31,10 @@ beforeAll(async () => {
   for (let i = 0; i < 12; i++) {
     const dir = path.join(stateRoot, "sessions", `pending-${String(i).padStart(4, "0")}`);
     await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, "gateway-contract.json"), JSON.stringify({ task: "pending" }));
+    await fs.writeFile(
+      path.join(dir, "gateway-contract.json"),
+      JSON.stringify({ task: "pending" }),
+    );
   }
 
   for (const id of realIds) {
@@ -39,7 +42,14 @@ beforeAll(async () => {
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, "manifest.json"),
-      JSON.stringify({ task: `task ${id}`, status: "verified", workspace: "/ws", branch: "glimmer/x", attempts: [], updatedAt: "2026-08-16T12:00:00Z" })
+      JSON.stringify({
+        task: `task ${id}`,
+        status: "verified",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        attempts: [],
+        updatedAt: "2026-08-16T12:00:00Z",
+      }),
     );
   }
 
@@ -56,7 +66,9 @@ describe("GET /api/status with stale pending-* dirs on disk", () => {
     const res = await request(app).get("/api/status");
     expect(res.status).toBe(200);
     expect(res.body.recentSessions).toHaveLength(realIds.length);
-    expect(res.body.recentSessions.map((s: { id: string }) => s.id).sort()).toEqual([...realIds].sort());
+    expect(res.body.recentSessions.map((s: { id: string }) => s.id).sort()).toEqual(
+      [...realIds].sort(),
+    );
     expect(res.body.latestSession).not.toBeNull();
     expect(res.body.latestSession.id).toBe("20260816-090000-glimmer-newest");
   });

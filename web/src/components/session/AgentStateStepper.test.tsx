@@ -11,7 +11,13 @@ describe("AgentStateStepper", () => {
 
   it("renders a terminal status as its own badge instead of an unhighlighted flow", () => {
     for (const terminal of [
-      "blocked", "failed", "needs_review", "verified", "completed", "no_change", "cancelled",
+      "blocked",
+      "failed",
+      "needs_review",
+      "verified",
+      "completed",
+      "no_change",
+      "cancelled",
     ] as const) {
       const { unmount } = render(<AgentStateStepper current={terminal} />);
       expect(screen.getByText(terminal)).toBeInTheDocument();

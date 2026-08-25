@@ -54,10 +54,13 @@ fn gateway_dir(app: &tauri::AppHandle) -> PathBuf {
     // in debug builds too once the script has been run — tauri-build copies
     // `bundle.resources` at compile time (build.rs), not just at `tauri
     // build` time, so this also works under plain `cargo run`/`tauri dev`.
-    if let Ok(resource_dir) = app.path().resolve("resources/gateway", tauri::path::BaseDirectory::Resource) {
-        if resource_dir.join("dist/index.js").exists() {
-            return resource_dir;
-        }
+    if let Some(resource_dir) = app
+        .path()
+        .resolve("resources/gateway", tauri::path::BaseDirectory::Resource)
+        .ok()
+        .filter(|resource_dir| resource_dir.join("dist/index.js").exists())
+    {
+        return resource_dir;
     }
 
     // Dev fallback: compile-time repo path, only meaningful for a debug
@@ -66,7 +69,7 @@ fn gateway_dir(app: &tauri::AppHandle) -> PathBuf {
     // this branch is compiled out there.
     #[cfg(debug_assertions)]
     {
-        return PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../server")
     }
     #[cfg(not(debug_assertions))]
     {
@@ -80,7 +83,7 @@ fn find_in_path(path: &str, program: &str) -> Option<PathBuf> {
     path.split(':')
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join(program))
-        .find(|candidate| is_executable(candidate))
+        .find(is_executable)
 }
 
 /// A *runnable* file, not just a file: a non-executable `node` earlier in PATH
@@ -89,9 +92,9 @@ fn is_executable(path: &PathBuf) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path)
+        std::fs::metadata(path)
             .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(unix))]
     {
@@ -120,7 +123,9 @@ fn login_shell_path() -> Option<String> {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
-                eprintln!("[glimmer] login shell ({shell}) did not report its PATH within {SHELL_PATH_TIMEOUT:?} — killing it and falling back.");
+                eprintln!(
+                    "[glimmer] login shell ({shell}) did not report its PATH within {SHELL_PATH_TIMEOUT:?} — killing it and falling back."
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -153,19 +158,33 @@ fn resolve_user_path() -> String {
 
     if let Some(shell_path) = login_shell_path() {
         if let Some(node) = find_in_path(&shell_path, "node") {
-            println!("[glimmer] PATH resolved from login shell (node at {}): {shell_path}", node.display());
+            println!(
+                "[glimmer] PATH resolved from login shell (node at {}): {shell_path}",
+                node.display()
+            );
             return shell_path;
         }
-        eprintln!("[glimmer] login shell PATH contains no node — falling back to the standard locations. Shell PATH was: {shell_path}");
+        eprintln!(
+            "[glimmer] login shell PATH contains no node — falling back to the standard locations. Shell PATH was: {shell_path}"
+        );
     } else {
-        eprintln!("[glimmer] could not read the login shell's PATH — falling back to the standard locations.");
+        eprintln!(
+            "[glimmer] could not read the login shell's PATH — falling back to the standard locations."
+        );
     }
 
     let mut dirs: Vec<&str> = FALLBACK_PATH_DIRS.to_vec();
-    dirs.extend(inherited.split(':').filter(|d| !d.is_empty() && !FALLBACK_PATH_DIRS.contains(d)));
+    dirs.extend(
+        inherited
+            .split(':')
+            .filter(|d| !d.is_empty() && !FALLBACK_PATH_DIRS.contains(d)),
+    );
     let fallback = dirs.join(":");
     match find_in_path(&fallback, "node") {
-        Some(node) => println!("[glimmer] PATH resolved from fallback locations (node at {}): {fallback}", node.display()),
+        Some(node) => println!(
+            "[glimmer] PATH resolved from fallback locations (node at {}): {fallback}",
+            node.display()
+        ),
         None => eprintln!(
             "[glimmer] PATH resolved from fallback locations but NO node was found in it: {fallback}. The gateway will start, but verification commands (npm run typecheck, ...) will fail with 'command not found'."
         ),
@@ -242,13 +261,20 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
 /// exec lookup, which searches the *parent's* PATH — the launchd one that
 /// started this whole bug.
 fn node_binary(path: &str) -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sidecar = dir.join(if cfg!(windows) { "glimmer-node.exe" } else { "glimmer-node" });
-            if sidecar.exists() {
-                return sidecar;
-            }
-        }
+    let sidecar = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent().map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "glimmer-node.exe"
+                } else {
+                    "glimmer-node"
+                })
+            })
+        })
+        .filter(|sidecar| sidecar.exists());
+    if let Some(sidecar) = sidecar {
+        return sidecar;
     }
     find_in_path(path, "node").unwrap_or_else(|| PathBuf::from("node"))
 }
@@ -266,12 +292,11 @@ fn notify(app: tauri::AppHandle, title: String, body: String) {
 }
 
 fn kill_gateway(state: &GatewayChild) {
-    if let Ok(mut guard) = state.0.lock() {
-        if let Some(mut child) = guard.take() {
-            println!("[glimmer] stopping gateway (pid {})", child.id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    let child = state.0.lock().ok().and_then(|mut guard| guard.take());
+    if let Some(mut child) = child {
+        println!("[glimmer] stopping gateway (pid {})", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

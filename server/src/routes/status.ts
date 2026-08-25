@@ -7,8 +7,14 @@ import { listSessionIds, readSession } from "../lib/sessions.js";
 export const statusRouter = Router();
 
 const IN_FLIGHT_STATUSES = new Set<GlimmerSessionStatus>([
-  "preflight", "understanding", "discovery", "candidate_selection",
-  "implementing", "verifying", "repairing", "waiting_for_approval",
+  "preflight",
+  "understanding",
+  "discovery",
+  "candidate_selection",
+  "implementing",
+  "verifying",
+  "repairing",
+  "waiting_for_approval",
 ]);
 
 statusRouter.get("/status", async (_req, res) => {
@@ -20,9 +26,11 @@ statusRouter.get("/status", async (_req, res) => {
   // V7 §20: plain readSession(id) (computeStale left false) -- this reads
   // the whole session list on this polled status endpoint, same reasoning
   // as GET /sessions.
-  const sessions = ((await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean) as NonNullable<
-    Awaited<ReturnType<typeof readSession>>
-  >[]).slice(0, 10);
+  const sessions = (
+    (await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean) as NonNullable<
+      Awaited<ReturnType<typeof readSession>>
+    >[]
+  ).slice(0, 10);
   // Inclusion, not exclusion: an unmapped/terminal status must never be shown
   // as the live "active session" (spec: never show fake live values as real).
   const active = sessions.find((s) => IN_FLIGHT_STATUSES.has(s.status));
@@ -30,10 +38,18 @@ statusRouter.get("/status", async (_req, res) => {
 
   const body: DashboardStatus = {
     model,
-    activeSession: active ? { id: active.id, status: active.status, changedFiles: active.changedFiles } : null,
-    latestSession: latest ? { id: latest.id, task: latest.task, status: latest.status, completedAt: latest.completedAt } : null,
+    activeSession: active
+      ? { id: active.id, status: active.status, changedFiles: active.changedFiles }
+      : null,
+    latestSession: latest
+      ? { id: latest.id, task: latest.task, status: latest.status, completedAt: latest.completedAt }
+      : null,
     recentSessions: sessions.map((s) => ({
-      id: s.id, task: s.task, status: s.status, changedFiles: s.changedFiles, completedAt: s.completedAt,
+      id: s.id,
+      task: s.task,
+      status: s.status,
+      changedFiles: s.changedFiles,
+      completedAt: s.completedAt,
     })),
     verification: latest ? latest.verification : null,
   };

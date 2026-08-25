@@ -49,10 +49,18 @@ function gateSuffix(key: ValueGateKey, gates: Gates): string {
 export function GatesRow({ gates }: { gates?: Gates }) {
   if (!gates) return null;
   return (
-    <div className="gates-row" style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "8px 0" }}>
+    <div
+      className="gates-row"
+      style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 12, margin: "8px 0" }}
+    >
       {GATE_LABELS.map(([key, label]) => (
-        <span key={key} className="meta-value" style={{ ["--badge-color" as any]: gateColor(gates[key]) }}>
-          {label} {gateSymbol(gates[key])}{gateSuffix(key, gates)}
+        <span
+          key={key}
+          className="meta-value"
+          style={{ ["--badge-color" as any]: gateColor(gates[key]) }}
+        >
+          {label} {gateSymbol(gates[key])}
+          {gateSuffix(key, gates)}
         </span>
       ))}
     </div>

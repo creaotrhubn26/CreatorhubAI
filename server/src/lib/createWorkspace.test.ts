@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
@@ -110,7 +110,12 @@ describe("resolvesWithinRoot", () => {
   });
 
   it("rejects a traversal that escapes root via ..", () => {
-    expect(resolvesWithinRoot("/Users/danielqazi/worktrees", "/Users/danielqazi/worktrees/../../etc/passwd")).toBe(false);
+    expect(
+      resolvesWithinRoot(
+        "/Users/danielqazi/worktrees",
+        "/Users/danielqazi/worktrees/../../etc/passwd",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -146,12 +151,18 @@ describe("createWorkspace — success path", () => {
     expect(result.baselineSha).toBe(originalMainSha);
     expect(resolvesWithinRoot(worktreeRoot, result.workspace)).toBe(true);
 
-    const headSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: result.workspace })).stdout.trim();
-    const currentBranch = (await exec("git", ["branch", "--show-current"], { cwd: result.workspace })).stdout.trim();
+    const headSha = (
+      await exec("git", ["rev-parse", "HEAD"], { cwd: result.workspace })
+    ).stdout.trim();
+    const currentBranch = (
+      await exec("git", ["branch", "--show-current"], { cwd: result.workspace })
+    ).stdout.trim();
     const status = (await exec("git", ["status", "--porcelain"], { cwd: result.workspace })).stdout;
     // Reference script's 4th verification check: --no-track must mean no
     // upstream, not just no explicit tracking config.
-    const upstream = await exec("git", ["rev-parse", "--abbrev-ref", "@{upstream}"], { cwd: result.workspace })
+    const upstream = await exec("git", ["rev-parse", "--abbrev-ref", "@{upstream}"], {
+      cwd: result.workspace,
+    })
       .then((r) => r.stdout.trim())
       .catch(() => "");
 
@@ -192,7 +203,7 @@ describe("createWorkspace — duplicate branch name", () => {
     // Pin the clock so both calls compute the identical branch/worktree name
     // (the real timestamp component is second-granular) — this forces a
     // genuine "branch already exists" collision deterministically rather
-        // than relying on both real calls landing in the same wall-clock second.
+    // than relying on both real calls landing in the same wall-clock second.
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-08-21T12:00:00Z"));
     try {

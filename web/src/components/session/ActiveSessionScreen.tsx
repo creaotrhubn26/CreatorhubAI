@@ -34,7 +34,8 @@ const NON_SUCCESS_TERMINAL = ["blocked", "failed", "needs_review", "cancelled"];
 // UNKNOWN, ...) is a real failure (red).
 function failureSeverityColor(failureClass: string): string {
   if (failureClass === "USER_CANCELLED") return "var(--gray)";
-  if (["INFRA_BLOCKED", "TIMEOUT", "ORCHESTRATION_ABORTED"].includes(failureClass)) return "var(--amber)";
+  if (["INFRA_BLOCKED", "TIMEOUT", "ORCHESTRATION_ABORTED"].includes(failureClass))
+    return "var(--amber)";
   return "var(--red)";
 }
 
@@ -47,8 +48,14 @@ function humanCase(value: string): string {
 // line re-renders every second without re-rendering the rest of the screen
 // (panels, stepper, etc. don't depend on wall-clock time).
 function LivenessLine({
-  isRunning, startedAt, lastEventAt,
-}: { isRunning: boolean; startedAt: string | null; lastEventAt: number | null }) {
+  isRunning,
+  startedAt,
+  lastEventAt,
+}: {
+  isRunning: boolean;
+  startedAt: string | null;
+  lastEventAt: number | null;
+}) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!isRunning) return;
@@ -79,7 +86,10 @@ function LivenessLine({
 // V7 §35 risk vocabulary -- distinct from failureSeverityColor above (that
 // one colors terminal outcomes; this colors a still-pending decision).
 const RISK_COLOR: Record<string, string> = {
-  low: "var(--gray)", medium: "var(--amber)", high: "var(--red)", critical: "var(--red)",
+  low: "var(--gray)",
+  medium: "var(--amber)",
+  high: "var(--red)",
+  critical: "var(--red)",
 };
 
 // Task 8.3 (V7 §14/§35): the YELLOW human-approval boundary. Rendered
@@ -100,8 +110,14 @@ const RISK_COLOR: Record<string, string> = {
 // finally-block orphan cleanup (_resolve_orphaned_pending_approval) is
 // the durable fix for the manifest/sidecar state itself -- this is just
 // the UI not inviting a pointless click in the meantime.
-function ApprovalCard({ sessionId, approval, stalled }: {
-  sessionId: string; approval: NonNullable<GlimmerSession["pendingApproval"]>; stalled: boolean;
+function ApprovalCard({
+  sessionId,
+  approval,
+  stalled,
+}: {
+  sessionId: string;
+  approval: NonNullable<GlimmerSession["pendingApproval"]>;
+  stalled: boolean;
 }) {
   const queryClient = useQueryClient();
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
@@ -117,11 +133,24 @@ function ApprovalCard({ sessionId, approval, stalled }: {
   const resolved = approval.status !== "pending";
 
   return (
-    <div className="row" style={{ flexDirection: "column", alignItems: "stretch", gap: 6, border: "1px solid var(--amber)", borderRadius: 8, padding: 12, margin: "12px 0" }}>
+    <div
+      className="row"
+      style={{
+        flexDirection: "column",
+        alignItems: "stretch",
+        gap: 6,
+        border: "1px solid var(--amber)",
+        borderRadius: 8,
+        padding: 12,
+        margin: "12px 0",
+      }}
+    >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <StatusBadge status="waiting_for_approval" />
         <strong>{approval.action}</strong>
-        <span style={{ color: RISK_COLOR[approval.risk] ?? "var(--gray)" }}>{approval.risk} risk</span>
+        <span style={{ color: RISK_COLOR[approval.risk] ?? "var(--gray)" }}>
+          {approval.risk} risk
+        </span>
       </div>
       <p style={{ fontSize: 13, margin: 0 }}>{approval.reason}</p>
       {approval.proposedChanges.length > 0 && (
@@ -130,20 +159,28 @@ function ApprovalCard({ sessionId, approval, stalled }: {
         </div>
       )}
       {(approveMutation.isError || denyMutation.isError) && (
-        <div style={{ fontSize: 12, color: "var(--red)" }}>Unavailable — could not record this decision.</div>
+        <div style={{ fontSize: 12, color: "var(--red)" }}>
+          Unavailable — could not record this decision.
+        </div>
       )}
       {resolved ? (
         <p style={{ fontSize: 12, color: "var(--text-muted)", margin: 0 }}>
-          {approval.status}{approval.approvedBy ? ` by ${approval.approvedBy}` : ""}
+          {approval.status}
+          {approval.approvedBy ? ` by ${approval.approvedBy}` : ""}
         </p>
       ) : stalled ? (
         <p style={{ fontSize: 12, color: "var(--amber)", margin: 0 }}>
-          No recent activity — this session may have ended without resolving this request. Refresh before deciding.
+          No recent activity — this session may have ended without resolving this request. Refresh
+          before deciding.
         </p>
       ) : (
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => approveMutation.mutate()} disabled={pending}>Approve</button>
-          <button onClick={() => denyMutation.mutate()} disabled={pending}>Deny</button>
+          <button onClick={() => approveMutation.mutate()} disabled={pending}>
+            Approve
+          </button>
+          <button onClick={() => denyMutation.mutate()} disabled={pending}>
+            Deny
+          </button>
         </div>
       )}
     </div>
@@ -198,8 +235,11 @@ export function ActiveSessionScreen() {
 
   // Older archived manifests predate startedAt; their timestamp-shaped id is
   // still a deterministic fallback.
-  const startedAtBase = session.startedAt ?? sessionTimestamp({ id: session.id })?.toISOString() ?? null;
-  const readOnlyMode = session.taskContract != null && ["inspect", "plan", "review"].includes(session.taskContract.mode);
+  const startedAtBase =
+    session.startedAt ?? sessionTimestamp({ id: session.id })?.toISOString() ?? null;
+  const readOnlyMode =
+    session.taskContract != null &&
+    ["inspect", "plan", "review"].includes(session.taskContract.mode);
 
   const showFailureBanner = session.failure && NON_SUCCESS_TERMINAL.includes(state);
 
@@ -210,15 +250,23 @@ export function ActiveSessionScreen() {
           className="failure-banner"
           style={{ ["--badge-color" as any]: failureSeverityColor(session.failure!.class) }}
         >
-          <p className="failure-banner__title">{humanCase(state)}: {humanCase(session.failure!.class)}</p>
-          {session.failure!.detail && <p className="failure-banner__detail">{session.failure!.detail}</p>}
+          <p className="failure-banner__title">
+            {humanCase(state)}: {humanCase(session.failure!.class)}
+          </p>
+          {session.failure!.detail && (
+            <p className="failure-banner__detail">{session.failure!.detail}</p>
+          )}
           {id && <Link to={`/sessions/${id}/verification`}>See verification</Link>}
         </div>
       )}
       <h1>{session.task}</h1>
       <LivenessLine isRunning={isRunning} startedAt={startedAtBase} lastEventAt={lastEventAt} />
       {session.pendingApproval && id && (
-        <ApprovalCard sessionId={id} approval={session.pendingApproval} stalled={isStalled(lastEventAt, Date.now())} />
+        <ApprovalCard
+          sessionId={id}
+          approval={session.pendingApproval}
+          stalled={isStalled(lastEventAt, Date.now())}
+        />
       )}
       <div className="toolbar">
         {!readOnlyMode && <Link to={`/sessions/${id}/diff`}>View diff</Link>}
@@ -233,7 +281,9 @@ export function ActiveSessionScreen() {
         )}
       </div>
       {isRunning && cancelMutation.isError && (
-        <div>Could not send the cancellation request. Refresh the session; it may already have stopped.</div>
+        <div>
+          Could not send the cancellation request. Refresh the session; it may already have stopped.
+        </div>
       )}
       <AgentStateStepper current={state} />
       <dl>
@@ -266,8 +316,12 @@ export function ActiveSessionScreen() {
         // estimate computed before the run existed).
         <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
           architect: {session.architectTrigger.mode}
-          {session.architectTrigger.score !== undefined && ` (score ${session.architectTrigger.score}${
-            session.architectTrigger.signals?.length ? `: ${session.architectTrigger.signals.join(", ")}` : ""})`}
+          {session.architectTrigger.score !== undefined &&
+            ` (score ${session.architectTrigger.score}${
+              session.architectTrigger.signals?.length
+                ? `: ${session.architectTrigger.signals.join(", ")}`
+                : ""
+            })`}
         </p>
       )}
       {!readOnlyMode && <RepairCycleStepper session={session} />}

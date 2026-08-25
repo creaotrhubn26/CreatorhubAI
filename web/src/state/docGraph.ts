@@ -5,7 +5,12 @@ import type { DocEdge, DocNode, DocNodeType } from "@glimmer/shared";
 // alphabetical-by-whatever-arrived-first ordering.
 const TYPE_ORDER: DocNodeType[] = ["system", "service", "route", "schema", "config", "doc"];
 const TYPE_LABEL: Record<DocNodeType, string> = {
-  system: "Systems", service: "Services", route: "Routes", schema: "Schemas", config: "Config", doc: "Docs",
+  system: "Systems",
+  service: "Services",
+  route: "Routes",
+  schema: "Schemas",
+  config: "Config",
+  doc: "Docs",
 };
 
 export interface DocNodeGroup {
@@ -29,14 +34,19 @@ export function filterDocNodes(nodes: DocNode[], query: string): DocNode[] {
   const q = query.trim().toLowerCase();
   if (!q) return nodes;
   return nodes.filter(
-    (n) => str(n.id).toLowerCase().includes(q) || str(n.title).toLowerCase().includes(q) || str(n.path).toLowerCase().includes(q)
+    (n) =>
+      str(n.id).toLowerCase().includes(q) ||
+      str(n.title).toLowerCase().includes(q) ||
+      str(n.path).toLowerCase().includes(q),
   );
 }
 
 export function groupDocNodesByType(nodes: DocNode[]): DocNodeGroup[] {
-  return TYPE_ORDER.map((type) => ({ type, label: TYPE_LABEL[type], nodes: nodes.filter((n) => n.type === type) })).filter(
-    (g) => g.nodes.length > 0
-  );
+  return TYPE_ORDER.map((type) => ({
+    type,
+    label: TYPE_LABEL[type],
+    nodes: nodes.filter((n) => n.type === type),
+  })).filter((g) => g.nodes.length > 0);
 }
 
 export function edgesForNode(edges: DocEdge[], nodeId: string): { in: DocEdge[]; out: DocEdge[] } {

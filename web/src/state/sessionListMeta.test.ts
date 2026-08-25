@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { isPendingSessionId, sessionTimestamp, relativeTime, dayLabel, groupSessionsByDay } from "./sessionListMeta";
+import {
+  isPendingSessionId,
+  sessionTimestamp,
+  relativeTime,
+  dayLabel,
+  groupSessionsByDay,
+} from "./sessionListMeta";
 
 describe("sessionListMeta", () => {
   it("flags pending-* ids as transient", () => {
@@ -15,7 +21,10 @@ describe("sessionListMeta", () => {
   });
 
   it("prefers completedAt over the id timestamp when present", () => {
-    const d = sessionTimestamp({ id: "20260101-000000-glimmer-x", completedAt: "2026-08-21T00:00:00.000Z" });
+    const d = sessionTimestamp({
+      id: "20260101-000000-glimmer-x",
+      completedAt: "2026-08-21T00:00:00.000Z",
+    });
     expect(d?.toISOString().startsWith("2026-08-21")).toBe(true);
   });
 
@@ -40,7 +49,7 @@ describe("sessionListMeta", () => {
         { id: "b", completedAt: "2026-08-21T08:00:00.000Z" },
         { id: "c", completedAt: "2026-08-20T08:00:00.000Z" },
       ],
-      now
+      now,
     );
     expect(groups.map((g) => g.label)).toEqual(["Today", "Yesterday"]);
     expect(groups[0].sessions.map((s) => s.id)).toEqual(["a", "b"]);

@@ -17,15 +17,23 @@ function LocationProbe() {
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
   onmessage: ((ev: MessageEvent) => void) | null = null;
-  constructor(public url: string) { FakeEventSource.instances.push(this); }
+  constructor(public url: string) {
+    FakeEventSource.instances.push(this);
+  }
   close() {}
-  emit(data: unknown) { this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent); }
+  emit(data: unknown) {
+    this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent);
+  }
 }
 
 function withProviders(ui: React.ReactElement, initialEntries = ["/"]) {
   vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
   vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([]);
-  vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+  vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
+    status: "OFFLINE",
+    endpoint: "x",
+    provenance: "deterministic-backend",
+  });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={qc}>
@@ -38,7 +46,15 @@ describe("AppShell", () => {
   it("renders every activity-bar entry from spec §5.2", () => {
     render(withProviders(<AppShell repoContext={null}>content</AppShell>));
     const activityBar = within(screen.getByRole("navigation"));
-    for (const label of ["Dashboard", "Sessions", "New Task", "Verification", "Repository", "Model", "Settings"]) {
+    for (const label of [
+      "Dashboard",
+      "Sessions",
+      "New Task",
+      "Verification",
+      "Repository",
+      "Model",
+      "Settings",
+    ]) {
       expect(activityBar.getByRole("button", { name: label })).toBeInTheDocument();
     }
   });
@@ -60,7 +76,11 @@ describe("AppShell", () => {
 
   it("clicking the model status bar item navigates to the Model Status screen", async () => {
     vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([]);
-    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
+      status: "OFFLINE",
+      endpoint: "x",
+      provenance: "deterministic-backend",
+    });
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
@@ -68,7 +88,7 @@ describe("AppShell", () => {
           <AppShell repoContext={null}>content</AppShell>
           <LocationProbe />
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     const modelItem = await screen.findByRole("button", { name: /model: OFFLINE/ });
@@ -78,34 +98,71 @@ describe("AppShell", () => {
 
   it("opens a tab for a visited session and closes it via its close button", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
-      id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
-      baselineSha: "abc", changedFiles: [], verification: { overall: "PARTIAL", checks: [] },
-      repairsUsed: 0, repairBudget: 2,
+      id: "s1",
+      task: "Fix dialog parser",
+      status: "verifying",
+      workspace: "/ws",
+      branch: "glimmer/x",
+      baselineSha: "abc",
+      changedFiles: [],
+      verification: { overall: "PARTIAL", checks: [] },
+      repairsUsed: 0,
+      repairBudget: 2,
     } as any);
-    render(withProviders(<AppShell repoContext={null}>session content</AppShell>, ["/sessions/s1"]));
+    render(
+      withProviders(<AppShell repoContext={null}>session content</AppShell>, ["/sessions/s1"]),
+    );
 
     const closeBtn = await screen.findByRole("button", { name: "Close s1" });
     expect(closeBtn).toBeInTheDocument();
 
     fireEvent.click(closeBtn);
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Close s1" })).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Close s1" })).not.toBeInTheDocument(),
+    );
   });
 
   // pending-* rows are transient adopted-workspace placeholders — a
   // duplicate of the real session once it lands, not a second session.
   it("hides pending-* session rows from the sidebar list", async () => {
     vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([
-      { id: "pending-abc123", task: "Fix dialog parser", status: "created", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2 },
-      { id: "20260821-221803-glimmer-x", task: "Fix dialog parser", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2 },
+      {
+        id: "pending-abc123",
+        task: "Fix dialog parser",
+        status: "created",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
+      },
+      {
+        id: "20260821-221803-glimmer-x",
+        task: "Fix dialog parser",
+        status: "verified",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "VERIFIED", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
+      },
     ] as any);
-    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
+      status: "OFFLINE",
+      endpoint: "x",
+      provenance: "deterministic-backend",
+    });
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/"]}>
           <AppShell repoContext={null}>content</AppShell>
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     await waitFor(() => expect(screen.getAllByText("Fix dialog parser")).toHaveLength(1));
@@ -113,17 +170,43 @@ describe("AppShell", () => {
 
   it("pulses the status dot for a running session's sidebar row and tab, not for a terminal one", async () => {
     vi.spyOn(client.glimmerApi, "listSessions").mockResolvedValue([
-      { id: "20260821-221803-glimmer-running", task: "Running task", status: "implementing", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2 },
-      { id: "20260821-221804-glimmer-done", task: "Done task", status: "verified", workspace: "/ws", branch: "glimmer/x", baselineSha: "abc", changedFiles: [], verification: { overall: "VERIFIED", checks: [] }, repairsUsed: 0, repairBudget: 2 },
+      {
+        id: "20260821-221803-glimmer-running",
+        task: "Running task",
+        status: "implementing",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
+      },
+      {
+        id: "20260821-221804-glimmer-done",
+        task: "Done task",
+        status: "verified",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "VERIFIED", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
+      },
     ] as any);
-    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+    vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
+      status: "OFFLINE",
+      endpoint: "x",
+      provenance: "deterministic-backend",
+    });
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/"]}>
           <AppShell repoContext={null}>content</AppShell>
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     const runningRow = (await screen.findByText("Running task")).closest(".ide-session-row");
@@ -181,9 +264,16 @@ describe("AppShell", () => {
     it("opens only one EventSource when a session route renders, shared with the routed screen", async () => {
       (globalThis as any).EventSource = FakeEventSource;
       vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
-        id: "s1", task: "Fix dialog parser", status: "verifying", workspace: "/ws", branch: "glimmer/x",
-        baselineSha: "abc", changedFiles: [], verification: { overall: "PARTIAL", checks: [] },
-        repairsUsed: 0, repairBudget: 2,
+        id: "s1",
+        task: "Fix dialog parser",
+        status: "verifying",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "PARTIAL", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
       } as any);
 
       render(
@@ -193,8 +283,8 @@ describe("AppShell", () => {
               <Route path="/sessions/:id" element={<ActiveSessionScreen />} />
             </Routes>
           </AppShell>,
-          ["/sessions/s1"]
-        )
+          ["/sessions/s1"],
+        ),
       );
 
       await waitFor(() => expect(screen.getByText(/Fix dialog parser/)).toBeInTheDocument());
@@ -205,9 +295,16 @@ describe("AppShell", () => {
     it("propagates an SSE event's own timestamp through the shared context so the liveness line renders", async () => {
       (globalThis as any).EventSource = FakeEventSource;
       vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
-        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
-        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
-        repairsUsed: 0, repairBudget: 2,
+        id: "s1",
+        task: "Fix dialog parser",
+        status: "implementing",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
       } as any);
 
       render(
@@ -217,14 +314,21 @@ describe("AppShell", () => {
               <Route path="/sessions/:id" element={<ActiveSessionScreen />} />
             </Routes>
           </AppShell>,
-          ["/sessions/s1"]
-        )
+          ["/sessions/s1"],
+        ),
       );
 
       await waitFor(() => expect(screen.getByText(/Fix dialog parser/)).toBeInTheDocument());
       const es = FakeEventSource.instances[0];
       act(() => {
-        es.emit({ id: "e1", sessionId: "s1", timestamp: new Date().toISOString(), type: "tool_started", tool: "read_file", args: {} });
+        es.emit({
+          id: "e1",
+          sessionId: "s1",
+          timestamp: new Date().toISOString(),
+          type: "tool_started",
+          tool: "read_file",
+          args: {},
+        });
       });
 
       await waitFor(() => expect(screen.getByText(/last activity/i)).toBeInTheDocument());
@@ -233,9 +337,16 @@ describe("AppShell", () => {
     it("keeps a diff-origin session stream alive on /files and shows the sessionless selection assistant", async () => {
       (globalThis as any).EventSource = FakeEventSource;
       const session = {
-        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/w", branch: "glimmer/x",
-        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] },
-        repairsUsed: 0, repairBudget: 2,
+        id: "s1",
+        task: "Fix dialog parser",
+        status: "implementing",
+        workspace: "/w",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
       } as any;
       vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session);
 
@@ -247,9 +358,16 @@ describe("AppShell", () => {
         ["/files?path=%2Fw%2Fsrc%2Fa.ts&start=2&end=3&session=s1"],
       );
       vi.mocked(client.glimmerApi.listSessions).mockResolvedValue([session]);
-      vi.mocked(client.glimmerApi.listWorkspaces).mockResolvedValue([{
-        path: "/w", branch: "glimmer/x", headSha: "abc", baselineSha: "abc", dirty: false, changedFiles: [],
-      }]);
+      vi.mocked(client.glimmerApi.listWorkspaces).mockResolvedValue([
+        {
+          path: "/w",
+          branch: "glimmer/x",
+          headSha: "abc",
+          baselineSha: "abc",
+          dirty: false,
+          changedFiles: [],
+        },
+      ]);
       render(tree);
 
       expect(await screen.findByText("/w/src/a.ts")).toBeInTheDocument();
@@ -260,7 +378,9 @@ describe("AppShell", () => {
       fireEvent.change(screen.getByPlaceholderText(/ask, or describe a change/i), {
         target: { value: "Extract this helper" },
       });
-      await waitFor(() => expect(screen.getByRole("button", { name: "Draft task" })).not.toBeDisabled());
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Draft task" })).not.toBeDisabled(),
+      );
       fireEvent.click(screen.getByRole("button", { name: "Draft task" }));
       expect(screen.getByTestId("location-probe")).toHaveTextContent("/tasks/new");
     });
@@ -277,16 +397,33 @@ describe("AppShell", () => {
       (globalThis as any).Notification = Object.assign(ctorSpy, { permission: "granted" });
 
       const runningSession = {
-        id: "s1", task: "Fix dialog parser", status: "implementing", workspace: "/ws", branch: "glimmer/x",
-        baselineSha: "abc", changedFiles: [], verification: { overall: "NOT_RUN", checks: [] }, repairsUsed: 0, repairBudget: 2,
+        id: "s1",
+        task: "Fix dialog parser",
+        status: "implementing",
+        workspace: "/ws",
+        branch: "glimmer/x",
+        baselineSha: "abc",
+        changedFiles: [],
+        verification: { overall: "NOT_RUN", checks: [] },
+        repairsUsed: 0,
+        repairBudget: 2,
       };
-      const doneSession = { ...runningSession, status: "verified", verification: { overall: "VERIFIED", checks: [] } };
+      const doneSession = {
+        ...runningSession,
+        status: "verified",
+        verification: { overall: "VERIFIED", checks: [] },
+      };
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
-      const listSpy = vi.spyOn(client.glimmerApi, "listSessions")
+      const listSpy = vi
+        .spyOn(client.glimmerApi, "listSessions")
         .mockResolvedValueOnce([runningSession] as any)
         .mockResolvedValue([doneSession] as any);
-      vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({ status: "OFFLINE", endpoint: "x", provenance: "deterministic-backend" });
+      vi.spyOn(client.glimmerApi, "getModelStatus").mockResolvedValue({
+        status: "OFFLINE",
+        endpoint: "x",
+        provenance: "deterministic-backend",
+      });
       vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(runningSession as any);
 
       const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -295,14 +432,16 @@ describe("AppShell", () => {
           <MemoryRouter initialEntries={["/sessions/s1"]}>
             <AppShell repoContext={null}>session content</AppShell>
           </MemoryRouter>
-        </QueryClientProvider>
+        </QueryClientProvider>,
       );
 
       // First poll sees it running; advancing to the next 5000ms poll (the
       // sessions query's refetchInterval) sees it terminal — s1 is both the
       // completing session and the one currently routed to.
       await vi.waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
-      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
       await vi.waitFor(() => expect(listSpy).toHaveBeenCalledTimes(2));
 
       expect(ctorSpy).not.toHaveBeenCalled();

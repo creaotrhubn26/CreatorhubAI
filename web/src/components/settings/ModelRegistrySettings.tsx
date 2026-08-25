@@ -22,7 +22,11 @@ type Draft = { models: DraftModel[]; roles: ModelRegistry["roles"] };
 function draftFromRegistry(registry: ModelRegistry): Draft {
   return {
     models: registry.models.map((model) => ({
-      ...model, apiKey: "", clearApiKey: false, persisted: true, draftKey: `saved:${model.id}`,
+      ...model,
+      apiKey: "",
+      clearApiKey: false,
+      persisted: true,
+      draftKey: `saved:${model.id}`,
     })),
     roles: { ...registry.roles },
   };
@@ -50,13 +54,20 @@ export function ModelRegistrySettings() {
     mutationFn: async () => {
       if (!draft) throw new Error("model registry is not loaded");
       return glimmerApi.saveModelRegistry({
-        models: draft.models.map(({
-          hasApiKey: _has, persisted: _persisted, draftKey: _draftKey, apiKey, clearApiKey, ...model
-        }) => ({
-          ...model,
-          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(clearApiKey ? { clearApiKey: true } : {}),
-        })),
+        models: draft.models.map(
+          ({
+            hasApiKey: _has,
+            persisted: _persisted,
+            draftKey: _draftKey,
+            apiKey,
+            clearApiKey,
+            ...model
+          }) => ({
+            ...model,
+            ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+            ...(clearApiKey ? { clearApiKey: true } : {}),
+          }),
+        ),
         roles: draft.roles,
       });
     },
@@ -67,10 +78,16 @@ export function ModelRegistrySettings() {
   });
 
   function updateModel(index: number, patch: Partial<DraftModel>) {
-    setDraft((current) => current ? {
-      ...current,
-      models: current.models.map((model, i) => i === index ? { ...model, ...patch } : model),
-    } : current);
+    setDraft((current) =>
+      current
+        ? {
+            ...current,
+            models: current.models.map((model, i) =>
+              i === index ? { ...model, ...patch } : model,
+            ),
+          }
+        : current,
+    );
   }
 
   function addModel() {
@@ -79,10 +96,20 @@ export function ModelRegistrySettings() {
       const id = nextModelId(current.models);
       return {
         ...current,
-        models: [...current.models, {
-          id, label: "New model", baseUrl: "https://", modelId: "", hasApiKey: false,
-          apiKey: "", clearApiKey: false, persisted: false, draftKey: `new:${id}`,
-        }],
+        models: [
+          ...current.models,
+          {
+            id,
+            label: "New model",
+            baseUrl: "https://",
+            modelId: "",
+            hasApiKey: false,
+            apiKey: "",
+            clearApiKey: false,
+            persisted: false,
+            draftKey: `new:${id}`,
+          },
+        ],
       };
     });
   }
@@ -103,18 +130,34 @@ export function ModelRegistrySettings() {
   }
 
   if (isPending) return <p>Loading model registry…</p>;
-  if (error || !draft) return <p role="alert">Could not load model registry — {(error as Error)?.message ?? "unavailable"}</p>;
+  if (error || !draft)
+    return (
+      <p role="alert">
+        Could not load model registry — {(error as Error)?.message ?? "unavailable"}
+      </p>
+    );
 
   return (
     <section aria-labelledby="model-registry-heading">
-      <h2 id="model-registry-heading" style={{ fontSize: "var(--fs-h1)", fontWeight: 600, textTransform: "none", letterSpacing: "-0.01em", color: "inherit" }}>
+      <h2
+        id="model-registry-heading"
+        style={{
+          fontSize: "var(--fs-h1)",
+          fontWeight: 600,
+          textTransform: "none",
+          letterSpacing: "-0.01em",
+          color: "inherit",
+        }}
+      >
         Model registry
       </h2>
       <p>
-        Role routing is read when a new Glimmer process starts. API keys are stored in separate local files;
-        existing values are never returned to this screen.
+        Role routing is read when a new Glimmer process starts. API keys are stored in separate
+        local files; existing values are never returned to this screen.
       </p>
-      <p className="mono" style={{ fontSize: 12 }}>Configuration: {data?.source === "saved" ? "saved registry" : "local default"}</p>
+      <p className="mono" style={{ fontSize: 12 }}>
+        Configuration: {data?.source === "saved" ? "saved registry" : "local default"}
+      </p>
 
       <div className="model-registry__models">
         {draft.models.map((model, index) => (
@@ -131,24 +174,36 @@ export function ModelRegistrySettings() {
             </label>
             <label>
               Label
-              <input value={model.label} onChange={(event) => updateModel(index, { label: event.target.value })} />
+              <input
+                value={model.label}
+                onChange={(event) => updateModel(index, { label: event.target.value })}
+              />
             </label>
             <label>
               Base URL
-              <input value={model.baseUrl} onChange={(event) => updateModel(index, { baseUrl: event.target.value })} />
+              <input
+                value={model.baseUrl}
+                onChange={(event) => updateModel(index, { baseUrl: event.target.value })}
+              />
               <small>Use the provider origin or its OpenAI-compatible /v1 base.</small>
             </label>
             <label>
               Model id
-              <input value={model.modelId} onChange={(event) => updateModel(index, { modelId: event.target.value })} />
+              <input
+                value={model.modelId}
+                onChange={(event) => updateModel(index, { modelId: event.target.value })}
+              />
             </label>
             <label>
-              API key {model.hasApiKey && !model.clearApiKey ? "(stored; blank keeps it)" : "(optional)"}
+              API key{" "}
+              {model.hasApiKey && !model.clearApiKey ? "(stored; blank keeps it)" : "(optional)"}
               <input
                 type="password"
                 autoComplete="new-password"
                 value={model.apiKey}
-                onChange={(event) => updateModel(index, { apiKey: event.target.value, clearApiKey: false })}
+                onChange={(event) =>
+                  updateModel(index, { apiKey: event.target.value, clearApiKey: false })
+                }
                 placeholder={model.hasApiKey ? "Keep existing key" : "No key"}
               />
             </label>
@@ -157,17 +212,26 @@ export function ModelRegistrySettings() {
                 <input
                   type="checkbox"
                   checked={model.clearApiKey}
-                  onChange={(event) => updateModel(index, { clearApiKey: event.target.checked, apiKey: "" })}
-                /> Remove stored key on save
+                  onChange={(event) =>
+                    updateModel(index, { clearApiKey: event.target.checked, apiKey: "" })
+                  }
+                />{" "}
+                Remove stored key on save
               </label>
             )}
-            <button type="button" onClick={() => removeModel(model.draftKey)} disabled={draft.models.length === 1}>
+            <button
+              type="button"
+              onClick={() => removeModel(model.draftKey)}
+              disabled={draft.models.length === 1}
+            >
               Remove model
             </button>
           </fieldset>
         ))}
       </div>
-      <button type="button" onClick={addModel}>Add model</button>
+      <button type="button" onClick={addModel}>
+        Add model
+      </button>
 
       <fieldset>
         <legend>Role assignments</legend>
@@ -177,12 +241,21 @@ export function ModelRegistrySettings() {
             <select
               aria-label={`${role.label} model`}
               value={draft.roles[role.id]}
-              onChange={(event) => setDraft((current) => current ? {
-                ...current, roles: { ...current.roles, [role.id]: event.target.value },
-              } : current)}
+              onChange={(event) =>
+                setDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        roles: { ...current.roles, [role.id]: event.target.value },
+                      }
+                    : current,
+                )
+              }
             >
               {draft.models.map((model) => (
-                <option key={model.draftKey} value={model.id}>{model.label || model.id}</option>
+                <option key={model.draftKey} value={model.id}>
+                  {model.label || model.id}
+                </option>
               ))}
             </select>
           </label>
@@ -192,8 +265,12 @@ export function ModelRegistrySettings() {
       <button type="button" onClick={() => save.mutate()} disabled={save.isPending}>
         {save.isPending ? "Saving…" : "Save model registry"}
       </button>
-      {save.isSuccess && <p role="status">Model registry saved. New sessions will use these assignments.</p>}
-      {save.error && <p role="alert">Could not save model registry — {(save.error as Error).message}</p>}
+      {save.isSuccess && (
+        <p role="status">Model registry saved. New sessions will use these assignments.</p>
+      )}
+      {save.error && (
+        <p role="alert">Could not save model registry — {(save.error as Error).message}</p>
+      )}
     </section>
   );
 }

@@ -14,15 +14,24 @@ const ARCHITECT_RISK_CANDIDATE_THRESHOLD = 5;
 
 // Mirrors glimmer-v2.py's _PROTECTED_AREA_WORDS exactly.
 const PROTECTED_AREA_WORDS = new Set([
-  "auth", "authentication", "payment", "payments",
-  "migration", "migrations", "schema", "security",
+  "auth",
+  "authentication",
+  "payment",
+  "payments",
+  "migration",
+  "migrations",
+  "schema",
+  "security",
 ]);
 
 // Mirrors glimmer-v2.py's _segment_tokens: split on any run of
 // non-alphanumeric characters, case-insensitive, exact-token match (not
 // substring -- "author" does not match "auth").
 function segmentTokens(text: string): string[] {
-  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
 }
 
 // The exact derivation server/src/lib/runner.ts's buildArgs uses for

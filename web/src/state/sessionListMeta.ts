@@ -68,7 +68,7 @@ export function shortSessionId(id: string): string {
 
 export function groupSessionsByDay<T extends { id: string; completedAt?: string }>(
   sessions: T[],
-  now: Date = new Date()
+  now: Date = new Date(),
 ): Array<{ label: string; sessions: T[] }> {
   const groups: Array<{ label: string; sessions: T[] }> = [];
   for (const s of sessions) {

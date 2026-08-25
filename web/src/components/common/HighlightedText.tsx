@@ -10,7 +10,13 @@ import { highlightLine, type Lang } from "../../state/highlight";
 // ponytail: bail to plain text past 400 chars — an extra-long single line
 // (minified bundle, huge JSON blob) would turn into hundreds of tok-* spans
 // for a line no one reads token-by-token anyway.
-export const HighlightedText = memo(function HighlightedText({ text, lang }: { text: string; lang: Lang }) {
+export const HighlightedText = memo(function HighlightedText({
+  text,
+  lang,
+}: {
+  text: string;
+  lang: Lang;
+}) {
   if (text.length > 400) return <>{text}</>;
   return (
     <>

@@ -13,9 +13,9 @@ workspacesRouter.get("/workspaces", async (_req, res) => {
     const ids = await listSessionIds();
     // V7 §20: plain readSession(id) (computeStale left false) -- this reads
     // every session on the list, same reasoning as GET /sessions.
-    const sessions = (await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean) as NonNullable<
-      Awaited<ReturnType<typeof readSession>>
-    >[];
+    const sessions = (await Promise.all(ids.map((id) => readSession(id)))).filter(
+      Boolean,
+    ) as NonNullable<Awaited<ReturnType<typeof readSession>>>[];
     const uniqueWorkspaces = [...new Set(sessions.map((s) => s.workspace))];
     const infos: WorkspaceInfo[] = await Promise.all(
       uniqueWorkspaces.map(async (ws) => {
@@ -23,9 +23,16 @@ workspacesRouter.get("/workspaces", async (_req, res) => {
           const status = await gitStatus(ws);
           return { path: ws, ...status };
         } catch {
-          return { path: ws, branch: "Unavailable", headSha: "Unavailable", baselineSha: null, dirty: false, changedFiles: [] };
+          return {
+            path: ws,
+            branch: "Unavailable",
+            headSha: "Unavailable",
+            baselineSha: null,
+            dirty: false,
+            changedFiles: [],
+          };
         }
-      })
+      }),
     );
     res.json(infos);
   } catch (err: any) {
@@ -79,10 +86,25 @@ const MAX_FS_ENTRIES = 500;
 // as noise reduction; the real boundary is FS_BOUNDARY plus the fact that
 // this endpoint never returns file contents.
 const SENSITIVE_NAMES = new Set([
-  ".ssh", ".aws", ".gnupg", ".gpg", ".docker", ".kube",
-  ".password-store", ".claude", ".claude.json", ".git-credentials", ".gitconfig",
-  ".netrc", ".npmrc", ".pypirc", ".zsh_history",
-  ".appstoreconnect", ".fastlane-creds", ".render", ".copilot",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".gpg",
+  ".docker",
+  ".kube",
+  ".password-store",
+  ".claude",
+  ".claude.json",
+  ".git-credentials",
+  ".gitconfig",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  ".zsh_history",
+  ".appstoreconnect",
+  ".fastlane-creds",
+  ".render",
+  ".copilot",
 ]);
 
 // `.config` is denied only as a FIRST segment (the XDG config home under
@@ -126,8 +148,10 @@ function hasSensitiveSegment(base: string, target: string): boolean {
 // like. Review MN3: a null byte or an over-long path is a CLIENT error, and
 // the old 500 echoed the caller's own input back in the message.
 function fsErrorStatus(err: any): { status: number; error: string } {
-  if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return { status: 404, error: "path does not exist" };
-  if (err?.code === "EACCES" || err?.code === "EPERM") return { status: 403, error: "permission denied" };
+  if (err?.code === "ENOENT" || err?.code === "ENOTDIR")
+    return { status: 404, error: "path does not exist" };
+  if (err?.code === "EACCES" || err?.code === "EPERM")
+    return { status: 403, error: "permission denied" };
   if (err?.code === "ENAMETOOLONG" || err?.code === "ERR_INVALID_ARG_VALUE") {
     return { status: 400, error: "path is not a valid filesystem path" };
   }
@@ -192,8 +216,12 @@ async function resolveContained(rawRoot: string, rawPath: string): Promise<Resol
 }
 
 workspacesRouter.get("/fs/dirs", async (req, res) => {
-  const rawRoot = typeof req.query.root === "string" && req.query.root.trim() ? req.query.root.trim() : browseRoot();
-  const rawPath = typeof req.query.path === "string" && req.query.path.trim() ? req.query.path.trim() : rawRoot;
+  const rawRoot =
+    typeof req.query.root === "string" && req.query.root.trim()
+      ? req.query.root.trim()
+      : browseRoot();
+  const rawPath =
+    typeof req.query.path === "string" && req.query.path.trim() ? req.query.path.trim() : rawRoot;
   const includeFiles = req.query.includeFiles === "1";
 
   const resolved = await resolveContained(rawRoot, rawPath);
@@ -245,7 +273,8 @@ workspacesRouter.get("/fs/dirs", async (req, res) => {
     };
     res.json(listing);
   } catch (err: any) {
-    if (err.code === "EACCES" || err.code === "EPERM") return res.status(403).json({ error: "permission denied" });
+    if (err.code === "EACCES" || err.code === "EPERM")
+      return res.status(403).json({ error: "permission denied" });
     res.status(500).json({ error: err.message });
   }
 });
@@ -290,8 +319,7 @@ async function knownWorkspaceRoots(): Promise<string[]> {
 const MAX_FILE_BYTES = 512 * 1024;
 
 export type WorkspaceFileReadResult =
-  | { ok: true; file: FsFile }
-  | { ok: false; status: number; error: string };
+  { ok: true; file: FsFile } | { ok: false; status: number; error: string };
 
 // Shared by GET /fs/file and Round B's repository-selection assistant. The
 // latter must not grow a second file-read implementation just because its
@@ -329,7 +357,8 @@ export async function readWorkspaceFile(rawPathInput: string): Promise<Workspace
     let read: Buffer;
     try {
       const buf = Buffer.alloc(Math.min(stat.size, MAX_FILE_BYTES));
-      const { bytesRead } = buf.length > 0 ? await fh.read(buf, 0, buf.length, 0) : { bytesRead: 0 };
+      const { bytesRead } =
+        buf.length > 0 ? await fh.read(buf, 0, buf.length, 0) : { bytesRead: 0 };
       read = buf.subarray(0, bytesRead);
     } finally {
       await fh.close();
@@ -342,7 +371,14 @@ export async function readWorkspaceFile(rawPathInput: string): Promise<Workspace
     if (read.includes(0)) {
       // Nothing was returned, so nothing was truncated — `binary` is the whole
       // story and the viewer renders a notice, never bytes.
-      const answer: FsFile = { path: file, size: stat.size, bytesReturned: 0, truncated: false, binary: true, content: null };
+      const answer: FsFile = {
+        path: file,
+        size: stat.size,
+        bytesReturned: 0,
+        truncated: false,
+        binary: true,
+        content: null,
+      };
       return { ok: true, file: answer };
     }
 

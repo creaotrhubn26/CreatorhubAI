@@ -8,8 +8,20 @@ import type { ModelRegistry } from "@glimmer/shared";
 const registry: ModelRegistry = {
   version: 1,
   models: [
-    { id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080", modelId: "local-model", hasApiKey: false },
-    { id: "frontier", label: "Frontier", baseUrl: "https://models.example.test/v1", modelId: "frontier-model", hasApiKey: true },
+    {
+      id: "local",
+      label: "Local",
+      baseUrl: "http://127.0.0.1:8080",
+      modelId: "local-model",
+      hasApiKey: false,
+    },
+    {
+      id: "frontier",
+      label: "Frontier",
+      baseUrl: "https://models.example.test/v1",
+      modelId: "frontier-model",
+      hasApiKey: true,
+    },
   ],
   roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
   source: "saved",
@@ -47,12 +59,14 @@ describe("ModelRegistrySettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save model registry" }));
 
     await waitFor(() => expect(saveRegistry).toHaveBeenCalledTimes(1));
-    expect(saveRegistry).toHaveBeenCalledWith(expect.objectContaining({
-      roles: expect.objectContaining({ architect: "frontier" }),
-      models: expect.arrayContaining([
-        expect.objectContaining({ id: "frontier", apiKey: "new-private-key" }),
-      ]),
-    }));
+    expect(saveRegistry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        roles: expect.objectContaining({ architect: "frontier" }),
+        models: expect.arrayContaining([
+          expect.objectContaining({ id: "frontier", apiKey: "new-private-key" }),
+        ]),
+      }),
+    );
     expect(await screen.findByRole("status")).toHaveTextContent("New sessions");
     expect((within(frontier).getByLabelText(/API key/i) as HTMLInputElement).value).toBe("");
   });

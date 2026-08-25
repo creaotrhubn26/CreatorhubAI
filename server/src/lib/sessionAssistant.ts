@@ -7,7 +7,9 @@ function summarizeEvidence(session: GlimmerSession, events: GlimmerEvent[]): str
   lines.push(`Changed files: ${session.changedFiles.map((f) => f.path).join(", ") || "none"}`);
   lines.push(`Verification: ${session.verification.overall}`);
   for (const c of session.verification.checks) {
-    const newErrors = c.newErrorSignatures.length ? ` (new errors: ${c.newErrorSignatures.join("; ")})` : "";
+    const newErrors = c.newErrorSignatures.length
+      ? ` (new errors: ${c.newErrorSignatures.join("; ")})`
+      : "";
     lines.push(`  - ${c.command}: ${c.status}${newErrors}`);
   }
   // V7 §18: recommended checks run but never gate — label them so the
@@ -23,8 +25,12 @@ function summarizeEvidence(session: GlimmerSession, events: GlimmerEvent[]): str
     // evidence text feeds a model, so an honest distinction here matters
     // exactly the same way it does in AgentTimeline's own rendering.
     if (e.type === "scope_expanded") {
-      const approval = e.approved ? ` (human-approved${e.approvedBy ? ` by ${e.approvedBy}` : ""})` : "";
-      lines.push(`Scope expanded${approval} — expected ${e.expected.join(", ")}, actual ${e.actual.join(", ")}`);
+      const approval = e.approved
+        ? ` (human-approved${e.approvedBy ? ` by ${e.approvedBy}` : ""})`
+        : "";
+      lines.push(
+        `Scope expanded${approval} — expected ${e.expected.join(", ")}, actual ${e.actual.join(", ")}`,
+      );
     }
   }
   return lines.join("\n");
@@ -58,7 +64,7 @@ async function askAssistant(
   modelBaseUrl: string,
   context: AssistantContext,
   question: string,
-  timeoutMs: number
+  timeoutMs: number,
 ): Promise<SessionAssistantAnswer> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -86,7 +92,7 @@ export async function askSessionAssistant(
   session: GlimmerSession,
   events: GlimmerEvent[],
   question: string,
-  timeoutMs = 30_000
+  timeoutMs = 30_000,
 ): Promise<SessionAssistantAnswer> {
   return askAssistant(
     modelBaseUrl,
@@ -126,7 +132,7 @@ async function streamAssistant(
   question: string,
   onDelta: (delta: string) => void,
   timeoutMs = 30_000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
 ): Promise<string> {
   // Idle timeout, not one wall-clock deadline: a slow-but-steady stream of
   // deltas must not be killed just because the whole answer takes longer
@@ -138,7 +144,9 @@ async function streamAssistant(
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => idleController.abort(), timeoutMs);
   }
-  const combinedSignal = signal ? AbortSignal.any([idleController.signal, signal]) : idleController.signal;
+  const combinedSignal = signal
+    ? AbortSignal.any([idleController.signal, signal])
+    : idleController.signal;
 
   let full = "";
   // Shared by the in-loop parse and the final flush below (item 7: a stream
@@ -170,7 +178,11 @@ async function streamAssistant(
       signal: combinedSignal,
       // Same no-tools boundary as askAssistant above; streaming changes only
       // transport, never the model's capabilities.
-      body: JSON.stringify({ model: "muse-glimmer", stream: true, messages: buildMessages(context, question) }),
+      body: JSON.stringify({
+        model: "muse-glimmer",
+        stream: true,
+        messages: buildMessages(context, question),
+      }),
     });
     if (!res.ok || !res.body) throw new Error(`model request failed: ${res.status}`);
 

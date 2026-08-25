@@ -7,12 +7,24 @@ import { getTheme, setTheme, resolveTheme } from "./themePreference";
 // a fake. Installed fresh before each test to isolate state between them.
 class FakeStorage implements Storage {
   private store = new Map<string, string>();
-  get length() { return this.store.size; }
-  clear() { this.store.clear(); }
-  getItem(key: string) { return this.store.has(key) ? this.store.get(key)! : null; }
-  key(index: number) { return [...this.store.keys()][index] ?? null; }
-  removeItem(key: string) { this.store.delete(key); }
-  setItem(key: string, value: string) { this.store.set(key, String(value)); }
+  get length() {
+    return this.store.size;
+  }
+  clear() {
+    this.store.clear();
+  }
+  getItem(key: string) {
+    return this.store.has(key) ? this.store.get(key)! : null;
+  }
+  key(index: number) {
+    return [...this.store.keys()][index] ?? null;
+  }
+  removeItem(key: string) {
+    this.store.delete(key);
+  }
+  setItem(key: string, value: string) {
+    this.store.set(key, String(value));
+  }
 }
 
 describe("resolveTheme", () => {

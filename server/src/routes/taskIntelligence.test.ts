@@ -90,14 +90,16 @@ describe("GET /api/task-intelligence", () => {
   });
 
   it("scores mode=refactor + scopePackage=repository as HIGH (score 5, at the auto-trigger threshold)", async () => {
-    const res = await request(app).get("/api/task-intelligence?scopePackage=repository&mode=refactor");
+    const res = await request(app).get(
+      "/api/task-intelligence?scopePackage=repository&mode=refactor",
+    );
     expect(res.status).toBe(200);
     expect(res.body.estimatedRisk).toBe("HIGH");
   });
 
   it("scores a plain frontend/implement/minimal request as LOW (zero signals)", async () => {
     const res = await request(app).get(
-      "/api/task-intelligence?scopePackage=frontend&mode=implement&verificationLevel=minimal"
+      "/api/task-intelligence?scopePackage=frontend&mode=implement&verificationLevel=minimal",
     );
     expect(res.status).toBe(200);
     expect(res.body.estimatedRisk).toBe("LOW");
@@ -107,7 +109,7 @@ describe("GET /api/task-intelligence", () => {
     const res = await request(app).get(
       "/api/task-intelligence?scopePackage=repository&mode=refactor&objective=" +
         encodeURIComponent("rotate the auth secrets") +
-        "&verificationLevel=full&candidateCount=9"
+        "&verificationLevel=full&candidateCount=9",
     );
     expect(res.status).toBe(200);
     expect(res.body.estimatedRisk).toBe("CRITICAL");
@@ -131,9 +133,19 @@ describe("GET /api/task-intelligence", () => {
       await fs.mkdir(dir, { recursive: true });
       await fs.writeFile(
         path.join(dir, "manifest.json"),
-        JSON.stringify({ task: "t", status: "initialized", workspace, branch: "main", baseline: null, attempts: [] })
+        JSON.stringify({
+          task: "t",
+          status: "initialized",
+          workspace,
+          branch: "main",
+          baseline: null,
+          attempts: [],
+        }),
       );
-      await fs.writeFile(path.join(dir, "repo-map.json"), JSON.stringify({ ...REPO_MAP, workspace }));
+      await fs.writeFile(
+        path.join(dir, "repo-map.json"),
+        JSON.stringify({ ...REPO_MAP, workspace }),
+      );
     });
 
     afterAll(async () => {
@@ -144,7 +156,7 @@ describe("GET /api/task-intelligence", () => {
 
     it("resolves the repo map belonging to the workspace the caller named", async () => {
       const res = await request(app).get(
-        `/api/task-intelligence?scopePackage=frontend&workspace=${encodeURIComponent(workspace)}`
+        `/api/task-intelligence?scopePackage=frontend&workspace=${encodeURIComponent(workspace)}`,
       );
       expect(res.status).toBe(200);
       expect(res.body.likelyArea).toBe("frontend");
@@ -155,7 +167,7 @@ describe("GET /api/task-intelligence", () => {
 
     it("returns nulls — never another repository's map — for a workspace no session has run in", async () => {
       const res = await request(app).get(
-        `/api/task-intelligence?scopePackage=frontend&workspace=${encodeURIComponent(otherWorkspace)}`
+        `/api/task-intelligence?scopePackage=frontend&workspace=${encodeURIComponent(otherWorkspace)}`,
       );
       expect(res.status).toBe(200);
       expect(res.body.likelyArea).toBeNull();
@@ -173,7 +185,7 @@ describe("GET /api/task-intelligence", () => {
 
     it("still scores risk for an unmatched workspace — risk needs no repo map", async () => {
       const res = await request(app).get(
-        `/api/task-intelligence?scopePackage=repository&mode=refactor&workspace=${encodeURIComponent(otherWorkspace)}`
+        `/api/task-intelligence?scopePackage=repository&mode=refactor&workspace=${encodeURIComponent(otherWorkspace)}`,
       );
       expect(res.body.estimatedRisk).toBe("HIGH");
       expect(res.body.repoMapStatus).toBe("unmatched-workspace");
@@ -182,11 +194,11 @@ describe("GET /api/task-intelligence", () => {
 
   it("only counts a candidateCount strictly above the threshold (5)", async () => {
     const atThreshold = await request(app).get(
-      "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=5"
+      "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=5",
     );
     expect(atThreshold.body.estimatedRisk).toBe("LOW");
     const aboveThreshold = await request(app).get(
-      "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=6"
+      "/api/task-intelligence?scopePackage=frontend&mode=implement&candidateCount=6",
     );
     expect(aboveThreshold.body.estimatedRisk).toBe("MEDIUM");
   });

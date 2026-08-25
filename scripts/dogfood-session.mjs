@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
-const options = Object.fromEntries(process.argv.slice(2).map((arg) => {
-  const [key, ...rest] = arg.replace(/^--/, "").split("=");
-  return [key, rest.join("=") || "true"];
-}));
+const options = Object.fromEntries(
+  process.argv.slice(2).map((arg) => {
+    const [key, ...rest] = arg.replace(/^--/, "").split("=");
+    return [key, rest.join("=") || "true"];
+  }),
+);
 
 const baseUrl = options.gateway ?? "http://127.0.0.1:4317";
 const workspace = options.workspace ?? process.cwd();
@@ -19,7 +21,10 @@ async function api(path, init = {}) {
     headers: { "Content-Type": "application/json", Origin: origin, ...(init.headers ?? {}) },
   });
   const body = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(`${init.method ?? "GET"} ${path}: ${response.status} ${body?.error ?? ""}`.trim());
+  if (!response.ok)
+    throw new Error(
+      `${init.method ?? "GET"} ${path}: ${response.status} ${body?.error ?? ""}`.trim(),
+    );
   return body;
 }
 
@@ -43,13 +48,19 @@ const contract = {
   advanced: { toolchainMode: "none" },
 };
 
-const created = await api("/api/sessions", { method: "POST", body: JSON.stringify({ taskContract: contract, workspace }) });
+const created = await api("/api/sessions", {
+  method: "POST",
+  body: JSON.stringify({ taskContract: contract, workspace }),
+});
 assert(/^\d{8}-\d{6}-[a-f0-9-]{12}$/.test(created.id), `non-canonical session id ${created.id}`);
 assert(!created.id.startsWith("pending-"), "pending id leaked to client");
 assert(created.task === objective, "original objective was replaced");
 assert(created.taskContract?.objective === objective, "persisted contract lost original objective");
 if (/hva|forbedr|improv/i.test(objective)) {
-  assert(created.taskContract?.intent?.kind === "improvement-assessment", "improvement intent was not inferred");
+  assert(
+    created.taskContract?.intent?.kind === "improvement-assessment",
+    "improvement intent was not inferred",
+  );
 }
 
 await api(`/api/sessions/${created.id}/run`, { method: "POST" });
@@ -59,7 +70,16 @@ if (cancelAfterMs !== null) {
   await api(`/api/sessions/${created.id}/cancel`, { method: "POST" });
 }
 
-const terminal = new Set(["verified", "completed", "no_change", "needs_review", "failed", "blocked", "cancelled", "stale"]);
+const terminal = new Set([
+  "verified",
+  "completed",
+  "no_change",
+  "needs_review",
+  "failed",
+  "blocked",
+  "cancelled",
+  "stale",
+]);
 const deadline = Date.now() + timeoutMs;
 let session;
 while (Date.now() < deadline) {
@@ -84,14 +104,23 @@ if (["inspect", "plan", "review"].includes(mode) && cancelAfterMs === null) {
   assert(report.reportFailed !== true, "task report is a fallback failure artifact");
 }
 
-if (cancelAfterMs !== null) assert(session.status === "cancelled", `cancelled run ended as ${session.status}`);
+if (cancelAfterMs !== null)
+  assert(session.status === "cancelled", `cancelled run ended as ${session.status}`);
 
-process.stdout.write(JSON.stringify({
-  ok: true,
-  sessionId: created.id,
-  status: session.status,
-  objective: session.task,
-  intent: session.taskContract?.intent,
-  changedFiles: session.changedFiles.length,
-  report: report ? { mode: report.mode, findings: report.findings.length, confidence: report.confidence } : null,
-}, null, 2) + "\n");
+process.stdout.write(
+  JSON.stringify(
+    {
+      ok: true,
+      sessionId: created.id,
+      status: session.status,
+      objective: session.task,
+      intent: session.taskContract?.intent,
+      changedFiles: session.changedFiles.length,
+      report: report
+        ? { mode: report.mode, findings: report.findings.length, confidence: report.confidence }
+        : null,
+    },
+    null,
+    2,
+  ) + "\n",
+);

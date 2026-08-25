@@ -5,12 +5,29 @@ import { sessionsDir } from "../config.js";
 import { computeDiffHash } from "./git.js";
 import { gatewayRunToSession, listGatewayRunIds, readGatewayRun } from "./runState.js";
 import type {
-  GlimmerSession, GlimmerSessionStatus, ChangedFile,
-  VerificationSummary, VerificationCheckResult, VerificationOverall, TaskContract,
-  ArchitecturePlan, ArchitectReview, DeliveryReview, ArchitectEscalation, DeliveryPacket,
-  GlimmerTask, HumanAcceptance,
-  FinalStatus, FinalGateStatus, VisualManifest, VisualFindings, TaskOverride,
-  EvidenceIndexEntry, EvidenceEntryResponse, ApprovalRequest, HunkAcceptance,
+  GlimmerSession,
+  GlimmerSessionStatus,
+  ChangedFile,
+  VerificationSummary,
+  VerificationCheckResult,
+  VerificationOverall,
+  TaskContract,
+  ArchitecturePlan,
+  ArchitectReview,
+  DeliveryReview,
+  ArchitectEscalation,
+  DeliveryPacket,
+  GlimmerTask,
+  HumanAcceptance,
+  FinalStatus,
+  FinalGateStatus,
+  VisualManifest,
+  VisualFindings,
+  TaskOverride,
+  EvidenceIndexEntry,
+  EvidenceEntryResponse,
+  ApprovalRequest,
+  HunkAcceptance,
   TaskReport,
 } from "@glimmer/shared";
 
@@ -19,7 +36,13 @@ import type {
 // overallFromManifest/gating has always been computed from.
 
 const TERMINAL_STATUSES = new Set<GlimmerSessionStatus>([
-  "verified", "completed", "no_change", "failed", "blocked", "needs_review", "cancelled",
+  "verified",
+  "completed",
+  "no_change",
+  "failed",
+  "blocked",
+  "needs_review",
+  "cancelled",
 ]);
 
 // glimmer-v2.py's real manifest["status"] values: initialized, repo-map-only,
@@ -36,7 +59,8 @@ export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   if (raw === "understanding") return "understanding";
   if (raw === "verified") return "verified";
   if (raw === "no-change-verified" || raw === "no-change-unverified") return "no_change";
-  if (raw === "inspect-completed" || raw === "plan-completed" || raw === "review-completed") return "completed";
+  if (raw === "inspect-completed" || raw === "plan-completed" || raw === "review-completed")
+    return "completed";
   // Task 8.3 (V7 §14/§35): glimmer-engineer.py patches this raw string
   // directly into manifest.json while it's blocked polling approvals.json
   // for a YELLOW-classified action, and reverts it as soon as the wait
@@ -87,9 +111,20 @@ function overallFromManifest(manifest: any): VerificationOverall {
   const attempts = manifest.attempts ?? [];
   if (attempts.length === 0) return "NOT_RUN";
   const last = attempts[attempts.length - 1];
-  const results: VerificationCheckResult[] = (last.verificationResults ?? []).map(toVerificationCheck);
+  const results: VerificationCheckResult[] = (last.verificationResults ?? []).map(
+    toVerificationCheck,
+  );
   if (results.length === 0) return "NOT_RUN";
-  if (results.some((r) => !r.ok && (r.status === "FAIL" || r.status === "ERROR" || (r.status === "CODE_FAIL" && r.newErrorSignatures.length > 0)))) return "FAILED";
+  if (
+    results.some(
+      (r) =>
+        !r.ok &&
+        (r.status === "FAIL" ||
+          r.status === "ERROR" ||
+          (r.status === "CODE_FAIL" && r.newErrorSignatures.length > 0)),
+    )
+  )
+    return "FAILED";
   if (results.every((r) => r.ok)) return manifest.status === "verified" ? "VERIFIED" : "PARTIAL";
   return "PARTIAL";
 }
@@ -108,7 +143,10 @@ function gateToFinalStatus(value: boolean | null | undefined): FinalGateStatus {
 // `visual` starts as "not_run" and is upgraded by readSession (below) after
 // an async read of the session's visual/findings.json, which is the only
 // leg that needs I/O.
-function composeFinalStatus(overall: VerificationOverall, gates: GlimmerSession["gates"]): FinalStatus {
+function composeFinalStatus(
+  overall: VerificationOverall,
+  gates: GlimmerSession["gates"],
+): FinalStatus {
   return {
     functional: overall,
     visual: "not_run",
@@ -121,7 +159,9 @@ export function parseManifest(raw: unknown, sessionId: string): GlimmerSession {
   const m = raw as any;
   const attempts = m.attempts ?? [];
   const lastAttempt = attempts[attempts.length - 1];
-  const checks: VerificationCheckResult[] = (lastAttempt?.verificationResults ?? []).map(toVerificationCheck);
+  const checks: VerificationCheckResult[] = (lastAttempt?.verificationResults ?? []).map(
+    toVerificationCheck,
+  );
   // V7 §18: recommended-tier results, kept off `checks` entirely -- never
   // consulted by overallFromManifest/gating, only reported. Omitted (not an
   // empty array) when the attempt genuinely never ran a recommended check.
@@ -326,9 +366,9 @@ export function readDeliveryPacket(id: string): Promise<DeliveryPacket | null> {
 // unrecognized shape) reads back as null, same "no readable artifact"
 // convention every other opt-in read here follows.
 export async function readSessionTasks(id: string): Promise<GlimmerTask[] | null> {
-  const raw = await readSessionJsonFile<GlimmerTask[] | { schemaVersion: number; tasks: GlimmerTask[] }>(
-    id, "tasks.json"
-  );
+  const raw = await readSessionJsonFile<
+    GlimmerTask[] | { schemaVersion: number; tasks: GlimmerTask[] }
+  >(id, "tasks.json");
   if (raw === null) return null;
   if (Array.isArray(raw)) return raw;
   if (raw && typeof raw === "object" && Array.isArray((raw as { tasks: unknown }).tasks)) {
@@ -369,7 +409,10 @@ export function readTaskOverrides(id: string): Promise<Record<string, TaskOverri
 // same filesystem, and the temp file lives in the same directory so it
 // always is.
 export async function writeTaskOverride(
-  id: string, taskId: string, action: TaskOverride["action"], taskFacts: { kind: GlimmerTask["kind"]; description: string },
+  id: string,
+  taskId: string,
+  action: TaskOverride["action"],
+  taskFacts: { kind: GlimmerTask["kind"]; description: string },
 ): Promise<TaskOverride> {
   const real = resolveSessionId(id);
   // Review round 1 (Minor 8b): this function is reachable directly (not
@@ -406,7 +449,10 @@ export function readApprovals(id: string): Promise<Record<string, ApprovalReques
 // unchanged rather than overwriting resolvedAt/approvedBy -- a second
 // "approve" can't un-resolve a "denied" decision or reset its timestamp.
 export async function resolveApproval(
-  id: string, approvalId: string, action: "approve" | "deny", approvedBy: string,
+  id: string,
+  approvalId: string,
+  action: "approve" | "deny",
+  approvedBy: string,
 ): Promise<ApprovalRequest | null> {
   const real = resolveSessionId(id);
   if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
@@ -452,7 +498,10 @@ function overrideMatchesTask(override: TaskOverride, task: GlimmerTask): boolean
 // chiefly for completion.type=="manual" tasks with no automatic evaluator).
 // Either way the raw fact is preserved on `override` so the UI can badge it
 // as a human decision rather than orchestrator-derived evidence.
-export function applyTaskOverrides(tasks: GlimmerTask[], overrides: Record<string, TaskOverride> | null): GlimmerTask[] {
+export function applyTaskOverrides(
+  tasks: GlimmerTask[],
+  overrides: Record<string, TaskOverride> | null,
+): GlimmerTask[] {
   if (!overrides) return tasks;
   return tasks.map((t) => {
     const override = overrides[t.id];
@@ -462,7 +511,8 @@ export function applyTaskOverrides(tasks: GlimmerTask[], overrides: Record<strin
     // task), but keep the raw fact visible via staleOverride so a human
     // can tell why a Skip/Approve they remember seems to have vanished.
     if (!overrideMatchesTask(override, t)) return { ...t, staleOverride: override };
-    if (override.action === "skip") return { ...t, status: "skipped", priority: "optional", override };
+    if (override.action === "skip")
+      return { ...t, status: "skipped", priority: "optional", override };
     if (override.action === "approve") return { ...t, status: "complete", override };
     return t; // Review round 1 (Moderate 5): unrecognized action -- fail OPEN to unchanged, never guess a display.
   });
@@ -481,7 +531,13 @@ export function readVisualFindings(id: string): Promise<VisualFindings | null> {
   return readSessionJsonFile<VisualFindings>(id, path.join("visual", "findings.json"));
 }
 
-const KNOWN_VISUAL_FINDINGS_STATUSES = new Set(["NOT_RUN", "PASS", "FAIL", "BLOCKED", "PASS_WITH_WARNINGS"]);
+const KNOWN_VISUAL_FINDINGS_STATUSES = new Set([
+  "NOT_RUN",
+  "PASS",
+  "FAIL",
+  "BLOCKED",
+  "PASS_WITH_WARNINGS",
+]);
 
 const ARCHITECT_REVIEW_FILE_RE = /^architect-review-\d+-\d+\.json$/;
 
@@ -549,7 +605,13 @@ const EVIDENCE_FILE_RE = /^evidence-\d+\.jsonl$/;
 const EVIDENCE_WRITE_TOOL_NAMES = new Set(["write_file", "edit_file"]);
 
 function cappedEvidenceArguments(tool: string | undefined, args: unknown): unknown {
-  if (tool && EVIDENCE_WRITE_TOOL_NAMES.has(tool) && args && typeof args === "object" && !Array.isArray(args)) {
+  if (
+    tool &&
+    EVIDENCE_WRITE_TOOL_NAMES.has(tool) &&
+    args &&
+    typeof args === "object" &&
+    !Array.isArray(args)
+  ) {
     const obj = args as Record<string, unknown>;
     return { path: obj.path, keys: Object.keys(obj) };
   }
@@ -574,7 +636,10 @@ function cappedEvidenceArguments(tool: string | undefined, args: unknown): unkno
 // are unique within a session by construction, see
 // glimmer-engineer.py's _persist_evidence). null when the session dir
 // is missing, no evidence file matches, or no line carries this id.
-export async function readEvidenceEntry(id: string, evidenceId: string): Promise<EvidenceEntryResponse | null> {
+export async function readEvidenceEntry(
+  id: string,
+  evidenceId: string,
+): Promise<EvidenceEntryResponse | null> {
   const real = resolveSessionId(id);
   if (!isValidSessionId(real)) return null;
   let entries: string[];
@@ -610,9 +675,10 @@ export async function readEvidenceEntry(id: string, evidenceId: string): Promise
         id: evidenceId,
         tool,
         arguments: cappedEvidenceArguments(tool, record.arguments),
-        content: content !== undefined && content.length > EVIDENCE_ENTRY_FIELD_MAX_CHARS
-          ? content.slice(0, EVIDENCE_ENTRY_FIELD_MAX_CHARS) + "\n\n[truncated]"
-          : content,
+        content:
+          content !== undefined && content.length > EVIDENCE_ENTRY_FIELD_MAX_CHARS
+            ? content.slice(0, EVIDENCE_ENTRY_FIELD_MAX_CHARS) + "\n\n[truncated]"
+            : content,
       };
     }
   }
@@ -655,7 +721,11 @@ export async function writeHumanAcceptance(id: string): Promise<HumanAcceptance>
   const existing = await readHumanAcceptance(real);
   if (existing?.accepted) return existing;
   const record: HumanAcceptance = { accepted: true, acceptedAt: new Date().toISOString() };
-  await fs.writeFile(path.join(sessionsDir(), real, "human-acceptance.json"), JSON.stringify(record), "utf-8");
+  await fs.writeFile(
+    path.join(sessionsDir(), real, "human-acceptance.json"),
+    JSON.stringify(record),
+    "utf-8",
+  );
   return record;
 }
 
@@ -681,27 +751,42 @@ const HUNK_ID_RE = /^[a-f0-9]{64}$/;
 
 export async function readHunkAcceptances(id: string): Promise<Record<string, HunkAcceptance>> {
   const raw = await readSessionJsonFile<Partial<HunkAcceptanceFile>>(id, "hunk-acceptances.json");
-  if (!raw || raw.version !== 1 || !raw.acceptances || typeof raw.acceptances !== "object") return {};
+  if (!raw || raw.version !== 1 || !raw.acceptances || typeof raw.acceptances !== "object")
+    return {};
   const valid: Record<string, HunkAcceptance> = {};
   for (const [hunkId, record] of Object.entries(raw.acceptances)) {
     if (
-      HUNK_ID_RE.test(hunkId) && record && record.hunkId === hunkId &&
-      typeof record.path === "string" && typeof record.acceptedAt === "string"
-    ) valid[hunkId] = record;
+      HUNK_ID_RE.test(hunkId) &&
+      record &&
+      record.hunkId === hunkId &&
+      typeof record.path === "string" &&
+      typeof record.acceptedAt === "string"
+    )
+      valid[hunkId] = record;
   }
   return valid;
 }
 
-async function writeHunkAcceptances(id: string, acceptances: Record<string, HunkAcceptance>): Promise<void> {
+async function writeHunkAcceptances(
+  id: string,
+  acceptances: Record<string, HunkAcceptance>,
+): Promise<void> {
   const real = resolveSessionId(id);
   if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
   const finalPath = path.join(sessionsDir(), real, "hunk-acceptances.json");
   const tempPath = `${finalPath}.${randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, JSON.stringify({ version: 1, acceptances }), { encoding: "utf8", mode: 0o600 });
+  await fs.writeFile(tempPath, JSON.stringify({ version: 1, acceptances }), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   await fs.rename(tempPath, finalPath);
 }
 
-export async function writeHunkAcceptance(id: string, hunkId: string, filePath: string): Promise<HunkAcceptance> {
+export async function writeHunkAcceptance(
+  id: string,
+  hunkId: string,
+  filePath: string,
+): Promise<HunkAcceptance> {
   if (!HUNK_ID_RE.test(hunkId) || !filePath) throw new Error("invalid hunk acceptance");
   const existing = await readHunkAcceptances(id);
   const prior = existing[hunkId];
@@ -721,7 +806,9 @@ export async function clearHunkAcceptance(id: string, hunkId: string): Promise<v
 
 export async function clearHunkAcceptancesForPath(id: string, filePath: string): Promise<void> {
   const existing = await readHunkAcceptances(id);
-  const next = Object.fromEntries(Object.entries(existing).filter(([, record]) => record.path !== filePath));
+  const next = Object.fromEntries(
+    Object.entries(existing).filter(([, record]) => record.path !== filePath),
+  );
   if (Object.keys(next).length === Object.keys(existing).length) return;
   await writeHunkAcceptances(id, next);
 }
@@ -736,7 +823,7 @@ export async function clearHunkAcceptancesForPath(id: string, filePath: string):
 // just read back as "verified" until someone opens them.
 export async function readSession(
   id: string,
-  opts: { computeStale?: boolean } = {}
+  opts: { computeStale?: boolean } = {},
 ): Promise<GlimmerSession | null> {
   const real = resolveSessionId(id);
   const raw = await readManifestRaw(real);
@@ -758,7 +845,10 @@ export async function readSession(
   // same honest "not_run" fallback composeFinalStatus already uses, rather
   // than passing an untrusted/malformed string straight into finalStatus.
   if (visualFindings && KNOWN_VISUAL_FINDINGS_STATUSES.has(visualFindings.status)) {
-    session = { ...session, finalStatus: { ...session.finalStatus, visual: visualFindings.status } };
+    session = {
+      ...session,
+      finalStatus: { ...session.finalStatus, visual: visualFindings.status },
+    };
   }
   // Missing finalDiffHash (manifest predates this task) -> never stale, same
   // honesty rule as currentDiffHash returning null: no fingerprint to

@@ -7,12 +7,24 @@ import { IconChevron } from "./Icons";
 // content stays queryable (existing tests that assert on panel content keep
 // working) while still being visually collapsed by default.
 export function CollapsibleSection({
-  title, summary, defaultOpen = false, children,
-}: { title: string; summary?: ReactNode; defaultOpen?: boolean; children: ReactNode }) {
+  title,
+  summary,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  summary?: ReactNode;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <section className="section-panel">
-      <button className="section-panel__header" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+      <button
+        className="section-panel__header"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
         <IconChevron open={open} />
         <span className="section-panel__title">{title}</span>
         {summary && <span className="section-panel__summary">{summary}</span>}

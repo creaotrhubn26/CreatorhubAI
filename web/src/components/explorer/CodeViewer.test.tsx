@@ -30,7 +30,9 @@ describe("CodeViewer", () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
     const { container } = render(withQuery(<CodeViewer path="/w/src/a.ts" />));
 
-    await waitFor(() => expect(screen.getAllByText("const", { selector: ".tok-keyword" }).length).toBe(2));
+    await waitFor(() =>
+      expect(screen.getAllByText("const", { selector: ".tok-keyword" }).length).toBe(2),
+    );
     const lines = container.querySelectorAll(".code-view__line");
     expect(lines).toHaveLength(2); // trailing newline is not a third line
     expect(lines[0].querySelector(".code-view__lineno")?.textContent).toBe("1");
@@ -42,8 +44,12 @@ describe("CodeViewer", () => {
   it("marks the requested line", async () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
     const { container } = render(withQuery(<CodeViewer path="/w/src/a.ts" line={2} />));
-    await waitFor(() => expect(container.querySelector(".code-view__line.is-current")).not.toBeNull());
-    expect(container.querySelector(".code-view__line.is-current")?.getAttribute("data-line")).toBe("2");
+    await waitFor(() =>
+      expect(container.querySelector(".code-view__line.is-current")).not.toBeNull(),
+    );
+    expect(container.querySelector(".code-view__line.is-current")?.getAttribute("data-line")).toBe(
+      "2",
+    );
   });
 
   it("says so when the requested line is past what was read, instead of silently landing at the top", async () => {
@@ -61,16 +67,25 @@ describe("CodeViewer", () => {
       truncated: true,
     });
     render(withQuery(<CodeViewer path="/w/src/a.ts" />));
-    expect(await screen.findByText(/showing the first 524,288 of 900,000 bytes/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/showing the first 524,288 of 900,000 bytes/i),
+    ).toBeInTheDocument();
     expect(screen.getByText(/not the end of the file/i)).toBeInTheDocument();
   });
 
   it("shows a binary notice and no content at all", async () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
-      path: "/w/logo.png", size: 4096, bytesReturned: 0, truncated: false, binary: true, content: null,
+      path: "/w/logo.png",
+      size: 4096,
+      bytesReturned: 0,
+      truncated: false,
+      binary: true,
+      content: null,
     });
     const { container } = render(withQuery(<CodeViewer path="/w/logo.png" />));
-    expect(await screen.findByText(/Binary file — not shown \(4,096 bytes on disk\)/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Binary file — not shown \(4,096 bytes on disk\)/),
+    ).toBeInTheDocument();
     expect(container.querySelectorAll(".code-view__line")).toHaveLength(0);
   });
 
@@ -96,7 +111,12 @@ describe("CodeViewer", () => {
 
   it("names an empty file as empty", async () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
-      path: "/w/empty.txt", size: 0, bytesReturned: 0, truncated: false, binary: false, content: "",
+      path: "/w/empty.txt",
+      size: 0,
+      bytesReturned: 0,
+      truncated: false,
+      binary: false,
+      content: "",
     });
     render(withQuery(<CodeViewer path="/w/empty.txt" />));
     expect(await screen.findByText("This file is empty (0 bytes).")).toBeInTheDocument();
@@ -105,7 +125,9 @@ describe("CodeViewer", () => {
   it("offers no way to edit — it is a viewer", async () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
     const { container } = render(withQuery(<CodeViewer path="/w/src/a.ts" />));
-    await waitFor(() => expect(screen.getAllByText("const", { selector: ".tok-keyword" })).toHaveLength(2));
+    await waitFor(() =>
+      expect(screen.getAllByText("const", { selector: ".tok-keyword" })).toHaveLength(2),
+    );
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector("[contenteditable]")).toBeNull();
     expect(screen.queryByRole("button", { name: /save/i })).not.toBeInTheDocument();
@@ -114,9 +136,9 @@ describe("CodeViewer", () => {
   it("reports the complete line range selected in the read-only viewer", async () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
     const onSelectionChange = vi.fn();
-    const { container } = render(withQuery(
-      <CodeViewer path="/w/src/a.ts" onSelectionChange={onSelectionChange} />
-    ));
+    const { container } = render(
+      withQuery(<CodeViewer path="/w/src/a.ts" onSelectionChange={onSelectionChange} />),
+    );
     await waitFor(() => expect(container.querySelectorAll(".code-view__line")).toHaveLength(2));
 
     const rows = container.querySelectorAll<HTMLElement>(".code-view__line");
@@ -135,24 +157,31 @@ describe("CodeViewer", () => {
 
   it("keeps the selected range visibly marked after URL state replaces the native selection", async () => {
     vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(textFile);
-    const { container } = render(withQuery(
-      <CodeViewer path="/tmp/a.ts" selectionStart={1} selectionEnd={2} />
-    ));
+    const { container } = render(
+      withQuery(<CodeViewer path="/tmp/a.ts" selectionStart={1} selectionEnd={2} />),
+    );
     await waitFor(() => expect(container.querySelectorAll(".code-view__line")).toHaveLength(2));
     expect(container.querySelectorAll(".code-view__line.is-selected")).toHaveLength(2);
   });
 
   it("re-reads the open file once for a new matching file_changed event", async () => {
-    const readFile = vi.spyOn(client.glimmerApi, "readFile")
+    const readFile = vi
+      .spyOn(client.glimmerApi, "readFile")
       .mockResolvedValueOnce(textFile)
       .mockResolvedValue({ ...textFile, content: "const x = 2;\nconst y = 2;\n" });
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const empty = { events: [], lastEventAt: null };
     const changed = {
-      events: [{
-        id: "e-file-1", sessionId: "s1", timestamp: "2026-08-25T00:00:00.000Z",
-        type: "file_changed", path: "src/a.ts", changeType: "modified",
-      }] as any,
+      events: [
+        {
+          id: "e-file-1",
+          sessionId: "s1",
+          timestamp: "2026-08-25T00:00:00.000Z",
+          type: "file_changed",
+          path: "src/a.ts",
+          changeType: "modified",
+        },
+      ] as any,
       lastEventAt: Date.now(),
     };
     const { rerender } = render(
@@ -160,7 +189,7 @@ describe("CodeViewer", () => {
         <SessionEventsContext.Provider value={empty}>
           <CodeViewer path="/w/src/a.ts" workspace="/w" />
         </SessionEventsContext.Provider>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
     await waitFor(() => expect(readFile).toHaveBeenCalledTimes(1));
 
@@ -169,7 +198,7 @@ describe("CodeViewer", () => {
         <SessionEventsContext.Provider value={changed}>
           <CodeViewer path="/w/src/a.ts" workspace="/w" />
         </SessionEventsContext.Provider>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
     await waitFor(() => expect(readFile).toHaveBeenCalledTimes(2));
 
@@ -179,7 +208,7 @@ describe("CodeViewer", () => {
         <SessionEventsContext.Provider value={changed}>
           <CodeViewer path="/w/src/a.ts" workspace="/w" />
         </SessionEventsContext.Provider>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(readFile).toHaveBeenCalledTimes(2);

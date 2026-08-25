@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
-  fileHref, absolutePath, ancestorDirs, looksLikeDirectoryPath, mostSpecificContainingWorkspace,
+  fileHref,
+  absolutePath,
+  ancestorDirs,
+  looksLikeDirectoryPath,
+  mostSpecificContainingWorkspace,
 } from "./fileLink";
 
 describe("fileHref", () => {
@@ -50,8 +54,9 @@ describe("absolutePath", () => {
 
 describe("mostSpecificContainingWorkspace", () => {
   it("chooses the deepest known workspace when workspaces are nested", () => {
-    expect(mostSpecificContainingWorkspace(["/w", "/w/packages/app"], "/w/packages/app/src/a.ts"))
-      .toBe("/w/packages/app");
+    expect(
+      mostSpecificContainingWorkspace(["/w", "/w/packages/app"], "/w/packages/app/src/a.ts"),
+    ).toBe("/w/packages/app");
   });
 
   it("uses path boundaries rather than string prefixes", () => {

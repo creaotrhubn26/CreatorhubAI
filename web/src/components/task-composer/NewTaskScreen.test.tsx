@@ -9,7 +9,10 @@ import * as client from "../../api/client";
 // which requires a Router context to render. MemoryRouter is added here (matching
 // the pattern already used in AppShell.test.tsx) purely as test scaffolding — it
 // does not change what is asserted.
-function withQuery(ui: React.ReactElement, initialEntries: Array<string | { pathname: string; state?: unknown }> = ["/"]) {
+function withQuery(
+  ui: React.ReactElement,
+  initialEntries: Array<string | { pathname: string; state?: unknown }> = ["/"],
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={qc}>
@@ -23,17 +26,24 @@ describe("NewTaskScreen", () => {
     // NewTaskScreen now renders TaskIntelligencePanel, which fetches on mount.
     // Stub it so these tests exercise the composer form, not the network.
     vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockResolvedValue({
-      likelyArea: null, likelyPackage: null, suggestedVerification: [], estimatedRisk: null,
-      provenance: "deterministic-backend", repoMapStatus: "none",
+      likelyArea: null,
+      likelyPackage: null,
+      suggestedVerification: [],
+      estimatedRisk: null,
+      provenance: "deterministic-backend",
+      repoMapStatus: "none",
     });
     // Task 4c(2): the composer now also lists known workspaces for quick-pick
     // and can browse directories. Stub both network boundaries.
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([]);
     vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
-      root: "/tmp/ws", path: "/tmp/ws", parent: null, entries: [{ name: "src", isDir: true }], truncated: false,
+      root: "/tmp/ws",
+      path: "/tmp/ws",
+      parent: null,
+      entries: [{ name: "src", isDir: true }],
+      truncated: false,
     });
   });
-
 
   it("renders commit/push/deploy/install as permanently disabled and unchecked", () => {
     render(withQuery(<NewTaskScreen />));
@@ -75,7 +85,9 @@ describe("NewTaskScreen", () => {
   });
 
   it("turns an open-ended improvement question into an evidence-first implementation task", async () => {
-    const createSpy = vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "s-improve" } as any);
+    const createSpy = vi
+      .spyOn(client.glimmerApi, "createSession")
+      .mockResolvedValue({ id: "s-improve" } as any);
     vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
 
     render(withQuery(<NewTaskScreen />));
@@ -85,7 +97,10 @@ describe("NewTaskScreen", () => {
     fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
 
     expect(screen.getByRole("status")).toHaveTextContent(/not search for those words/i);
-    expect((screen.getByText("Mode").closest("fieldset")!.querySelector("select") as HTMLSelectElement).value).toBe("implement");
+    expect(
+      (screen.getByText("Mode").closest("fieldset")!.querySelector("select") as HTMLSelectElement)
+        .value,
+    ).toBe("implement");
     fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
 
     await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
@@ -99,7 +114,9 @@ describe("NewTaskScreen", () => {
   });
 
   it("respects a manually selected review mode when interpreting an improvement question", async () => {
-    const createSpy = vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "s-review" } as any);
+    const createSpy = vi
+      .spyOn(client.glimmerApi, "createSession")
+      .mockResolvedValue({ id: "s-review" } as any);
     vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
 
     render(withQuery(<NewTaskScreen />));
@@ -135,9 +152,13 @@ describe("NewTaskScreen", () => {
   // requires an explicit click.
   it("prefills the objective from router state when arriving via 'convert to task'", () => {
     render(
-      withQuery(<NewTaskScreen />, [{ pathname: "/tasks/new", state: { objective: "Add restoration progress state" } }])
+      withQuery(<NewTaskScreen />, [
+        { pathname: "/tasks/new", state: { objective: "Add restoration progress state" } },
+      ]),
     );
-    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("Add restoration progress state");
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue(
+      "Add restoration progress state",
+    );
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
   });
 
@@ -148,27 +169,40 @@ describe("NewTaskScreen", () => {
 
   it("prefills a selection draft with workspace, file scope, and task-intelligence verification defaults", async () => {
     vi.mocked(client.glimmerApi.getTaskIntelligence).mockResolvedValue({
-      likelyArea: "src", likelyPackage: "web", suggestedVerification: ["frontend-typecheck", "targeted-test"],
-      estimatedRisk: "LOW", provenance: "git-derived", repoMapStatus: "workspace-matched",
+      likelyArea: "src",
+      likelyPackage: "web",
+      suggestedVerification: ["frontend-typecheck", "targeted-test"],
+      estimatedRisk: "LOW",
+      provenance: "git-derived",
+      repoMapStatus: "workspace-matched",
     });
     const createSession = vi.spyOn(client.glimmerApi, "createSession");
-    render(withQuery(<NewTaskScreen />, [{
-      pathname: "/tasks/new",
-      state: {
-        selectionDraft: {
-          objective: "Extract this validation into a helper",
-          workspace: "/tmp/ws",
-          path: "/tmp/ws/src/a.ts",
-          startLine: 3,
-          endLine: 5,
+    render(
+      withQuery(<NewTaskScreen />, [
+        {
+          pathname: "/tasks/new",
+          state: {
+            selectionDraft: {
+              objective: "Extract this validation into a helper",
+              workspace: "/tmp/ws",
+              path: "/tmp/ws/src/a.ts",
+              startLine: 3,
+              endLine: 5,
+            },
+          },
         },
-      },
-    }]));
+      ]),
+    );
 
-    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("Extract this validation into a helper");
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue(
+      "Extract this validation into a helper",
+    );
     expect(screen.getByLabelText("Workspace path")).toHaveValue("/tmp/ws");
     expect(screen.getByLabelText(/scope path/i)).toHaveValue("src/a.ts");
-    expect((screen.getByText("Scope").closest("fieldset")!.querySelector("select") as HTMLSelectElement).value).toBe("files");
+    expect(
+      (screen.getByText("Scope").closest("fieldset")!.querySelector("select") as HTMLSelectElement)
+        .value,
+    ).toBe("files");
     expect(screen.getByText(/nothing has started yet/i)).toBeInTheDocument();
     await vi.waitFor(() => expect(screen.getByLabelText("Frontend typecheck")).toBeChecked());
     expect(screen.getByLabelText("Targeted test")).toBeChecked();
@@ -177,29 +211,49 @@ describe("NewTaskScreen", () => {
 
   it("does not overwrite the human's edits when selection intelligence arrives later", async () => {
     const intelligence = {
-      likelyArea: "src", likelyPackage: "web", suggestedVerification: ["frontend-typecheck" as const],
-      estimatedRisk: "LOW" as const, provenance: "git-derived" as const, repoMapStatus: "workspace-matched" as const,
+      likelyArea: "src",
+      likelyPackage: "web",
+      suggestedVerification: ["frontend-typecheck" as const],
+      estimatedRisk: "LOW" as const,
+      provenance: "git-derived" as const,
+      repoMapStatus: "workspace-matched" as const,
     };
     let resolveIntelligence!: (value: typeof intelligence) => void;
-    const pending = new Promise<typeof intelligence>((resolve) => { resolveIntelligence = resolve; });
-    vi.mocked(client.glimmerApi.getTaskIntelligence).mockReturnValueOnce(pending).mockResolvedValue(intelligence);
+    const pending = new Promise<typeof intelligence>((resolve) => {
+      resolveIntelligence = resolve;
+    });
+    vi.mocked(client.glimmerApi.getTaskIntelligence)
+      .mockReturnValueOnce(pending)
+      .mockResolvedValue(intelligence);
 
-    render(withQuery(<NewTaskScreen />, [{
-      pathname: "/tasks/new",
-      state: {
-        selectionDraft: {
-          objective: "Extract this helper", workspace: "/tmp/ws", path: "/tmp/ws/src/a.ts", startLine: 3, endLine: 5,
+    render(
+      withQuery(<NewTaskScreen />, [
+        {
+          pathname: "/tasks/new",
+          state: {
+            selectionDraft: {
+              objective: "Extract this helper",
+              workspace: "/tmp/ws",
+              path: "/tmp/ws/src/a.ts",
+              startLine: 3,
+              endLine: 5,
+            },
+          },
         },
-      },
-    }]));
+      ]),
+    );
     await vi.waitFor(() => expect(client.glimmerApi.getTaskIntelligence).toHaveBeenCalled());
     fireEvent.change(screen.getByPlaceholderText("What should Glimmer work on?"), {
       target: { value: "Keep the human wording" },
     });
 
-    await act(async () => { resolveIntelligence(intelligence); });
+    await act(async () => {
+      resolveIntelligence(intelligence);
+    });
     await vi.waitFor(() => expect(screen.getByText("frontend-typecheck")).toBeInTheDocument());
-    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("Keep the human wording");
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue(
+      "Keep the human wording",
+    );
     expect(screen.getByLabelText("Frontend typecheck")).not.toBeChecked();
   });
 
@@ -222,7 +276,9 @@ describe("NewTaskScreen", () => {
     const pathInput = screen.getByLabelText(/scope path/i) as HTMLInputElement;
     expect(pathInput).toBeInTheDocument();
 
-    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), { target: { value: "Fix the dialog" } });
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Fix the dialog" },
+    });
     fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
 
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeDisabled();
@@ -272,7 +328,9 @@ describe("NewTaskScreen", () => {
       vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
 
       render(withQuery(<NewTaskScreen />));
-      fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), { target: { value: "Fix the dialog" } });
+      fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+        target: { value: "Fix the dialog" },
+      });
       fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
       fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
 
@@ -288,7 +346,9 @@ describe("NewTaskScreen", () => {
       vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
 
       render(withQuery(<NewTaskScreen />));
-      fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), { target: { value: "Fix the dialog" } });
+      fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+        target: { value: "Fix the dialog" },
+      });
       fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
       fireEvent.change(screen.getByLabelText("Timeout (seconds)"), { target: { value: "300" } });
       fireEvent.change(screen.getByLabelText("Toolchain mode"), { target: { value: "linked" } });
@@ -297,7 +357,11 @@ describe("NewTaskScreen", () => {
 
       await vi.waitFor(() => expect(createSpy).toHaveBeenCalled());
       const [contract] = createSpy.mock.calls[0];
-      expect(contract.advanced).toEqual({ timeoutSeconds: 300, toolchainMode: "linked", architectFirst: true });
+      expect(contract.advanced).toEqual({
+        timeoutSeconds: 300,
+        toolchainMode: "linked",
+        architectFirst: true,
+      });
     });
   });
 
@@ -310,18 +374,24 @@ describe("NewTaskScreen", () => {
       render(withQuery(<NewTaskScreen />));
       const createButton = screen.getByRole("button", { name: "Create" });
       expect(createButton).toBeDisabled();
-      fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "role room story logic" } });
+      fireEvent.change(screen.getByLabelText("Task name"), {
+        target: { value: "role room story logic" },
+      });
       expect(createButton).not.toBeDisabled();
     });
 
     it("on success, adopts the created workspace path as the selected workspace", async () => {
       let resolveCreate: (v: { workspace: string; branch: string; baselineSha: string }) => void;
       vi.spyOn(client.glimmerApi, "createWorkspace").mockReturnValue(
-        new Promise((resolve) => { resolveCreate = resolve; })
+        new Promise((resolve) => {
+          resolveCreate = resolve;
+        }),
       );
 
       render(withQuery(<NewTaskScreen />));
-      fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "role room story logic" } });
+      fireEvent.change(screen.getByLabelText("Task name"), {
+        target: { value: "role room story logic" },
+      });
       fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
       // Pending state: fetch can take ~10s+, so the button must reflect that
@@ -336,14 +406,16 @@ describe("NewTaskScreen", () => {
 
       await vi.waitFor(() =>
         expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe(
-          "/Users/danielqazi/glimmer-role-room-story-logic-20260821-010000"
-        )
+          "/Users/danielqazi/glimmer-role-room-story-logic-20260821-010000",
+        ),
       );
     });
 
     it("on failure, shows the server's error text — including a half-created path if one is named", async () => {
       vi.spyOn(client.glimmerApi, "createWorkspace").mockRejectedValue(
-        new Error("workspace and branch were created but failed post-create verification: worktree is dirty — workspace: /Users/danielqazi/glimmer-x-20260821-010000 — branch: glimmer/x-20260821-010000")
+        new Error(
+          "workspace and branch were created but failed post-create verification: worktree is dirty — workspace: /Users/danielqazi/glimmer-x-20260821-010000 — branch: glimmer/x-20260821-010000",
+        ),
       );
 
       render(withQuery(<NewTaskScreen />));
@@ -367,11 +439,20 @@ describe("NewTaskScreen", () => {
 
     it("offers known workspaces as one-click quick picks", async () => {
       vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([
-        { path: "/Users/u/glimmer-x", branch: "glimmer/x", headSha: "a", baselineSha: null, dirty: false, changedFiles: [] },
+        {
+          path: "/Users/u/glimmer-x",
+          branch: "glimmer/x",
+          headSha: "a",
+          baselineSha: null,
+          dirty: false,
+          changedFiles: [],
+        },
       ]);
       render(withQuery(<NewTaskScreen />));
       fireEvent.click(await screen.findByRole("button", { name: "/Users/u/glimmer-x" }));
-      expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe("/Users/u/glimmer-x");
+      expect((screen.getByLabelText("Workspace path") as HTMLInputElement).value).toBe(
+        "/Users/u/glimmer-x",
+      );
     });
 
     it("keeps the workspace text input editable for pasted paths", () => {
@@ -394,7 +475,11 @@ describe("NewTaskScreen", () => {
     // would never match a changed-file path in the backend's scope guard.
     it("stores a browsed scope directory workspace-relative, rooted at the workspace", async () => {
       vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
-        root: "/tmp/ws", path: "/tmp/ws/frontend/src", parent: "/tmp/ws/frontend", entries: [], truncated: false,
+        root: "/tmp/ws",
+        path: "/tmp/ws/frontend/src",
+        parent: "/tmp/ws/frontend",
+        entries: [],
+        truncated: false,
       });
       render(withQuery(<NewTaskScreen />));
       fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
@@ -411,7 +496,11 @@ describe("NewTaskScreen", () => {
     // in the run out of scope.
     it("does not store '.' when the workspace root itself is picked as a directory scope", async () => {
       vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
-        root: "/tmp/ws", path: "/tmp/ws", parent: null, entries: [], truncated: false,
+        root: "/tmp/ws",
+        path: "/tmp/ws",
+        parent: null,
+        entries: [],
+        truncated: false,
       });
       render(withQuery(<NewTaskScreen />));
       fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
@@ -429,7 +518,11 @@ describe("NewTaskScreen", () => {
 
     it("refuses a picked path outside the workspace instead of storing an unusable absolute path", async () => {
       vi.spyOn(client.glimmerApi, "listDirectory").mockResolvedValue({
-        root: "/tmp/ws", path: "/somewhere/else", parent: null, entries: [], truncated: false,
+        root: "/tmp/ws",
+        path: "/somewhere/else",
+        parent: null,
+        entries: [],
+        truncated: false,
       });
       render(withQuery(<NewTaskScreen />));
       fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
@@ -449,7 +542,10 @@ describe("NewTaskScreen", () => {
         root: "/tmp/ws",
         path: "/tmp/ws/src",
         parent: "/tmp/ws",
-        entries: [{ name: "a.ts", isDir: false }, { name: "b.ts", isDir: false }],
+        entries: [
+          { name: "a.ts", isDir: false },
+          { name: "b.ts", isDir: false },
+        ],
         truncated: false,
       });
       render(withQuery(<NewTaskScreen />));
@@ -485,7 +581,9 @@ describe("NewTaskScreen", () => {
         target: { value: "refactor" },
       });
       expect(
-        screen.getByText("Architect mode will auto-trigger (score 5: mode_refactor, multi_package_scope)")
+        screen.getByText(
+          "Architect mode will auto-trigger (score 5: mode_refactor, multi_package_scope)",
+        ),
       ).toBeInTheDocument();
     });
   });

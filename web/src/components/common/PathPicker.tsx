@@ -76,7 +76,9 @@ export function PathPicker({
         <div className="path-picker__browser">
           <div className="path-picker__bar">
             <code>{data?.path ?? cwd ?? "…"}</code>
-            <button type="button" onClick={() => setBrowsing(false)}>Close</button>
+            <button type="button" onClick={() => setBrowsing(false)}>
+              Close
+            </button>
           </div>
           {error && <p role="alert">{(error as Error).message}</p>}
           {isFetching && !data && <p>Loading…</p>}
@@ -85,7 +87,9 @@ export function PathPicker({
               <ul className="path-picker__list">
                 {data.parent && (
                   <li>
-                    <button type="button" onClick={() => setCwd(data.parent!)}>../</button>
+                    <button type="button" onClick={() => setCwd(data.parent!)}>
+                      ../
+                    </button>
                   </li>
                 )}
                 {data.entries.map((entry) =>
@@ -103,13 +107,15 @@ export function PathPicker({
                           checked={checked.includes(`${data.path}/${entry.name}`)}
                           onChange={(e) => {
                             const full = `${data.path}/${entry.name}`;
-                            setChecked((prev) => (e.target.checked ? [...prev, full] : prev.filter((p) => p !== full)));
+                            setChecked((prev) =>
+                              e.target.checked ? [...prev, full] : prev.filter((p) => p !== full),
+                            );
                           }}
                         />
                         {entry.name}
                       </label>
                     </li>
-                  )
+                  ),
                 )}
               </ul>
               {data.entries.length === 0 && <p>No selectable entries here.</p>}

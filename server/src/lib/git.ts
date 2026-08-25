@@ -14,7 +14,11 @@ const exec = promisify(execFile);
 // user input, e.g. the workspace-creation slug) can be interpreted as shell
 // syntax. `timeoutMs` lets callers bound a call that touches the network
 // (git fetch) without affecting the many callers that don't need it.
-async function git(cwd: string, args: string[], opts: { timeoutMs?: number } = {}): Promise<string> {
+async function git(
+  cwd: string,
+  args: string[],
+  opts: { timeoutMs?: number } = {},
+): Promise<string> {
   const { stdout } = await exec("git", args, {
     cwd,
     maxBuffer: 20 * 1024 * 1024,
@@ -24,7 +28,10 @@ async function git(cwd: string, args: string[], opts: { timeoutMs?: number } = {
 }
 
 const STATUS_CODE_MAP: Record<string, ChangedFile["status"]> = {
-  A: "added", M: "modified", D: "deleted", R: "renamed",
+  A: "added",
+  M: "modified",
+  D: "deleted",
+  R: "renamed",
 };
 
 export async function gitStatus(workspace: string) {
@@ -57,9 +64,14 @@ async function isUntracked(cwd: string, filePath: string): Promise<boolean> {
 // rejection — the diff text is still on the error's stdout, so recover it.
 async function gitDiffUntrackedFile(cwd: string, filePath: string): Promise<string> {
   try {
-    const { stdout } = await exec("git", ["diff", "--no-color", "--no-index", "--", "/dev/null", filePath], {
-      cwd, maxBuffer: 20 * 1024 * 1024,
-    });
+    const { stdout } = await exec(
+      "git",
+      ["diff", "--no-color", "--no-index", "--", "/dev/null", filePath],
+      {
+        cwd,
+        maxBuffer: 20 * 1024 * 1024,
+      },
+    );
     return stdout;
   } catch (err: any) {
     if (typeof err.stdout === "string" && err.code === 1) return err.stdout;
@@ -73,11 +85,13 @@ export async function gitDiff(workspace: string, paths: string[] = []): Promise<
   const tracked: string[] = [];
   const untracked: string[] = [];
   for (const p of paths) {
-    if (await isUntracked(workspace, p)) untracked.push(p); else tracked.push(p);
+    if (await isUntracked(workspace, p)) untracked.push(p);
+    else tracked.push(p);
   }
 
   const parts: string[] = [];
-  if (tracked.length > 0) parts.push(await git(workspace, ["diff", "--no-color", "--", ...tracked]));
+  if (tracked.length > 0)
+    parts.push(await git(workspace, ["diff", "--no-color", "--", ...tracked]));
   for (const p of untracked) parts.push(await gitDiffUntrackedFile(workspace, p));
   return parts.filter(Boolean).join("");
 }
@@ -163,7 +177,10 @@ export function parseGitDiffHunks(diff: string): ParsedGitDiffHunk[] {
 }
 
 export class GitHunkReviewError extends Error {
-  constructor(message: string, readonly status: 403 | 409) {
+  constructor(
+    message: string,
+    readonly status: 403 | 409,
+  ) {
     super(message);
   }
 }
@@ -176,11 +193,17 @@ export async function gitRejectHunk(
   targetHunkId: string,
 ): Promise<ParsedGitDiffHunk> {
   if (!allowedPaths.includes(targetPath)) {
-    throw new GitHunkReviewError(`Refusing to reject a hunk in ${targetPath}: not in this session's changed files`, 403);
+    throw new GitHunkReviewError(
+      `Refusing to reject a hunk in ${targetPath}: not in this session's changed files`,
+      403,
+    );
   }
   const resolved = path.resolve(workspace, targetPath);
   if (!resolved.startsWith(path.resolve(workspace) + path.sep)) {
-    throw new GitHunkReviewError(`Refusing to reject a hunk in ${targetPath}: resolves outside workspace`, 403);
+    throw new GitHunkReviewError(
+      `Refusing to reject a hunk in ${targetPath}: resolves outside workspace`,
+      403,
+    );
   }
 
   const currentDiff = await gitDiff(workspace, [targetPath]);
@@ -188,7 +211,10 @@ export async function gitRejectHunk(
     (candidate) => candidate.path === targetPath && candidate.id === targetHunkId,
   );
   if (!hunk) {
-    throw new GitHunkReviewError("This hunk is no longer present in the current diff; refresh and review again", 409);
+    throw new GitHunkReviewError(
+      "This hunk is no longer present in the current diff; refresh and review again",
+      409,
+    );
   }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-hunk-review-"));
@@ -196,10 +222,20 @@ export async function gitRejectHunk(
   try {
     await fs.writeFile(patchFile, hunk.patch, { encoding: "utf8", mode: 0o600 });
     try {
-      await git(workspace, ["apply", "--reverse", "--recount", "--whitespace=nowarn", "--check", patchFile]);
+      await git(workspace, [
+        "apply",
+        "--reverse",
+        "--recount",
+        "--whitespace=nowarn",
+        "--check",
+        patchFile,
+      ]);
       await git(workspace, ["apply", "--reverse", "--recount", "--whitespace=nowarn", patchFile]);
     } catch {
-      throw new GitHunkReviewError("This hunk no longer applies cleanly; refresh and review again", 409);
+      throw new GitHunkReviewError(
+        "This hunk no longer applies cleanly; refresh and review again",
+        409,
+      );
     }
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -224,11 +260,14 @@ export async function gitRejectHunk(
 async function gitDiffHashInput(
   workspace: string,
   baseline: string,
-  opts: { timeoutMs?: number }
+  opts: { timeoutMs?: number },
 ): Promise<{ diff: Buffer; others: string[] }> {
   const [{ stdout: diff }, othersRaw] = await Promise.all([
     exec("git", ["diff", "--binary", baseline, "--"], {
-      cwd: workspace, maxBuffer: 20 * 1024 * 1024, timeout: opts.timeoutMs, encoding: "buffer",
+      cwd: workspace,
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: opts.timeoutMs,
+      encoding: "buffer",
     }),
     git(workspace, ["ls-files", "--others", "--exclude-standard"], opts),
   ]);
@@ -240,7 +279,7 @@ async function gitDiffHashInput(
 export async function computeDiffHash(
   workspace: string,
   baseline: string,
-  opts: { timeoutMs?: number } = {}
+  opts: { timeoutMs?: number } = {},
 ): Promise<string> {
   const { diff, others } = await gitDiffHashInput(workspace, baseline, opts);
   const hash = createHash("sha256");
@@ -264,7 +303,7 @@ export async function gitRevertFile(
   workspace: string,
   allowedPaths: string[],
   targetPath: string,
-  baselineSha: string
+  baselineSha: string,
 ): Promise<void> {
   if (!allowedPaths.includes(targetPath)) {
     throw new Error(`Refusing to revert ${targetPath}: not in this session's changed files`);
@@ -332,7 +371,10 @@ export function sanitizeTaskSlug(raw: string): string {
   // "..-evil" by charset alone, which `git worktree add` then rejects as an
   // invalid ref, an unhandled failure rather than a clean 400). Strip both
   // shapes explicitly instead of relying on git to reject them for us.
-  slug = slug.replace(/\.{2,}/g, "-").replace(/^\.+/, "").replace(/^-+|-+$/g, "");
+  slug = slug
+    .replace(/\.{2,}/g, "-")
+    .replace(/^\.+/, "")
+    .replace(/^-+|-+$/g, "");
   // Slicing can leave a trailing "-" at the cut point; trim again.
   return slug.slice(0, SLUG_MAX_LEN).replace(/^-+|-+$/g, "");
 }
@@ -420,7 +462,7 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   } catch {
     throw new WorkspaceCreateError(
       `GLIMMER_SOURCE_REPO (${sourceRepo}) does not exist or is not a git repository`,
-      500
+      500,
     );
   }
 
@@ -446,7 +488,10 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   // this. A trip here means worktreeRoot itself is misconfigured -> 500,
   // not 400.
   if (!resolvesWithinRoot(CONFIG.worktreeRoot, workspace)) {
-    throw new WorkspaceCreateError(`refusing to create a worktree outside worktreeRoot: ${workspace}`, 500);
+    throw new WorkspaceCreateError(
+      `refusing to create a worktree outside worktreeRoot: ${workspace}`,
+      500,
+    );
   }
 
   if (await refExists(sourceRepo, `refs/heads/${branch}`)) {
@@ -460,7 +505,7 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
     await git(
       sourceRepo,
       ["worktree", "add", "--no-track", "-b", branch, workspace, CONFIG.worktreeBase],
-      { timeoutMs: WORKTREE_ADD_TIMEOUT_MS }
+      { timeoutMs: WORKTREE_ADD_TIMEOUT_MS },
     );
   } catch (err: any) {
     // Nothing was actually created if this call itself failed (git rejects
@@ -474,10 +519,16 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
     // loop trying to "fix" an input that was never the problem.
     const detail = String(err.stderr ?? err.message ?? "");
     if (REF_NAME_REJECTION.test(detail)) {
-      throw new WorkspaceCreateError(`could not create branch/worktree for taskName: ${err.message}`, 400);
+      throw new WorkspaceCreateError(
+        `could not create branch/worktree for taskName: ${err.message}`,
+        400,
+      );
     }
     console.error("[workspace-create] git worktree add failed:", err);
-    throw new WorkspaceCreateError("failed to create the worktree (server-side git error, see server logs)", 500);
+    throw new WorkspaceCreateError(
+      "failed to create the worktree (server-side git error, see server logs)",
+      500,
+    );
   }
 
   // From here on the worktree and branch are real. A failure past this point
@@ -495,7 +546,9 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
       .catch(() => "");
 
     if (headSha !== baselineSha) {
-      throw new Error(`HEAD (${headSha}) does not match fetched ${CONFIG.worktreeBase} (${baselineSha})`);
+      throw new Error(
+        `HEAD (${headSha}) does not match fetched ${CONFIG.worktreeBase} (${baselineSha})`,
+      );
     }
     if (currentBranch !== branch) {
       throw new Error(`worktree is on branch "${currentBranch}", expected "${branch}"`);
@@ -510,7 +563,7 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
     throw new WorkspaceCreateError(
       `workspace and branch were created but failed post-create verification: ${err.message}`,
       500,
-      { workspace, branch }
+      { workspace, branch },
     );
   }
 

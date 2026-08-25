@@ -4,7 +4,10 @@ import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
 
 const RISK_COLOR: Record<ArchitecturePlanRisk, string> = {
-  low: "var(--green)", medium: "var(--amber)", high: "var(--red)", critical: "var(--red)",
+  low: "var(--green)",
+  medium: "var(--amber)",
+  high: "var(--red)",
+  critical: "var(--red)",
 };
 
 export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
@@ -42,7 +45,9 @@ export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
         <div>
           <dt>Risk</dt>
           <dd>
-            <span className="meta-value" style={{ ["--badge-color" as any]: color }}>{plan.risk}</span>
+            <span className="meta-value" style={{ ["--badge-color" as any]: color }}>
+              {plan.risk}
+            </span>
           </dd>
         </div>
         <div>
@@ -55,7 +60,9 @@ export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
           <h3>Candidate files</h3>
           <ul>
             {plan.candidateFiles.map((f) => (
-              <li key={f.path}>{f.path} — {f.reason} ({f.confidence})</li>
+              <li key={f.path}>
+                {f.path} — {f.reason} ({f.confidence})
+              </li>
             ))}
           </ul>
         </>
@@ -64,7 +71,9 @@ export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
         <>
           <h3>Implementation plan</h3>
           <ol>
-            {plan.implementationPlan.map((step, i) => <li key={i}>{step}</li>)}
+            {plan.implementationPlan.map((step, i) => (
+              <li key={i}>{step}</li>
+            ))}
           </ol>
         </>
       )}
@@ -72,7 +81,11 @@ export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
         <>
           <h3>Constraints</h3>
           <div className="chip-row">
-            {plan.constraints.map((c, i) => <span className="chip" key={i}>{c}</span>)}
+            {plan.constraints.map((c, i) => (
+              <span className="chip" key={i}>
+                {c}
+              </span>
+            ))}
           </div>
         </>
       )}
@@ -80,7 +93,9 @@ export function ArchitecturePlanPanel({ sessionId }: { sessionId: string }) {
         <>
           <h3>Uncertainties</h3>
           <ul>
-            {plan.uncertainties.map((u, i) => <li key={i}>{u}</li>)}
+            {plan.uncertainties.map((u, i) => (
+              <li key={i}>{u}</li>
+            ))}
           </ul>
         </>
       )}

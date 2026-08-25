@@ -5,11 +5,17 @@ function fakeStorage(overrides: Partial<Storage> = {}): Storage {
   const store = new Map<string, string>();
   return {
     getItem: (k: string) => store.get(k) ?? null,
-    setItem: (k: string, v: string) => { store.set(k, v); },
-    removeItem: (k: string) => { store.delete(k); },
+    setItem: (k: string, v: string) => {
+      store.set(k, v);
+    },
+    removeItem: (k: string) => {
+      store.delete(k);
+    },
     clear: () => store.clear(),
     key: () => null,
-    get length() { return store.size; },
+    get length() {
+      return store.size;
+    },
     ...overrides,
   } as Storage;
 }
@@ -41,18 +47,37 @@ describe("assistantHistory", () => {
 
   it("persists an errored turn's error state", () => {
     stub(fakeStorage());
-    const turns: Turn[] = [{ id: 1, question: "why?", askedAt: "t", error: "Unavailable — the assistant could not answer that." }];
+    const turns: Turn[] = [
+      {
+        id: 1,
+        question: "why?",
+        askedAt: "t",
+        error: "Unavailable — the assistant could not answer that.",
+      },
+    ];
     saveTurns("s1", turns);
     expect(loadTurns("s1")).toEqual(turns);
   });
 
   it("loadTurns returns [] when storage.getItem throws", () => {
-    stub(fakeStorage({ getItem: () => { throw new Error("blocked"); } }));
+    stub(
+      fakeStorage({
+        getItem: () => {
+          throw new Error("blocked");
+        },
+      }),
+    );
     expect(loadTurns("s1")).toEqual([]);
   });
 
   it("saveTurns swallows a storage.setItem throw instead of crashing", () => {
-    stub(fakeStorage({ setItem: () => { throw new Error("quota exceeded"); } }));
+    stub(
+      fakeStorage({
+        setItem: () => {
+          throw new Error("quota exceeded");
+        },
+      }),
+    );
     expect(() => saveTurns("s1", [])).not.toThrow();
   });
 

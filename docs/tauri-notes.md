@@ -1,6 +1,7 @@
 # Tauri desktop shell — build & operations notes
 
 ## App icon
+
 `src-tauri/icon-source.png` (1024×1024, dark rounded square + teal glimmer
 sparkle) is the single source. Regenerate every platform icon with:
 
@@ -9,6 +10,7 @@ cd src-tauri && npx @tauri-apps/cli icon icon-source.png
 ```
 
 ## Bundled gateway
+
 The gateway (`server/dist` + `@glimmer/shared` + its prod npm deps) is
 bundled as a Tauri `resources` entry, so a moved .app no longer needs the
 repo checkout to find `dist/index.js` or `node_modules`.
@@ -35,7 +37,7 @@ src-tauri/scripts/prepare-gateway.sh
   which crashed the gateway with `ERR_MODULE_NOT_FOUND` on any machine
   without the repo checkout to invisibly fall back on (caught in review:
   both live tests in the original version of this work ran the bundled
-  gateway from *inside* the git checkout, where it silently succeeded via
+  gateway from _inside_ the git checkout, where it silently succeeded via
   the workspace's hoisted `node_modules/@glimmer/shared` symlink instead of
   the vendored copy — the exact failure mode this bundling exists to
   prevent).
@@ -44,7 +46,7 @@ src-tauri/scripts/prepare-gateway.sh
   committed.
 - **Required before `cargo build`/`tauri build`** if you want the bundled
   path exercised — `tauri-build` copies `bundle.resources` into
-  `target/<profile>/resources/` at *compile* time (`build.rs`), so this
+  `target/<profile>/resources/` at _compile_ time (`build.rs`), so this
   also takes effect under plain `cargo run`/`tauri dev`, not just release
   bundles. `npm run tauri:build` runs it automatically (added to that
   script alongside `prepare-sidecar.sh`).
@@ -70,6 +72,7 @@ src-tauri/scripts/prepare-gateway.sh
   this documented invariant.
 
 ### What's still NOT bundled — external requirement, by design
+
 `CONFIG.glimmerV2Path` / `CONFIG.engineerPath` (see `server/src/config.ts`)
 default to `~/AI/muse-glimmer/glimmer-v2.py` /
 `~/AI/muse-glimmer/glimmer-engineer.py` — the Python orchestrator. That
@@ -82,6 +85,7 @@ fail — that's a real external dependency of the product, not a Tauri
 packaging gap, and is out of scope here.
 
 ## Bundled Node sidecar
+
 The gateway needs Node. Bundled builds ship it as a Tauri `externalBin`
 sidecar so the app has zero runtime dependency on a machine-installed node.
 
@@ -105,6 +109,7 @@ src-tauri/scripts/prepare-sidecar.sh
   PATH is the dev-mode fallback, so `tauri dev` works without the binary.
 
 ## PATH for the gateway child
+
 A GUI-launched .app inherits launchd's minimal PATH
 (`/usr/bin:/bin:/usr/sbin:/sbin`) — no node, no npm. That PATH reached the
 gateway, then glimmer-v2.py, then its verification commands, so every real
@@ -112,7 +117,7 @@ task in the packaged app failed with `npm: command not found` →
 INFRA_BLOCKED. `src/lib.rs::resolve_user_path` fixes it at the source:
 
 - Ask the login shell once at startup: `$SHELL -ilc 'printf
-  __GLIMMER_PATH__%s\n "$PATH"'`, 5s timeout (killed on timeout). `-i` so
+__GLIMMER_PATH__%s\n "$PATH"'`, 5s timeout (killed on timeout). `-i` so
   interactive-only rc files are sourced; the marker prefix means an rc-file
   banner can never be mistaken for the PATH.
 - Fall back to `/opt/homebrew/bin:/usr/local/bin:/usr/bin` prepended to the
@@ -120,12 +125,13 @@ INFRA_BLOCKED. `src/lib.rs::resolve_user_path` fixes it at the source:
   with no node in it.
 - The result is passed explicitly as the gateway child's `PATH` env (and
   used to locate `node` when no sidecar is bundled — `execvp` searches the
-  *parent's* PATH, which is the launchd one). Every outcome is logged,
+  _parent's_ PATH, which is the launchd one). Every outcome is logged,
   including "no node found anywhere", which is never silently swallowed.
 - The gateway logs its own inherited PATH at boot (`[gateway] PATH=...`),
   so a packaged run can be checked from the app's stdout or `ps eww <pid>`.
 
 ## CLI and integration checks
+
 Settings → **CLI & Integrations** reports the tools visible on that resolved
 PATH. `GET /api/integrations/cli` performs fixed-argument, no-shell probes for
 Git, GitHub CLI, Python, npm, Cargo, pnpm, Yarn and Homebrew, and separately
@@ -149,6 +155,7 @@ checks the bundled Node runtime and configured orchestrator files.
   informational and are not agent-executable.
 
 ## Who may call the gateway
+
 `server/src/app.ts::localOnlyGuard` runs ahead of every router:
 
 - **Host** must be a loopback spelling (`127.0.0.1`, `localhost`, `[::1]`,
@@ -162,10 +169,11 @@ checks the bundled Node runtime and configured orchestrator files.
   attack shape), so allowing Origin-less writes would only be a
   header-omission bypass. A CLI client must therefore send
   `-H "Origin: http://127.0.0.1:5183"`.
-- CORS is unchanged and still governs what may be *read*; it never stopped a
-  cross-origin request from *executing*, which is why the guard exists.
+- CORS is unchanged and still governs what may be _read_; it never stopped a
+  cross-origin request from _executing_, which is why the guard exists.
 
 ## Model server lifecycle
+
 Start/Stop from the Model screen run only `start-glimmer.sh` /
 `stop-glimmer.sh` (absolute paths from CONFIG, argv, no shell). Two things
 worth knowing:
@@ -181,16 +189,17 @@ worth knowing:
   it reports `stopped: false` with a reason when the target survives.
 
 ## Code signing & notarization (macOS)
+
 The bundle is Developer ID signed, hardened-runtime, notarized and stapled,
 so it opens with no Gatekeeper prompt. **No credential lives in this repo** —
 Tauri reads all of them from the environment at build time:
 
-| Env var | What |
-| --- | --- |
-| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <Org> (<TeamID>)`, as listed by `security find-identity -v -p codesigning` |
-| `APPLE_API_KEY` | App Store Connect API key id (must be an **Admin** key — an App Manager key cannot notarize) |
-| `APPLE_API_ISSUER` | API issuer UUID |
-| `APPLE_API_KEY_PATH` | Path to the `AuthKey_<id>.p8` file (keep it outside the repo, e.g. `~/.appstoreconnect/private_keys/`) |
+| Env var                  | What                                                                                                   |
+| ------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <Org> (<TeamID>)`, as listed by `security find-identity -v -p codesigning`  |
+| `APPLE_API_KEY`          | App Store Connect API key id (must be an **Admin** key — an App Manager key cannot notarize)           |
+| `APPLE_API_ISSUER`       | API issuer UUID                                                                                        |
+| `APPLE_API_KEY_PATH`     | Path to the `AuthKey_<id>.p8` file (keep it outside the repo, e.g. `~/.appstoreconnect/private_keys/`) |
 
 With those exported, plain `npm run tauri:build` signs (app + the
 `glimmer-node` sidecar, inside-out), notarizes via `notarytool submit
@@ -217,6 +226,7 @@ If notarization is rejected, read the real reason with `xcrun notarytool
 log <submission-id>` — never "fix" it by turning off hardened runtime.
 
 ## Notifications
+
 WKWebView has no `window.Notification`, so the web UI feature-detects
 `window.__TAURI__` (enabled via `app.withGlobalTauri`) and invokes the Rust
 `notify` command (`tauri-plugin-notification`, permission
@@ -225,12 +235,14 @@ the Web Notification API. macOS shows its own per-app permission prompt on
 first delivery — no in-app permission flow needed on the desktop path.
 
 ## Theme flash on first paint — accepted
+
 Light-theme users may see one dark frame before `main.tsx` runs
 `initTheme()`. The usual fix (an inline `<script>` in `<head>`) is blocked
 by the `script-src 'self'` CSP — do NOT loosen the CSP for this; accept the
 flash or use a hashed external bootstrap script if it ever matters.
 
 ## Auto-update — PARKED
+
 `tauri-plugin-updater` needs infrastructure that does not exist yet:
 
 1. A signing keypair (`tauri signer generate`) — public key goes in

@@ -1,12 +1,18 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
 import {
-  askRepositoryAssistant, askSessionAssistant, streamRepositoryAssistant, streamSessionAssistant,
+  askRepositoryAssistant,
+  askSessionAssistant,
+  streamRepositoryAssistant,
+  streamSessionAssistant,
 } from "./sessionAssistant.js";
 import type { GlimmerSession, GlimmerEvent } from "@glimmer/shared";
 
 let server: http.Server | undefined;
-afterEach(() => { server?.close(); server = undefined; });
+afterEach(() => {
+  server?.close();
+  server = undefined;
+});
 
 function listen(handler: http.RequestListener): Promise<string> {
   return new Promise((resolve) => {
@@ -20,14 +26,46 @@ function listen(handler: http.RequestListener): Promise<string> {
 }
 
 const SESSION: GlimmerSession = {
-  id: "s1", task: "Fix dialog parser", status: "verified", workspace: "/ws", branch: "glimmer/x",
-  baselineSha: "abc", changedFiles: [{ path: "DialogParser.ts", status: "modified" }],
-  verification: { overall: "VERIFIED", checks: [{ command: "npm run typecheck", status: "PASS", ok: true, returncode: 0, elapsedSeconds: 1, outputTail: "", baselineAware: false, newErrorSignatures: [] }] },
-  repairsUsed: 0, repairBudget: 2,
-  finalStatus: { functional: "VERIFIED", visual: "not_run", architecture: "not_run", documentation: "not_run" },
+  id: "s1",
+  task: "Fix dialog parser",
+  status: "verified",
+  workspace: "/ws",
+  branch: "glimmer/x",
+  baselineSha: "abc",
+  changedFiles: [{ path: "DialogParser.ts", status: "modified" }],
+  verification: {
+    overall: "VERIFIED",
+    checks: [
+      {
+        command: "npm run typecheck",
+        status: "PASS",
+        ok: true,
+        returncode: 0,
+        elapsedSeconds: 1,
+        outputTail: "",
+        baselineAware: false,
+        newErrorSignatures: [],
+      },
+    ],
+  },
+  repairsUsed: 0,
+  repairBudget: 2,
+  finalStatus: {
+    functional: "VERIFIED",
+    visual: "not_run",
+    architecture: "not_run",
+    documentation: "not_run",
+  },
 };
 const EVENTS: GlimmerEvent[] = [
-  { id: "e1", sessionId: "s1", timestamp: "t", type: "candidate_selected", file: "DialogParser.ts", reasons: ["owns parser state"] },
+  {
+    id: "e1",
+    sessionId: "s1",
+    timestamp: "t",
+    type: "candidate_selected",
+    file: "DialogParser.ts",
+    reasons: ["owns parser state"],
+  },
 ];
 
 describe("askSessionAssistant", () => {
@@ -39,7 +77,9 @@ describe("askSessionAssistant", () => {
       req.on("end", () => {
         receivedBody = JSON.parse(body);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ choices: [{ message: { content: "It owns the parser state." } }] }));
+        res.end(
+          JSON.stringify({ choices: [{ message: { content: "It owns the parser state." } }] }),
+        );
       });
     });
     await askSessionAssistant(url, SESSION, EVENTS, "Why was DialogParser.ts chosen?");
@@ -59,7 +99,9 @@ describe("askSessionAssistant", () => {
   });
 
   it("throws a clear error when the model is unreachable, rather than hanging", async () => {
-    await expect(askSessionAssistant("http://127.0.0.1:1", SESSION, EVENTS, "Why?", 500)).rejects.toThrow();
+    await expect(
+      askSessionAssistant("http://127.0.0.1:1", SESSION, EVENTS, "Why?", 500),
+    ).rejects.toThrow();
   });
 
   it("throws when the model responds but with no usable answer", async () => {
@@ -88,7 +130,9 @@ describe("repository selection assistant", () => {
       req.on("end", () => {
         receivedBody = JSON.parse(body);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ choices: [{ message: { content: "It parses the selected input." } }] }));
+        res.end(
+          JSON.stringify({ choices: [{ message: { content: "It parses the selected input." } }] }),
+        );
       });
     });
     const result = await askRepositoryAssistant(url, evidence, "What does this do?");
@@ -108,7 +152,9 @@ describe("repository selection assistant", () => {
       req.on("end", () => {
         receivedBody = JSON.parse(body);
         res.writeHead(200, { "Content-Type": "text/event-stream" });
-        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "Selected answer" } }] })}\n\ndata: [DONE]\n\n`);
+        res.end(
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "Selected answer" } }] })}\n\ndata: [DONE]\n\n`,
+        );
       });
     });
     const answer = await streamRepositoryAssistant(url, evidence, "Why?", () => {});
@@ -124,12 +170,16 @@ describe("streamSessionAssistant", () => {
     const url = await listen((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "It owns " } }] })}\n\n`);
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "the parser state." } }] })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "the parser state." } }] })}\n\n`,
+      );
       res.write("data: [DONE]\n\n");
       res.end();
     });
     const deltas: string[] = [];
-    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", (d) => deltas.push(d));
+    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", (d) =>
+      deltas.push(d),
+    );
     expect(deltas).toEqual(["It owns ", "the parser state."]);
     expect(answer).toBe("It owns the parser state.");
   });
@@ -138,10 +188,14 @@ describe("streamSessionAssistant", () => {
     const url = await listen((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       // No trailing "\n\n" — the connection just ends right after this frame.
-      res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "It owns the parser state." } }] })}`);
+      res.end(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "It owns the parser state." } }] })}`,
+      );
     });
     const deltas: string[] = [];
-    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", (d) => deltas.push(d));
+    const answer = await streamSessionAssistant(url, SESSION, EVENTS, "Why?", (d) =>
+      deltas.push(d),
+    );
     expect(deltas).toEqual(["It owns the parser state."]);
     expect(answer).toBe("It owns the parser state.");
   });
@@ -151,7 +205,9 @@ describe("streamSessionAssistant", () => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.end("data: [DONE]\n\n");
     });
-    await expect(streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {})).rejects.toThrow(/no usable answer/);
+    await expect(streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {})).rejects.toThrow(
+      /no usable answer/,
+    );
   });
 
   it("aborts the upstream request when the caller's signal fires (client disconnected)", async () => {
@@ -159,13 +215,15 @@ describe("streamSessionAssistant", () => {
     const url = await listen((req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`);
-      req.on("close", () => { upstreamAborted = true; });
+      req.on("close", () => {
+        upstreamAborted = true;
+      });
       // Never ends on its own — only the caller's signal (or a timeout) ends this.
     });
     const callerGone = new AbortController();
     setTimeout(() => callerGone.abort(), 30);
     await expect(
-      streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 30_000, callerGone.signal)
+      streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 30_000, callerGone.signal),
     ).rejects.toThrow();
     await new Promise((r) => setTimeout(r, 20)); // let the server-side 'close' event land
     expect(upstreamAborted).toBe(true);
@@ -195,6 +253,8 @@ describe("streamSessionAssistant", () => {
       // Then goes silent well past the idle timeout before ever sending [DONE].
       setTimeout(() => res.end("data: [DONE]\n\n"), 200);
     });
-    await expect(streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 50)).rejects.toThrow();
+    await expect(
+      streamSessionAssistant(url, SESSION, EVENTS, "Why?", () => {}, 50),
+    ).rejects.toThrow();
   });
 });

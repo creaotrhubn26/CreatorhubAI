@@ -48,7 +48,9 @@ describe("ArchitectReviewPanel", () => {
   });
 
   it("renders nothing when reviews 404 and there is no gate data (absence is normal)", async () => {
-    vi.spyOn(client.glimmerApi, "getArchitectReviews").mockRejectedValue(new Error("GET .../architect-reviews failed: 404"));
+    vi.spyOn(client.glimmerApi, "getArchitectReviews").mockRejectedValue(
+      new Error("GET .../architect-reviews failed: 404"),
+    );
     const { container } = render(withQuery(<ArchitectReviewPanel sessionId="s1" />));
 
     await waitFor(() => expect(client.glimmerApi.getArchitectReviews).toHaveBeenCalled());
@@ -61,24 +63,42 @@ describe("ArchitectReviewPanel", () => {
     // sentence rather than a bare substring so the two don't collide.
     vi.spyOn(client.glimmerApi, "getArchitectReviews").mockRejectedValue(new Error("404"));
     const { rerender } = render(
-      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
         <ArchitectReviewPanel sessionId="s1" gates={{ architectureApproved: true }} />
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText("Architecture gate (orchestrator-recorded fact): approved")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByText("Architecture gate (orchestrator-recorded fact): approved"),
+      ).toBeInTheDocument(),
+    );
 
     rerender(
-      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
         <ArchitectReviewPanel sessionId="s1" gates={{ architectureApproved: false }} />
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText("Architecture gate (orchestrator-recorded fact): rejected")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByText("Architecture gate (orchestrator-recorded fact): rejected"),
+      ).toBeInTheDocument(),
+    );
 
     rerender(
-      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
         <ArchitectReviewPanel sessionId="s1" gates={{ architectureApproved: null }} />
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText("Architecture gate (orchestrator-recorded fact): not reviewed")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        screen.getByText("Architecture gate (orchestrator-recorded fact): not reviewed"),
+      ).toBeInTheDocument(),
+    );
   });
 });

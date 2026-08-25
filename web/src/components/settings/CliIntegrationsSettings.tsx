@@ -117,19 +117,28 @@ export function CliIntegrationsSettings() {
       </div>
 
       <p className="cli-integrations__policy">
-        System tools are never installed or authenticated automatically. External writes require approval; Git push remains blocked.
+        System tools are never installed or authenticated automatically. External writes require
+        approval; Git push remains blocked.
       </p>
 
       {query.isLoading && <p role="status">Checking CLI integrations…</p>}
-      {query.error && <p role="alert">Could not inspect CLI integrations — {(query.error as Error).message}</p>}
-      {copyError && <p role="alert">Could not access the clipboard. Copy the visible command manually.</p>}
+      {query.error && (
+        <p role="alert">Could not inspect CLI integrations — {(query.error as Error).message}</p>
+      )}
+      {copyError && (
+        <p role="alert">Could not access the clipboard. Copy the visible command manually.</p>
+      )}
 
       {query.data && (
         <>
           <div className="cli-integrations__summary">
             <span>{query.data.platform}</span>
-            <span>{query.data.integrations.filter((item) => item.state === "ready").length} ready</span>
-            <span>{query.data.integrations.filter((item) => item.state === "missing").length} missing</span>
+            <span>
+              {query.data.integrations.filter((item) => item.state === "ready").length} ready
+            </span>
+            <span>
+              {query.data.integrations.filter((item) => item.state === "missing").length} missing
+            </span>
           </div>
           <div className="cli-integrations__grid">
             {query.data.integrations.map((integration) => (

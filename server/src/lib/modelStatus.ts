@@ -6,7 +6,10 @@ import type { ModelStatus } from "@glimmer/shared";
 // { default_generation_settings: { n_ctx, speculative, ... }, model_path, ... }.
 export type ModelProps = Pick<ModelStatus, "contextSize" | "modelPath" | "speculativeDecoding">;
 
-export async function probeModelProps(baseUrl: string, timeoutMs = 1500): Promise<ModelProps | null> {
+export async function probeModelProps(
+  baseUrl: string,
+  timeoutMs = 1500,
+): Promise<ModelProps | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -32,12 +35,27 @@ export async function probeModel(baseUrl: string, timeoutMs = 3000): Promise<Mod
   try {
     const res = await fetch(`${baseUrl.replace(/\/$/, "")}/health`, { signal: controller.signal });
     if (res.status === 401 || res.status === 403) {
-      return { status: "REACHABLE_AUTH", endpoint: baseUrl, httpStatus: res.status, provenance: "deterministic-backend" };
+      return {
+        status: "REACHABLE_AUTH",
+        endpoint: baseUrl,
+        httpStatus: res.status,
+        provenance: "deterministic-backend",
+      };
     }
     if (res.ok) {
-      return { status: "ONLINE", endpoint: baseUrl, httpStatus: res.status, provenance: "deterministic-backend" };
+      return {
+        status: "ONLINE",
+        endpoint: baseUrl,
+        httpStatus: res.status,
+        provenance: "deterministic-backend",
+      };
     }
-    return { status: "OFFLINE", endpoint: baseUrl, httpStatus: res.status, provenance: "deterministic-backend" };
+    return {
+      status: "OFFLINE",
+      endpoint: baseUrl,
+      httpStatus: res.status,
+      provenance: "deterministic-backend",
+    };
   } catch {
     return { status: "OFFLINE", endpoint: baseUrl, provenance: "deterministic-backend" };
   } finally {

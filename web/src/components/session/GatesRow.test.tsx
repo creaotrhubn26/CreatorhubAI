@@ -20,7 +20,7 @@ describe("GatesRow", () => {
           tasksResolved: false,
           customerReadinessApproved: false,
         }}
-      />
+      />,
     );
     expect(getByText("Implementation ✓")).toBeInTheDocument();
     expect(getByText("Architecture ✗")).toBeInTheDocument();
@@ -41,14 +41,18 @@ describe("GatesRow", () => {
 
   it("marks Tasks ✓ (human) distinctly when tasksResolvedBy is human, not a plain ✓", () => {
     const { getByText, queryByText } = render(
-      <GatesRow gates={{ architectureApproved: null, tasksResolved: true, tasksResolvedBy: "human" }} />
+      <GatesRow
+        gates={{ architectureApproved: null, tasksResolved: true, tasksResolvedBy: "human" }}
+      />,
     );
     expect(getByText("Tasks ✓ (human)")).toBeInTheDocument();
     expect(queryByText("Tasks ✓")).not.toBeInTheDocument();
   });
 
   it("renders a plain Tasks ✓ when tasksResolved is true with no human override involved", () => {
-    const { getByText } = render(<GatesRow gates={{ architectureApproved: null, tasksResolved: true }} />);
+    const { getByText } = render(
+      <GatesRow gates={{ architectureApproved: null, tasksResolved: true }} />,
+    );
     expect(getByText("Tasks ✓")).toBeInTheDocument();
   });
 });

@@ -23,18 +23,36 @@ function withProviders(path: string, route: string) {
 
 function check(overrides: Partial<VerificationCheckResult>): VerificationCheckResult {
   return {
-    command: "npm test", status: "PASS", ok: true, returncode: 0,
-    elapsedSeconds: 1.2, outputTail: "", baselineAware: false, newErrorSignatures: [],
+    command: "npm test",
+    status: "PASS",
+    ok: true,
+    returncode: 0,
+    elapsedSeconds: 1.2,
+    outputTail: "",
+    baselineAware: false,
+    newErrorSignatures: [],
     ...overrides,
   };
 }
 
 function session(overrides: Partial<GlimmerSession>): GlimmerSession {
   return {
-    id: "s1", task: "Fix dialog parser", status: "verified", workspace: "/ws", branch: "glimmer/x",
-    baselineSha: "abc", changedFiles: [], verification: { overall: "VERIFIED", checks: [] },
-    repairsUsed: 0, repairBudget: 2,
-    finalStatus: { functional: "VERIFIED", visual: "not_run", architecture: "not_run", documentation: "not_run" },
+    id: "s1",
+    task: "Fix dialog parser",
+    status: "verified",
+    workspace: "/ws",
+    branch: "glimmer/x",
+    baselineSha: "abc",
+    changedFiles: [],
+    verification: { overall: "VERIFIED", checks: [] },
+    repairsUsed: 0,
+    repairBudget: 2,
+    finalStatus: {
+      functional: "VERIFIED",
+      visual: "not_run",
+      architecture: "not_run",
+      documentation: "not_run",
+    },
     ...overrides,
   };
 }
@@ -43,7 +61,9 @@ describe("VerificationCenterScreen", () => {
   it("with no :id, falls back to the latest global session via getStatus (sidebar link behavior)", async () => {
     const getStatusSpy = vi.spyOn(client.glimmerApi, "getStatus").mockResolvedValue({
       model: { status: "UNKNOWN", endpoint: "", provenance: "deterministic-backend" },
-      activeSession: null, latestSession: null, recentSessions: [],
+      activeSession: null,
+      latestSession: null,
+      recentSessions: [],
       verification: { overall: "VERIFIED", checks: [check({ command: "git diff --check" })] },
     } as any);
     const getSessionSpy = vi.spyOn(client.glimmerApi, "getSession");
@@ -57,9 +77,14 @@ describe("VerificationCenterScreen", () => {
 
   it("with :id, uses the session's own verification summary via getSession, not the global status route", async () => {
     const getStatusSpy = vi.spyOn(client.glimmerApi, "getStatus");
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: { overall: "FAILED", checks: [check({ command: "vitest", status: "CODE_FAIL", ok: false })] },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "FAILED",
+          checks: [check({ command: "vitest", status: "CODE_FAIL", ok: false })],
+        },
+      }),
+    );
 
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
@@ -68,23 +93,32 @@ describe("VerificationCenterScreen", () => {
   });
 
   it("renders the overall VERIFIED banner distinctly from FAILED", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: { overall: "VERIFIED", checks: [check({})] },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: { overall: "VERIFIED", checks: [check({})] },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
     await waitFor(() => expect(screen.getByText("VERIFIED")).toBeInTheDocument());
   });
 
   it("renders PASS_BASELINE distinct from a clean PASS", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: {
-        overall: "PARTIAL",
-        checks: [
-          check({ command: "git diff --check", status: "PASS", ok: true }),
-          check({ command: "npm run typecheck", status: "PASS_BASELINE", ok: true, baselineAware: true }),
-        ],
-      },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "PARTIAL",
+          checks: [
+            check({ command: "git diff --check", status: "PASS", ok: true }),
+            check({
+              command: "npm run typecheck",
+              status: "PASS_BASELINE",
+              ok: true,
+              baselineAware: true,
+            }),
+          ],
+        },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
     await waitFor(() => expect(screen.getByText("PASS")).toBeInTheDocument());
@@ -92,48 +126,73 @@ describe("VerificationCenterScreen", () => {
   });
 
   it("labels a baseline-aware check with new error signatures as NEW FAILURE, not a pass", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: {
-        overall: "FAILED",
-        checks: [check({
-          command: "npm run typecheck", status: "PASS_BASELINE", ok: true,
-          baselineAware: true, newErrorSignatures: ["TS2345: new error"],
-        })],
-      },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "FAILED",
+          checks: [
+            check({
+              command: "npm run typecheck",
+              status: "PASS_BASELINE",
+              ok: true,
+              baselineAware: true,
+              newErrorSignatures: ["TS2345: new error"],
+            }),
+          ],
+        },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
     await waitFor(() => expect(screen.getByText("NEW FAILURE")).toBeInTheDocument());
   });
 
   it("surfaces the baseline-aware summary: count of baseline-accepted checks and total new error signatures", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: {
-        overall: "PARTIAL",
-        checks: [
-          check({ command: "a", status: "PASS_BASELINE", baselineAware: true, newErrorSignatures: [] }),
-          check({ command: "b", status: "PASS_BASELINE", baselineAware: true, newErrorSignatures: ["e1", "e2"] }),
-          check({ command: "c", status: "PASS", ok: true }),
-        ],
-      },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "PARTIAL",
+          checks: [
+            check({
+              command: "a",
+              status: "PASS_BASELINE",
+              baselineAware: true,
+              newErrorSignatures: [],
+            }),
+            check({
+              command: "b",
+              status: "PASS_BASELINE",
+              baselineAware: true,
+              newErrorSignatures: ["e1", "e2"],
+            }),
+            check({ command: "c", status: "PASS", ok: true }),
+          ],
+        },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
-    await waitFor(() => expect(screen.getByText(/2 pre-existing failures accepted via baseline/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/2 pre-existing failures accepted via baseline/)).toBeInTheDocument(),
+    );
     expect(screen.getByText(/2 NEW failures introduced/)).toBeInTheDocument();
   });
 
   it("shows an honest zero-state 'No new failures introduced' only once checks actually ran", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: { overall: "VERIFIED", checks: [check({})] },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: { overall: "VERIFIED", checks: [check({})] },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
     await waitFor(() => expect(screen.getByText(/No new failures introduced/)).toBeInTheDocument());
   });
 
   it("never shows the zero-state or a success banner when verification never ran (NOT_RUN with no checks)", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: { overall: "NOT_RUN", checks: [] },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: { overall: "NOT_RUN", checks: [] },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
     await waitFor(() => expect(screen.getByText("NOT_RUN")).toBeInTheDocument());
@@ -142,25 +201,29 @@ describe("VerificationCenterScreen", () => {
   });
 
   it("renders an individual NOT_RUN check as not-run, never blended into FAIL", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: {
-        overall: "PARTIAL",
-        checks: [check({ command: "e2e", status: "NOT_RUN", ok: false })],
-      },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "PARTIAL",
+          checks: [check({ command: "e2e", status: "NOT_RUN", ok: false })],
+        },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
     await waitFor(() => expect(screen.getByText("NOT RUN")).toBeInTheDocument());
     expect(screen.queryByText("FAIL")).not.toBeInTheDocument();
   });
 
   it("shows recommended checks in a separate muted section, never mixed into the gating checks list", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: {
-        overall: "VERIFIED",
-        checks: [check({ command: "npm run typecheck" })],
-        recommendedChecks: [check({ command: "npm run lint", status: "CODE_FAIL", ok: false })],
-      },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "VERIFIED",
+          checks: [check({ command: "npm run typecheck" })],
+          recommendedChecks: [check({ command: "npm run lint", status: "CODE_FAIL", ok: false })],
+        },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
     await waitFor(() => expect(screen.getByText("npm run typecheck")).toBeInTheDocument());
@@ -172,9 +235,11 @@ describe("VerificationCenterScreen", () => {
   });
 
   it("renders no recommended section when there are no recommended checks (absent or empty)", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: { overall: "VERIFIED", checks: [check({})] },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: { overall: "VERIFIED", checks: [check({})] },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
     await waitFor(() => expect(screen.getByText("VERIFIED")).toBeInTheDocument());
@@ -182,12 +247,23 @@ describe("VerificationCenterScreen", () => {
   });
 
   it("shows command, returncode, elapsed, and a collapsible output tail per check", async () => {
-    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-      verification: {
-        overall: "FAILED",
-        checks: [check({ command: "vitest", status: "CODE_FAIL", ok: false, returncode: 1, elapsedSeconds: 3.4, outputTail: "1 test failed" })],
-      },
-    }));
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+      session({
+        verification: {
+          overall: "FAILED",
+          checks: [
+            check({
+              command: "vitest",
+              status: "CODE_FAIL",
+              ok: false,
+              returncode: 1,
+              elapsedSeconds: 3.4,
+              outputTail: "1 test failed",
+            }),
+          ],
+        },
+      }),
+    );
     render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
     await waitFor(() => expect(screen.getByText("vitest")).toBeInTheDocument());
@@ -201,10 +277,17 @@ describe("VerificationCenterScreen", () => {
   // V7 §22.17
   describe("finalStatus 4-cell gate row", () => {
     it("renders all 4 cells from the session's finalStatus", async () => {
-      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(session({
-        verification: { overall: "VERIFIED", checks: [check({})] },
-        finalStatus: { functional: "VERIFIED", visual: "PASS_WITH_WARNINGS", architecture: "approved", documentation: "not_run" },
-      }));
+      vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue(
+        session({
+          verification: { overall: "VERIFIED", checks: [check({})] },
+          finalStatus: {
+            functional: "VERIFIED",
+            visual: "PASS_WITH_WARNINGS",
+            architecture: "approved",
+            documentation: "not_run",
+          },
+        }),
+      );
       render(withProviders("/sessions/s1/verification", "/sessions/:id/verification"));
 
       await waitFor(() => expect(screen.getByText(/Functional: VERIFIED/)).toBeInTheDocument());
@@ -216,7 +299,9 @@ describe("VerificationCenterScreen", () => {
     it("renders nothing extra with no :id (global status has no finalStatus to compose from)", async () => {
       vi.spyOn(client.glimmerApi, "getStatus").mockResolvedValue({
         model: { status: "UNKNOWN", endpoint: "", provenance: "deterministic-backend" },
-        activeSession: null, latestSession: null, recentSessions: [],
+        activeSession: null,
+        latestSession: null,
+        recentSessions: [],
         verification: { overall: "VERIFIED", checks: [check({})] },
       } as any);
       render(withProviders("/verification", "/verification"));

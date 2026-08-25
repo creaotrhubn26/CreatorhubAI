@@ -77,8 +77,12 @@ describe("GET /api/fs/dirs", () => {
   beforeAll(async () => {
     // realpath: macOS tmpdir is a symlink (/var -> /private/var) and the route
     // compares resolved paths, so the fixture must be expressed the same way.
-    browseRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-root-")));
-    outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-outside-")));
+    browseRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-root-")),
+    );
+    outside = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-browse-outside-")),
+    );
     process.env.GLIMMER_BROWSE_ROOT = browseRoot;
 
     await fs.mkdir(path.join(browseRoot, "project", "src"), { recursive: true });
@@ -95,7 +99,9 @@ describe("GET /api/fs/dirs", () => {
   });
 
   it("lists subdirectory names only, hiding files by default", async () => {
-    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}`);
+    const res = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}`,
+    );
     expect(res.status).toBe(200);
     expect(res.body.entries).toEqual([{ name: "src", isDir: true }]);
     expect(res.body.path).toBe(path.join(browseRoot, "project"));
@@ -104,7 +110,7 @@ describe("GET /api/fs/dirs", () => {
 
   it("includes file names (never contents) when includeFiles=1", async () => {
     const res = await request(app).get(
-      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}&includeFiles=1`
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project"))}&includeFiles=1`,
     );
     expect(res.status).toBe(200);
     // Review MJ2: ordinary dotfiles are listed now — .hidden here stands for
@@ -124,7 +130,9 @@ describe("GET /api/fs/dirs", () => {
   });
 
   it("rejects ../ traversal out of the browse root", async () => {
-    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "..", ".."))}`);
+    const res = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "..", ".."))}`,
+    );
     expect(res.status).toBe(403);
   });
 
@@ -134,13 +142,15 @@ describe("GET /api/fs/dirs", () => {
   });
 
   it("rejects a symlink that escapes the root, even though it lives inside it", async () => {
-    const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "escape-hatch"))}`);
+    const res = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "escape-hatch"))}`,
+    );
     expect(res.status).toBe(403);
   });
 
   it("rejects a caller-supplied root outside the browse root (scope picker can't widen the boundary)", async () => {
     const res = await request(app).get(
-      `/api/fs/dirs?root=${encodeURIComponent(outside)}&path=${encodeURIComponent(outside)}`
+      `/api/fs/dirs?root=${encodeURIComponent(outside)}&path=${encodeURIComponent(outside)}`,
     );
     expect(res.status).toBe(403);
   });
@@ -148,13 +158,13 @@ describe("GET /api/fs/dirs", () => {
   it("confines the listing to a caller-supplied root inside the boundary", async () => {
     const root = path.join(browseRoot, "project");
     const inside = await request(app).get(
-      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path.join(root, "src"))}`
+      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path.join(root, "src"))}`,
     );
     expect(inside.status).toBe(200);
     expect(inside.body.parent).toBe(root);
 
     const above = await request(app).get(
-      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(browseRoot)}`
+      `/api/fs/dirs?root=${encodeURIComponent(root)}&path=${encodeURIComponent(browseRoot)}`,
     );
     expect(above.status).toBe(403);
   });
@@ -166,7 +176,7 @@ describe("GET /api/fs/dirs", () => {
   it("answers identically for existing and non-existent paths outside the boundary (no existence oracle)", async () => {
     const existing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(outside)}`);
     const missing = await request(app).get(
-      `/api/fs/dirs?path=${encodeURIComponent(path.join(outside, "definitely-not-here-zzz"))}`
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(outside, "definitely-not-here-zzz"))}`,
     );
     expect(existing.status).toBe(403);
     expect(missing.status).toBe(existing.status);
@@ -174,7 +184,9 @@ describe("GET /api/fs/dirs", () => {
 
     // Same for absolute system paths the boundary has nothing to do with.
     const realSystemPath = await request(app).get("/api/fs/dirs?path=%2Fetc");
-    const fakeSystemPath = await request(app).get("/api/fs/dirs?path=%2Fetc-not-a-real-directory-zzz");
+    const fakeSystemPath = await request(app).get(
+      "/api/fs/dirs?path=%2Fetc-not-a-real-directory-zzz",
+    );
     expect(realSystemPath.status).toBe(403);
     expect(fakeSystemPath.status).toBe(403);
     expect(fakeSystemPath.body).toEqual(realSystemPath.body);
@@ -188,7 +200,9 @@ describe("GET /api/fs/dirs", () => {
       await fs.mkdir(path.join(browseRoot, ".ssh"), { recursive: true });
       await fs.writeFile(path.join(browseRoot, ".ssh", "id_ed25519"), "PRIVATE");
 
-      const direct = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, ".ssh"))}&includeFiles=1`);
+      const direct = await request(app).get(
+        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, ".ssh"))}&includeFiles=1`,
+      );
       expect(direct.status).toBe(403);
       expect(JSON.stringify(direct.body)).not.toContain("id_ed25519");
 
@@ -199,7 +213,7 @@ describe("GET /api/fs/dirs", () => {
     it("refuses a credential directory at any depth, not just at the boundary", async () => {
       await fs.mkdir(path.join(browseRoot, "project", ".aws"), { recursive: true });
       const res = await request(app).get(
-        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", ".aws"))}&includeFiles=1`
+        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", ".aws"))}&includeFiles=1`,
       );
       expect(res.status).toBe(403);
     });
@@ -208,10 +222,12 @@ describe("GET /api/fs/dirs", () => {
       await fs.mkdir(path.join(browseRoot, ".smoke-test-repo", "src"), { recursive: true });
 
       const listing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot)}`);
-      expect(listing.body.entries.map((e: { name: string }) => e.name)).toContain(".smoke-test-repo");
+      expect(listing.body.entries.map((e: { name: string }) => e.name)).toContain(
+        ".smoke-test-repo",
+      );
 
       const entered = await request(app).get(
-        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, ".smoke-test-repo"))}`
+        `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, ".smoke-test-repo"))}`,
       );
       expect(entered.status).toBe(200);
       expect(entered.body.entries).toEqual([{ name: "src", isDir: true }]);
@@ -221,22 +237,26 @@ describe("GET /api/fs/dirs", () => {
   // Review MN3: client errors were reported as 500s that echoed the caller's
   // own input back in the message.
   it("400s (without echoing the input) on a null byte or an over-long path", async () => {
-    const nullByte = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot + "\0/etc")}`);
+    const nullByte = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(browseRoot + "\0/etc")}`,
+    );
     expect(nullByte.status).toBe(400);
     expect(nullByte.body.error).not.toContain(browseRoot);
 
     const tooLong = await request(app).get(
-      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "a".repeat(300).split("").join("/")))}`
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "a".repeat(300).split("").join("/")))}`,
     );
     expect([400, 403, 404]).toContain(tooLong.status);
     expect(tooLong.status).not.toBe(500);
   });
 
   it("404s for a path that does not exist, and 400s for a file", async () => {
-    const missing = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "nope"))}`);
+    const missing = await request(app).get(
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "nope"))}`,
+    );
     expect(missing.status).toBe(404);
     const file = await request(app).get(
-      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", "README.md"))}`
+      `/api/fs/dirs?path=${encodeURIComponent(path.join(browseRoot, "project", "README.md"))}`,
     );
     expect(file.status).toBe(400);
   });
@@ -258,14 +278,19 @@ describe("GET /api/fs/file", () => {
     // Review M1: content reads are confined to a KNOWN WORKSPACE, so this
     // fixture needs a real session manifest naming one — being inside the
     // browse root is no longer enough to be readable.
-    await fs.mkdir(path.join(stateRoot, "sessions", "20260824-000000-fs-file"), { recursive: true });
+    await fs.mkdir(path.join(stateRoot, "sessions", "20260824-000000-fs-file"), {
+      recursive: true,
+    });
     await fs.writeFile(
       path.join(stateRoot, "sessions", "20260824-000000-fs-file", "manifest.json"),
-      JSON.stringify({ id: "20260824-000000-fs-file", workspace: path.join(browseRoot, "repo") })
+      JSON.stringify({ id: "20260824-000000-fs-file", workspace: path.join(browseRoot, "repo") }),
     );
 
     await fs.mkdir(path.join(browseRoot, "repo", "src"), { recursive: true });
-    await fs.writeFile(path.join(browseRoot, "repo", "src", "a.ts"), "const x = 1;\nconst y = 2;\n");
+    await fs.writeFile(
+      path.join(browseRoot, "repo", "src", "a.ts"),
+      "const x = 1;\nconst y = 2;\n",
+    );
     await fs.writeFile(path.join(browseRoot, "repo", "empty.txt"), "");
     await fs.writeFile(path.join(outside, "secret.txt"), "TOP-SECRET-MARKER");
     await fs.symlink(path.join(outside, "secret.txt"), path.join(browseRoot, "repo", "escape.txt"));
@@ -273,7 +298,10 @@ describe("GET /api/fs/file", () => {
     await fs.writeFile(path.join(browseRoot, "repo", ".ssh", "id_ed25519"), "PRIVATE-KEY-MARKER");
     // Inside the browse root, but in NO workspace — the M1 case.
     await fs.mkdir(path.join(browseRoot, ".local", "share", "opencode"), { recursive: true });
-    await fs.writeFile(path.join(browseRoot, ".local", "share", "opencode", "auth.json"), "API-KEY-MARKER");
+    await fs.writeFile(
+      path.join(browseRoot, ".local", "share", "opencode", "auth.json"),
+      "API-KEY-MARKER",
+    );
   });
 
   afterAll(async () => {
@@ -287,28 +315,45 @@ describe("GET /api/fs/file", () => {
     request(app).post("/api/repository/ask").set("Origin", UI_ORIGIN).send({ question, selection });
 
   it("validates a sessionless repository selection before any model request", async () => {
-    const missingQuestion = await askSelection({
-      path: path.join(browseRoot, "repo", "src", "a.ts"), startLine: 1, endLine: 1,
-    }, "");
+    const missingQuestion = await askSelection(
+      {
+        path: path.join(browseRoot, "repo", "src", "a.ts"),
+        startLine: 1,
+        endLine: 1,
+      },
+      "",
+    );
     expect(missingQuestion.status).toBe(400);
     expect(missingQuestion.body.error).toBe("question is required");
 
     const backwards = await askSelection({
-      path: path.join(browseRoot, "repo", "src", "a.ts"), startLine: 2, endLine: 1,
+      path: path.join(browseRoot, "repo", "src", "a.ts"),
+      startLine: 2,
+      endLine: 1,
     });
     expect(backwards.status).toBe(400);
     expect(backwards.body.error).toMatch(/valid repository selection/i);
 
     const pastExcerpt = await askSelection({
-      path: path.join(browseRoot, "repo", "src", "a.ts"), startLine: 1, endLine: 99,
+      path: path.join(browseRoot, "repo", "src", "a.ts"),
+      startLine: 1,
+      endLine: 99,
     });
     expect(pastExcerpt.status).toBe(400);
     expect(pastExcerpt.body.error).toMatch(/outside the file excerpt/i);
   });
 
   it("gives the selection route the same workspace confinement and no-existence-oracle answer as the viewer", async () => {
-    const existing = await askSelection({ path: path.join(outside, "secret.txt"), startLine: 1, endLine: 1 });
-    const missing = await askSelection({ path: path.join(outside, "not-real.txt"), startLine: 1, endLine: 1 });
+    const existing = await askSelection({
+      path: path.join(outside, "secret.txt"),
+      startLine: 1,
+      endLine: 1,
+    });
+    const missing = await askSelection({
+      path: path.join(outside, "not-real.txt"),
+      startLine: 1,
+      endLine: 1,
+    });
     expect(existing.status).toBe(403);
     expect(missing.status).toBe(403);
     expect(missing.body).toEqual(existing.body);
@@ -325,7 +370,7 @@ describe("GET /api/fs/file", () => {
     expect(res.body.path).toBe(path.join(browseRoot, "repo", "src", "a.ts"));
   });
 
-  it("distinguishes a genuinely empty file (content \"\") from a refused read (content null)", async () => {
+  it('distinguishes a genuinely empty file (content "") from a refused read (content null)', async () => {
     const res = await get(path.join(browseRoot, "repo", "empty.txt"));
     expect(res.status).toBe(200);
     expect(res.body.content).toBe("");
@@ -351,7 +396,7 @@ describe("GET /api/fs/file", () => {
     expect(Buffer.byteLength(res.body.content)).toBe(res.body.bytesReturned);
   });
 
-  it("refuses binary content instead of returning garbage, with content null (not \"\")", async () => {
+  it('refuses binary content instead of returning garbage, with content null (not "")', async () => {
     const bin = path.join(browseRoot, "repo", "logo.png");
     await fs.writeFile(bin, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]));
     const res = await get(bin);
@@ -367,7 +412,10 @@ describe("GET /api/fs/file", () => {
   // now covers every byte the response would carry.
   it("detects a NUL past the first 8000 bytes rather than serving it as text", async () => {
     const late = path.join(browseRoot, "repo", "late-nul.bin");
-    await fs.writeFile(late, Buffer.concat([Buffer.alloc(9000, 0x61), Buffer.from([0x00]), Buffer.alloc(1000, 0x62)]));
+    await fs.writeFile(
+      late,
+      Buffer.concat([Buffer.alloc(9000, 0x61), Buffer.from([0x00]), Buffer.alloc(1000, 0x62)]),
+    );
     const res = await get(late);
     expect(res.status).toBe(200);
     expect(res.body.binary).toBe(true);
@@ -402,7 +450,10 @@ describe("GET /api/fs/file", () => {
     expect(JSON.stringify(atRoot.body)).not.toContain("PRIVATE-KEY-MARKER");
 
     await fs.mkdir(path.join(browseRoot, "repo", "sub", ".aws"), { recursive: true });
-    await fs.writeFile(path.join(browseRoot, "repo", "sub", ".aws", "credentials"), "PRIVATE-KEY-MARKER");
+    await fs.writeFile(
+      path.join(browseRoot, "repo", "sub", ".aws", "credentials"),
+      "PRIVATE-KEY-MARKER",
+    );
     const deeper = await get(path.join(browseRoot, "repo", "sub", ".aws", "credentials"));
     expect(deeper.status).toBe(403);
     expect(JSON.stringify(deeper.body)).not.toContain("PRIVATE-KEY-MARKER");
@@ -429,7 +480,7 @@ describe("GET /api/fs/file", () => {
       // server picks the root itself, from the session manifests.
       const res = await request(app).get(
         `/api/fs/file?path=${encodeURIComponent(path.join(browseRoot, ".local", "share", "opencode", "auth.json"))}` +
-          `&root=${encodeURIComponent(path.join(browseRoot, ".local", "share", "opencode"))}`
+          `&root=${encodeURIComponent(path.join(browseRoot, ".local", "share", "opencode"))}`,
       );
       expect(res.status).toBe(403);
       expect(JSON.stringify(res.body)).not.toContain("API-KEY-MARKER");
@@ -481,25 +532,38 @@ describe("POST /api/workspaces — validation", () => {
   });
 
   it("400s when taskName is not a string", async () => {
-    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: 42 });
+    const res = await request(app)
+      .post("/api/workspaces")
+      .set("Origin", UI_ORIGIN)
+      .send({ taskName: 42 });
     expect(res.status).toBe(400);
   });
 
   it("400s when taskName sanitizes to an empty slug", async () => {
-    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "!!!///???" });
+    const res = await request(app)
+      .post("/api/workspaces")
+      .set("Origin", UI_ORIGIN)
+      .send({ taskName: "!!!///???" });
     expect(res.status).toBe(400);
   });
 });
 
 describe("POST /api/workspaces — success", () => {
   it("creates a real branch+worktree and returns {workspace, branch, baselineSha}", async () => {
-    const res = await request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "route level task" });
+    const res = await request(app)
+      .post("/api/workspaces")
+      .set("Origin", UI_ORIGIN)
+      .send({ taskName: "route level task" });
     expect(res.status).toBe(200);
     expect(res.body.branch).toMatch(/^glimmer\/route-level-task-\d{8}-\d{6}$/);
     expect(typeof res.body.baselineSha).toBe("string");
-    expect(path.resolve(res.body.workspace).startsWith(path.resolve(worktreeRoot) + path.sep)).toBe(true);
+    expect(path.resolve(res.body.workspace).startsWith(path.resolve(worktreeRoot) + path.sep)).toBe(
+      true,
+    );
 
-    const headSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: res.body.workspace })).stdout.trim();
+    const headSha = (
+      await exec("git", ["rev-parse", "HEAD"], { cwd: res.body.workspace })
+    ).stdout.trim();
     expect(headSha).toBe(res.body.baselineSha);
   });
 });
@@ -507,8 +571,14 @@ describe("POST /api/workspaces — success", () => {
 describe("POST /api/workspaces — concurrency", () => {
   it("returns 409 for a second request fired while the first is still in flight", async () => {
     const [r1, r2] = await Promise.all([
-      request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "concurrent-route-a" }),
-      request(app).post("/api/workspaces").set("Origin", UI_ORIGIN).send({ taskName: "concurrent-route-b" }),
+      request(app)
+        .post("/api/workspaces")
+        .set("Origin", UI_ORIGIN)
+        .send({ taskName: "concurrent-route-a" }),
+      request(app)
+        .post("/api/workspaces")
+        .set("Origin", UI_ORIGIN)
+        .send({ taskName: "concurrent-route-b" }),
     ]);
     const statuses = [r1.status, r2.status].sort();
     expect(statuses).toEqual([200, 409]);

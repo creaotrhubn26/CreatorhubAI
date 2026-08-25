@@ -15,7 +15,11 @@ describe("buildTaskContract", () => {
   it("always forces noCommit/noPush/noDeploy/noDependencyInstall to true", () => {
     const contract = buildTaskContract(BASE);
     expect(contract.constraints).toEqual({
-      minimalChange: true, noCommit: true, noPush: true, noDeploy: true, noDependencyInstall: true,
+      minimalChange: true,
+      noCommit: true,
+      noPush: true,
+      noDeploy: true,
+      noDependencyInstall: true,
     });
   });
 
@@ -43,10 +47,18 @@ describe("buildTaskContract", () => {
   // guard checks every entry of scope.paths but treats scope.area as a single
   // prefix, so a multi-file selection has to land in paths.
   it("splits a multi-file scope into scope.paths, leaving other scopes on scope.area", () => {
-    const files = buildTaskContract({ ...BASE, scopePackage: "files", scopeArea: "src/a.ts, src/b.ts" });
+    const files = buildTaskContract({
+      ...BASE,
+      scopePackage: "files",
+      scopeArea: "src/a.ts, src/b.ts",
+    });
     expect(files.scope).toEqual({ package: "files", paths: ["src/a.ts", "src/b.ts"] });
 
-    const directory = buildTaskContract({ ...BASE, scopePackage: "directory", scopeArea: "frontend/src/dialog" });
+    const directory = buildTaskContract({
+      ...BASE,
+      scopePackage: "directory",
+      scopeArea: "frontend/src/dialog",
+    });
     expect(directory.scope).toEqual({ package: "directory", area: "frontend/src/dialog" });
   });
 
@@ -82,14 +94,18 @@ describe("buildTaskContract", () => {
 
   it("omits an empty/whitespace modelReadinessUrl but includes a real one, trimmed", () => {
     expect(buildTaskContract({ ...BASE, modelReadinessUrl: "   " }).advanced).toBeUndefined();
-    expect(buildTaskContract({ ...BASE, modelReadinessUrl: " https://model.local/ready  " }).advanced).toEqual({
+    expect(
+      buildTaskContract({ ...BASE, modelReadinessUrl: " https://model.local/ready  " }).advanced,
+    ).toEqual({
       modelReadinessUrl: "https://model.local/ready",
     });
   });
 
   it("omits architectFirst when false, includes it when true", () => {
     expect(buildTaskContract({ ...BASE, architectFirst: false }).advanced).toBeUndefined();
-    expect(buildTaskContract({ ...BASE, architectFirst: true }).advanced).toEqual({ architectFirst: true });
+    expect(buildTaskContract({ ...BASE, architectFirst: true }).advanced).toEqual({
+      architectFirst: true,
+    });
   });
 
   it("carries maxTurns through unchanged (existing top-level field, not nested under advanced)", () => {

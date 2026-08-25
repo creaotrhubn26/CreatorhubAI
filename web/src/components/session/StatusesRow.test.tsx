@@ -19,7 +19,7 @@ describe("StatusesRow", () => {
           delivery: "needs_polish",
           overall: "needs_polish",
         }}
-      />
+      />,
     );
     expect(getByText("Technical VERIFIED")).toBeInTheDocument();
     expect(getByText("Architecture approved")).toBeInTheDocument();
@@ -40,7 +40,7 @@ describe("StatusesRow", () => {
           delivery: "not_run",
           overall: "not_run",
         }}
-      />
+      />,
     );
     expect(getByText("Technical NOT_RUN")).toBeInTheDocument();
     expect(getByText("Overall not_run")).toBeInTheDocument();

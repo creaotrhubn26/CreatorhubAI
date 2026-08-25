@@ -3,7 +3,11 @@ import path from "node:path";
 import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import type {
-  ModelRegistry, ModelRegistryEntry, ModelRegistryUpdate, ModelRegistryUpdateEntry, ModelRole,
+  ModelRegistry,
+  ModelRegistryEntry,
+  ModelRegistryUpdate,
+  ModelRegistryUpdateEntry,
+  ModelRole,
 } from "@glimmer/shared";
 import { CONFIG } from "../config.js";
 
@@ -35,13 +39,15 @@ interface StoredRegistry {
 function defaultStoredRegistry(): StoredRegistry {
   return {
     version: 1,
-    models: [{
-      id: "local",
-      label: "Local Glimmer",
-      baseUrl: CONFIG.modelBaseUrl.replace(/\/+$/, ""),
-      modelId: "muse-glimmer",
-      apiKeyFile: path.join(os.homedir(), "AI", "muse-glimmer", "config", "api-key.txt"),
-    }],
+    models: [
+      {
+        id: "local",
+        label: "Local Glimmer",
+        baseUrl: CONFIG.modelBaseUrl.replace(/\/+$/, ""),
+        modelId: "muse-glimmer",
+        apiKeyFile: path.join(os.homedir(), "AI", "muse-glimmer", "config", "api-key.txt"),
+      },
+    ],
     roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
   };
 }
@@ -49,8 +55,14 @@ function defaultStoredRegistry(): StoredRegistry {
 function validBaseUrl(value: string): boolean {
   try {
     const parsed = new URL(value);
-    return (parsed.protocol === "http:" || parsed.protocol === "https:") &&
-      !!parsed.host && !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      !!parsed.host &&
+      !parsed.username &&
+      !parsed.password &&
+      !parsed.search &&
+      !parsed.hash
+    );
   } catch {
     return false;
   }
@@ -59,19 +71,24 @@ function validBaseUrl(value: string): boolean {
 function isStoredRegistry(value: unknown): value is StoredRegistry {
   if (!value || typeof value !== "object") return false;
   const raw = value as Partial<StoredRegistry>;
-  if (raw.version !== 1 || !Array.isArray(raw.models) || !raw.models.length || !raw.roles) return false;
+  if (raw.version !== 1 || !Array.isArray(raw.models) || !raw.models.length || !raw.roles)
+    return false;
   const ids = new Set<string>();
   for (const model of raw.models) {
     if (!model || typeof model !== "object") return false;
     if (!ID_PATTERN.test(model.id) || ids.has(model.id)) return false;
     ids.add(model.id);
-    if (!model.label?.trim() || !validBaseUrl(model.baseUrl) || !model.modelId?.trim()) return false;
+    if (!model.label?.trim() || !validBaseUrl(model.baseUrl) || !model.modelId?.trim())
+      return false;
     if (model.apiKeyFile !== null && typeof model.apiKeyFile !== "string") return false;
   }
   return ROLES.every((role) => typeof raw.roles![role] === "string" && ids.has(raw.roles![role]));
 }
 
-async function readStoredRegistry(): Promise<{ registry: StoredRegistry; source: "default" | "saved" }> {
+async function readStoredRegistry(): Promise<{
+  registry: StoredRegistry;
+  source: "default" | "saved";
+}> {
   try {
     const parsed = JSON.parse(await fs.readFile(CONFIG.modelConfigPath, "utf8"));
     if (isStoredRegistry(parsed)) return { registry: parsed, source: "saved" };
@@ -90,14 +107,19 @@ async function exists(file: string | null): Promise<boolean> {
   }
 }
 
-async function toPublic(registry: StoredRegistry, source: "default" | "saved"): Promise<ModelRegistry> {
-  const models: ModelRegistryEntry[] = await Promise.all(registry.models.map(async (model) => ({
-    id: model.id,
-    label: model.label,
-    baseUrl: model.baseUrl,
-    modelId: model.modelId,
-    hasApiKey: await exists(model.apiKeyFile),
-  })));
+async function toPublic(
+  registry: StoredRegistry,
+  source: "default" | "saved",
+): Promise<ModelRegistry> {
+  const models: ModelRegistryEntry[] = await Promise.all(
+    registry.models.map(async (model) => ({
+      id: model.id,
+      label: model.label,
+      baseUrl: model.baseUrl,
+      modelId: model.modelId,
+      hasApiKey: await exists(model.apiKeyFile),
+    })),
+  );
   return { version: 1, models, roles: registry.roles, source };
 }
 
@@ -114,20 +136,42 @@ function normalizeUpdate(input: unknown): ModelRegistryUpdate {
   }
   const ids = new Set<string>();
   const models: ModelRegistryUpdateEntry[] = raw.models.map((model) => {
-    if (!model || typeof model !== "object" || !ID_PATTERN.test(model.id ?? "") || ids.has(model.id)) {
-      invalid("each model id must be unique and contain only letters, numbers, dot, underscore, or dash");
+    if (
+      !model ||
+      typeof model !== "object" ||
+      !ID_PATTERN.test(model.id ?? "") ||
+      ids.has(model.id)
+    ) {
+      invalid(
+        "each model id must be unique and contain only letters, numbers, dot, underscore, or dash",
+      );
     }
     ids.add(model.id);
     const label = typeof model.label === "string" ? model.label.trim() : "";
-    const baseUrl = typeof model.baseUrl === "string" ? model.baseUrl.trim().replace(/\/+$/, "") : "";
+    const baseUrl =
+      typeof model.baseUrl === "string" ? model.baseUrl.trim().replace(/\/+$/, "") : "";
     const modelId = typeof model.modelId === "string" ? model.modelId.trim() : "";
-    if (!label || label.length > 120) invalid(`model ${model.id}: label is required and must be at most 120 characters`);
-    if (!validBaseUrl(baseUrl)) invalid(`model ${model.id}: baseUrl must be an http(s) URL without credentials, query, or fragment`);
-    if (!modelId || modelId.length > 200) invalid(`model ${model.id}: modelId is required and must be at most 200 characters`);
+    if (!label || label.length > 120)
+      invalid(`model ${model.id}: label is required and must be at most 120 characters`);
+    if (!validBaseUrl(baseUrl))
+      invalid(
+        `model ${model.id}: baseUrl must be an http(s) URL without credentials, query, or fragment`,
+      );
+    if (!modelId || modelId.length > 200)
+      invalid(`model ${model.id}: modelId is required and must be at most 200 characters`);
     const apiKey = typeof model.apiKey === "string" ? model.apiKey.trim() : undefined;
-    if (apiKey && apiKey.length > MAX_API_KEY_CHARS) invalid(`model ${model.id}: apiKey is too long`);
-    if (apiKey && model.clearApiKey) invalid(`model ${model.id}: cannot set and clear an API key together`);
-    return { id: model.id, label, baseUrl, modelId, ...(apiKey ? { apiKey } : {}), clearApiKey: model.clearApiKey === true };
+    if (apiKey && apiKey.length > MAX_API_KEY_CHARS)
+      invalid(`model ${model.id}: apiKey is too long`);
+    if (apiKey && model.clearApiKey)
+      invalid(`model ${model.id}: cannot set and clear an API key together`);
+    return {
+      id: model.id,
+      label,
+      baseUrl,
+      modelId,
+      ...(apiKey ? { apiKey } : {}),
+      clearApiKey: model.clearApiKey === true,
+    };
   });
   if (!raw.roles || typeof raw.roles !== "object") invalid("all model roles are required");
   const roles = {} as Record<ModelRole, string>;
@@ -195,7 +239,7 @@ export async function saveModelRegistry(input: unknown): Promise<ModelRegistry> 
   // user files outside its dedicated key directory.
   const kept = new Set(storedModels.map((model) => model.id));
   const referencedKeyFiles = new Set(
-    storedModels.flatMap((model) => model.apiKeyFile ? [path.resolve(model.apiKeyFile)] : []),
+    storedModels.flatMap((model) => (model.apiKeyFile ? [path.resolve(model.apiKeyFile)] : [])),
   );
   for (const old of current.models) {
     const replacement = update.models.find((model) => model.id === old.id);
