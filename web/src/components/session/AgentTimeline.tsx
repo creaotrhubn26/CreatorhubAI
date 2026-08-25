@@ -44,7 +44,8 @@ function rowMatchesFilter(row: TimelineRow, filter: Filter): boolean {
   if (filter === "All") return true;
   if (row.kind === "tool") return filter === "Tools";
   const e = row.event;
-  if (filter === "Agent") return e.type === "agent_state_changed" || e.type === "candidate_selected" || e.type === "scope_expanded";
+  if (filter === "Agent") return e.type === "agent_state_changed" || e.type === "candidate_selected" ||
+    e.type === "scope_expanded" || e.type === "model_request_started";
   if (filter === "Tools") return e.type === "tool_completed";
   if (filter === "Security") return e.type === "tool_blocked";
   if (filter === "Changes") return e.type === "file_changed";
@@ -71,6 +72,7 @@ function describe(e: GlimmerEvent): string {
       : "SCOPE EXPANSION";
     case "repair_started": return `REPAIR ${e.iteration}`;
     case "parser_recovery": return `PEG retry (attempt ${e.attempt})`;
+    case "model_request_started": return `MODEL ${e.role} → ${e.providerId}/${e.modelId}`;
     case "session_completed": return `SESSION ${e.status}`;
     // Generic fallback: any event type this build doesn't have a
     // dedicated case for yet (including new V7 types) still renders a
@@ -101,6 +103,7 @@ function iconMeta(row: TimelineRow): { glyph: string; color: string } {
     case "scope_expanded": return { glyph: "⚠", color: e.approved ? "var(--amber)" : "var(--red)" };
     case "repair_started": return { glyph: "↻", color: "var(--amber)" };
     case "parser_recovery": return { glyph: "⟲", color: "var(--gray)" };
+    case "model_request_started": return { glyph: "◇", color: "var(--blue)" };
     case "session_completed": return { glyph: "■", color: statusColor(e.status) };
     default: return { glyph: "•", color: "var(--text-muted)" };
   }
@@ -123,6 +126,13 @@ function eventDetails(e: GlimmerEvent): Record<string, unknown> {
     };
     case "repair_started": return { ...base, iteration: e.iteration };
     case "parser_recovery": return { ...base, attempt: e.attempt, payloadPath: e.payloadPath };
+    case "model_request_started": return {
+      ...base,
+      requestId: e.requestId,
+      role: e.role,
+      providerId: e.providerId,
+      modelId: e.modelId,
+    };
     case "session_completed": return { ...base, status: e.status };
     // Generic fallback: dump every field the event actually carries
     // (base plus whatever else is on it) rather than hand-listing fields

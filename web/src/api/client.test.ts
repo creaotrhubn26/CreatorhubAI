@@ -13,6 +13,29 @@ describe("glimmerApi", () => {
     expect(status.model.status).toBe("ONLINE");
   });
 
+  it("reads and saves the secret-free model registry", async () => {
+    const registry = {
+      version: 1 as const,
+      models: [{ id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080", modelId: "m", hasApiKey: true }],
+      roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
+      source: "saved" as const,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify(registry), { status: 200 })
+    );
+    expect(await glimmerApi.getModelRegistry()).toEqual(registry);
+    expect(fetchMock).toHaveBeenLastCalledWith(`${API_BASE}/api/models/config`, expect.anything());
+
+    const update = {
+      models: [{ id: "local", label: "Local", baseUrl: "http://127.0.0.1:8080", modelId: "m", apiKey: "secret" }],
+      roles: registry.roles,
+    };
+    await glimmerApi.saveModelRegistry(update);
+    const [, init] = fetchMock.mock.calls.at(-1)!;
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(init?.body as string)).toEqual(update);
+  });
+
   it("createSession POSTs the task contract as JSON", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ id: "s1" }), { status: 201 })

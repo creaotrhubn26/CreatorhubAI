@@ -779,6 +779,13 @@ export interface ModelRetryEvent extends GlimmerEventBase {
   // call this retry announces -- optional/additive, see ParserRecoveryEvent.
   requestId?: string;
 }
+export interface ModelRequestStartedEvent extends GlimmerEventBase {
+  type: "model_request_started";
+  requestId: string;
+  role: "engineer" | "architect" | "consult";
+  providerId: string;
+  modelId: string;
+}
 // context_selected (Task 5.1, V7 §7 context tiers): tier0Chars (system +
 // task -- permanent, never compacted), tier1Chars (active tool-result
 // history live in the conversation), tier2Refs (how many Tier1 messages
@@ -967,6 +974,7 @@ export type GlimmerEvent =
   | SessionCreatedEvent
   | SkillLoadedEvent
   | ModelRetryEvent
+  | ModelRequestStartedEvent
   | ContextSelectedEvent
   | ArchitectPlanningStartedEvent
   | ArchitectPlanCreatedEvent
@@ -996,7 +1004,7 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "verification_started", "verification_completed", "agent_state_changed",
   "candidate_selected", "scope_expanded", "repair_started",
   "parser_recovery", "session_completed",
-  "session_created", "skill_loaded", "model_retry", "context_selected",
+  "session_created", "skill_loaded", "model_retry", "model_request_started", "context_selected",
   "architect_planning_started", "architect_plan_created",
   "architect_review_requested", "architect_review_completed",
   "architect_replan_started", "architect_autotriggered",
@@ -1122,6 +1130,39 @@ export interface ModelStatus {
   runState?: ModelRunState;
   exitCode?: number | null;
   logTail?: string;
+}
+
+export type ModelRole = "engineer" | "architect" | "consult" | "vision";
+
+export interface ModelRegistryEntry {
+  id: string;
+  label: string;
+  baseUrl: string;
+  modelId: string;
+  hasApiKey: boolean;
+}
+
+export interface ModelRegistry {
+  version: 1;
+  models: ModelRegistryEntry[];
+  roles: Record<ModelRole, string>;
+  source: "default" | "saved";
+}
+
+export interface ModelRegistryUpdateEntry {
+  id: string;
+  label: string;
+  baseUrl: string;
+  modelId: string;
+  /** Omit/blank to preserve an existing key; never returned by the API. */
+  apiKey?: string;
+  /** Removes this registry entry's safe, gateway-owned key file. */
+  clearApiKey?: boolean;
+}
+
+export interface ModelRegistryUpdate {
+  models: ModelRegistryUpdateEntry[];
+  roles: Record<ModelRole, string>;
 }
 
 // Task 4c(2/3): one page of the gateway's read-only directory browser

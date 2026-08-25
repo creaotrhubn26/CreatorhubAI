@@ -1,8 +1,12 @@
 import os from "node:os";
 import path from "node:path";
 
+const stateRoot = process.env.GLIMMER_STATE_ROOT ?? path.join(os.homedir(), ".muse-glimmer");
+
 export const CONFIG = {
-  stateRoot: process.env.GLIMMER_STATE_ROOT ?? path.join(os.homedir(), ".muse-glimmer"),
+  stateRoot,
+  modelConfigPath: process.env.GLIMMER_MODEL_CONFIG ?? path.join(stateRoot, "models.json"),
+  modelKeysDir: path.join(stateRoot, "model-keys"),
   glimmerV2Path:
     process.env.GLIMMER_V2_PATH ??
     path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-v2.py"),

@@ -53,6 +53,26 @@ describe("AgentTimeline", () => {
     expect(screen.getByText("Remote writes are disabled for autonomous sessions.")).toBeInTheDocument();
   });
 
+  it("shows model identity per call while allowlisting secret-free details", () => {
+    const modelCall = Object.assign({
+      id: "e-model", sessionId: "s1", timestamp: "t", type: "model_request_started",
+      requestId: "req-1", role: "architect", providerId: "frontier", modelId: "reasoner-1",
+    }, {
+      apiKey: "must-not-render",
+      apiKeyFile: "/private/key",
+      baseUrl: "https://private-endpoint.example/v1",
+    }) as unknown as GlimmerEvent;
+    render(<AgentTimeline events={[modelCall]} />);
+
+    const label = screen.getByText("MODEL architect → frontier/reasoner-1");
+    fireEvent.click(label);
+    const rendered = screen.getByText(/"requestId"/).textContent ?? "";
+    expect(rendered).toContain("req-1");
+    expect(rendered).not.toContain("must-not-render");
+    expect(rendered).not.toContain("apiKeyFile");
+    expect(rendered).not.toContain("baseUrl");
+  });
+
   // M3 (followup-1-2 review): a scope_expanded event a human explicitly
   // approved (V7 §15 write-time pause) must not read/look identical to an
   // unapproved one -- distinct label, distinct icon color, and the
