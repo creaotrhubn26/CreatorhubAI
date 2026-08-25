@@ -67,7 +67,7 @@ describe("FileTreeScreen", () => {
     render(withProviders(<FileTreeScreen />));
 
     fireEvent.click(await screen.findByRole("button", { name: "README.md" }));
-    await waitFor(() => expect(readFile).toHaveBeenCalledWith({ path: "/w/README.md", root: "/w" }));
+    await waitFor(() => expect(readFile).toHaveBeenCalledWith({ path: "/w/README.md" }));
   });
 
   it("expands the branch that reveals a file handed to it in the URL, and opens it", async () => {
@@ -80,17 +80,21 @@ describe("FileTreeScreen", () => {
 
     await waitFor(() => expect(screen.getByText("a.ts")).toBeInTheDocument());
     expect(listing).toHaveBeenCalledWith({ path: "/w/src", root: "/w", includeFiles: true });
-    expect(readFile).toHaveBeenCalledWith({ path: "/w/src/a.ts", root: "/w" });
+    expect(readFile).toHaveBeenCalledWith({ path: "/w/src/a.ts" });
   });
 
-  it("says a path outside the workspace tree is outside it, instead of implying it belongs", async () => {
+  // Review M1: `?path=` comes straight from the URL, so a path in no known
+  // workspace must be REFUSED, not rendered with a caveat. (The gateway
+  // refuses it too — that is the boundary; this is the message in front of it,
+  // and it must not even ask for the bytes.)
+  it("refuses a path that is in no known workspace, and does not request it", async () => {
     mockListing();
     vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
-    vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue({
-      path: "/elsewhere/x.ts", size: 1, bytesReturned: 1, truncated: false, binary: false, content: "x",
-    });
-    render(withProviders(<FileTreeScreen />, "/files?path=%2Felsewhere%2Fx.ts"));
-    expect(await screen.findByText(/outside the workspace shown in the tree/i)).toBeInTheDocument();
+    const readFile = vi.spyOn(client.glimmerApi, "readFile");
+    render(withProviders(<FileTreeScreen />, "/files?path=%2FUsers%2Fu%2F.local%2Fshare%2Fopencode%2Fauth.json"));
+
+    expect(await screen.findByText(/not inside any workspace Glimmer knows about/i)).toBeInTheDocument();
+    expect(readFile).not.toHaveBeenCalled();
   });
 
   it("reports a directory it could not list rather than showing an empty branch", async () => {

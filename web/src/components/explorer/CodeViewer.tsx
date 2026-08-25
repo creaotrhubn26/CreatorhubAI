@@ -29,10 +29,10 @@ function splitLines(content: string): string[] {
   return lines;
 }
 
-export function CodeViewer({ path, root, line }: { path: string; root?: string; line?: number }) {
+export function CodeViewer({ path, line }: { path: string; line?: number }) {
   const { data, error, isPending, isFetching, refetch, dataUpdatedAt } = useQuery({
-    queryKey: ["fs-file", root ?? "", path],
-    queryFn: () => glimmerApi.readFile({ path, root }),
+    queryKey: ["fs-file", path],
+    queryFn: () => glimmerApi.readFile({ path }),
     retry: false,
   });
 

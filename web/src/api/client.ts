@@ -261,9 +261,11 @@ export const glimmerApi = {
   // tell the user WHY a read failed ("path is a directory", "permission
   // denied", "path does not exist"), and a failed read must never be able to
   // render as an empty file.
-  readFile: async (params: { path: string; root?: string }): Promise<FsFile> => {
+  // No `root` here on purpose (review M1): the gateway picks the root itself —
+  // the known workspace containing the path — so the client cannot influence
+  // what boundary a content read is checked against.
+  readFile: async (params: { path: string }): Promise<FsFile> => {
     const query = new URLSearchParams({ path: params.path });
-    if (params.root) query.set("root", params.root);
     const res = await fetch(`${API_BASE}/api/fs/file?${query.toString()}`);
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || `GET /api/fs/file failed: ${res.status}`);

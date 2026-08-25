@@ -2,7 +2,7 @@ import { Router } from "express";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { listSessionIds, readSession } from "../lib/sessions.js";
+import { listSessionIds, readManifestRaw, readSession } from "../lib/sessions.js";
 import { gitStatus, createWorkspace, WorkspaceCreateError } from "../lib/git.js";
 import type { WorkspaceInfo, FsListing, FsFile } from "@glimmer/shared";
 
@@ -250,6 +250,32 @@ workspacesRouter.get("/fs/dirs", async (req, res) => {
   }
 });
 
+// The workspaces this gateway knows about: the `workspace` of every session
+// manifest on disk, the same set GET /api/workspaces is derived from (that
+// route uses readSession for git status; only the path is needed here, so the
+// manifest is read directly). This is the boundary for CONTENT reads.
+//
+// Review M1. Listing NAMES over $HOME is what the tree needs — it exists to
+// find a workspace. Serving BYTES over $HOME is a different thing entirely,
+// and the ~20-name credential denylist is documented as knowingly incomplete
+// noise reduction, not a boundary: a review demonstrated live plaintext API
+// keys and token caches read from paths it does not cover. Every path the
+// viewer legitimately opens (repo map entry, doc-graph node, diff file
+// header) is already inside a workspace, so confining reads to one costs no
+// feature. HOME still applies on top, via resolveContained's own boundary: a
+// manifest naming a workspace outside HOME is refused rather than widening
+// what this route will serve.
+async function knownWorkspaceRoots(): Promise<string[]> {
+  const ids = await listSessionIds();
+  const manifests = await Promise.all(ids.map((id) => readManifestRaw(id)));
+  const roots = new Set<string>();
+  for (const m of manifests) {
+    const ws = (m as { workspace?: unknown } | null)?.workspace;
+    if (typeof ws === "string" && ws.trim()) roots.add(path.resolve(ws.trim()));
+  }
+  return [...roots];
+}
+
 // Round A / Task A1: read ONE file's text for the read-only code viewer.
 // Same containment as /fs/dirs — literally the same resolveContained() — plus
 // three refusals of its own, all of which report what actually happened:
@@ -262,15 +288,24 @@ workspacesRouter.get("/fs/dirs", async (req, res) => {
 //     is refused BEFORE it is opened, since open(2) on a fifo blocks until a
 //     writer appears and would hang the gateway
 const MAX_FILE_BYTES = 512 * 1024;
-// git's own heuristic: NUL anywhere in the first 8000 bytes means binary.
-const BINARY_SNIFF_BYTES = 8000;
 
 workspacesRouter.get("/fs/file", async (req, res) => {
   const rawPath = typeof req.query.path === "string" ? req.query.path.trim() : "";
   if (!rawPath) return res.status(400).json({ error: "path is required" });
-  const rawRoot = typeof req.query.root === "string" && req.query.root.trim() ? req.query.root.trim() : browseRoot();
+  if (rawPath.includes("\0")) return res.status(400).json({ error: "path is not a valid filesystem path" });
 
-  const resolved = await resolveContained(rawRoot, rawPath);
+  // Review M1: the root is NOT caller-supplied and never defaults to $HOME —
+  // it is whichever known workspace contains the requested path. Matched
+  // LEXICALLY, before any syscall touches the caller's path, so a path in no
+  // workspace gets the same answer whether or not it exists (same
+  // no-existence-oracle property as resolveContained itself).
+  const lexicalPath = path.resolve(rawPath);
+  const workspace = (await knownWorkspaceRoots()).find((root) => contains(root, lexicalPath));
+  if (!workspace) {
+    return res.status(403).json({ error: "path is not inside a known workspace" });
+  }
+
+  const resolved = await resolveContained(workspace, rawPath);
   if (!resolved.ok) return res.status(resolved.status).json({ error: resolved.error });
   const file = resolved.target;
 
@@ -289,7 +324,11 @@ workspacesRouter.get("/fs/file", async (req, res) => {
       await fh.close();
     }
 
-    if (read.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
+    // Review m1: sniff everything actually being returned, not git's first
+    // 8000 bytes — a NUL past that mark was served as "text" with the NUL
+    // embedded in the JSON. Scanning ≤512 KiB is a memchr; the label now
+    // covers exactly the bytes the response carries.
+    if (read.includes(0)) {
       // Nothing was returned, so nothing was truncated — `binary` is the whole
       // story and the viewer renders a notice, never bytes.
       const answer: FsFile = { path: file, size: stat.size, bytesReturned: 0, truncated: false, binary: true, content: null };

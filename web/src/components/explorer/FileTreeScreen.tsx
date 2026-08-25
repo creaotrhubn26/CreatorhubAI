@@ -12,8 +12,12 @@ import { ancestorDirs } from "../../state/fileLink";
 // one request per open directory, none for a closed one.
 //
 // URL is the state: ?path=<absolute file> opens it in the viewer and expands
-// the branch that reveals it, &line=<n> marks a line. The gateway refuses
-// anything outside the root regardless of what the URL says.
+// the branch that reveals it, &line=<n> marks a line.
+//
+// The tree browses the whole browse root (finding a workspace is its job), but
+// CONTENT is only ever read inside a known workspace — the gateway enforces
+// that itself (review M1), and a path in none of them is refused here rather
+// than shown with a caveat.
 
 function join(dir: string, name: string): string {
   return `${dir.replace(/\/+$/, "")}/${name}`;
@@ -159,7 +163,7 @@ export function FileTreeScreen() {
     );
   }
 
-  const outsideRoot = !!(target && !containing);
+  const outsideWorkspaces = !!(target && !containing);
 
   return (
     <div className="file-explorer">
@@ -195,16 +199,17 @@ export function FileTreeScreen() {
         </ul>
       </div>
       <div className="file-explorer__viewer">
-        {/* An out-of-workspace path is still readable (the gateway's own
-            boundary decides that), but it is never presented as part of this
-            tree. */}
-        {outsideRoot && (
-          <p className="code-view__notice" role="status">
-            This path is outside the workspace shown in the tree.
-          </p>
-        )}
-        {filePath ? (
-          <CodeViewer path={filePath} root={containing} line={line} />
+        {/* Review M1: a path in no known workspace is REFUSED, not shown with
+            a caveat. The gateway refuses it too — that is the boundary, this
+            is only the honest message in front of it, since `?path=` comes
+            straight from the URL. */}
+        {outsideWorkspaces ? (
+          <EmptyState
+            icon="○"
+            text="Not shown — this path is not inside any workspace Glimmer knows about."
+          />
+        ) : filePath ? (
+          <CodeViewer path={filePath} line={line} />
         ) : (
           <EmptyState icon="▤" text="Select a file to view it. This viewer is read-only." />
         )}

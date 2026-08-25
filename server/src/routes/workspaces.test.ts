@@ -255,13 +255,25 @@ describe("GET /api/fs/file", () => {
     outside = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-file-outside-")));
     process.env.GLIMMER_BROWSE_ROOT = browseRoot;
 
+    // Review M1: content reads are confined to a KNOWN WORKSPACE, so this
+    // fixture needs a real session manifest naming one — being inside the
+    // browse root is no longer enough to be readable.
+    await fs.mkdir(path.join(stateRoot, "sessions", "20260824-000000-fs-file"), { recursive: true });
+    await fs.writeFile(
+      path.join(stateRoot, "sessions", "20260824-000000-fs-file", "manifest.json"),
+      JSON.stringify({ id: "20260824-000000-fs-file", workspace: path.join(browseRoot, "repo") })
+    );
+
     await fs.mkdir(path.join(browseRoot, "repo", "src"), { recursive: true });
     await fs.writeFile(path.join(browseRoot, "repo", "src", "a.ts"), "const x = 1;\nconst y = 2;\n");
     await fs.writeFile(path.join(browseRoot, "repo", "empty.txt"), "");
     await fs.writeFile(path.join(outside, "secret.txt"), "TOP-SECRET-MARKER");
     await fs.symlink(path.join(outside, "secret.txt"), path.join(browseRoot, "repo", "escape.txt"));
-    await fs.mkdir(path.join(browseRoot, ".ssh"), { recursive: true });
-    await fs.writeFile(path.join(browseRoot, ".ssh", "id_ed25519"), "PRIVATE-KEY-MARKER");
+    await fs.mkdir(path.join(browseRoot, "repo", ".ssh"), { recursive: true });
+    await fs.writeFile(path.join(browseRoot, "repo", ".ssh", "id_ed25519"), "PRIVATE-KEY-MARKER");
+    // Inside the browse root, but in NO workspace — the M1 case.
+    await fs.mkdir(path.join(browseRoot, ".local", "share", "opencode"), { recursive: true });
+    await fs.writeFile(path.join(browseRoot, ".local", "share", "opencode", "auth.json"), "API-KEY-MARKER");
   });
 
   afterAll(async () => {
@@ -270,10 +282,7 @@ describe("GET /api/fs/file", () => {
     await fs.rm(outside, { recursive: true, force: true });
   });
 
-  const get = (p: string, root?: string) =>
-    request(app).get(
-      `/api/fs/file?path=${encodeURIComponent(p)}${root ? `&root=${encodeURIComponent(root)}` : ""}`
-    );
+  const get = (p: string) => request(app).get(`/api/fs/file?path=${encodeURIComponent(p)}`);
 
   it("returns the file's text with its real size, untruncated and not binary", async () => {
     const res = await get(path.join(browseRoot, "repo", "src", "a.ts"));
@@ -323,6 +332,18 @@ describe("GET /api/fs/file", () => {
     expect(res.body.size).toBe(8);
   });
 
+  // Review m1: git's heuristic stops at 8000 bytes, so a NUL past that mark
+  // used to be served as "text" with the NUL embedded in the JSON. The sniff
+  // now covers every byte the response would carry.
+  it("detects a NUL past the first 8000 bytes rather than serving it as text", async () => {
+    const late = path.join(browseRoot, "repo", "late-nul.bin");
+    await fs.writeFile(late, Buffer.concat([Buffer.alloc(9000, 0x61), Buffer.from([0x00]), Buffer.alloc(1000, 0x62)]));
+    const res = await get(late);
+    expect(res.status).toBe(200);
+    expect(res.body.binary).toBe(true);
+    expect(res.body.content).toBeNull();
+  });
+
   it("rejects ../ traversal, an absolute path outside the boundary, and a symlink that escapes it", async () => {
     const traversal = await get(path.join(browseRoot, "..", "..", "etc", "hosts"));
     expect(traversal.status).toBe(403);
@@ -345,28 +366,52 @@ describe("GET /api/fs/file", () => {
     expect(missing.body).toEqual(existing.body);
   });
 
-  it("refuses to read a credential file by name, at the boundary or deeper", async () => {
-    const atRoot = await get(path.join(browseRoot, ".ssh", "id_ed25519"));
+  it("refuses a credential name inside the workspace too, at its root or deeper", async () => {
+    const atRoot = await get(path.join(browseRoot, "repo", ".ssh", "id_ed25519"));
     expect(atRoot.status).toBe(403);
     expect(JSON.stringify(atRoot.body)).not.toContain("PRIVATE-KEY-MARKER");
 
-    await fs.mkdir(path.join(browseRoot, "repo", ".aws"), { recursive: true });
-    await fs.writeFile(path.join(browseRoot, "repo", ".aws", "credentials"), "PRIVATE-KEY-MARKER");
-    const deeper = await get(path.join(browseRoot, "repo", ".aws", "credentials"));
+    await fs.mkdir(path.join(browseRoot, "repo", "sub", ".aws"), { recursive: true });
+    await fs.writeFile(path.join(browseRoot, "repo", "sub", ".aws", "credentials"), "PRIVATE-KEY-MARKER");
+    const deeper = await get(path.join(browseRoot, "repo", "sub", ".aws", "credentials"));
     expect(deeper.status).toBe(403);
     expect(JSON.stringify(deeper.body)).not.toContain("PRIVATE-KEY-MARKER");
   });
 
-  it("confines the read to a caller-supplied root and refuses one that widens the boundary", async () => {
-    const root = path.join(browseRoot, "repo");
-    const inside = await get(path.join(root, "src", "a.ts"), root);
-    expect(inside.status).toBe(200);
+  // Review M1: the boundary for CONTENT is the known-workspace set, not the
+  // browse root. These two cases are the whole point of that change.
+  describe("workspace confinement", () => {
+    it("reads a file inside a known workspace", async () => {
+      const res = await get(path.join(browseRoot, "repo", "src", "a.ts"));
+      expect(res.status).toBe(200);
+      expect(res.body.content).toContain("const x = 1;");
+    });
 
-    const above = await get(path.join(browseRoot, "repo", "..", "outside-attempt.txt"), root);
-    expect(above.status).toBe(403);
+    it("refuses a file that is inside the browse root but in no workspace", async () => {
+      const res = await get(path.join(browseRoot, ".local", "share", "opencode", "auth.json"));
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/known workspace/i);
+      expect(JSON.stringify(res.body)).not.toContain("API-KEY-MARKER");
+    });
 
-    const widened = await get(path.join(outside, "secret.txt"), outside);
-    expect(widened.status).toBe(403);
+    it("takes no root from the caller — a caller-supplied root cannot widen anything", async () => {
+      // Naming the secret's own directory as `root` must change nothing: the
+      // server picks the root itself, from the session manifests.
+      const res = await request(app).get(
+        `/api/fs/file?path=${encodeURIComponent(path.join(browseRoot, ".local", "share", "opencode", "auth.json"))}` +
+          `&root=${encodeURIComponent(path.join(browseRoot, ".local", "share", "opencode"))}`
+      );
+      expect(res.status).toBe(403);
+      expect(JSON.stringify(res.body)).not.toContain("API-KEY-MARKER");
+    });
+
+    it("still lists names over the whole browse root — the tree's job is unchanged", async () => {
+      const res = await request(app).get(`/api/fs/dirs?path=${encodeURIComponent(browseRoot)}`);
+      expect(res.status).toBe(200);
+      expect(res.body.entries.map((e: { name: string }) => e.name)).toContain(".local");
+      // Names only: the listing never carried contents and still does not.
+      expect(JSON.stringify(res.body)).not.toContain("API-KEY-MARKER");
+    });
   });
 
   it("400s on a directory, a missing path param, and a null byte; 404s on a path that does not exist", async () => {
