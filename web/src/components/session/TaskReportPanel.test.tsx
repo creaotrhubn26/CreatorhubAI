@@ -4,13 +4,15 @@ import { describe, expect, it, vi } from "vitest";
 import * as client from "../../api/client";
 import { TaskReportPanel } from "./TaskReportPanel";
 
-function renderPanel() {
+function renderPanel(ready = true) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const panel = (isReady: boolean) => (
     <QueryClientProvider client={queryClient}>
-      <TaskReportPanel sessionId="s1" />
-    </QueryClientProvider>,
+      <TaskReportPanel sessionId="s1" ready={isReady} />
+    </QueryClientProvider>
   );
+  const result = render(panel(ready));
+  return { ...result, rerenderReady: (isReady: boolean) => result.rerender(panel(isReady)) };
 }
 
 describe("TaskReportPanel", () => {
@@ -42,5 +44,24 @@ describe("TaskReportPanel", () => {
     const { container } = renderPanel();
     await vi.waitFor(() => expect(client.glimmerApi.getTaskReport).toHaveBeenCalled());
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("waits for a terminal session before fetching a report that does not exist yet", async () => {
+    const request = vi.spyOn(client.glimmerApi, "getTaskReport").mockResolvedValue({
+      schemaVersion: 1,
+      mode: "inspect",
+      objective: "Hva kan bli bedre?",
+      summary: "The completed report is now available.",
+      findings: [],
+      implementationPlan: [],
+      confidence: "medium",
+    });
+    const { rerenderReady } = renderPanel(false);
+
+    expect(request).not.toHaveBeenCalled();
+    rerenderReady(true);
+
+    expect(await screen.findByText("The completed report is now available.")).toBeInTheDocument();
+    expect(request).toHaveBeenCalledTimes(1);
   });
 });
