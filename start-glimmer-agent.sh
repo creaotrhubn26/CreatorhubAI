@@ -89,6 +89,7 @@ fi
 MCP_ARGS=()
 
 if [ -f "$MCP_CONFIG" ]; then
+    "$ROOT/verify-llama-mcp-permissions.sh"
     MCP_ARGS=(--mcp-servers-config "$MCP_CONFIG")
     echo "MCP config: enabled"
 else

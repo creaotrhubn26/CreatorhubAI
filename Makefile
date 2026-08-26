@@ -32,6 +32,7 @@ selfcheck:
 	$(PYTHON) glimmer-engineer.py --task-report-selfcheck
 	$(PYTHON) glimmer-engineer.py --model-provider-selfcheck
 	$(PYTHON) glimmer-engineer.py --semantic-tools-selfcheck
+	$(PYTHON) glimmer-engineer.py --mcp-permissions-selfcheck
 	$(PYTHON) glimmer-v2.py --architect-risk-selfcheck
 	$(PYTHON) glimmer-v2.py --quality-gates-selfcheck
 	$(PYTHON) glimmer-v2.py --skills-selfcheck

@@ -9,6 +9,7 @@ __pycache__/
 
 # Secrets
 config/api-key.txt
+config/mcp-servers.json
 
 # Evolution backups (kept on disk, not versioned — git history replaces this going forward)
 backups/

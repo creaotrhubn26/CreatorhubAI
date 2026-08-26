@@ -362,6 +362,28 @@ WRITE_TOOLS = {
     "edit_file",
 }
 
+# Populated from the live /tools metadata on every get_tools() call. MCP
+# tools are optional and their names are not known at build time, so the
+# approval boundary cannot be a static allow-list. Missing or malformed
+# permission metadata fails closed into the approval-required set.
+_runtime_approval_tools = set()
+_runtime_read_only_tools = set()
+
+
+def _mcp_requires_approval(item):
+    if item.get("type") != "mcp":
+        return False
+    permissions = item.get("permissions")
+    return not isinstance(permissions, dict) or permissions.get("write") is not False
+
+
+def _requires_tool_approval(tool_name):
+    return tool_name in WRITE_TOOLS or tool_name in _runtime_approval_tools
+
+
+def _architect_tool_names():
+    return ARCHITECT_TOOL_NAMES | _runtime_read_only_tools
+
 # O4 (glimmer-v7 reconciliation doc, §3.11): find_symbol / find_references /
 # find_related_tests — served CLIENT-SIDE in this Python process, never a
 # llama.cpp/C++ change (the doc's explicit rationale: the 1200s exec_shell_
@@ -2448,6 +2470,9 @@ def get_tools():
     metadata = {}
     definitions = []
 
+    _runtime_approval_tools.clear()
+    _runtime_read_only_tools.clear()
+
     for item in raw:
         name = item.get("tool")
         definition = item.get("definition")
@@ -2457,6 +2482,12 @@ def get_tools():
 
         metadata[name] = item
         definitions.append(definition)
+
+        if item.get("type") == "mcp":
+            if _mcp_requires_approval(item):
+                _runtime_approval_tools.add(name)
+            else:
+                _runtime_read_only_tools.add(name)
 
     missing = (
         REQUIRED_ENGINEERING_TOOLS
@@ -2998,6 +3029,9 @@ def approval_description(
         ).relative_to(workspace)
 
         return f"{tool_name}: {path}"
+
+    if tool_name in _runtime_approval_tools:
+        return f"{tool_name}: approval-required MCP action"
 
     if tool_name == "exec_shell_command":
         return (
@@ -4332,10 +4366,10 @@ def execute_tool(
     # sanitization or any dispatch, regardless of caller. This must stay
     # the ONLY place execute_tool short-circuits on tool identity so the
     # guarantee can't be bypassed by adding a new call path later.
-    if mode == "architect" and tool_name in WRITE_TOOLS:
+    if mode == "architect" and _requires_tool_approval(tool_name):
         message = (
             "ENGINEERING SECURITY BLOCK: architect mode is read-only; "
-            "write_file/edit_file are never executed in this mode."
+            "write-capable tools are never executed in this mode."
         )
 
         print()
@@ -4703,7 +4737,7 @@ def execute_tool(
     # --------------------------------------------------------
 
     if (
-        tool_name in WRITE_TOOLS
+        _requires_tool_approval(tool_name)
         or tool_name
         == "exec_shell_command"
     ):
@@ -4737,15 +4771,16 @@ def execute_tool(
     print()
     print(f"→ TOOL: {tool_name}")
 
-    if tool_name in WRITE_TOOLS:
-        # Redacted: write-tool arguments can carry full file content, so only
-        # the path and key names are ever printed/emitted, never the values.
+    if _requires_tool_approval(tool_name):
+        # Redacted: write-capable tool arguments can carry file content,
+        # credentials, or external payloads, so only keys and a safe local
+        # path (for the two built-in file tools) are ever emitted.
         display_args = {
-            "path":
-                arguments.get("path"),
             "keys":
                 list(arguments.keys()),
         }
+        if tool_name in WRITE_TOOLS:
+            display_args["path"] = arguments.get("path")
     else:
         display_args = arguments
 
@@ -7928,7 +7963,7 @@ def run_architect(task, workspace, max_turns, review_request_path=None, task_mod
     architect_tools = [
         tool
         for tool in tools
-        if (tool.get("function") or {}).get("name") in ARCHITECT_TOOL_NAMES
+        if (tool.get("function") or {}).get("name") in _architect_tool_names()
     ]
 
     print("Glimmer Architect Mode (C1/C2, read-only)")
@@ -11750,6 +11785,67 @@ def _scope_expansion_selfcheck() -> None:
     print("scope-expansion approval (V7 §15 follow-up) self-check: PASS (9/9)")
 
 
+def _mcp_permissions_selfcheck() -> None:
+    """Prove that MCP permission metadata reaches every client-side gate."""
+    import tempfile
+
+    global MUSE_GLIMMER_HOME
+
+    real_approval = set(_runtime_approval_tools)
+    real_read_only = set(_runtime_read_only_tools)
+    real_glimmer_home = MUSE_GLIMMER_HOME
+    try:
+        assert _mcp_requires_approval({"type": "mcp"}) is True
+        assert _mcp_requires_approval({"type": "mcp", "permissions": {}}) is True
+        assert _mcp_requires_approval(
+            {"type": "mcp", "permissions": {"write": True}}
+        ) is True
+        assert _mcp_requires_approval(
+            {"type": "mcp", "permissions": {"write": False}}
+        ) is False
+        assert _mcp_requires_approval(
+            {"type": "builtin", "permissions": {"write": True}}
+        ) is False
+
+        _runtime_approval_tools.clear()
+        _runtime_read_only_tools.clear()
+        _runtime_approval_tools.add("browser_submit")
+        _runtime_read_only_tools.add("context7_query")
+
+        assert _requires_tool_approval("browser_submit") is True
+        assert "browser_submit" not in _architect_tool_names()
+        assert "context7_query" in _architect_tool_names()
+        description = approval_description(
+            "browser_submit",
+            {"password": "must-not-leak"},
+            Path("/tmp"),
+        )
+        assert description == "browser_submit: approval-required MCP action"
+        assert "must-not-leak" not in description
+
+        with tempfile.TemporaryDirectory() as td:
+            MUSE_GLIMMER_HOME = Path(td) / ".muse-glimmer"
+            result, changed = execute_tool(
+                "browser_submit",
+                {"password": "must-not-run"},
+                Path(td),
+                {"approve_all": True},
+                {},
+                [],
+                mode="architect",
+            )
+            assert "architect mode is read-only" in result
+            assert changed is False
+    finally:
+        _runtime_approval_tools.clear()
+        _runtime_approval_tools.update(real_approval)
+        _runtime_read_only_tools.clear()
+        _runtime_read_only_tools.update(real_read_only)
+        MUSE_GLIMMER_HOME = real_glimmer_home
+
+    print("MCP permission boundary self-check: PASS")
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -11992,6 +12088,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--scope-approval-selfcheck"]:
         _scope_expansion_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--mcp-permissions-selfcheck"]:
+        _mcp_permissions_selfcheck()
         sys.exit(0)
 
     try:

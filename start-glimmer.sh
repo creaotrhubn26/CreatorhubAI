@@ -10,9 +10,21 @@ MMPROJ="$ROOT/Muse-Glimmer-30B-GGUF/mmproj-Muse-Glimmer-30B-Q4_K_M.gguf"
 DFLASH="$ROOT/Muse-Glimmer-30B-GGUF/dflash-Muse-Glimmer-30B-Q4_K_M.gguf"
 
 API_KEY_FILE="$ROOT/config/api-key.txt"
+MCP_CONFIG="$ROOT/config/mcp-servers.json"
 
 PORT="${GLIMMER_PORT:-8080}"
 CTX="${GLIMMER_CTX:-65536}"
+
+MCP_ARGS=()
+
+if [ -f "$MCP_CONFIG" ]; then
+    echo "MCP preflight:"
+    "$ROOT/verify-llama-mcp-permissions.sh"
+    MCP_ARGS=(--mcp-servers-config "$MCP_CONFIG")
+    echo "MCP config: enabled"
+else
+    echo "MCP config: disabled"
+fi
 
 if lsof -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "Port $PORT er allerede i bruk."
@@ -44,6 +56,7 @@ exec "$BIN" \
   --api-key-file "$API_KEY_FILE" \
   -a muse-glimmer \
   --reasoning-format deepseek \
+  ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} \
   --temp 1.0 \
   --top-p 0.95 \
   --top-k 64
