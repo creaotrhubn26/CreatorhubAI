@@ -1,0 +1,70 @@
+diff --git a/tools/server/server-mcp.cpp b/tools/server/server-mcp.cpp
+--- a/tools/server/server-mcp.cpp
++++ b/tools/server/server-mcp.cpp
+@@ -306,6 +306,9 @@
+             if (t.contains("inputSchema")) {
+                 def.input_schema = t.at("inputSchema");
+             }
++            if (t.contains("annotations") && t.at("annotations").is_object()) {
++                def.permission_write = !t.at("annotations").value("readOnlyHint", false);
++            }
+             tools.push_back(std::move(def));
+         }
+     }
+diff --git a/tools/server/server-mcp.h b/tools/server/server-mcp.h
+--- a/tools/server/server-mcp.h
++++ b/tools/server/server-mcp.h
+@@ -35,4 +35,7 @@
+     std::string name; // bare tool name, no "<server>_" prefix
+     std::string description;
+     json input_schema; // JSON Schema for the arguments, or null
++    // Fail closed: MCP annotations are optional hints. An unannotated tool
++    // must require write approval until it explicitly declares readOnlyHint.
++    bool permission_write = true;
+ };
+diff --git a/tools/server/server-tools.cpp b/tools/server/server-tools.cpp
+--- a/tools/server/server-tools.cpp
++++ b/tools/server/server-tools.cpp
+@@ -1869,6 +1869,6 @@
+     {
+         name = server_name + "_" + tool_name;
+         display_name = name;
+-        permission_write = false;
++        permission_write = def.permission_write;
+         support_stream = false;
+     }
+diff --git a/tools/server/tests/fixtures/mcp_echo_server.py b/tools/server/tests/fixtures/mcp_echo_server.py
+--- a/tools/server/tests/fixtures/mcp_echo_server.py
++++ b/tools/server/tests/fixtures/mcp_echo_server.py
+@@ -16,6 +16,7 @@
+     {
+         "name": "echo",
+         "description": "Echo back the input message",
++        "annotations": {"readOnlyHint": True},
+         "inputSchema": {
+             "type": "object",
+             "properties": {
+diff --git a/tools/server/tests/unit/test_mcp_servers.py b/tools/server/tests/unit/test_mcp_servers.py
+--- a/tools/server/tests/unit/test_mcp_servers.py
++++ b/tools/server/tests/unit/test_mcp_servers.py
+@@ -9,6 +9,7 @@
+ 4. Misconfigured MCP servers do not crash the server
+ 5. Multiple MCP servers can be configured simultaneously
+ 6. Warmup populates the tool list at startup
++7. Unannotated MCP tools fail closed as write-capable
+ """
+ import json
+ import os
+@@ -77,5 +78,12 @@
+         # Verify tool structure
+         echo_tool = next(t for t in mcp_tools if get_tool_name(t) == "echo_echo")
+         assert "description" in echo_tool or "definition" in echo_tool
++        assert echo_tool["permissions"]["write"] is False
++
++        # MCP annotations are optional and controlled by the server. The
++        # absence of readOnlyHint must therefore fail closed and require the
++        # client approval path.
++        add_tool = next(t for t in mcp_tools if get_tool_name(t) == "echo_add")
++        assert add_tool["permissions"]["write"] is True
+     finally:
+         server.stop()

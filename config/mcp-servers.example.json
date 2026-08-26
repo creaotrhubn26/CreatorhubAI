@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@4.0.3"],
+      "timeout_ms": 30000
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@0.0.79", "--headless", "--isolated"],
+      "timeout_ms": 60000
+    },
+    "github": {
+      "command": "bash",
+      "args": ["-lc", "exec \"$HOME/AI/muse-glimmer/run-github-mcp.sh\""],
+      "timeout_ms": 60000
+    }
+  }
+}
