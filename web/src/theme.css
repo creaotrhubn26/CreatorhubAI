@@ -363,11 +363,20 @@ details > * + * {
 .cli-integration[data-state="ready"] {
   border-left-color: var(--green);
 }
+.cli-integration[data-state="active"] {
+  border-left-color: var(--green);
+}
 .cli-integration[data-state="authentication_required"] {
   border-left-color: var(--amber);
 }
 .cli-integration[data-state="missing"] {
   border-left-color: var(--red);
+}
+.cli-integration[data-state="missing_requirement"] {
+  border-left-color: var(--red);
+}
+.cli-integration[data-state="configured_restart_required"] {
+  border-left-color: var(--amber);
 }
 .cli-integration > * + * {
   margin-top: var(--space-2);

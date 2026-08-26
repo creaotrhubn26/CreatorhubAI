@@ -1280,6 +1280,55 @@ export interface CliIntegrationsStatus {
   };
 }
 
+export type McpIntegrationId = "context7" | "playwright" | "github";
+
+export type McpIntegrationState =
+  | "active"
+  | "configured_restart_required"
+  | "available"
+  | "missing_requirement"
+  | "authentication_required";
+
+export interface McpIntegration {
+  id: McpIntegrationId;
+  name: string;
+  description: string;
+  version: string;
+  adoption: "very_high" | "high";
+  recommended: boolean;
+  configured: boolean;
+  active: boolean;
+  state: McpIntegrationState;
+  agentAccess: "read_only" | "approval_required";
+  detail: string;
+  requirement?: string;
+  toolCount: number;
+}
+
+export interface McpIntegrationsStatus {
+  checkedAt: string;
+  configPath: string;
+  configExists: boolean;
+  configError?: string;
+  restartRequired: boolean;
+  customServerCount: number;
+  runtime: {
+    reachable: boolean;
+    totalToolCount: number;
+    mcpToolCount: number;
+  };
+  integrations: McpIntegration[];
+  policy: {
+    arbitraryServerCommandsFromUi: false;
+    credentialsReturnedByApi: false;
+    unclassifiedToolsRequireApproval: true;
+  };
+}
+
+export interface McpConfigUpdate {
+  enabled: McpIntegrationId[];
+}
+
 export type ModelRole = "engineer" | "architect" | "consult" | "vision";
 
 export interface ModelRegistryEntry {

@@ -1,6 +1,5 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   ModelRegistry,
@@ -45,7 +44,7 @@ function defaultStoredRegistry(): StoredRegistry {
         label: "Local Glimmer",
         baseUrl: CONFIG.modelBaseUrl.replace(/\/+$/, ""),
         modelId: "muse-glimmer",
-        apiKeyFile: path.join(os.homedir(), "AI", "muse-glimmer", "config", "api-key.txt"),
+        apiKeyFile: CONFIG.modelApiKeyFile,
       },
     ],
     roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
