@@ -14,8 +14,17 @@ MCP_CONFIG="$ROOT/config/mcp-servers.json"
 
 PORT="${GLIMMER_PORT:-8080}"
 CTX="${GLIMMER_CTX:-65536}"
+TOOLS="read_file,file_glob_search,grep_search,exec_shell_command,write_file,edit_file,get_datetime,get_info"
+GLIMMER_NODE_HEAP_MB="${GLIMMER_NODE_HEAP_MB:-12288}"
+
+if [[ "${NODE_OPTIONS:-}" != *"--max-old-space-size="* ]]; then
+    export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=${GLIMMER_NODE_HEAP_MB}"
+fi
 
 MCP_ARGS=()
+
+echo "Engineering preflight:"
+"$ROOT/verify-llama-timeout.sh"
 
 if [ -f "$MCP_CONFIG" ]; then
     echo "MCP preflight:"
@@ -35,7 +44,7 @@ fi
 echo "Starting Muse Glimmer 30B"
 echo "Context: $CTX"
 echo "Port:    $PORT"
-echo "Mode:    standard"
+echo "Mode:    control-center write"
 echo
 
 exec "$BIN" \
@@ -56,6 +65,7 @@ exec "$BIN" \
   --api-key-file "$API_KEY_FILE" \
   -a muse-glimmer \
   --reasoning-format deepseek \
+  --tools "$TOOLS" \
   ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} \
   --temp 1.0 \
   --top-p 0.95 \
