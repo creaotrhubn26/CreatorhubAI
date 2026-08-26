@@ -5,8 +5,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import crypto from "node:crypto";
 
 const EXPECTED_ORCHESTRATOR_COMMIT = "0ec371d9dc5f76ec68b6463585183f19ddb6180d";
+const EXPECTED_PYTHON_FILES = {
+  "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
+  "lib/python3.13/ssl.py": "538bb1cb334bebb9cd45b58503473ba7fd99cc9a5b769b2ff5caea81876227c3",
+  "lib/python3.13/json/__init__.py":
+    "43e38afede6d52ae0d602a42209b9959fc66d6020a25bcf15921446f5d1c262f",
+  "lib/python3.13/sqlite3/__init__.py":
+    "6e956d2166e24ccf36fef21ad63d06a5dd8f7b674aca6c81ea91eacca6b85b01",
+};
+const EXPECTED_ORCHESTRATOR_FILES = {
+  "glimmer-v2.py": "3a09e47002b129063b56da89ca4602e56c5b07ee443e44a22c64a897d13b7c65",
+  "glimmer-engineer.py": "f337bae58b458252e30e0cc330575aafeb3d87959b142950bc107e49bdf1bd34",
+  "glimmer_events.py": "0e2e6978de1de562d5580e331bab1e93acfadab130de85a57bd5201d4ccad1d5",
+  "glimmer_models.py": "bf84fe821df6ce7e21babdeecc3dab3f053519ecf1edc467b4df83434b9ff6ee",
+  "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
+  "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
+};
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
 
 function preparedTriple() {
@@ -31,6 +48,7 @@ const preparedPython = appPath
 const requiredFiles = [
   preparedPython,
   path.join(pythonHome, "lib", "python3.13", "os.py"),
+  path.join(pythonHome, "ORIGIN.json"),
   path.join(orchestratorRoot, "glimmer-v2.py"),
   path.join(orchestratorRoot, "glimmer-engineer.py"),
   path.join(orchestratorRoot, "glimmer-visual.py"),
@@ -43,9 +61,47 @@ for (const file of requiredFiles) {
   if (!fs.statSync(file).isFile()) throw new Error(`bundled runtime file missing: ${file}`);
 }
 
+const pythonOrigin = JSON.parse(fs.readFileSync(path.join(pythonHome, "ORIGIN.json"), "utf8"));
+if (pythonOrigin.version !== "3.13.15" || !pythonOrigin.files) {
+  throw new Error("bundled Python integrity manifest is invalid");
+}
+for (const [name, expected] of Object.entries(EXPECTED_PYTHON_FILES)) {
+  if (
+    path.isAbsolute(name) ||
+    name.split(/[\\/]/).includes("..") ||
+    !/^[a-f0-9]{64}$/.test(String(expected))
+  ) {
+    throw new Error(`invalid bundled Python integrity entry: ${name}`);
+  }
+  if (pythonOrigin.files[name] !== expected) {
+    throw new Error(`unexpected bundled Python manifest checksum: ${name}`);
+  }
+  const actual = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(path.join(pythonHome, name)))
+    .digest("hex");
+  if (actual !== expected) throw new Error(`bundled Python checksum mismatch: ${name}`);
+}
+
 const origin = JSON.parse(fs.readFileSync(path.join(orchestratorRoot, "ORIGIN.json"), "utf8"));
 if (origin.commit !== EXPECTED_ORCHESTRATOR_COMMIT) {
   throw new Error(`unexpected bundled orchestrator commit: ${origin.commit}`);
+}
+if (!origin.files || typeof origin.files !== "object") {
+  throw new Error("bundled orchestrator integrity manifest has no file checksums");
+}
+for (const [name, expected] of Object.entries(EXPECTED_ORCHESTRATOR_FILES)) {
+  if (path.basename(name) !== name || !/^[a-f0-9]{64}$/.test(String(expected))) {
+    throw new Error(`invalid bundled orchestrator integrity entry: ${name}`);
+  }
+  if (origin.files[name] !== expected) {
+    throw new Error(`unexpected bundled orchestrator manifest checksum: ${name}`);
+  }
+  const actual = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(path.join(orchestratorRoot, name)))
+    .digest("hex");
+  if (actual !== expected) throw new Error(`bundled orchestrator checksum mismatch: ${name}`);
 }
 
 const temporaryBin = appPath

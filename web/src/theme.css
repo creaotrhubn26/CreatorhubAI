@@ -503,6 +503,115 @@ details > * + * {
   white-space: pre-wrap;
 }
 
+/* ---- runtime diagnostics and recovery ---- */
+.diagnostics {
+  margin-top: var(--space-6);
+}
+.diagnostics__title-row,
+.diagnostics__summary,
+.diagnostics__component > div,
+.diagnostics__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.diagnostics__title-row,
+.diagnostics__component > div {
+  justify-content: space-between;
+}
+.diagnostics__title-row h2 {
+  color: var(--text-primary);
+  font-size: var(--fs-h1);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-transform: none;
+}
+.diagnostics__summary {
+  background: var(--surface-1);
+  border-left: 3px solid var(--green);
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border);
+  flex-wrap: wrap;
+  padding: var(--space-3);
+}
+.diagnostics__summary[data-state="degraded"] {
+  border-left-color: var(--amber);
+}
+.diagnostics__summary[data-state="unavailable"] {
+  border-left-color: var(--red);
+}
+.diagnostics__summary span {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+.diagnostics__grid {
+  display: grid;
+  gap: var(--space-3);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr));
+}
+.diagnostics__component {
+  background: var(--surface-2);
+  border-left: 3px solid var(--green);
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border);
+  padding: var(--space-3);
+}
+.diagnostics__component[data-state="degraded"] {
+  border-left-color: var(--amber);
+}
+.diagnostics__component[data-state="unavailable"] {
+  border-left-color: var(--red);
+}
+.diagnostics__component h3,
+.diagnostics__component p {
+  margin: 0;
+}
+.diagnostics__component > div span,
+.diagnostics__component small {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.diagnostics__component p {
+  margin-top: var(--space-2);
+}
+.diagnostics__component small {
+  display: block;
+  margin-top: var(--space-2);
+}
+.diagnostics__result {
+  background: var(--surface-1);
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border);
+  padding: var(--space-3);
+}
+.diagnostics__result ul {
+  margin-bottom: 0;
+}
+
+.runtime-banners {
+  flex-shrink: 0;
+}
+.runtime-banner {
+  align-items: center;
+  background: var(--surface-2);
+  border-left: 3px solid var(--amber);
+  box-shadow: inset 0 -1px 0 var(--border);
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+}
+.runtime-banner[data-state="success"] {
+  border-left-color: var(--green);
+}
+.runtime-banner[data-state="error"] {
+  border-left-color: var(--red);
+}
+.runtime-banner span {
+  color: var(--text-secondary);
+  flex: 1;
+}
+
 /* details/summary as a subtle disclosure, not the default triangle box */
 details {
   background: var(--surface-1);

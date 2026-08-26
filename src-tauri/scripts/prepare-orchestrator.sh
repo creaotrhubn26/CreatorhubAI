@@ -57,8 +57,16 @@ cp "$STAGING"/* "$OUT/"
 chmod +x "$OUT/glimmer-v2.py" "$OUT/glimmer-engineer.py" \
   "$OUT/glimmer-visual.py" "$OUT/run-github-mcp.sh"
 
-printf '{\n  "repository": "creaotrhubn26/CreatorhubAI",\n  "commit": "%s"\n}\n' \
-  "$ORCHESTRATOR_REF" > "$OUT/ORIGIN.json"
+{
+  printf '{\n  "repository": "creaotrhubn26/CreatorhubAI",\n  "commit": "%s",\n  "files": {\n' \
+    "$ORCHESTRATOR_REF"
+  for index in "${!FILES[@]}"; do
+    comma=","
+    [[ "$index" -eq $((${#FILES[@]} - 1)) ]] && comma=""
+    printf '    "%s": "%s"%s\n' "${FILES[$index]}" "${SHAS[$index]}" "$comma"
+  done
+  printf '  }\n}\n'
+} > "$OUT/ORIGIN.json"
 
 printf 'orchestrator ready: src-tauri/%s (%s) at %s (checksums verified)\n' \
   "$OUT" "$(du -sh "$OUT" | cut -f1)" "$ORCHESTRATOR_REF"

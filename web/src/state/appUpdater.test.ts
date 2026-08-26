@@ -31,6 +31,15 @@ describe("appUpdater", () => {
   });
 
   it("maps signed updater metadata and download progress", async () => {
+    const storage = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+      },
+    });
     const update = {
       currentVersion: "0.2.0",
       version: "0.2.1",
@@ -44,7 +53,8 @@ describe("appUpdater", () => {
       }),
     };
     mocks.check.mockResolvedValue(update);
-    const { checkForAppUpdate, downloadAndInstallAppUpdate } = await import("./appUpdater");
+    const { checkForAppUpdate, downloadAndInstallAppUpdate, readPendingUpdateSmoke } =
+      await import("./appUpdater");
     const progress = vi.fn();
 
     await expect(checkForAppUpdate()).resolves.toEqual({
@@ -63,6 +73,10 @@ describe("appUpdater", () => {
       downloadedBytes: 12,
       totalBytes: 30,
       finished: true,
+    });
+    expect(readPendingUpdateSmoke()).toMatchObject({
+      fromVersion: "0.2.0",
+      toVersion: "0.2.1",
     });
   });
 

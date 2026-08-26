@@ -1380,6 +1380,55 @@ export interface McpConfigUpdate {
   enabled: McpIntegrationId[];
 }
 
+export type RuntimeComponentId = "gateway" | "python" | "orchestrator" | "model";
+export type RuntimeComponentState = "ready" | "degraded" | "unavailable";
+
+export interface RuntimeComponentCheck {
+  id: RuntimeComponentId;
+  label: string;
+  state: RuntimeComponentState;
+  required: boolean;
+  detail: string;
+  version?: string;
+  source?: "bundled" | "configured" | "local";
+}
+
+/** Cheap liveness contract used by the native gateway supervisor. */
+export interface GatewayHealth {
+  service: "glimmer-gateway";
+  status: "ok";
+  version: string;
+  timestamp: string;
+  uptimeSeconds: number;
+}
+
+/** Deep runtime readiness. An offline optional model degrades but does not block coreReady. */
+export interface GatewayReadiness {
+  status: RuntimeComponentState;
+  coreReady: boolean;
+  checkedAt: string;
+  components: RuntimeComponentCheck[];
+}
+
+export interface DiagnosticsStatus {
+  health: GatewayHealth;
+  readiness: GatewayReadiness;
+  cli: CliIntegrationsStatus;
+  mcp: McpIntegrationsStatus;
+}
+
+export interface RepairCheck extends RuntimeComponentCheck {
+  repaired: boolean;
+}
+
+export interface RepairResult {
+  checkedAt: string;
+  repaired: boolean;
+  reinstallRequired: boolean;
+  checks: RepairCheck[];
+  actions: string[];
+}
+
 export type ModelRole = "engineer" | "architect" | "consult" | "vision";
 
 export interface ModelRegistryEntry {

@@ -68,6 +68,29 @@ mv "$DEST.tmp" "$DEST"
 PYTHONHOME="$PWD/$PYTHON_HOME" "$PWD/$DEST" -c \
   'import json, ssl, subprocess, urllib.request; print("bundled Python runtime ready")'
 
+# Runtime repair/diagnostics cannot safely modify a signed app bundle, but it
+# can prove whether its critical interpreter files still match this prepared
+# snapshot. Keep the manifest inside PYTHONHOME so the gateway can find it via
+# the PYTHONHOME environment it already inherits from the Tauri shell.
+node -e '
+  const crypto = require("node:crypto");
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const [home, version, archive, archiveSha256] = process.argv.slice(1);
+  const names = [
+    "lib/python3.13/os.py",
+    "lib/python3.13/ssl.py",
+    "lib/python3.13/json/__init__.py",
+    "lib/python3.13/sqlite3/__init__.py",
+  ];
+  const hash = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  const files = Object.fromEntries(names.map((name) => [name, hash(path.join(home, name))]));
+  fs.writeFileSync(
+    path.join(home, "ORIGIN.json"),
+    JSON.stringify({ version, archive, archiveSha256, files }, null, 2) + "\n",
+  );
+' "$PYTHON_HOME" "$PYTHON_VERSION" "$TARBALL" "$SHA256"
+
 printf 'python runtime ready: src-tauri/%s (%s) + %s (%s), CPython %s (checksum verified)\n' \
   "$DEST" "$(du -h "$DEST" | cut -f1)" \
   "$PYTHON_HOME" "$(du -sh "$PYTHON_HOME" | cut -f1)" \

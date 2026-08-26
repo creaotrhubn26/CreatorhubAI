@@ -4,6 +4,25 @@ import { glimmerApi, API_BASE } from "./client";
 afterEach(() => vi.restoreAllMocks());
 
 describe("glimmerApi", () => {
+  it("reads health, readiness and diagnostics contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/api/health"))
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      if (url.endsWith("/api/ready"))
+        return new Response(JSON.stringify({ coreReady: true }), { status: 200 });
+      return new Response(JSON.stringify({ health: {}, readiness: {} }), { status: 200 });
+    });
+    await expect(glimmerApi.getHealth()).resolves.toMatchObject({ status: "ok" });
+    await expect(glimmerApi.getReadiness()).resolves.toMatchObject({ coreReady: true });
+    await expect(glimmerApi.getDiagnostics()).resolves.toHaveProperty("health");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      `${API_BASE}/api/health`,
+      `${API_BASE}/api/ready`,
+      `${API_BASE}/api/diagnostics`,
+    ]);
+  });
+
   it("getStatus calls GET /api/status and returns parsed JSON", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")

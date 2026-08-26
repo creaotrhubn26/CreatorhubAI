@@ -7,6 +7,7 @@ import { modelRouter } from "./routes/model.js";
 import { repositoryRouter } from "./routes/repository.js";
 import { taskIntelligenceRouter } from "./routes/taskIntelligence.js";
 import { integrationsRouter } from "./routes/integrations.js";
+import { diagnosticsRouter } from "./routes/diagnostics.js";
 
 // The only origins allowed to reach this API: the local web dev server
 // (web/vite.config.ts port 5183, either loopback spelling) and the packaged
@@ -73,7 +74,15 @@ export function createApp(): Express {
   app.use(localOnlyGuard);
   // CORS still matters for the read path (it decides what the webview is
   // allowed to *read*); the guard above decides what may *execute*.
-  app.use(cors({ origin: [...ALLOWED_ORIGINS] }));
+  app.use(
+    cors({
+      origin: [...ALLOWED_ORIGINS],
+      // Support export reads this one response header to preserve the
+      // gateway-generated, date-stamped filename. No credential or runtime
+      // metadata header is exposed to the webview.
+      exposedHeaders: ["Content-Disposition"],
+    }),
+  );
   app.use(express.json());
   app.use("/api", statusRouter);
   app.use("/api", sessionsRouter);
@@ -82,6 +91,7 @@ export function createApp(): Express {
   app.use("/api", repositoryRouter);
   app.use("/api", taskIntelligenceRouter);
   app.use("/api", integrationsRouter);
+  app.use("/api", diagnosticsRouter);
   // Terminal error handler: Express 4 does not catch async handler rejections,
   // and an unhandled rejection kills the gateway (orphaning running agents).
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

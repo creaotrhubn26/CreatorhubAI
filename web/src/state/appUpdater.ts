@@ -21,6 +21,53 @@ export interface AppUpdateProgress {
 type PendingUpdate = Awaited<ReturnType<(typeof import("@tauri-apps/plugin-updater"))["check"]>>;
 
 let pendingUpdate: PendingUpdate = null;
+const PENDING_UPDATE_KEY = "glimmer.pendingUpdateSmoke";
+
+export interface PendingUpdateSmoke {
+  fromVersion: string;
+  toVersion: string;
+  installedAt: string;
+}
+
+export function readPendingUpdateSmoke(): PendingUpdateSmoke | null {
+  try {
+    const parsed = JSON.parse(window.localStorage?.getItem(PENDING_UPDATE_KEY) ?? "null");
+    if (
+      !parsed ||
+      typeof parsed.fromVersion !== "string" ||
+      typeof parsed.toVersion !== "string" ||
+      typeof parsed.installedAt !== "string"
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingUpdateSmoke(): void {
+  try {
+    window.localStorage?.removeItem(PENDING_UPDATE_KEY);
+  } catch {
+    // A restricted webview can still update; it simply cannot persist smoke-test state.
+  }
+}
+
+function recordPendingUpdateSmoke(update: { currentVersion: string; version: string }): void {
+  try {
+    window.localStorage?.setItem(
+      PENDING_UPDATE_KEY,
+      JSON.stringify({
+        fromVersion: update.currentVersion,
+        toVersion: update.version,
+        installedAt: new Date().toISOString(),
+      } satisfies PendingUpdateSmoke),
+    );
+  } catch {
+    // See clearPendingUpdateSmoke: update installation must not depend on storage availability.
+  }
+}
 
 export function appUpdaterSupported(): boolean {
   return tauriGlobal() !== null;
@@ -78,6 +125,7 @@ export async function downloadAndInstallAppUpdate(
       finished: event.event === "Finished",
     });
   });
+  recordPendingUpdateSmoke(update);
   pendingUpdate = null;
 }
 

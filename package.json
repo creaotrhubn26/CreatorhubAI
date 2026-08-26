@@ -27,7 +27,9 @@
     "tauri": "tauri",
     "tauri:dev": "npx @tauri-apps/cli dev",
     "tauri:build": "src-tauri/scripts/prepare-sidecar.sh && src-tauri/scripts/prepare-gateway.sh && npm run runtime:prepare && npx @tauri-apps/cli build",
-    "dogfood:e2e": "node scripts/dogfood-session.mjs"
+    "dogfood:e2e": "node scripts/dogfood-session.mjs",
+    "packaged:e2e": "node scripts/packaged-app-e2e.mjs",
+    "packaged:ui-e2e": "node scripts/packaged-ui-e2e.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",

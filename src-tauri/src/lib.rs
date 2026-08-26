@@ -27,12 +27,14 @@
 //! `resolve_user_path`), which is what glimmer-v2.py and every verification
 //! command it runs will inherit.
 
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tauri::{Manager, RunEvent, WindowEvent};
 
 const GATEWAY_PORT: u16 = 4317;
@@ -45,10 +47,42 @@ const SHELL_PATH_TIMEOUT: Duration = Duration::from_secs(5);
 /// when the login shell can't be asked (see `resolve_user_path`).
 const FALLBACK_PATH_DIRS: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
 
-/// Holds the spawned gateway child process, if this app instance started one.
-/// `None` means either the gateway wasn't spawned (port already in use) or it
-/// has already been reaped.
-struct GatewayChild(Mutex<Option<Child>>);
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewaySupervisorStatus {
+    state: String,
+    detail: String,
+    pid: Option<u32>,
+    restart_count: u32,
+    last_error: Option<String>,
+}
+
+struct GatewaySupervisorInner {
+    child: Option<Child>,
+    shutdown: bool,
+    status: GatewaySupervisorStatus,
+}
+
+/// Owns only children started by this app. A healthy Glimmer gateway already
+/// on 4317 is adopted without taking process ownership; an unknown listener is
+/// reported and re-probed, never killed.
+struct GatewaySupervisor(Mutex<GatewaySupervisorInner>);
+
+impl GatewaySupervisor {
+    fn new() -> Self {
+        Self(Mutex::new(GatewaySupervisorInner {
+            child: None,
+            shutdown: false,
+            status: GatewaySupervisorStatus {
+                state: "starting".into(),
+                detail: "Checking the local gateway port.".into(),
+                pid: None,
+                restart_count: 0,
+                last_error: None,
+            },
+        }))
+    }
+}
 
 struct BundledRuntime {
     python: PathBuf,
@@ -120,8 +154,11 @@ fn prepend_absolute_executable_parent(path: &str, executable: &std::path::Path) 
 
 #[cfg(test)]
 mod runtime_path_tests {
-    use super::prepend_absolute_executable_parent;
+    use super::{
+        GatewayProbe, classify_health_response, prepend_absolute_executable_parent, restart_backoff,
+    };
     use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn prepends_the_parent_of_an_absolute_bundled_executable() {
@@ -137,6 +174,27 @@ mod runtime_path_tests {
             prepend_absolute_executable_parent("/usr/bin", Path::new("python3")),
             "/usr/bin"
         );
+    }
+
+    #[test]
+    fn identifies_only_the_glimmer_health_contract_as_healthy() {
+        assert_eq!(
+            classify_health_response(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"service\":\"glimmer-gateway\",\"status\":\"ok\"}"
+            ),
+            GatewayProbe::Healthy
+        );
+        assert_eq!(
+            classify_health_response("HTTP/1.1 200 OK\r\n\r\nhello"),
+            GatewayProbe::Occupied
+        );
+    }
+
+    #[test]
+    fn restart_backoff_is_bounded() {
+        assert_eq!(restart_backoff(1), Duration::from_millis(250));
+        assert_eq!(restart_backoff(3), Duration::from_secs(1));
+        assert_eq!(restart_backoff(99), Duration::from_secs(4));
     }
 }
 
@@ -166,6 +224,7 @@ fn bundled_runtime(app: &tauri::AppHandle) -> Option<BundledRuntime> {
 
     let required = [
         python_home.join("lib/python3.13/os.py"),
+        python_home.join("ORIGIN.json"),
         orchestrator_root.join("glimmer-v2.py"),
         orchestrator_root.join("glimmer-engineer.py"),
     ];
@@ -286,32 +345,78 @@ fn resolve_user_path() -> String {
     fallback
 }
 
-fn port_in_use(port: u16) -> bool {
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    TcpStream::connect_timeout(&addr, GATEWAY_PROBE_TIMEOUT).is_ok()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayProbe {
+    Healthy,
+    Occupied,
+    Unavailable,
 }
 
-/// Spawns `node dist/index.js` in the gateway dir, unless something is
-/// already listening on the gateway port (typical in `tauri dev`, where
-/// `npm --prefix server run dev` is usually already running). Never panics —
-/// a missing checkout or missing `node` is logged, not fatal, since the web
-/// UI already degrades honestly ("Unavailable") when the API is unreachable.
-fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
-    if port_in_use(GATEWAY_PORT) {
-        println!(
-            "[glimmer] port {GATEWAY_PORT} already in use — assuming the gateway is already running, not spawning another."
-        );
-        return None;
+fn classify_health_response(response: &str) -> GatewayProbe {
+    let status_ok = response
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "));
+    if status_ok && response.contains("\"service\":\"glimmer-gateway\"") {
+        GatewayProbe::Healthy
+    } else {
+        GatewayProbe::Occupied
     }
+}
 
+fn probe_gateway(port: u16) -> GatewayProbe {
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, GATEWAY_PROBE_TIMEOUT) else {
+        return GatewayProbe::Unavailable;
+    };
+    let _ = stream.set_read_timeout(Some(GATEWAY_PROBE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(GATEWAY_PROBE_TIMEOUT));
+    if stream
+        .write_all(
+            format!(
+                "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .is_err()
+    {
+        return GatewayProbe::Occupied;
+    }
+    let mut response = Vec::with_capacity(4096);
+    let mut buffer = [0_u8; 1024];
+    while response.len() < 8192 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response
+                    .windows(b"\"service\":\"glimmer-gateway\"".len())
+                    .any(|window| window == b"\"service\":\"glimmer-gateway\"")
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if response.is_empty() {
+        GatewayProbe::Occupied
+    } else {
+        classify_health_response(&String::from_utf8_lossy(&response))
+    }
+}
+
+/// Spawns `node dist/index.js`. Port ownership is decided by the supervisor
+/// before this function is called, so this function never guesses that an
+/// arbitrary listener is Glimmer.
+fn spawn_gateway(app: &tauri::AppHandle) -> Result<Child, String> {
     let dir = gateway_dir(app);
     let entry = dir.join("dist/index.js");
     if !entry.exists() {
-        eprintln!(
-            "[glimmer] gateway entrypoint not found at {}. Build it with `npm --prefix server run build`, or point GLIMMER_GATEWAY_DIR at a built server. The UI will show 'Unavailable' until the gateway is reachable.",
+        return Err(format!(
+            "Gateway entrypoint not found at {}. Build the server or reinstall Glimmer.",
             entry.display()
-        );
-        return None;
+        ));
     }
 
     // Resolved before the spawn and passed explicitly: the child's env is the
@@ -372,6 +477,10 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
     }
 
     command.env("PATH", &path);
+    command.env(
+        "GLIMMER_APP_VERSION",
+        app.package_info().version.to_string(),
+    );
     match command.spawn() {
         Ok(child) => {
             println!(
@@ -380,15 +489,12 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
                 dir.display(),
                 node.display()
             );
-            Some(child)
+            Ok(child)
         }
-        Err(err) => {
-            eprintln!(
-                "[glimmer] failed to spawn gateway via {}: {err}. Is node on PATH?",
-                node.display()
-            );
-            None
-        }
+        Err(err) => Err(format!(
+            "Failed to spawn the gateway via {}: {err}",
+            node.display()
+        )),
     }
 }
 
@@ -420,6 +526,195 @@ fn node_binary(path: &str) -> PathBuf {
     find_in_path(path, "node").unwrap_or_else(|| PathBuf::from("node"))
 }
 
+fn restart_backoff(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4);
+    Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent)).min(Duration::from_secs(4))
+}
+
+fn update_supervisor_status(
+    state: &GatewaySupervisor,
+    status: &str,
+    detail: impl Into<String>,
+    pid: Option<u32>,
+    last_error: Option<String>,
+) {
+    if let Ok(mut guard) = state.0.lock() {
+        guard.status.state = status.into();
+        guard.status.detail = detail.into();
+        guard.status.pid = pid;
+        guard.status.last_error = last_error;
+    }
+}
+
+fn supervisor_should_stop(state: &GatewaySupervisor) -> bool {
+    state.0.lock().map(|guard| guard.shutdown).unwrap_or(true)
+}
+
+fn gateway_supervisor_loop(app: tauri::AppHandle) {
+    let mut next_spawn = Instant::now();
+    let mut unhealthy_ticks = 0_u8;
+
+    loop {
+        let state = app.state::<GatewaySupervisor>();
+        if supervisor_should_stop(&state) {
+            return;
+        }
+
+        let mut child_exit: Option<String> = None;
+        let mut child_pid = None;
+        if let Ok(mut guard) = state.0.lock() {
+            if let Some(child) = guard.child.as_mut() {
+                child_pid = Some(child.id());
+                match child.try_wait() {
+                    Ok(Some(exit)) => child_exit = Some(format!("Gateway exited with {exit}.")),
+                    Ok(None) => {}
+                    Err(error) => {
+                        child_exit = Some(format!("Could not inspect gateway process: {error}"))
+                    }
+                }
+            }
+            if child_exit.is_some() {
+                guard.child.take();
+                guard.status.restart_count = guard.status.restart_count.saturating_add(1);
+            }
+        }
+
+        if let Some(error) = child_exit {
+            let attempt = state
+                .0
+                .lock()
+                .map(|guard| guard.status.restart_count)
+                .unwrap_or(1);
+            let delay = restart_backoff(attempt);
+            next_spawn = Instant::now() + delay;
+            update_supervisor_status(
+                &state,
+                "restarting",
+                format!("{error} Restarting in {:.2}s.", delay.as_secs_f32()),
+                None,
+                Some(error),
+            );
+            unhealthy_ticks = 0;
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        if let Some(pid) = child_pid {
+            match probe_gateway(GATEWAY_PORT) {
+                GatewayProbe::Healthy => {
+                    unhealthy_ticks = 0;
+                    update_supervisor_status(
+                        &state,
+                        "running",
+                        "The app-owned gateway is healthy.",
+                        Some(pid),
+                        None,
+                    );
+                }
+                GatewayProbe::Occupied | GatewayProbe::Unavailable => {
+                    unhealthy_ticks = unhealthy_ticks.saturating_add(1);
+                    update_supervisor_status(
+                        &state,
+                        "starting",
+                        "The gateway process is running but has not become healthy yet.",
+                        Some(pid),
+                        None,
+                    );
+                    // A process that stays alive but never serves its health
+                    // contract is owned by us and safe to recycle. Unknown
+                    // processes on the same port are never touched.
+                    if unhealthy_ticks >= 20 {
+                        let child = state.0.lock().ok().and_then(|mut guard| {
+                            guard.status.restart_count =
+                                guard.status.restart_count.saturating_add(1);
+                            guard.child.take()
+                        });
+                        if let Some(mut child) = child {
+                            let error = "The gateway did not become healthy within 10 seconds.";
+                            eprintln!("[glimmer] {error} Recycling pid {}.", child.id());
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            next_spawn = Instant::now() + Duration::from_millis(250);
+                            update_supervisor_status(
+                                &state,
+                                "restarting",
+                                error,
+                                None,
+                                Some(error.into()),
+                            );
+                        }
+                        unhealthy_ticks = 0;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        match probe_gateway(GATEWAY_PORT) {
+            GatewayProbe::Healthy => {
+                update_supervisor_status(
+                    &state,
+                    "external_gateway",
+                    "A healthy Glimmer gateway already owns port 4317; this app is using it without taking process ownership.",
+                    None,
+                    None,
+                );
+                next_spawn = Instant::now();
+            }
+            GatewayProbe::Occupied => {
+                update_supervisor_status(
+                    &state,
+                    "port_conflict",
+                    "Port 4317 is occupied by a service that is not a Glimmer gateway. Close that service or change its port; Glimmer will retry automatically.",
+                    None,
+                    Some("Unknown service occupies port 4317.".into()),
+                );
+                next_spawn = Instant::now();
+            }
+            GatewayProbe::Unavailable if Instant::now() >= next_spawn => {
+                update_supervisor_status(
+                    &state,
+                    "starting",
+                    "Starting the local gateway.",
+                    None,
+                    None,
+                );
+                match spawn_gateway(&app) {
+                    Ok(child) => {
+                        let pid = child.id();
+                        if let Ok(mut guard) = state.0.lock() {
+                            guard.child = Some(child);
+                            guard.status.pid = Some(pid);
+                        }
+                        unhealthy_ticks = 0;
+                    }
+                    Err(error) => {
+                        let attempt = if let Ok(mut guard) = state.0.lock() {
+                            guard.status.restart_count =
+                                guard.status.restart_count.saturating_add(1);
+                            guard.status.restart_count
+                        } else {
+                            1
+                        };
+                        next_spawn = Instant::now() + restart_backoff(attempt);
+                        eprintln!("[glimmer] {error}");
+                        update_supervisor_status(
+                            &state,
+                            "error",
+                            "The gateway could not be started; Glimmer will retry automatically.",
+                            None,
+                            Some(error),
+                        );
+                    }
+                }
+            }
+            GatewayProbe::Unavailable => {}
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Desktop notification bridge: WKWebView has no `window.Notification`, so
 /// the web UI invokes this command (via `window.__TAURI__.core.invoke`)
 /// instead when running inside Tauri. Body text is the same deterministic
@@ -432,8 +727,31 @@ fn notify(app: tauri::AppHandle, title: String, body: String) {
     }
 }
 
-fn kill_gateway(state: &GatewayChild) {
-    let child = state.0.lock().ok().and_then(|mut guard| guard.take());
+#[tauri::command]
+fn gateway_supervisor_status(
+    state: tauri::State<'_, GatewaySupervisor>,
+) -> GatewaySupervisorStatus {
+    state
+        .0
+        .lock()
+        .map(|guard| guard.status.clone())
+        .unwrap_or(GatewaySupervisorStatus {
+            state: "error".into(),
+            detail: "Gateway supervisor state is unavailable.".into(),
+            pid: None,
+            restart_count: 0,
+            last_error: Some("Supervisor state lock failed.".into()),
+        })
+}
+
+fn kill_gateway(state: &GatewaySupervisor) {
+    let child = state.0.lock().ok().and_then(|mut guard| {
+        guard.shutdown = true;
+        guard.status.state = "stopped".into();
+        guard.status.detail = "The application is shutting down.".into();
+        guard.status.pid = None;
+        guard.child.take()
+    });
     if let Some(mut child) = child {
         println!("[glimmer] stopping gateway (pid {})", child.id());
         let _ = child.kill();
@@ -451,15 +769,18 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         // Task 4c(2/3): native directory/file chooser for the task composer.
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![notify])
+        .invoke_handler(tauri::generate_handler![notify, gateway_supervisor_status])
         .setup(|app| {
             let handle = app.handle().clone();
-            app.manage(GatewayChild(Mutex::new(spawn_gateway(&handle))));
+            app.manage(GatewaySupervisor::new());
+            std::thread::Builder::new()
+                .name("glimmer-gateway-supervisor".into())
+                .spawn(move || gateway_supervisor_loop(handle))?;
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::Destroyed = event {
-                let state = window.state::<GatewayChild>();
+                let state = window.state::<GatewaySupervisor>();
                 kill_gateway(&state);
             }
         });
@@ -475,7 +796,7 @@ pub fn run() {
         // so the gateway never survives the app.
         match event {
             RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-                let state = app_handle.state::<GatewayChild>();
+                let state = app_handle.state::<GatewaySupervisor>();
                 kill_gateway(&state);
             }
             _ => {}

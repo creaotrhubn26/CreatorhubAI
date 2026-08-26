@@ -24,6 +24,7 @@ export const CONFIG = {
   orchestratorBundled: process.env.GLIMMER_ORCHESTRATOR_BUNDLED === "1",
   pythonPath: process.env.GLIMMER_PYTHON_PATH ?? "python3",
   pythonBundled: process.env.GLIMMER_PYTHON_BUNDLED === "1",
+  appVersion: process.env.GLIMMER_APP_VERSION ?? "development",
   modelConfigPath: process.env.GLIMMER_MODEL_CONFIG ?? path.join(stateRoot, "models.json"),
   modelKeysDir: path.join(stateRoot, "model-keys"),
   glimmerV2Path,

@@ -36,6 +36,10 @@ import type {
   WorkspaceHandoffResult,
   McpConfigUpdate,
   McpIntegrationsStatus,
+  DiagnosticsStatus,
+  GatewayHealth,
+  GatewayReadiness,
+  RepairResult,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -144,6 +148,30 @@ async function streamAssistant(
 }
 
 export const glimmerApi = {
+  getHealth: () => request<GatewayHealth>("/api/health"),
+  getReadiness: () => request<GatewayReadiness>("/api/ready"),
+  getDiagnostics: () => request<DiagnosticsStatus>("/api/diagnostics"),
+  repairInstallation: () => request<RepairResult>("/api/diagnostics/repair", { method: "POST" }),
+  downloadSupportBundle: async () => {
+    const response = await fetch(`${API_BASE}/api/diagnostics/support-bundle`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!response.ok) throw new Error(`Support export failed: ${response.status}`);
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? "glimmer-support.json";
+    const url = URL.createObjectURL(blob);
+    try {
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    return filename;
+  },
   getStatus: () => request<DashboardStatus>("/api/status"),
   getCliIntegrations: () => request<CliIntegrationsStatus>("/api/integrations/cli"),
   getDeveloperClients: () => request<DeveloperClientsStatus>("/api/integrations/developer-clients"),

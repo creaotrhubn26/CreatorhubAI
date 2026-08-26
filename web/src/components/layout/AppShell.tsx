@@ -19,6 +19,7 @@ import {
 } from "../../state/sessionListMeta";
 import { buildCommands, type PaletteMode } from "../../state/paletteCommands";
 import { CommandPalette } from "../common/CommandPalette";
+import { RuntimeBanner } from "./RuntimeBanner";
 import { completionTitle, isUnseenCompletion, newlyCompleted } from "../../state/completionNotify";
 import { sendCompletionNotification } from "../../state/desktopNotify";
 import { mostSpecificContainingWorkspace } from "../../state/fileLink";
@@ -551,6 +552,8 @@ export function AppShell({
           </Link>
         </div>
       </header>
+
+      <RuntimeBanner />
 
       <div className="ide-body">
         <nav className="ide-activitybar">
