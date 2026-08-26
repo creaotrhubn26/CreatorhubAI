@@ -31,6 +31,8 @@ import type {
   HunkReviewResult,
   TaskReport,
   CliIntegrationsStatus,
+  McpConfigUpdate,
+  McpIntegrationsStatus,
 } from "@glimmer/shared";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
@@ -141,6 +143,12 @@ async function streamAssistant(
 export const glimmerApi = {
   getStatus: () => request<DashboardStatus>("/api/status"),
   getCliIntegrations: () => request<CliIntegrationsStatus>("/api/integrations/cli"),
+  getMcpIntegrations: () => request<McpIntegrationsStatus>("/api/integrations/mcp"),
+  saveMcpIntegrations: (update: McpConfigUpdate) =>
+    request<McpIntegrationsStatus>("/api/integrations/mcp", {
+      method: "PUT",
+      body: JSON.stringify(update),
+    }),
   getModelStatus: () => request<ModelStatus>("/api/model/status"),
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>

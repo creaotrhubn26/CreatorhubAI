@@ -3,6 +3,7 @@ import { getTheme, setTheme, type ThemePreference } from "../../state/themePrefe
 import { tauriGlobal } from "../../state/desktopNotify";
 import { ModelRegistrySettings } from "./ModelRegistrySettings";
 import { CliIntegrationsSettings } from "./CliIntegrationsSettings";
+import { McpIntegrationsSettings } from "./McpIntegrationsSettings";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -78,6 +79,8 @@ export function SettingsScreen() {
       <ModelRegistrySettings />
 
       <CliIntegrationsSettings />
+
+      <McpIntegrationsSettings />
 
       <h2
         style={{
