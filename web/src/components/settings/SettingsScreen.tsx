@@ -5,6 +5,7 @@ import { ModelRegistrySettings } from "./ModelRegistrySettings";
 import { CliIntegrationsSettings } from "./CliIntegrationsSettings";
 import { DeveloperClientsSettings } from "./DeveloperClientsSettings";
 import { McpIntegrationsSettings } from "./McpIntegrationsSettings";
+import { AppUpdateSettings } from "./AppUpdateSettings";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -84,6 +85,8 @@ export function SettingsScreen() {
       <DeveloperClientsSettings />
 
       <McpIntegrationsSettings />
+
+      <AppUpdateSettings />
 
       <h2
         style={{

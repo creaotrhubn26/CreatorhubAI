@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Glimmer Control Center",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "no.creatorhubn.glimmer-control-center",
   "build": {
     "beforeDevCommand": "npm --prefix web run dev",
@@ -45,5 +45,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYyOTQxRUM0QUU1NzU2NDkKUldSSlZsZXV4QjZVOGtGTHkvWjFqMTB3WG1CNXM4dituVFdBeHBMd0JxNUpDNUdLYkMwWlVuSXgK",
+      "endpoints": [
+        "https://github.com/creaotrhubn26/CreatorhubAI/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

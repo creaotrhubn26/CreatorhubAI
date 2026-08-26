@@ -427,6 +427,58 @@ details > * + * {
   flex-shrink: 0;
 }
 
+/* ---- signed desktop updates ---- */
+.app-updates {
+  margin-top: var(--space-6);
+}
+.app-updates__title-row,
+.app-updates__release,
+.app-updates__ready {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.app-updates__title-row h2,
+.app-updates__release h3,
+.app-updates__ready p {
+  margin: 0;
+}
+.app-updates__title-row h2 {
+  color: var(--text-primary);
+  font-size: var(--fs-h1);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-transform: none;
+}
+.app-updates__title-row p,
+.app-updates__release p {
+  margin: var(--space-1) 0 0;
+}
+.app-updates__trust,
+.app-updates__release,
+.app-updates__ready {
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border);
+  padding: var(--space-3);
+}
+.app-updates__trust {
+  background: var(--surface-1);
+  color: var(--text-secondary);
+}
+.app-updates__release,
+.app-updates__ready {
+  background: var(--surface-2);
+  margin-top: var(--space-3);
+}
+.app-updates__release {
+  flex-direction: column;
+}
+.app-updates__notes {
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
 /* details/summary as a subtle disclosure, not the default triangle box */
 details {
   background: var(--surface-1);

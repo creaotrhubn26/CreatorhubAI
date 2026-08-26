@@ -304,6 +304,10 @@ fn kill_gateway(state: &GatewayChild) {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Restart is exposed separately from installation so the user keeps
+        // control over when an already-downloaded update takes effect.
+        .plugin(tauri_plugin_process::init())
         // Task 4c(2/3): native directory/file chooser for the task composer.
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![notify])

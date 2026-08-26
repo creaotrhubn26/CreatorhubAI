@@ -17,13 +17,17 @@
     "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "rust:check": "npm run rust:fmt && npm run rust:clippy",
     "quality": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run rust:check",
+    "release:check": "node scripts/check-release-version.mjs",
+    "release:verify": "node scripts/verify-updater-artifact.mjs",
     "dev:server": "npm run dev -w server",
     "dev:web": "npm run dev -w web",
+    "tauri": "tauri",
     "tauri:dev": "npx @tauri-apps/cli dev",
     "tauri:build": "src-tauri/scripts/prepare-sidecar.sh && src-tauri/scripts/prepare-gateway.sh && npx @tauri-apps/cli build",
     "dogfood:e2e": "node scripts/dogfood-session.mjs"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
     "@eslint/js": "^10.0.1",
     "eslint": "^10.9.1",
     "eslint-plugin-react-hooks": "^7.1.1",

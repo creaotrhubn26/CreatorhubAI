@@ -190,20 +190,26 @@ worth knowing:
 
 ## Code signing & notarization (macOS)
 
-The bundle is Developer ID signed, hardened-runtime, notarized and stapled,
-so it opens with no Gatekeeper prompt. **No credential lives in this repo** —
-Tauri reads all of them from the environment at build time:
+Release bundles are required to be Developer ID signed, hardened-runtime,
+notarized and stapled so they open with no Gatekeeper prompt. **No credential
+lives in this repo.** The tag workflow fails before building if any required
+secret is missing; it never silently publishes an ad-hoc-signed app.
 
-| Env var                  | What                                                                                                   |
-| ------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <Org> (<TeamID>)`, as listed by `security find-identity -v -p codesigning`  |
-| `APPLE_API_KEY`          | App Store Connect API key id (must be an **Admin** key — an App Manager key cannot notarize)           |
-| `APPLE_API_ISSUER`       | API issuer UUID                                                                                        |
-| `APPLE_API_KEY_PATH`     | Path to the `AuthKey_<id>.p8` file (keep it outside the repo, e.g. `~/.appstoreconnect/private_keys/`) |
+| GitHub secret                | What                                                                                   |
+| ---------------------------- | -------------------------------------------------------------------------------------- |
+| `APPLE_CERTIFICATE`          | Base64-encoded Developer ID Application `.p12` certificate                             |
+| `APPLE_CERTIFICATE_PASSWORD` | Password used when the `.p12` was exported                                             |
+| `APPLE_SIGNING_IDENTITY`     | `Developer ID Application: Creatorhub AS (9TAUZCPK95)`                                 |
+| `APPLE_API_KEY`              | App Store Connect API key ID                                                           |
+| `APPLE_API_ISSUER`           | App Store Connect API issuer ID                                                        |
+| `APPLE_API_KEY_CONTENT`      | Contents of the matching private `.p8` key; materialized only on the temporary CI host |
 
-With those exported, plain `npm run tauri:build` signs (app + the
-`glimmer-node` sidecar, inside-out), notarizes via `notarytool submit
---wait`, and staples. Config side (committed, no secrets):
+CreatorHub's Developer ID Application identity is present in the local login
+Keychain and is valid until June 2031. The release workflow imports an exported
+copy of that identity, signs the app and sidecar inside-out, notarizes through
+CreatorHub's existing App Store Connect Admin API key, staples the ticket, and
+creates a **draft** release. It does not depend on a personal Apple ID password.
+Config side (committed, no secrets):
 `bundle.macOS.hardenedRuntime: true` and
 `bundle.macOS.entitlements: "entitlements.plist"`.
 
@@ -241,19 +247,67 @@ Light-theme users may see one dark frame before `main.tsx` runs
 by the `script-src 'self'` CSP — do NOT loosen the CSP for this; accept the
 flash or use a hashed external bootstrap script if it ever matters.
 
-## Auto-update — PARKED
+## Signed auto-update
 
-`tauri-plugin-updater` needs infrastructure that does not exist yet:
+The update path is implemented for the macOS Apple Silicon desktop app:
 
-1. A signing keypair (`tauri signer generate`) — public key goes in
-   `tauri.conf.json` `plugins.updater.pubkey`, private key stays in CI
-   secrets; every artifact must be signed at build time.
-2. A reachable update endpoint serving the update JSON (version, platform
-   URLs, signatures) — e.g. GitHub Releases (this repo is private, so
-   release assets would need token-authenticated access, which the updater
-   does not do out of the box) or a small static endpoint.
-3. A release pipeline producing signed bundles per platform.
+- `tauri-plugin-updater` verifies every downloaded artifact against the
+  public key embedded in `tauri.conf.json`. Signature verification is
+  mandatory in Tauri and is not bypassed by Glimmer.
+- The private updater key is outside the repository at
+  `~/.tauri/glimmer-control-center` (mode `0600`). Its password is in the
+  macOS Keychain under service
+  `no.creatorhubn.glimmer-control-center.updater`; both values also exist as
+  write-only GitHub secrets `TAURI_SIGNING_PRIVATE_KEY` and
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The encrypted private key is also
+  backed up in Keychain service
+  `no.creatorhubn.glimmer-control-center.updater.private-key`. Treat it as a
+  release-critical recovery asset and include the login Keychain in the
+  machine's encrypted backup.
+- This repository is public. Published release assets are therefore reachable
+  at the static endpoint embedded in the app:
+  `https://github.com/creaotrhubn26/CreatorhubAI/releases/latest/download/latest.json`.
+- Normal local builds do not create updater artifacts and need no updater
+  private key. `tauri.release.conf.json` enables
+  `bundle.createUpdaterArtifacts` only in the release workflow.
+- Settings → **App updates** performs no background request. Checking,
+  downloading/installing, and restarting are three explicit user actions.
+  Browsers show an honest unsupported state.
 
-Until those exist, updates are manual (pull + `npm run tauri:build`).
-Deliberately not half-shipped: an updater without signatures or a live
-endpoint is worse than none.
+### Release procedure
+
+1. Choose a new SemVer version and update both `src-tauri/tauri.conf.json` and
+   `src-tauri/Cargo.toml`. Run `npm run release:check` and the full quality
+   suite.
+2. Commit and push the version change. Create and push the matching tag, for
+   example `v0.2.0`. The workflow rejects a tag that does not match both files.
+3. `.github/workflows/release.yml` builds only macOS Apple Silicon, checks all
+   updater/Apple secrets, runs quality gates, signs, notarizes, staples, and
+   uploads the `.dmg`, updater archive, signature and `latest.json` to a GitHub
+   **draft** release.
+4. Download the draft artifact and run the verification commands above. Also
+   inspect `latest.json` and confirm its `darwin-aarch64` URL and signature
+   refer to the attached archive. Run
+   `npm run release:verify -- "path/to/Glimmer Control Center.app.tar.gz"`
+   to cryptographically verify the archive against the public key embedded in
+   Glimmer.
+5. Publish the draft manually. A draft is never returned by `/releases/latest`,
+   so existing installations cannot see it before this approval.
+
+Do not publish an updater release unless the workflow preflight and post-build
+signature, stapling, Gatekeeper, and updater-signature checks all pass. A local
+Developer ID identity alone is not enough; all Apple and updater secrets listed
+above must also exist in the Glimmer GitHub repository.
+
+### Rollback
+
+Tauri correctly rejects older SemVer releases by default. Do not enable
+`allowDowngrades`, replace the embedded public key, delete signatures, or edit
+`latest.json` by hand.
+
+For a bad published release, check out the last known-good commit, apply any
+necessary compatibility fix, assign a **new higher patch version**, and run the
+same release procedure. Publish that replacement after verification. Keep the
+bad release and its evidence available until the replacement is live; then mark
+it clearly in GitHub rather than silently rewriting artifacts under an existing
+version.
