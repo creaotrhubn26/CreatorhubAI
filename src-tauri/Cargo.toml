@@ -1,6 +1,6 @@
 [package]
 name = "glimmer-control-center"
-version = "0.2.0"
+version = "0.2.1"
 description = "Glimmer Control Center — desktop shell for the local Glimmer gateway"
 authors = ["Creatorhubn"]
 edition = "2024"

@@ -455,6 +455,30 @@ details > * + * {
 .app-updates__release p {
   margin: var(--space-1) 0 0;
 }
+.app-updates__release-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+.app-updates__release-info div {
+  background: var(--surface-1);
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border);
+  min-width: 8rem;
+  padding: var(--space-2) var(--space-3);
+}
+.app-updates__release-info dt {
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.app-updates__release-info dd {
+  color: var(--text-primary);
+  margin: var(--space-1) 0 0;
+}
 .app-updates__trust,
 .app-updates__release,
 .app-updates__ready {

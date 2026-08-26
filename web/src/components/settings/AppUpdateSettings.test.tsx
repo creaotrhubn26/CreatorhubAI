@@ -27,8 +27,20 @@ describe("AppUpdateSettings", () => {
     render(<AppUpdateSettings />);
 
     expect(screen.getByText(/available in the installed Glimmer desktop app/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText("Release information")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Check for updates" })).toBeDisabled();
     expect(updater.checkForAppUpdate).not.toHaveBeenCalled();
+  });
+
+  it("shows the installed version and stable Apple Silicon release identity", async () => {
+    updater.getInstalledAppVersion.mockResolvedValue("0.2.1");
+    render(<AppUpdateSettings />);
+
+    expect(await screen.findByText("Installed version: 0.2.1")).toBeInTheDocument();
+    const releaseInfo = screen.getByLabelText("Release information");
+    expect(releaseInfo).toHaveTextContent("ChannelStable");
+    expect(releaseInfo).toHaveTextContent("PlatformApple Silicon");
+    expect(releaseInfo).toHaveTextContent("TrustSigned updates");
   });
 
   it("requires separate check, install and restart actions", async () => {

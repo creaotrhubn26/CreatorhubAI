@@ -102,6 +102,23 @@ export function AppUpdateSettings() {
         </button>
       </div>
 
+      {supported && (
+        <dl className="app-updates__release-info" aria-label="Release information">
+          <div>
+            <dt>Channel</dt>
+            <dd>Stable</dd>
+          </div>
+          <div>
+            <dt>Platform</dt>
+            <dd>Apple Silicon</dd>
+          </div>
+          <div>
+            <dt>Trust</dt>
+            <dd>Signed updates</dd>
+          </div>
+        </dl>
+      )}
+
       <p className="app-updates__trust">
         Updates are downloaded from the official GitHub release and must pass Glimmer's embedded
         signature verification before installation.
