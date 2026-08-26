@@ -108,7 +108,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: Glimmer Control Center v__VERSION__
-          releaseBody: Signed Apple Silicon build. Review the attached bundles and latest.json before publishing this draft.
+          releaseBody: Signed and notarized Apple Silicon build with cryptographically verified automatic updates.
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true
