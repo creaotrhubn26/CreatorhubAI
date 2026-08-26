@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { buildArgs, runGlimmer, validateAdvanced } from "./runner.js";
+import { buildArgs, runGlimmer, runtimeCommand, validateAdvanced } from "./runner.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -492,6 +492,22 @@ describe("validateAdvanced", () => {
 describe("runGlimmer", () => {
   let cancelHandle: { cancel(): void } | undefined;
   afterEach(() => cancelHandle?.cancel());
+
+  it("uses an explicit bundled Python path for Python orchestrators", () => {
+    expect(
+      runtimeCommand("/Applications/Glimmer.app/orchestrator/glimmer-v2.py", "/app/python3"),
+    ).toEqual({
+      command: "/app/python3",
+      prefixArgs: ["/Applications/Glimmer.app/orchestrator/glimmer-v2.py"],
+    });
+  });
+
+  it("keeps Node fixtures on the current Node executable", () => {
+    expect(runtimeCommand(FAKE_ENGINEER, "/app/python3")).toEqual({
+      command: process.execPath,
+      prefixArgs: [FAKE_ENGINEER],
+    });
+  });
 
   it("spawns the given engineer script and streams stdout into the session log", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-run-test-"));

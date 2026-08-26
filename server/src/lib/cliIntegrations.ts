@@ -20,6 +20,8 @@ export interface CliProbeOptions {
   nodeVersion?: string;
   glimmerV2Path?: string;
   engineerPath?: string;
+  orchestratorBundled?: boolean;
+  pythonBundled?: boolean;
   runner?: CommandRunner;
 }
 
@@ -179,11 +181,22 @@ export async function probeCliIntegrations(
   const nodeVersion = options.nodeVersion ?? process.version;
   const glimmerV2Path = options.glimmerV2Path ?? CONFIG.glimmerV2Path;
   const engineerPath = options.engineerPath ?? CONFIG.engineerPath;
+  const orchestratorBundled = options.orchestratorBundled ?? CONFIG.orchestratorBundled;
+  const pythonBundled = options.pythonBundled ?? CONFIG.pythonBundled;
 
   const commandIntegrations = await Promise.all(
     SPECS.map(async (spec): Promise<CliIntegration> => {
       const executablePath = await findExecutable(spec.executable, pathValue);
       if (!executablePath) {
+        if (spec.id === "python" && pythonBundled) {
+          return {
+            ...spec,
+            state: "missing",
+            installed: false,
+            source: "bundled",
+            detail: "The bundled Python runtime is incomplete. Reinstall Glimmer Control Center.",
+          };
+        }
         return {
           ...spec,
           state: "missing",
@@ -204,9 +217,14 @@ export async function probeCliIntegrations(
         installed: true,
         version: firstOutputLine(versionResult),
         path: executablePath,
-        source: "path",
+        source: spec.id === "python" && pythonBundled ? "bundled" : "path",
         detail: readyDetail(spec.id),
       };
+
+      if (spec.id === "python" && pythonBundled) {
+        base.detail =
+          "Bundled with Glimmer Control Center; no separate Python installation is required for the orchestrator.";
+      }
 
       if (spec.id !== "github_cli") return base;
       const auth = await runner(executablePath, ["auth", "status", "--hostname", "github.com"]);
@@ -236,11 +254,15 @@ export async function probeCliIntegrations(
     state: orchestratorReady ? "ready" : "missing",
     installed: orchestratorReady,
     path: glimmerV2Path,
-    source: "configured",
+    source: orchestratorBundled ? "bundled" : "configured",
     agentAccess: "runtime",
     detail: orchestratorReady
-      ? "Both glimmer-v2.py and glimmer-engineer.py are readable."
-      : "The external orchestrator scripts are missing. Configure GLIMMER_V2_PATH and GLIMMER_ENGINEER_PATH.",
+      ? orchestratorBundled
+        ? "Bundled glimmer-v2.py and glimmer-engineer.py are ready."
+        : "Both configured orchestrator scripts are readable."
+      : orchestratorBundled
+        ? "The bundled orchestrator resources are incomplete. Reinstall Glimmer Control Center."
+        : "The external orchestrator scripts are missing. Configure GLIMMER_V2_PATH and GLIMMER_ENGINEER_PATH.",
   };
 
   const node: CliIntegration = {

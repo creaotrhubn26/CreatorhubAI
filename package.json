@@ -19,11 +19,14 @@
     "quality": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run rust:check",
     "release:check": "node scripts/check-release-version.mjs",
     "release:verify": "node scripts/verify-updater-artifact.mjs",
+    "runtime:prepare": "src-tauri/scripts/prepare-python.sh && src-tauri/scripts/prepare-orchestrator.sh",
+    "runtime:sign": "src-tauri/scripts/sign-python-runtime.sh",
+    "runtime:verify": "node scripts/verify-bundled-runtime.mjs",
     "dev:server": "npm run dev -w server",
     "dev:web": "npm run dev -w web",
     "tauri": "tauri",
     "tauri:dev": "npx @tauri-apps/cli dev",
-    "tauri:build": "src-tauri/scripts/prepare-sidecar.sh && src-tauri/scripts/prepare-gateway.sh && npx @tauri-apps/cli build",
+    "tauri:build": "src-tauri/scripts/prepare-sidecar.sh && src-tauri/scripts/prepare-gateway.sh && npm run runtime:prepare && npx @tauri-apps/cli build",
     "dogfood:e2e": "node scripts/dogfood-session.mjs"
   },
   "devDependencies": {

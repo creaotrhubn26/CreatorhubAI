@@ -34,6 +34,10 @@ jobs:
         run: |
           src-tauri/scripts/prepare-sidecar.sh
           src-tauri/scripts/prepare-gateway.sh
+          npm run runtime:prepare
+
+      - name: Verify bundled runtime
+        run: npm run runtime:verify
 
       - name: Run quality gates
         run: npm run quality

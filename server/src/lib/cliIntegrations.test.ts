@@ -8,6 +8,7 @@ let root: string;
 let bin: string;
 let glimmerV2: string;
 let engineer: string;
+let bundledBin: string;
 
 beforeAll(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-cli-probe-"));
@@ -22,6 +23,11 @@ beforeAll(async () => {
   engineer = path.join(root, "glimmer-engineer.py");
   await fs.writeFile(glimmerV2, "# fixture\n");
   await fs.writeFile(engineer, "# fixture\n");
+  bundledBin = path.join(root, "bundled-bin");
+  await fs.mkdir(bundledBin);
+  const bundledPython = path.join(bundledBin, "python3");
+  await fs.writeFile(bundledPython, "#!/bin/sh\nexit 0\n");
+  await fs.chmod(bundledPython, 0o755);
 });
 
 afterAll(async () => {
@@ -81,5 +87,24 @@ describe("CLI integration discovery", () => {
       state: "missing",
       installed: false,
     });
+  });
+
+  it("reports the packaged Python and orchestrator as bundled", async () => {
+    const result = await probeCliIntegrations({
+      pathValue: bundledBin,
+      glimmerV2Path: glimmerV2,
+      engineerPath: engineer,
+      orchestratorBundled: true,
+      pythonBundled: true,
+      runner: async () => ({ code: 0, stdout: "Python 3.13.15\n", stderr: "" }),
+    });
+    const byId = Object.fromEntries(result.integrations.map((item) => [item.id, item]));
+    expect(byId.python).toMatchObject({
+      state: "ready",
+      source: "bundled",
+      version: "Python 3.13.15",
+    });
+    expect(byId.python.detail).toMatch(/no separate Python installation/i);
+    expect(byId.orchestrator).toMatchObject({ state: "ready", source: "bundled" });
   });
 });

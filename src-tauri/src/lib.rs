@@ -16,6 +16,12 @@
 //! `bundle.externalBin` (see scripts/prepare-sidecar.sh), falling back to
 //! `node` on PATH in dev.
 //!
+//! Python/orchestrator location: packaged builds ship `Contents/MacOS/python3`
+//! plus `Resources/binaries/runtime/{python,orchestrator}`. The gateway gets
+//! explicit GLIMMER_* paths and PYTHONHOME for those resources. Environment
+//! overrides stay authoritative, and development builds still fall back to
+//! the external `~/AI/muse-glimmer` checkout and `python3` on PATH.
+//!
 //! PATH: a GUI-launched .app inherits launchd's minimal PATH, which has no
 //! node/npm — so the gateway child gets an explicitly resolved PATH (see
 //! `resolve_user_path`), which is what glimmer-v2.py and every verification
@@ -43,6 +49,12 @@ const FALLBACK_PATH_DIRS: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/
 /// `None` means either the gateway wasn't spawned (port already in use) or it
 /// has already been reaped.
 struct GatewayChild(Mutex<Option<Child>>);
+
+struct BundledRuntime {
+    python: PathBuf,
+    python_home: PathBuf,
+    orchestrator_root: PathBuf,
+}
 
 fn gateway_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(dir) = std::env::var("GLIMMER_GATEWAY_DIR") {
@@ -84,6 +96,88 @@ fn find_in_path(path: &str, program: &str) -> Option<PathBuf> {
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join(program))
         .find(is_executable)
+}
+
+fn prepend_to_path(path: &str, directory: &std::path::Path) -> String {
+    let directory = directory.to_string_lossy();
+    if path.is_empty() {
+        directory.into_owned()
+    } else {
+        format!("{directory}:{path}")
+    }
+}
+
+fn prepend_absolute_executable_parent(path: &str, executable: &std::path::Path) -> String {
+    if executable.is_absolute() {
+        executable
+            .parent()
+            .map(|parent| prepend_to_path(path, parent))
+            .unwrap_or_else(|| path.to_owned())
+    } else {
+        path.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod runtime_path_tests {
+    use super::prepend_absolute_executable_parent;
+    use std::path::Path;
+
+    #[test]
+    fn prepends_the_parent_of_an_absolute_bundled_executable() {
+        assert_eq!(
+            prepend_absolute_executable_parent("/usr/bin", Path::new("/Applications/app/python3")),
+            "/Applications/app:/usr/bin"
+        );
+    }
+
+    #[test]
+    fn does_not_introduce_an_empty_path_entry_for_a_relative_override() {
+        assert_eq!(
+            prepend_absolute_executable_parent("/usr/bin", Path::new("python3")),
+            "/usr/bin"
+        );
+    }
+}
+
+fn bundled_runtime(app: &tauri::AppHandle) -> Option<BundledRuntime> {
+    let python = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(if cfg!(windows) {
+            "python3.exe"
+        } else {
+            "python3"
+        });
+    let python_home = app
+        .path()
+        .resolve(
+            "binaries/runtime/python",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .ok()?;
+    let orchestrator_root = app
+        .path()
+        .resolve(
+            "binaries/runtime/orchestrator",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .ok()?;
+
+    let required = [
+        python_home.join("lib/python3.13/os.py"),
+        orchestrator_root.join("glimmer-v2.py"),
+        orchestrator_root.join("glimmer-engineer.py"),
+    ];
+    if is_executable(&python) && required.iter().all(|path| path.is_file()) {
+        Some(BundledRuntime {
+            python,
+            python_home,
+            orchestrator_root,
+        })
+    } else {
+        None
+    }
 }
 
 /// A *runnable* file, not just a file: a non-executable `node` earlier in PATH
@@ -224,14 +318,61 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Option<Child> {
     // only thing that reaches glimmer-v2.py and the verification subprocesses
     // it runs. It also decides where `node` itself is found when no sidecar
     // is bundled (dev), so don't rely on the ambiguous execvp PATH lookup.
-    let path = resolve_user_path();
+    let mut path = resolve_user_path();
     let node = node_binary(&path);
-    match Command::new(&node)
-        .arg("dist/index.js")
-        .current_dir(&dir)
-        .env("PATH", &path)
-        .spawn()
-    {
+    let mut command = Command::new(&node);
+    command.arg("dist/index.js").current_dir(&dir);
+
+    if let Some(runtime) = bundled_runtime(app) {
+        let configured_python = std::env::var_os("GLIMMER_PYTHON_PATH").map(PathBuf::from);
+        let python = configured_python
+            .as_ref()
+            .unwrap_or(&runtime.python)
+            .to_path_buf();
+        // A relative user override such as `python3` should be resolved by
+        // the existing PATH. Its parent is the empty path; prepending that
+        // would introduce an empty PATH entry and make the gateway search its
+        // writable working directory for unrelated commands.
+        path = prepend_absolute_executable_parent(&path, &python);
+        command.env("GLIMMER_PYTHON_PATH", &python);
+        if configured_python.is_none() {
+            command.env("PYTHONHOME", &runtime.python_home);
+            command.env("GLIMMER_PYTHON_BUNDLED", "1");
+        }
+        command.env("PYTHONDONTWRITEBYTECODE", "1");
+
+        let v2_overridden = std::env::var_os("GLIMMER_V2_PATH").is_some();
+        let engineer_overridden = std::env::var_os("GLIMMER_ENGINEER_PATH").is_some();
+        if !v2_overridden {
+            command.env(
+                "GLIMMER_V2_PATH",
+                runtime.orchestrator_root.join("glimmer-v2.py"),
+            );
+        }
+        if !engineer_overridden {
+            command.env(
+                "GLIMMER_ENGINEER_PATH",
+                runtime.orchestrator_root.join("glimmer-engineer.py"),
+            );
+        }
+        if !v2_overridden && !engineer_overridden {
+            command.env("GLIMMER_ORCHESTRATOR_BUNDLED", "1");
+        }
+
+        println!(
+            "[glimmer] bundled runtime: Python {} with PYTHONHOME {} and orchestrator {}",
+            python.display(),
+            runtime.python_home.display(),
+            runtime.orchestrator_root.display()
+        );
+    } else {
+        println!(
+            "[glimmer] bundled Python/orchestrator resources not found — using configured development runtime."
+        );
+    }
+
+    command.env("PATH", &path);
+    match command.spawn() {
         Ok(child) => {
             println!(
                 "[glimmer] spawned gateway (pid {}) from {} via {}",

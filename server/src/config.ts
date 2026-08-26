@@ -1,34 +1,44 @@
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const stateRoot = process.env.GLIMMER_STATE_ROOT ?? path.join(os.homedir(), ".muse-glimmer");
+const legacyOrchestratorRoot = path.join(os.homedir(), "AI", "muse-glimmer");
 const glimmerV2Path =
-  process.env.GLIMMER_V2_PATH ?? path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-v2.py");
+  process.env.GLIMMER_V2_PATH ?? path.join(legacyOrchestratorRoot, "glimmer-v2.py");
 const orchestratorRoot = path.dirname(glimmerV2Path);
+
+export function selectWritableRuntimeConfig(
+  name: string,
+  runtimeStateRoot = stateRoot,
+  legacyRoot = legacyOrchestratorRoot,
+  fileExists: (file: string) => boolean = existsSync,
+): string {
+  const legacy = path.join(legacyRoot, "config", name);
+  return fileExists(legacy) ? legacy : path.join(runtimeStateRoot, name);
+}
 
 export const CONFIG = {
   stateRoot,
   orchestratorRoot,
+  orchestratorBundled: process.env.GLIMMER_ORCHESTRATOR_BUNDLED === "1",
+  pythonPath: process.env.GLIMMER_PYTHON_PATH ?? "python3",
+  pythonBundled: process.env.GLIMMER_PYTHON_BUNDLED === "1",
   modelConfigPath: process.env.GLIMMER_MODEL_CONFIG ?? path.join(stateRoot, "models.json"),
   modelKeysDir: path.join(stateRoot, "model-keys"),
   glimmerV2Path,
   engineerPath:
-    process.env.GLIMMER_ENGINEER_PATH ??
-    path.join(os.homedir(), "AI", "muse-glimmer", "glimmer-engineer.py"),
+    process.env.GLIMMER_ENGINEER_PATH ?? path.join(legacyOrchestratorRoot, "glimmer-engineer.py"),
   modelBaseUrl: process.env.GLIMMER_MODEL_URL ?? "http://127.0.0.1:8080",
-  modelApiKeyFile:
-    process.env.GLIMMER_API_KEY_FILE ?? path.join(orchestratorRoot, "config", "api-key.txt"),
-  mcpConfigPath:
-    process.env.GLIMMER_MCP_CONFIG ?? path.join(orchestratorRoot, "config", "mcp-servers.json"),
+  modelApiKeyFile: process.env.GLIMMER_API_KEY_FILE ?? selectWritableRuntimeConfig("api-key.txt"),
+  mcpConfigPath: process.env.GLIMMER_MCP_CONFIG ?? selectWritableRuntimeConfig("mcp-servers.json"),
   // The only two commands POST /api/model/{start,stop} may ever run: fixed
   // absolute paths, executed as argv with no arguments and no shell (see
   // lib/modelServer.ts). Nothing from a request body reaches a process.
   modelStartScript:
-    process.env.GLIMMER_MODEL_START_SCRIPT ??
-    path.join(os.homedir(), "AI", "muse-glimmer", "start-glimmer.sh"),
+    process.env.GLIMMER_MODEL_START_SCRIPT ?? path.join(legacyOrchestratorRoot, "start-glimmer.sh"),
   modelStopScript:
-    process.env.GLIMMER_MODEL_STOP_SCRIPT ??
-    path.join(os.homedir(), "AI", "muse-glimmer", "stop-glimmer.sh"),
+    process.env.GLIMMER_MODEL_STOP_SCRIPT ?? path.join(legacyOrchestratorRoot, "stop-glimmer.sh"),
   port: Number(process.env.PORT ?? 4317),
   // §27/§4.1 workspace creation: the real source repo new worktrees are cut
   // from, where new worktrees/branches live, and the ref they're based on.

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import path from "node:path";
 import type { TaskContract } from "@glimmer/shared";
+import { CONFIG } from "../config.js";
 
 // Closed allowlist: `--verify` values are executed verbatim by glimmer-v2.py
 // (`shlex.split` -> subprocess) with no allowlist on that side, so a free-form
@@ -241,6 +242,15 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   return args;
 }
 
+export function runtimeCommand(
+  orchestratorPath: string,
+  pythonPath = CONFIG.pythonPath,
+): { command: string; prefixArgs: string[] } {
+  return orchestratorPath.endsWith(".mjs")
+    ? { command: process.execPath, prefixArgs: [orchestratorPath] }
+    : { command: pythonPath, prefixArgs: [orchestratorPath] };
+}
+
 export function runGlimmer(
   sessionDir: string,
   engineerScriptPath: string,
@@ -249,12 +259,15 @@ export function runGlimmer(
 ) {
   const logPath = path.join(sessionDir, "engineer-00.log");
   const log = createWriteStream(logPath, { flags: "a" });
-  const isNodeFixture = engineerScriptPath.endsWith(".mjs");
-  const child = isNodeFixture
-    ? spawn(process.execPath, [engineerScriptPath, ...args], {
-        detached: process.platform !== "win32",
-      })
-    : spawn("python3", [engineerScriptPath, ...args], { detached: process.platform !== "win32" });
+  const invocation = runtimeCommand(engineerScriptPath);
+  const child = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
+    detached: process.platform !== "win32",
+    env: {
+      ...process.env,
+      GLIMMER_API_KEY_FILE: CONFIG.modelApiKeyFile,
+      GLIMMER_MODEL_CONFIG: CONFIG.modelConfigPath,
+    },
+  });
 
   let settled = false;
   const finish = (code: number | null) => {

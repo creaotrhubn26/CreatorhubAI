@@ -31,8 +31,8 @@
     "active": true,
     "targets": "all",
     "category": "DeveloperTool",
-    "externalBin": ["binaries/glimmer-node"],
-    "resources": ["resources/gateway"],
+    "externalBin": ["binaries/glimmer-node", "binaries/python3"],
+    "resources": ["resources/gateway", "binaries/runtime"],
     "macOS": {
       "hardenedRuntime": true,
       "entitlements": "entitlements.plist"

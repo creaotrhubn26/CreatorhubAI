@@ -57,6 +57,12 @@ jobs:
             exit 1
           fi
 
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -78,6 +84,15 @@ jobs:
         run: |
           src-tauri/scripts/prepare-sidecar.sh
           src-tauri/scripts/prepare-gateway.sh
+          npm run runtime:prepare
+
+      - name: Sign bundled Python native libraries
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: npm run runtime:sign
+
+      - name: Verify bundled runtime
+        run: npm run runtime:verify
 
       - name: Run quality gates
         run: npm run quality
@@ -99,8 +114,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -124,6 +137,8 @@ jobs:
           test -d "${app_path}"
           test -n "${updater_archive}"
           codesign --verify --deep --strict --verbose=2 "${app_path}"
+          src-tauri/scripts/verify-python-signatures.sh \
+            "${app_path}/Contents/Resources/binaries/runtime/python"
           xcrun stapler validate "${app_path}"
           spctl -a -vvv -t install "${app_path}"
           npm run release:verify -- "${updater_archive}"
