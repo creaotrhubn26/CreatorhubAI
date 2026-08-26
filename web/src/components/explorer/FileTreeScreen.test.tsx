@@ -36,6 +36,52 @@ const workspace = {
   changedFiles: [],
 };
 
+const developerClients = {
+  checkedAt: "2026-08-26T12:00:00.000Z",
+  platform: "darwin arm64",
+  clients: [
+    {
+      id: "vscode" as const,
+      name: "Visual Studio Code",
+      kind: "editor" as const,
+      state: "app_only" as const,
+      installed: true,
+      workspaceHandoff: true,
+      appPath: "/Applications/Visual Studio Code.app",
+      executable: "code",
+      detail: "Ready for workspace handoff.",
+      mcp: {
+        supported: true as const,
+        setupMethod: "command_palette" as const,
+        setupHint: "Open the MCP configuration.",
+        docsUrl: "https://code.visualstudio.com/docs/agent-customization/mcp-servers",
+      },
+    },
+    {
+      id: "cursor" as const,
+      name: "Cursor",
+      kind: "editor" as const,
+      state: "missing" as const,
+      installed: false,
+      workspaceHandoff: false,
+      executable: "cursor",
+      detail: "Missing.",
+      mcp: {
+        supported: true as const,
+        setupMethod: "file" as const,
+        setupHint: "Use mcp.json.",
+        docsUrl: "https://cursor.com/docs/context/model-context-protocol",
+      },
+    },
+  ],
+  policy: {
+    automaticInstall: false as const,
+    automaticConfigWrites: false as const,
+    credentialContentsInspected: false as const,
+    agentNestingAllowed: false as const,
+  },
+};
+
 // One directory listing per absolute path, so lazy expansion is observable.
 const TREE: Record<string, { entries: { name: string; isDir: boolean }[] }> = {
   "/w": {
@@ -58,6 +104,7 @@ function mockListing() {
 beforeEach(() => {
   vi.restoreAllMocks();
   Element.prototype.scrollIntoView = vi.fn();
+  vi.spyOn(client.glimmerApi, "getDeveloperClients").mockResolvedValue(developerClients);
 });
 
 describe("FileTreeScreen", () => {
@@ -91,6 +138,47 @@ describe("FileTreeScreen", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "README.md" }));
     await waitFor(() => expect(readFile).toHaveBeenCalledWith({ path: "/w/README.md" }));
+  });
+
+  it("opens the exact workspace in a detected client only after a user click", async () => {
+    mockListing();
+    vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
+    const openWorkspace = vi.spyOn(client.glimmerApi, "openWorkspace").mockResolvedValue({
+      clientId: "vscode",
+      workspace: "/w",
+      opened: true,
+      method: "application",
+    });
+    render(withProviders(<FileTreeScreen />));
+
+    const button = await screen.findByRole("button", {
+      name: "Open workspace in Visual Studio Code",
+    });
+    expect(openWorkspace).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Open workspace in Cursor" })).toBeNull();
+    fireEvent.click(button);
+
+    await waitFor(() => expect(openWorkspace).toHaveBeenCalledWith("vscode", "/w"));
+    expect(await screen.findByRole("status")).toHaveTextContent("Opened in Visual Studio Code");
+  });
+
+  it("keeps a failed handoff recoverable and shows the gateway explanation", async () => {
+    mockListing();
+    vi.spyOn(client.glimmerApi, "listWorkspaces").mockResolvedValue([workspace]);
+    vi.spyOn(client.glimmerApi, "openWorkspace").mockRejectedValue(
+      new Error("Visual Studio Code was not found"),
+    );
+    render(withProviders(<FileTreeScreen />));
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open workspace in Visual Studio Code" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not open in Visual Studio Code — Visual Studio Code was not found",
+    );
+    expect(
+      screen.getByRole("button", { name: "Open workspace in Visual Studio Code" }),
+    ).toBeEnabled();
   });
 
   it("stores a selected line range in the URL without dropping its session context", async () => {

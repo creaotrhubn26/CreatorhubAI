@@ -18,7 +18,7 @@ const ACCESS_LABEL: Record<CliAgentAccess, string> = {
   blocked: "Blocked",
 };
 
-function CommandAction({
+export function CommandAction({
   label,
   command,
   copied,

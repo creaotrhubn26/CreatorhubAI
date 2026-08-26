@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import request from "supertest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -6,6 +6,13 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Express } from "express";
+
+vi.mock("../lib/developerClients.js", async () => {
+  const actual = await vi.importActual<typeof import("../lib/developerClients.js")>(
+    "../lib/developerClients.js",
+  );
+  return { ...actual, openDeveloperClientWorkspace: vi.fn() };
+});
 
 // Writes require an allowed Origin (app.ts localOnlyGuard): a browser always
 // sends one on a state-changing request, so the tests speak the same way.
@@ -313,6 +320,85 @@ describe("GET /api/fs/file", () => {
   const get = (p: string) => request(app).get(`/api/fs/file?path=${encodeURIComponent(p)}`);
   const askSelection = (selection: unknown, question = "What does this do?") =>
     request(app).post("/api/repository/ask").set("Origin", UI_ORIGIN).send({ question, selection });
+
+  it("opens only the exact known workspace with a closed developer-client id", async () => {
+    const developerClients = await import("../lib/developerClients.js");
+    vi.mocked(developerClients.openDeveloperClientWorkspace).mockResolvedValueOnce({
+      clientId: "vscode",
+      workspace: path.join(browseRoot, "repo"),
+      opened: true,
+      method: "application",
+    });
+
+    const res = await request(app)
+      .post("/api/workspaces/open")
+      .set("Origin", UI_ORIGIN)
+      .send({ clientId: "vscode", workspace: path.join(browseRoot, "repo") });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ clientId: "vscode", opened: true });
+    expect(developerClients.openDeveloperClientWorkspace).toHaveBeenCalledWith(
+      "vscode",
+      path.join(browseRoot, "repo"),
+    );
+  });
+
+  it("refuses descendants, unknown roots, extra command fields, and agent clients", async () => {
+    const developerClients = await import("../lib/developerClients.js");
+    vi.mocked(developerClients.openDeveloperClientWorkspace).mockClear();
+    const post = (body: unknown) =>
+      request(app).post("/api/workspaces/open").set("Origin", UI_ORIGIN).send(body);
+
+    const descendant = await post({
+      clientId: "vscode",
+      workspace: path.join(browseRoot, "repo", "src"),
+    });
+    const unknown = await post({ clientId: "vscode", workspace: outside });
+    const command = await post({
+      clientId: "vscode",
+      workspace: path.join(browseRoot, "repo"),
+      command: "open anything",
+    });
+    const agent = await post({ clientId: "codex", workspace: path.join(browseRoot, "repo") });
+
+    expect(descendant.status).toBe(403);
+    expect(unknown.status).toBe(403);
+    expect(unknown.body).toEqual(descendant.body);
+    expect(command.status).toBe(400);
+    expect(command.body.error).toMatch(/only clientId and workspace/i);
+    expect(agent.status).toBe(400);
+    expect(developerClients.openDeveloperClientWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("requires the gateway's allowed Origin before launching a local app", async () => {
+    const developerClients = await import("../lib/developerClients.js");
+    vi.mocked(developerClients.openDeveloperClientWorkspace).mockClear();
+
+    const res = await request(app)
+      .post("/api/workspaces/open")
+      .send({ clientId: "vscode", workspace: path.join(browseRoot, "repo") });
+
+    expect(res.status).toBe(403);
+    expect(developerClients.openDeveloperClientWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("returns an actionable conflict when a previously detected app is no longer available", async () => {
+    const developerClients = await import("../lib/developerClients.js");
+    vi.mocked(developerClients.openDeveloperClientWorkspace).mockRejectedValueOnce(
+      new developerClients.DeveloperClientOpenError(
+        "Visual Studio Code cannot open this workspace because it was not found.",
+        409,
+      ),
+    );
+
+    const res = await request(app)
+      .post("/api/workspaces/open")
+      .set("Origin", UI_ORIGIN)
+      .send({ clientId: "vscode", workspace: path.join(browseRoot, "repo") });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Visual Studio Code.*not found/i);
+  });
 
   it("validates a sessionless repository selection before any model request", async () => {
     const missingQuestion = await askSelection(

@@ -1280,6 +1280,57 @@ export interface CliIntegrationsStatus {
   };
 }
 
+export type DeveloperClientId = "cursor" | "vscode" | "warp" | "claude_code" | "codex" | "opencode";
+
+export type WorkspaceHandoffClientId = Extract<DeveloperClientId, "cursor" | "vscode" | "warp">;
+
+export type WorkspaceHandoffMethod = "cli" | "application" | "uri";
+
+export type DeveloperClientState = "ready" | "app_only" | "missing";
+
+export interface DeveloperClient {
+  id: DeveloperClientId;
+  name: string;
+  kind: "editor" | "terminal" | "agent";
+  state: DeveloperClientState;
+  installed: boolean;
+  workspaceHandoff: boolean;
+  appPath?: string;
+  executable?: string;
+  executablePath?: string;
+  version?: string;
+  detail: string;
+  installCommand?: string;
+  mcp: {
+    supported: true;
+    setupMethod: "file" | "command_palette" | "settings" | "cli";
+    setupHint: string;
+    configPath?: string;
+    configPresent?: boolean;
+    inspectCommand?: string;
+    docsUrl: string;
+  };
+}
+
+export interface WorkspaceHandoffResult {
+  clientId: WorkspaceHandoffClientId;
+  workspace: string;
+  opened: true;
+  method: WorkspaceHandoffMethod;
+}
+
+export interface DeveloperClientsStatus {
+  checkedAt: string;
+  platform: string;
+  clients: DeveloperClient[];
+  policy: {
+    automaticInstall: false;
+    automaticConfigWrites: false;
+    credentialContentsInspected: false;
+    agentNestingAllowed: false;
+  };
+}
+
 export type McpIntegrationId = "context7" | "playwright" | "github";
 
 export type McpIntegrationState =

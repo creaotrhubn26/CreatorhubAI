@@ -27,6 +27,42 @@ vi.mock("../lib/cliIntegrations.js", () => ({
   }),
 }));
 
+vi.mock("../lib/developerClients.js", () => ({
+  DeveloperClientOpenError: class DeveloperClientOpenError extends Error {},
+  isWorkspaceHandoffClientId: (value: unknown) =>
+    value === "cursor" || value === "vscode" || value === "warp",
+  openDeveloperClientWorkspace: vi.fn(),
+  probeDeveloperClients: vi.fn().mockResolvedValue({
+    checkedAt: "2026-08-26T00:00:00.000Z",
+    platform: "darwin arm64",
+    clients: [
+      {
+        id: "vscode",
+        name: "Visual Studio Code",
+        kind: "editor",
+        state: "app_only",
+        installed: true,
+        workspaceHandoff: true,
+        appPath: "/Applications/Visual Studio Code.app",
+        executable: "code",
+        detail: "App installed.",
+        mcp: {
+          supported: true,
+          setupMethod: "command_palette",
+          setupHint: "Open user configuration.",
+          docsUrl: "https://code.visualstudio.com/docs/agent-customization/mcp-servers",
+        },
+      },
+    ],
+    policy: {
+      automaticInstall: false,
+      automaticConfigWrites: false,
+      credentialContentsInspected: false,
+      agentNestingAllowed: false,
+    },
+  }),
+}));
+
 const mcpStatus = {
   checkedAt: "2026-08-26T00:00:00.000Z",
   configPath: "/tmp/mcp-servers.json",
@@ -77,6 +113,25 @@ describe("GET /api/integrations/cli", () => {
       agentAccess: "read_only",
     });
     expect(response.body.policy.automaticSystemInstall).toBe(false);
+  });
+});
+
+describe("GET /api/integrations/developer-clients", () => {
+  it("returns read-only client and MCP setup diagnostics", async () => {
+    const response = await request(createApp()).get("/api/integrations/developer-clients");
+    expect(response.status).toBe(200);
+    expect(response.body.clients[0]).toMatchObject({
+      id: "vscode",
+      state: "app_only",
+      installed: true,
+      mcp: { supported: true, setupMethod: "command_palette" },
+    });
+    expect(response.body.policy).toMatchObject({
+      automaticInstall: false,
+      automaticConfigWrites: false,
+      credentialContentsInspected: false,
+      agentNestingAllowed: false,
+    });
   });
 });
 

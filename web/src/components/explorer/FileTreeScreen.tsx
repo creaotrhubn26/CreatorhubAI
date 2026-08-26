@@ -5,6 +5,7 @@ import { glimmerApi } from "../../api/client";
 import { EmptyState } from "../common/EmptyState";
 import { IconChevron } from "../common/Icons";
 import { CodeViewer } from "./CodeViewer";
+import { WorkspaceHandoff } from "./WorkspaceHandoff";
 import { ancestorDirs, mostSpecificContainingWorkspace } from "../../state/fileLink";
 
 // Task A2: read-only file tree over GET /api/fs/dirs, rooted at a session
@@ -244,6 +245,7 @@ export function FileTreeScreen() {
             <span className="mono">{root}</span>
           )}
         </div>
+        <WorkspaceHandoff workspace={root} />
         <ul className="file-tree">
           <DirNode
             root={root}

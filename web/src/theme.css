@@ -363,6 +363,9 @@ details > * + * {
 .cli-integration[data-state="ready"] {
   border-left-color: var(--green);
 }
+.cli-integration[data-state="app_only"] {
+  border-left-color: var(--amber);
+}
 .cli-integration[data-state="active"] {
   border-left-color: var(--green);
 }
@@ -2000,6 +2003,44 @@ pre {
   font-size: var(--fs-xs);
   color: var(--text-muted);
   overflow-wrap: anywhere;
+}
+.workspace-handoff {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 var(--space-2) var(--space-2);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.workspace-handoff__label {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+.workspace-handoff__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.workspace-handoff button {
+  padding: 3px 8px;
+  font-size: var(--fs-xs);
+}
+.workspace-handoff__note,
+.workspace-handoff__feedback {
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.workspace-handoff__note {
+  color: var(--text-muted);
+}
+.workspace-handoff__feedback--success {
+  color: var(--green);
+}
+.workspace-handoff__feedback--error {
+  color: var(--red);
 }
 .file-explorer__viewer {
   min-width: 0;

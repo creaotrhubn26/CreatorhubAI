@@ -31,6 +31,9 @@ import type {
   HunkReviewResult,
   TaskReport,
   CliIntegrationsStatus,
+  DeveloperClientsStatus,
+  WorkspaceHandoffClientId,
+  WorkspaceHandoffResult,
   McpConfigUpdate,
   McpIntegrationsStatus,
 } from "@glimmer/shared";
@@ -143,6 +146,12 @@ async function streamAssistant(
 export const glimmerApi = {
   getStatus: () => request<DashboardStatus>("/api/status"),
   getCliIntegrations: () => request<CliIntegrationsStatus>("/api/integrations/cli"),
+  getDeveloperClients: () => request<DeveloperClientsStatus>("/api/integrations/developer-clients"),
+  openWorkspace: (clientId: WorkspaceHandoffClientId, workspace: string) =>
+    request<WorkspaceHandoffResult>("/api/workspaces/open", {
+      method: "POST",
+      body: JSON.stringify({ clientId, workspace }),
+    }),
   getMcpIntegrations: () => request<McpIntegrationsStatus>("/api/integrations/mcp"),
   saveMcpIntegrations: (update: McpConfigUpdate) =>
     request<McpIntegrationsStatus>("/api/integrations/mcp", {

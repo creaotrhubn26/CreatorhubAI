@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { listSessionIds, readManifestRaw, readSession } from "../lib/sessions.js";
 import { gitStatus, createWorkspace, WorkspaceCreateError } from "../lib/git.js";
+import {
+  DeveloperClientOpenError,
+  isWorkspaceHandoffClientId,
+  openDeveloperClientWorkspace,
+} from "../lib/developerClients.js";
 import type { WorkspaceInfo, FsListing, FsFile } from "@glimmer/shared";
 
 export const workspacesRouter = Router();
@@ -305,6 +310,42 @@ async function knownWorkspaceRoots(): Promise<string[]> {
   return [...roots];
 }
 
+export type KnownWorkspaceDirectoryResult =
+  { ok: true; workspace: string } | { ok: false; status: number; error: string };
+
+// Resolves exactly one session-backed workspace directory for a machine-side
+// handoff. Unlike file reads, descendants are not accepted: the UI already
+// has the workspace root, and accepting an arbitrary child path would create
+// a second, wider filesystem-open surface. Unknown paths are rejected before
+// realpath/stat, preserving the same no-existence-oracle property as reads.
+export async function resolveKnownWorkspaceDirectory(
+  rawWorkspaceInput: string,
+): Promise<KnownWorkspaceDirectoryResult> {
+  const rawWorkspace = rawWorkspaceInput.trim();
+  if (!rawWorkspace) return { ok: false, status: 400, error: "workspace is required" };
+  if (rawWorkspace.includes("\0")) {
+    return { ok: false, status: 400, error: "workspace is not a valid filesystem path" };
+  }
+
+  const lexicalWorkspace = path.resolve(rawWorkspace);
+  const knownWorkspace = (await knownWorkspaceRoots()).find((root) => root === lexicalWorkspace);
+  if (!knownWorkspace) {
+    return { ok: false, status: 403, error: "workspace is not known to Glimmer" };
+  }
+
+  const resolved = await resolveContained(knownWorkspace, knownWorkspace);
+  if (!resolved.ok) return resolved;
+  try {
+    const stat = await fs.stat(resolved.target);
+    if (!stat.isDirectory()) {
+      return { ok: false, status: 400, error: "workspace is not a directory" };
+    }
+  } catch (err: any) {
+    return { ok: false, ...fsErrorStatus(err) };
+  }
+  return { ok: true, workspace: resolved.target };
+}
+
 // Round A / Task A1: read ONE file's text for the read-only code viewer.
 // Same containment as /fs/dirs — literally the same resolveContained() — plus
 // three refusals of its own, all of which report what actually happened:
@@ -419,6 +460,38 @@ workspacesRouter.get("/fs/file", async (req, res) => {
     // error mapping begins. Keep a corrupt/unreadable session store from
     // becoming an unhandled rejected Express handler.
     res.status(500).json({ error: String(err?.message ?? err) });
+  }
+});
+
+// Explicit user-triggered handoff to a closed set of installed clients. The
+// request cannot name a command or app; it can only select one fixed client
+// and one exact workspace already present in a session manifest.
+workspacesRouter.post("/workspaces/open", async (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({ error: "clientId and workspace are required" });
+  }
+  const keys = Object.keys(body);
+  if (keys.some((key) => key !== "clientId" && key !== "workspace")) {
+    return res.status(400).json({ error: "only clientId and workspace are accepted" });
+  }
+  if (!isWorkspaceHandoffClientId(body.clientId)) {
+    return res.status(400).json({ error: "clientId must be cursor, vscode, or warp" });
+  }
+  if (typeof body.workspace !== "string" || !body.workspace.trim()) {
+    return res.status(400).json({ error: "workspace is required" });
+  }
+
+  try {
+    const resolved = await resolveKnownWorkspaceDirectory(body.workspace);
+    if (!resolved.ok) return res.status(resolved.status).json({ error: resolved.error });
+    const result = await openDeveloperClientWorkspace(body.clientId, resolved.workspace);
+    res.json(result);
+  } catch (error) {
+    if (error instanceof DeveloperClientOpenError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    res.status(500).json({ error: "could not open the workspace" });
   }
 });
 

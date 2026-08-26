@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { probeCliIntegrations } from "../lib/cliIntegrations.js";
+import { probeDeveloperClients } from "../lib/developerClients.js";
 import {
   McpConfigValidationError,
   probeMcpIntegrations,
@@ -13,6 +14,13 @@ export const integrationsRouter = Router();
 // actually reach through its resolved Terminal PATH.
 integrationsRouter.get("/integrations/cli", async (_req, res) => {
   res.json(await probeCliIntegrations());
+});
+
+// Fixed, read-only probes for a closed set of developer clients. The probe
+// checks executable/app/config-file presence only; it never reads config
+// contents, invokes an agent, installs software, or writes client settings.
+integrationsRouter.get("/integrations/developer-clients", async (_req, res) => {
+  res.json(await probeDeveloperClients());
 });
 
 integrationsRouter.get("/integrations/mcp", async (_req, res) => {
