@@ -8,6 +8,7 @@ import type {
   GlimmerSessionStatus,
   VisualFinding,
 } from "@glimmer/shared";
+import { promises as fs } from "node:fs";
 import { gitStatus } from "../lib/git.js";
 import {
   activateDesignChangeSet,
@@ -34,6 +35,13 @@ import {
   readVisualFindings,
   readVisualManifest,
 } from "../lib/sessions.js";
+import {
+  captureVisualRegressionBaseline,
+  compareVisualRegression,
+  readVisualRegressionEvidence,
+  visualRegressionImagePath,
+  VisualRegressionError,
+} from "../lib/visualRegression.js";
 
 export const designWorkflowRouter = Router();
 
@@ -71,7 +79,11 @@ function exactBody(value: unknown, keys: readonly string[]): value is Record<str
 }
 
 function sendWorkflowError(response: Response, error: unknown) {
-  if (error instanceof DesignWorkflowError || error instanceof LiveDesignBridgeError) {
+  if (
+    error instanceof DesignWorkflowError ||
+    error instanceof LiveDesignBridgeError ||
+    error instanceof VisualRegressionError
+  ) {
     return response.status(error.status).json({ error: error.message });
   }
   console.error("[design-workflow] operation failed:", error);
@@ -97,6 +109,13 @@ async function workflowWithRevisions(id: string) {
   return reconcileDesignWorkflowRevisions(id, history.revisions);
 }
 
+async function requireChangeSet(id: string, changeSetId: string) {
+  const document = await workflowWithRevisions(id);
+  const changeSet = document.changeSets.find((item) => item.id === changeSetId);
+  if (!changeSet) throw new DesignWorkflowError("change set not found", 404);
+  return { document, changeSet };
+}
+
 designWorkflowRouter.get("/sessions/:id/design-workflow", async (request, response) => {
   try {
     await requireSession(request.params.id);
@@ -105,6 +124,132 @@ designWorkflowRouter.get("/sessions/:id/design-workflow", async (request, respon
     sendWorkflowError(response, error);
   }
 });
+
+designWorkflowRouter.get(
+  "/sessions/:id/design-workflow/change-sets/:changeSetId/visual-regression",
+  async (request, response) => {
+    try {
+      await requireSession(request.params.id);
+      await requireChangeSet(request.params.id, request.params.changeSetId);
+      response.json(
+        await readVisualRegressionEvidence(request.params.id, request.params.changeSetId),
+      );
+    } catch (error) {
+      sendWorkflowError(response, error);
+    }
+  },
+);
+
+designWorkflowRouter.post(
+  "/sessions/:id/design-workflow/change-sets/:changeSetId/visual-regression/baseline",
+  async (request, response) => {
+    try {
+      await requireSession(request.params.id);
+      const { changeSet } = await requireChangeSet(request.params.id, request.params.changeSetId);
+      if (!exactBody(request.body, [])) {
+        throw new DesignWorkflowError("visual baseline request is invalid", 400);
+      }
+      if (
+        changeSet.revisionIds.some(
+          (revisionId) => !changeSet.rolledBackRevisionIds.includes(revisionId),
+        )
+      ) {
+        throw new DesignWorkflowError(
+          "capture the visual baseline before applying source revisions",
+          409,
+        );
+      }
+      const manifest = await readVisualManifest(request.params.id);
+      if (!manifest) {
+        throw new DesignWorkflowError("run Visual Verification before capturing a baseline", 409);
+      }
+      if (manifest.route !== changeSet.route) {
+        throw new DesignWorkflowError(
+          "Visual Verification must capture the same route as this change set",
+          409,
+        );
+      }
+      response.status(201).json({
+        baseline: await captureVisualRegressionBaseline(
+          request.params.id,
+          request.params.changeSetId,
+          manifest,
+        ),
+        report: null,
+      });
+    } catch (error) {
+      sendWorkflowError(response, error);
+    }
+  },
+);
+
+designWorkflowRouter.post(
+  "/sessions/:id/design-workflow/change-sets/:changeSetId/visual-regression/compare",
+  async (request, response) => {
+    try {
+      await requireSession(request.params.id);
+      await requireChangeSet(request.params.id, request.params.changeSetId);
+      if (!exactBody(request.body, [])) {
+        throw new DesignWorkflowError("visual comparison request is invalid", 400);
+      }
+      const manifest = await readVisualManifest(request.params.id);
+      if (!manifest) {
+        throw new DesignWorkflowError("run Visual Verification before comparing screenshots", 409);
+      }
+      const report = await compareVisualRegression(
+        request.params.id,
+        request.params.changeSetId,
+        manifest,
+      );
+      if (!report) {
+        throw new DesignWorkflowError(
+          "capture a visual baseline before comparing screenshots",
+          409,
+        );
+      }
+      response.json({
+        baseline: (
+          await readVisualRegressionEvidence(request.params.id, request.params.changeSetId)
+        ).baseline,
+        report,
+      });
+    } catch (error) {
+      sendWorkflowError(response, error);
+    }
+  },
+);
+
+designWorkflowRouter.get(
+  "/sessions/:id/design-workflow/change-sets/:changeSetId/visual-regression/images/:kind/:file",
+  async (request, response) => {
+    try {
+      await requireSession(request.params.id);
+      if (request.params.kind !== "baseline" && request.params.kind !== "diff") {
+        return response.status(400).json({ error: "invalid visual regression image kind" });
+      }
+      const file = visualRegressionImagePath(
+        request.params.id,
+        request.params.changeSetId,
+        request.params.kind,
+        request.params.file,
+      );
+      if (!file) return response.status(400).json({ error: "invalid filename" });
+      const stat = await fs.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 50 * 1024 * 1024) {
+        return response.status(404).json({ error: "not found" });
+      }
+      response
+        .set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" })
+        .type("png")
+        .send(await fs.readFile(file));
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return response.status(404).json({ error: "not found" });
+      }
+      sendWorkflowError(response, error);
+    }
+  },
+);
 
 designWorkflowRouter.post(
   "/sessions/:id/design-workflow/change-sets",
@@ -125,14 +270,28 @@ designWorkflowRouter.post(
       ) {
         throw new DesignWorkflowError("change set create request is invalid", 400);
       }
-      response
-        .status(201)
-        .json(
-          await createDesignChangeSet(
-            request.params.id,
-            request.body as unknown as DesignChangeSetCreateRequest,
-          ),
-        );
+      const document = await createDesignChangeSet(
+        request.params.id,
+        request.body as unknown as DesignChangeSetCreateRequest,
+      );
+      const created = document.changeSets.find((item) => item.id === document.activeChangeSetId);
+      const manifest = await readVisualManifest(request.params.id);
+      if (
+        created &&
+        manifest?.status === "pass" &&
+        manifest.route === created.route &&
+        manifest.captures.length > 0 &&
+        manifest.captures.every(
+          (capture) => capture.status === "captured" && Boolean(capture.screenshot),
+        )
+      ) {
+        try {
+          await captureVisualRegressionBaseline(request.params.id, created.id, manifest);
+        } catch (error) {
+          console.warn("[design-workflow] automatic visual baseline was not captured:", error);
+        }
+      }
+      response.status(201).json(document);
     } catch (error) {
       sendWorkflowError(response, error);
     }
@@ -313,6 +472,16 @@ designWorkflowRouter.post(
       if (!exactBody(request.body, ["expectedRevision"])) {
         throw new DesignWorkflowError("verification request is invalid", 400);
       }
+      const { changeSet } = await requireChangeSet(request.params.id, request.params.changeSetId);
+      const history = await listLiveDesignRevisions(request.params.id);
+      const activeRevisionIds = new Set(
+        changeSet.revisionIds.filter(
+          (revisionId) => !changeSet.rolledBackRevisionIds.includes(revisionId),
+        ),
+      );
+      const latestActiveRevision = history.revisions
+        .filter((revision) => activeRevisionIds.has(revision.id))
+        .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
       const manifest = await readVisualManifest(request.params.id);
       if (!manifest) {
         throw new DesignWorkflowError(
@@ -348,8 +517,17 @@ designWorkflowRouter.post(
       }
       const checkedAt = new Date().toISOString();
       const hasMultipleViewports = new Set(manifest.viewports).size >= 2;
+      const regression = await compareVisualRegression(
+        request.params.id,
+        request.params.changeSetId,
+        manifest,
+        latestActiveRevision?.createdAt,
+      );
       const hardFailure =
-        manifest.status !== "pass" || findings?.status === "FAIL" || findings?.status === "BLOCKED";
+        manifest.status !== "pass" ||
+        findings?.status === "FAIL" ||
+        findings?.status === "BLOCKED" ||
+        regression?.status === "failed";
       const warning =
         !hardFailure &&
         (!hasMultipleViewports ||
@@ -361,16 +539,23 @@ designWorkflowRouter.post(
         checkedAt,
         manifestStatus: manifest.status,
         ...(findings ? { findingsStatus: findings.status } : {}),
+        regressionStatus: regression?.status ?? "not_configured",
         viewports: manifest.captures.map((capture) => {
           const state = capture.state ?? "initial";
           const relevant = findingsFor(findings?.findings ?? [], capture.viewport, state);
+          const visualDifference = regression?.comparisons.find(
+            (comparison) => comparison.viewport === capture.viewport && comparison.state === state,
+          );
           const captureFailed = capture.status === "failed";
           const findingFailed = relevant.some(
             (item) => item.severity === "critical" || item.severity === "high",
           );
+          const regressionFailed =
+            visualDifference !== undefined && visualDifference.status !== "passed";
           const viewportWarning =
             !captureFailed &&
             !findingFailed &&
+            !regressionFailed &&
             (!findings ||
               findings.status === "NOT_RUN" ||
               relevant.length > 0 ||
@@ -379,22 +564,41 @@ designWorkflowRouter.post(
             viewport: capture.viewport,
             state,
             status:
-              captureFailed || findingFailed ? "failed" : viewportWarning ? "warning" : "passed",
+              captureFailed || findingFailed || regressionFailed
+                ? "failed"
+                : viewportWarning
+                  ? "warning"
+                  : "passed",
             findingCount: relevant.length,
+            ...(visualDifference
+              ? {
+                  visualDifferenceRatio: visualDifference.differenceRatio,
+                  visualDifferenceThreshold: visualDifference.differenceThreshold,
+                  ...(visualDifference.diffScreenshot
+                    ? { visualDiffScreenshot: visualDifference.diffScreenshot }
+                    : {}),
+                }
+              : {}),
             ...(capture.error
               ? { message: capture.error }
-              : !findings || findings.status === "NOT_RUN"
-                ? { message: "Captured, but no vision review was run." }
-                : !hasMultipleViewports
-                  ? { message: "Add another viewport for responsive evidence." }
-                  : {}),
+              : visualDifference?.message
+                ? { message: visualDifference.message }
+                : !findings || findings.status === "NOT_RUN"
+                  ? { message: "Captured, but no vision review was run." }
+                  : !hasMultipleViewports
+                    ? { message: "Add another viewport for responsive evidence." }
+                    : {}),
           };
         }),
         summary: hardFailure
-          ? "Visual evidence contains a failed capture or blocking finding."
+          ? regression?.status === "failed"
+            ? regression.summary
+            : "Visual evidence contains a failed capture or blocking finding."
           : warning
             ? "Captured successfully with incomplete or warning-level review evidence."
-            : "Visual review passed across multiple viewports.",
+            : regression
+              ? `Visual review and screenshot regression gate passed across ${regression.comparisons.length} viewport state(s).`
+              : "Visual review passed across multiple viewports.",
       };
       response.json(
         await recordDesignWorkflowVerification(

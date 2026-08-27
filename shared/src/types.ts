@@ -811,6 +811,69 @@ export interface VisualFindings {
   referencesReviewedByModel?: string[];
 }
 
+export type VisualRegressionComparisonStatus =
+  "passed" | "failed" | "missing-current" | "stale-current" | "dimension-mismatch";
+
+export interface VisualRegressionBaselineCapture {
+  viewport: string;
+  state: string;
+  sourceScreenshot: string;
+  baselineScreenshot: string;
+  sha256: string;
+  width: number;
+  height: number;
+}
+
+/** Immutable screenshot baseline captured when a Live Design change set starts. */
+export interface VisualRegressionBaseline {
+  version: 1;
+  id: string;
+  sessionId: string;
+  changeSetId: string;
+  route: string;
+  createdAt: string;
+  differenceThreshold: number;
+  pixelTolerance: number;
+  captures: VisualRegressionBaselineCapture[];
+}
+
+export interface VisualRegressionComparison {
+  viewport: string;
+  state: string;
+  currentScreenshot: string | null;
+  baselineScreenshot: string;
+  diffScreenshot: string | null;
+  status: VisualRegressionComparisonStatus;
+  width: number;
+  height: number;
+  changedPixels: number;
+  totalPixels: number;
+  differenceRatio: number;
+  differenceThreshold: number;
+  message?: string;
+}
+
+/** Pixel-level comparison persisted beside the session's visual evidence. */
+export interface VisualRegressionReport {
+  version: 1;
+  sessionId: string;
+  changeSetId: string;
+  route: string;
+  baselineId: string;
+  baselineCreatedAt: string;
+  createdAt: string;
+  status: "passed" | "failed";
+  differenceThreshold: number;
+  pixelTolerance: number;
+  comparisons: VisualRegressionComparison[];
+  summary: string;
+}
+
+export interface VisualRegressionEvidence {
+  baseline: VisualRegressionBaseline | null;
+  report: VisualRegressionReport | null;
+}
+
 // GET /api/sessions/:id/visual/manifest response body -- combines both
 // files glimmer-visual.py writes per run. `findings` is null only when
 // findings.json itself is unreadable/absent (shouldn't happen once
@@ -819,6 +882,8 @@ export interface VisualFindings {
 export interface VisualVerification {
   manifest: VisualManifest;
   findings: VisualFindings | null;
+  /** Present for Live Design change sets that opted into a screenshot baseline. */
+  regression?: VisualRegressionReport | null;
 }
 
 export interface DesignFeedbackPoint {
@@ -909,6 +974,9 @@ export interface DesignChangeSetVerificationViewport {
   status: "passed" | "warning" | "failed";
   findingCount: number;
   message?: string;
+  visualDifferenceRatio?: number;
+  visualDifferenceThreshold?: number;
+  visualDiffScreenshot?: string;
 }
 
 export interface DesignChangeSetVerification {
@@ -916,6 +984,7 @@ export interface DesignChangeSetVerification {
   checkedAt?: string;
   manifestStatus?: VisualManifestStatus;
   findingsStatus?: VisualFindingsStatus;
+  regressionStatus?: "not_configured" | "passed" | "failed";
   viewports: DesignChangeSetVerificationViewport[];
   summary?: string;
 }

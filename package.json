@@ -32,6 +32,7 @@
     "packaged:ui-e2e": "node scripts/packaged-ui-e2e.mjs",
     "packaged:force-quit-e2e": "node scripts/native-force-quit-e2e.mjs",
     "design-workflow:e2e": "node scripts/design-workflow-e2e.mjs",
+    "live-design:framework-dogfood": "node scripts/live-design-framework-dogfood.mjs",
     "structure-mode:e2e": "node scripts/design-workflow-e2e.mjs"
   },
   "devDependencies": {

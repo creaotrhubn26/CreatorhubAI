@@ -6,6 +6,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Express } from "express";
+import { PNG } from "pngjs";
 import type {
   LiveDesignElement,
   LiveDesignSourceCandidate,
@@ -18,6 +19,29 @@ const sessionId = "live-design-test";
 let app: Express;
 let stateRoot: string;
 let workspace: string;
+
+function solidPng(
+  width: number,
+  height: number,
+  color: [number, number, number, number],
+  changed: Array<{ x: number; y: number; color: [number, number, number, number] }> = [],
+): Buffer {
+  const png = new PNG({ width, height });
+  for (let offset = 0; offset < png.data.length; offset += 4) {
+    png.data[offset] = color[0];
+    png.data[offset + 1] = color[1];
+    png.data[offset + 2] = color[2];
+    png.data[offset + 3] = color[3];
+  }
+  for (const pixel of changed) {
+    const offset = (pixel.y * width + pixel.x) * 4;
+    png.data[offset] = pixel.color[0];
+    png.data[offset + 1] = pixel.color[1];
+    png.data[offset + 2] = pixel.color[2];
+    png.data[offset + 3] = pixel.color[3];
+  }
+  return PNG.sync.write(png);
+}
 
 const element: LiveDesignElement = {
   selector: ".title",
@@ -174,6 +198,14 @@ beforeAll(async () => {
     ":root { --color-accent: #112233; --color-brand: var(--color-accent); }\n.title { color: var(--color-accent); background-color: #ffffff; font-size: 32px; padding: 8px; border-radius: 4px; }\n.titleish { opacity: 0.2; }\n",
   );
   await fs.writeFile(
+    path.join(workspace, "src", "VueSettings.vue"),
+    '<script setup lang="ts">\nconst section = "settings";\n</script>\n\n<template>\n  <main data-testid="vue-settings-shell">\n    <h1 class="vue-title">Vue settings</h1>\n  </main>\n</template>\n\n<style scoped>\n:root { --vue-accent: #334455; }\n.vue-title { color: var(--vue-accent); font-size: 30px; }\n</style>\n',
+  );
+  await fs.writeFile(
+    path.join(workspace, "src", "SvelteSettings.svelte"),
+    '<script lang="ts">\n  const section = "settings";\n</script>\n\n<main data-testid="svelte-settings-shell">\n  <h1 class="svelte-title">Svelte settings</h1>\n</main>\n\n<style>\n  :root { --svelte-accent: #556677; }\n  .svelte-title { color: var(--svelte-accent); font-size: 28px; }\n</style>\n',
+  );
+  await fs.writeFile(
     path.join(workspace, "content", "settings.json"),
     JSON.stringify({ page: { heading: "Settings" } }, null, 2),
   );
@@ -198,6 +230,8 @@ beforeEach(async () => {
       "--",
       "src/App.tsx",
       "src/theme.css",
+      "src/VueSettings.vue",
+      "src/SvelteSettings.svelte",
       "content/settings.json",
       "index.html",
     ],
@@ -214,6 +248,8 @@ beforeEach(async () => {
     recursive: true,
     force: true,
   });
+  await fs.rm(path.join(workspace, ".svelte-kit"), { recursive: true, force: true });
+  await fs.rm(path.join(workspace, "src", "app.html"), { force: true });
   await fs.rm(path.join(stateRoot, "sessions", sessionId, "live-design-draft.json"), {
     force: true,
   });
@@ -241,6 +277,8 @@ describe("live design bridge routes", () => {
     expect(response.text).toContain("preview-structure");
     expect(response.text).toContain("preview-responsive");
     expect(response.text).toContain("data-glimmer-resize-handle");
+    expect(response.text).toContain("element.__svelte_meta");
+    expect(response.text).toContain("svelteLocation.file");
     expect(response.text).toContain('"move"');
     expect(response.text).toContain("move-change");
     expect(response.text).toContain("highlight-many");
@@ -297,6 +335,149 @@ describe("live design bridge routes", () => {
       ),
     ).toBe(false);
   });
+
+  it.each([
+    {
+      framework: "react" as const,
+      sourcePath: "src/App.tsx",
+      text: "Settings",
+      replacement: "React workspace settings",
+      className: "title",
+      testId: "settings-shell",
+      tokenName: "--color-accent",
+      stylePath: "src/theme.css",
+    },
+    {
+      framework: "vue" as const,
+      sourcePath: "src/VueSettings.vue",
+      text: "Vue settings",
+      replacement: "Vue workspace settings",
+      className: "vue-title",
+      testId: "vue-settings-shell",
+      tokenName: "--vue-accent",
+      stylePath: "src/VueSettings.vue",
+    },
+    {
+      framework: "svelte" as const,
+      sourcePath: "src/SvelteSettings.svelte",
+      text: "Svelte settings",
+      replacement: "Svelte workspace settings",
+      className: "svelte-title",
+      testId: "svelte-settings-shell",
+      tokenName: "--svelte-accent",
+      stylePath: "src/SvelteSettings.svelte",
+    },
+  ])(
+    "applies and rolls back text, style, and structure bindings in $framework projects",
+    async (fixture) => {
+      const frameworkElement: LiveDesignElement = {
+        ...element,
+        selector: `h1.${fixture.className}`,
+        text: fixture.text,
+        attributes: { class: fixture.className },
+        tokens: [{ name: fixture.tokenName, value: "#334455", property: "color" }],
+        sourcePathHint: `http://127.0.0.1:5173/${fixture.sourcePath}?t=framework-matrix`,
+        framework: fixture.framework,
+        componentName: `${fixture.framework} settings`,
+        styleSources: [],
+      };
+      const resolved = await request(app)
+        .post(`/api/sessions/${sessionId}/design-bridge/resolve`)
+        .set("Origin", UI_ORIGIN)
+        .send({ element: frameworkElement });
+      expect(resolved.status).toBe(200);
+      const textCandidate = resolved.body.candidates.find(
+        (candidate: LiveDesignSourceCandidate) =>
+          candidate.kind === "text-node" && candidate.path === fixture.sourcePath,
+      );
+      const styleCandidate = resolved.body.candidates.find(
+        (candidate: LiveDesignSourceCandidate) =>
+          candidate.kind === "css-declaration" &&
+          candidate.path === fixture.stylePath &&
+          candidate.property === "font-size",
+      );
+      expect(textCandidate).toMatchObject({ confidence: "exact", expected: fixture.text });
+      expect(styleCandidate).toMatchObject({ confidence: "exact" });
+
+      const textApplied = await request(app)
+        .post(`/api/sessions/${sessionId}/design-bridge/apply`)
+        .set("Origin", UI_ORIGIN)
+        .send({ candidate: textCandidate, replacement: fixture.replacement });
+      expect(textApplied.status).toBe(200);
+      expect(await fs.readFile(path.join(workspace, fixture.sourcePath), "utf8")).toContain(
+        `>${fixture.replacement}<`,
+      );
+      const textRollback = await request(app)
+        .post(
+          `/api/sessions/${sessionId}/design-bridge/revisions/${textApplied.body.revision.id}/rollback`,
+        )
+        .set("Origin", UI_ORIGIN);
+      expect(textRollback.status).toBe(200);
+
+      const styleResolved = await request(app)
+        .post(`/api/sessions/${sessionId}/design-bridge/resolve`)
+        .set("Origin", UI_ORIGIN)
+        .send({ element: frameworkElement });
+      const freshStyleCandidate = styleResolved.body.candidates.find(
+        (candidate: LiveDesignSourceCandidate) =>
+          candidate.kind === "css-declaration" &&
+          candidate.path === fixture.stylePath &&
+          candidate.property === "font-size",
+      );
+      const styleApplied = await request(app)
+        .post(`/api/sessions/${sessionId}/design-bridge/style-override`)
+        .set("Origin", UI_ORIGIN)
+        .send({
+          element: frameworkElement,
+          source: freshStyleCandidate,
+          scope: "component",
+          className: fixture.className,
+          declarations: { gap: "12px" },
+        });
+      expect(styleApplied.status).toBe(200);
+      const styledSource = await fs.readFile(path.join(workspace, fixture.stylePath), "utf8");
+      expect(styledSource).toContain("glimmer-style:");
+      if (fixture.framework !== "react") {
+        expect(styledSource.indexOf("glimmer-style:")).toBeLessThan(
+          styledSource.indexOf("</style>"),
+        );
+      }
+      const styleRollback = await request(app)
+        .post(
+          `/api/sessions/${sessionId}/design-bridge/revisions/${styleApplied.body.revision.id}/rollback`,
+        )
+        .set("Origin", UI_ORIGIN);
+      expect(styleRollback.status).toBe(200);
+
+      const structureApplied = await request(app)
+        .post(`/api/sessions/${sessionId}/design-bridge/structure`)
+        .set("Origin", UI_ORIGIN)
+        .send({
+          kind: "insert",
+          target: {
+            selector: `main[data-testid="${fixture.testId}"]`,
+            tagName: "main",
+            text: fixture.text,
+            attributes: { "data-testid": fixture.testId },
+            sourcePathHint: fixture.sourcePath,
+            framework: fixture.framework,
+          },
+          placement: "inside-end",
+          preset: "paragraph",
+          text: `${fixture.framework} helper text`,
+        });
+      expect(structureApplied.status).toBe(200);
+      expect(await fs.readFile(path.join(workspace, fixture.sourcePath), "utf8")).toContain(
+        `${fixture.framework} helper text`,
+      );
+      const structureRollback = await request(app)
+        .post(
+          `/api/sessions/${sessionId}/design-bridge/revisions/${structureApplied.body.revision.id}/rollback`,
+        )
+        .set("Origin", UI_ORIGIN);
+      expect(structureRollback.status).toBe(200);
+    },
+  );
 
   it("returns a bounded model proposal and never writes source before acceptance", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -760,6 +941,47 @@ describe("live design bridge routes", () => {
     expect(unsafe.status).toBe(400);
   });
 
+  it("installs into the SvelteKit source template instead of generated output", async () => {
+    await fs.rm(path.join(workspace, "index.html"));
+    await fs.mkdir(path.join(workspace, ".svelte-kit", "output", "prerendered", "pages"), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(workspace, ".svelte-kit", "output", "prerendered", "pages", "index.html"),
+      "<!doctype html><html><head></head><body>generated</body></html>",
+    );
+    await fs.writeFile(
+      path.join(workspace, "src", "app.html"),
+      "<!doctype html><html><head>%sveltekit.head%</head><body>%sveltekit.body%</body></html>",
+    );
+
+    const applied = await request(app)
+      .post(`/api/sessions/${sessionId}/design-bridge/install`)
+      .set("Origin", UI_ORIGIN)
+      .send({
+        scriptUrl: "http://127.0.0.1:4317/api/design-bridge/client.js",
+        parentOrigin: UI_ORIGIN,
+      });
+    expect(applied.status).toBe(200);
+    expect(applied.body).toMatchObject({ installed: true, path: "src/app.html" });
+    expect(await fs.readFile(path.join(workspace, "src", "app.html"), "utf8")).toContain(
+      "data-glimmer-dev-only",
+    );
+    expect(
+      await fs.readFile(
+        path.join(workspace, ".svelte-kit", "output", "prerendered", "pages", "index.html"),
+        "utf8",
+      ),
+    ).not.toContain("data-glimmer-dev-only");
+
+    const rolledBack = await request(app)
+      .post(
+        `/api/sessions/${sessionId}/design-bridge/revisions/${applied.body.revision.id}/rollback`,
+      )
+      .set("Origin", UI_ORIGIN);
+    expect(rolledBack.status).toBe(200);
+  });
+
   it("writes a hash-bound text edit and rolls it back from its durable revision", async () => {
     const resolved = await resolveCandidates();
     const candidate = resolved.body.candidates.find(
@@ -1007,7 +1229,7 @@ describe("live design bridge routes", () => {
       .post(`/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/verify`)
       .set("Origin", UI_ORIGIN)
       .send({ expectedRevision: afterApply.body.revision });
-    expect(verified.status).toBe(200);
+    expect(verified.status, JSON.stringify(verified.body)).toBe(200);
     expect(verified.body.changeSets[0]).toMatchObject({
       status: "verified",
       verification: { status: "passed" },
@@ -1030,6 +1252,147 @@ describe("live design bridge routes", () => {
     expect(await fs.readFile(path.join(workspace, "src", "App.tsx"), "utf8")).toContain(
       ">Settings<",
     );
+  });
+
+  it("automatically preserves a pre-change baseline and blocks delivery on a screenshot regression", async () => {
+    const visualDir = path.join(stateRoot, "sessions", sessionId, "visual");
+    await fs.mkdir(visualDir, { recursive: true });
+    const visualManifest = {
+      route: "http://127.0.0.1:5183/settings",
+      viewports: ["390x844", "1280x720"],
+      states: ["initial"],
+      status: "pass",
+      captures: [
+        {
+          viewport: "390x844",
+          state: "initial",
+          screenshot: "mobile.png",
+          status: "captured",
+          error: null,
+        },
+        {
+          viewport: "1280x720",
+          state: "initial",
+          screenshot: "desktop.png",
+          status: "captured",
+          error: null,
+        },
+      ],
+    };
+    const baselineImage = solidPng(10, 10, [18, 24, 31, 255]);
+    await Promise.all([
+      fs.writeFile(path.join(visualDir, "mobile.png"), baselineImage),
+      fs.writeFile(path.join(visualDir, "desktop.png"), baselineImage),
+      fs.writeFile(path.join(visualDir, "visual-manifest.json"), JSON.stringify(visualManifest)),
+      fs.writeFile(
+        path.join(visualDir, "findings.json"),
+        JSON.stringify({
+          status: "PASS",
+          viewport: "multi",
+          viewports: ["390x844", "1280x720"],
+          findings: [],
+        }),
+      ),
+    ]);
+
+    const created = await request(app)
+      .post(`/api/sessions/${sessionId}/design-workflow/change-sets`)
+      .set("Origin", UI_ORIGIN)
+      .send({
+        expectedRevision: 0,
+        title: "Guard settings visuals",
+        goal: "Keep unrelated viewport pixels stable.",
+        route: visualManifest.route,
+      });
+    expect(created.status).toBe(201);
+    const changeSetId = created.body.activeChangeSetId;
+    const evidence = await request(app).get(
+      `/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/visual-regression`,
+    );
+    expect(evidence.status).toBe(200);
+    expect(evidence.body.baseline.captures).toHaveLength(2);
+
+    const reviewed = await request(app)
+      .post(`/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/transition`)
+      .set("Origin", UI_ORIGIN)
+      .send({ expectedRevision: created.body.revision, action: "submit_review" });
+    const approved = await request(app)
+      .post(`/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/transition`)
+      .set("Origin", UI_ORIGIN)
+      .send({ expectedRevision: reviewed.body.revision, action: "approve" });
+    expect(approved.status).toBe(200);
+    const resolved = await resolveCandidates();
+    const candidate = resolved.body.candidates.find(
+      (item: LiveDesignSourceCandidate) => item.kind === "text-node" && item.path === "src/App.tsx",
+    );
+    const applied = await request(app)
+      .post(`/api/sessions/${sessionId}/design-bridge/apply`)
+      .set("Origin", UI_ORIGIN)
+      .send({ candidate, replacement: "Regression guarded settings", changeSetId });
+    expect(applied.status).toBe(200);
+
+    await fs.writeFile(
+      path.join(visualDir, "desktop.png"),
+      solidPng(
+        10,
+        10,
+        [18, 24, 31, 255],
+        [
+          { x: 0, y: 0, color: [255, 255, 255, 255] },
+          { x: 1, y: 0, color: [255, 255, 255, 255] },
+        ],
+      ),
+    );
+    const afterApply = await request(app).get(`/api/sessions/${sessionId}/design-workflow`);
+    const verified = await request(app)
+      .post(`/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/verify`)
+      .set("Origin", UI_ORIGIN)
+      .send({ expectedRevision: afterApply.body.revision });
+    expect(verified.status, JSON.stringify(verified.body)).toBe(200);
+    expect(verified.body.changeSets[0]).toMatchObject({
+      status: "blocked",
+      verification: {
+        status: "failed",
+        regressionStatus: "failed",
+        viewports: expect.arrayContaining([
+          expect.objectContaining({
+            viewport: "1280x720",
+            status: "failed",
+            visualDifferenceRatio: 0.02,
+          }),
+        ]),
+      },
+    });
+
+    const compared = await request(app).get(
+      `/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/visual-regression`,
+    );
+    const desktopComparison = compared.body.report.comparisons.find(
+      (comparison: { viewport: string }) => comparison.viewport === "1280x720",
+    );
+    expect(desktopComparison).toMatchObject({ status: "failed", changedPixels: 2 });
+    const diffImage = await request(app).get(
+      `/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/visual-regression/images/diff/${desktopComparison.diffScreenshot}`,
+    );
+    expect(diffImage.status).toBe(200);
+    expect(diffImage.headers["content-type"]).toContain("image/png");
+    expect(diffImage.headers["cache-control"]).toBe("no-store");
+    expect(diffImage.headers["x-content-type-options"]).toBe("nosniff");
+
+    const lateBaseline = await request(app)
+      .post(
+        `/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/visual-regression/baseline`,
+      )
+      .set("Origin", UI_ORIGIN)
+      .send({});
+    expect(lateBaseline.status).toBe(409);
+    expect(lateBaseline.body.error).toContain("before applying source revisions");
+
+    const rolledBack = await request(app)
+      .post(`/api/sessions/${sessionId}/design-workflow/change-sets/${changeSetId}/rollback`)
+      .set("Origin", UI_ORIGIN)
+      .send({ expectedRevision: verified.body.revision });
+    expect(rolledBack.status).toBe(200);
   });
 
   it("rejects stale concurrent workflow writes and validates linked feedback against the session document", async () => {

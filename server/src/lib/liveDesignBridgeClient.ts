@@ -300,6 +300,14 @@ export const LIVE_DESIGN_BRIDGE_CLIENT = String.raw`(function () {
     if (explicit) return explicit.slice(0, 4096);
     var vue = element.__vueParentComponent;
     if (vue && vue.type && typeof vue.type.__file === "string") return vue.type.__file.slice(0, 4096);
+    var svelte = element.__svelte_meta;
+    var svelteLocation = svelte && svelte.loc;
+    if (svelteLocation && typeof svelteLocation.file === "string") {
+      var svelteSource = svelteLocation.file;
+      if (typeof svelteLocation.line === "number") svelteSource += ":" + svelteLocation.line;
+      if (typeof svelteLocation.column === "number") svelteSource += ":" + svelteLocation.column;
+      return svelteSource.slice(0, 4096);
+    }
     var keys = Object.keys(element);
     for (var index = 0; index < keys.length; index += 1) {
       if (keys[index].indexOf("__reactFiber$") !== 0) continue;

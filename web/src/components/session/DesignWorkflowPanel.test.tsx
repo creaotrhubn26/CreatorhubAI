@@ -46,12 +46,15 @@ function renderPanel(
     document: workflow,
     route: "http://localhost:4173/checkout",
     selected: null,
+    regressionLoading: false,
     busy: false,
     error: "",
     onCreate: vi.fn(),
     onActivate: vi.fn(),
     onTransition: vi.fn(),
     onVerify: vi.fn(),
+    onCaptureBaseline: vi.fn(),
+    onCompareRegression: vi.fn(),
     onRollback: vi.fn(),
   };
   const props = { ...defaults, ...callbacks };
@@ -119,5 +122,79 @@ describe("DesignWorkflowPanel", () => {
     expect(screen.getByText(/1280x720 · initial · 1 finding/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Mark delivered →" }));
     expect(onTransition).toHaveBeenCalledWith("deliver");
+  });
+
+  it("shows baseline controls and a blocking screenshot diff without hiding the threshold", () => {
+    const onCaptureBaseline = vi.fn();
+    const draft = renderPanel(document(changeSet()), { onCaptureBaseline });
+    fireEvent.click(screen.getByRole("button", { name: "Capture current baseline" }));
+    expect(draft.onCaptureBaseline).toHaveBeenCalled();
+
+    const active = changeSet({ status: "implementing", revisionIds: ["revision-1"] });
+    const onCompareRegression = vi.fn();
+    renderPanel(document(active), {
+      onCompareRegression,
+      regression: {
+        baseline: {
+          version: 1,
+          id: "baseline-1",
+          sessionId: "s1",
+          changeSetId: active.id,
+          route: active.route,
+          createdAt: "2026-08-27T12:00:00.000Z",
+          differenceThreshold: 0.01,
+          pixelTolerance: 16,
+          captures: [
+            {
+              viewport: "1280x720",
+              state: "initial",
+              sourceScreenshot: "desktop.png",
+              baselineScreenshot: "baseline-1234567890abcdef-desktop.png",
+              sha256: "a".repeat(64),
+              width: 10,
+              height: 10,
+            },
+          ],
+        },
+        report: {
+          version: 1,
+          sessionId: "s1",
+          changeSetId: active.id,
+          route: active.route,
+          baselineId: "baseline-1",
+          baselineCreatedAt: "2026-08-27T12:00:00.000Z",
+          createdAt: "2026-08-27T12:10:00.000Z",
+          status: "failed",
+          differenceThreshold: 0.01,
+          pixelTolerance: 16,
+          summary: "1 of 1 viewport state(s) exceeded the visual regression gate.",
+          comparisons: [
+            {
+              viewport: "1280x720",
+              state: "initial",
+              currentScreenshot: "desktop.png",
+              baselineScreenshot: "baseline-1234567890abcdef-desktop.png",
+              diffScreenshot: "diff-1234567890abcdef-desktop.png",
+              status: "failed",
+              width: 10,
+              height: 10,
+              changedPixels: 2,
+              totalPixels: 100,
+              differenceRatio: 0.02,
+              differenceThreshold: 0.01,
+            },
+          ],
+        },
+      },
+    });
+    expect(screen.getByText(/fails above 1.00%/)).toBeInTheDocument();
+    expect(screen.getByText("× Gate blocked")).toBeInTheDocument();
+    expect(screen.getByText(/1280x720 · initial · 2.000%/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open diff" })).toHaveAttribute(
+      "href",
+      expect.stringContaining("visual-regression/images/diff/"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Compare latest captures" }));
+    expect(onCompareRegression).toHaveBeenCalled();
   });
 });

@@ -27,6 +27,7 @@ import { sessionsDir } from "../config.js";
 
 const SOURCE_EXTENSIONS = new Set([".tsx", ".jsx", ".ts", ".js", ".vue", ".svelte", ".html"]);
 const STYLE_EXTENSIONS = new Set([".css", ".scss", ".less"]);
+const EMBEDDED_STYLE_EXTENSIONS = new Set([".vue", ".svelte"]);
 const SKIP_DIRECTORIES = new Set([
   ".git",
   "node_modules",
@@ -34,6 +35,7 @@ const SKIP_DIRECTORIES = new Set([
   "build",
   "out",
   ".next",
+  ".svelte-kit",
   ".cache",
   "coverage",
   "target",
@@ -567,7 +569,21 @@ async function resolveWorkspaceFile(workspace: string, relativePath: string) {
 
 function sourceHintPath(workspace: string, hint: string | undefined): string | null {
   if (!hint) return null;
-  let candidate = hint.replace(/^file:\/\//, "").replace(/:\d+(?::\d+)?$/, "");
+  let candidate = hint.trim();
+  try {
+    const url = new URL(candidate);
+    if (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname)
+    ) {
+      candidate = decodeURIComponent(url.pathname).replace(/^\/+/, "");
+    } else if (url.protocol === "file:") {
+      candidate = decodeURIComponent(url.pathname);
+    }
+  } catch {
+    candidate = candidate.replace(/^file:\/\//, "");
+  }
+  candidate = candidate.replace(/[?#].*$/, "").replace(/:\d+(?::\d+)?$/, "");
   const root = path.resolve(workspace);
   if (path.isAbsolute(candidate)) {
     const resolved = path.resolve(candidate);
@@ -638,6 +654,25 @@ interface SourceStructureBlock extends MarkupBlock {
 
 function regexEscape(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function supportsBoundStyles(extension: string): boolean {
+  return STYLE_EXTENSIONS.has(extension) || EMBEDDED_STYLE_EXTENSIONS.has(extension);
+}
+
+function appendBoundStyle(content: string, extension: string, block: string): string {
+  if (!EMBEDDED_STYLE_EXTENSIONS.has(extension)) {
+    return `${content.trimEnd()}\n\n${block}\n`;
+  }
+  const closing = content.toLowerCase().lastIndexOf("</style>");
+  if (closing < 0) {
+    throw new LiveDesignBridgeError(
+      "the component needs a source-owned <style> block before adding visual overrides",
+      409,
+    );
+  }
+  const before = content.slice(0, closing).trimEnd();
+  return `${before}\n\n${block}\n${content.slice(closing)}`;
 }
 
 function markupTagEnd(content: string, start: number): number {
@@ -1263,7 +1298,7 @@ export async function resolveLiveDesignSources(
       }
     }
 
-    if (tokenNames.size && STYLE_EXTENSIONS.has(extension)) {
+    if (tokenNames.size && supportsBoundStyles(extension)) {
       styleFiles.push({ path: relativePath, content });
       const tokenPattern = /(--[A-Za-z0-9_-]+)\s*:\s*(#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?)\s*;/g;
       for (const match of content.matchAll(tokenPattern)) {
@@ -1281,7 +1316,7 @@ export async function resolveLiveDesignSources(
         );
       }
     }
-    if (STYLE_EXTENSIONS.has(extension)) {
+    if (supportsBoundStyles(extension)) {
       if (!tokenNames.size) styleFiles.push({ path: relativePath, content });
       collectCssDeclarationCandidates(relativePath, content, fileHash, element, hinted, candidates);
     }
@@ -2065,7 +2100,8 @@ async function applyLiveDesignResponsiveOverrideUnlocked(
   ) {
     throw new LiveDesignBridgeError("responsive override values are invalid", 400);
   }
-  if (!STYLE_EXTENSIONS.has(path.extname(source.path).toLowerCase())) {
+  const extension = path.extname(source.path).toLowerCase();
+  if (!supportsBoundStyles(extension)) {
     throw new LiveDesignBridgeError("responsive overrides require a bound stylesheet", 409);
   }
   const problem = replacementError({ ...source, kind: "css-declaration", property }, value);
@@ -2095,7 +2131,7 @@ async function applyLiveDesignResponsiveOverrideUnlocked(
   const existing = new RegExp(`${regexEscape(start)}[\\s\\S]*?${regexEscape(end)}`, "g");
   const updated = existing.test(content)
     ? content.replace(existing, block)
-    : `${content.trimEnd()}\n\n${block}\n`;
+    : appendBoundStyle(content, extension, block);
   const revision = await persistSnapshotRevision({
     sessionId,
     path: resolved.relative,
@@ -2233,7 +2269,8 @@ async function applyLiveDesignStyleOverrideUnlocked(
   ) {
     throw new LiveDesignBridgeError("style override values are invalid", 400);
   }
-  if (!STYLE_EXTENSIONS.has(path.extname(source.path).toLowerCase())) {
+  const extension = path.extname(source.path).toLowerCase();
+  if (!supportsBoundStyles(extension)) {
     throw new LiveDesignBridgeError("style overrides require a bound stylesheet", 409);
   }
   const entries = Object.entries(raw.declarations as Record<string, unknown>);
@@ -2281,7 +2318,9 @@ async function applyLiveDesignStyleOverrideUnlocked(
     if (existing.test(updated)) updated = updated.replace(existing, block);
     else additions.push(block);
   }
-  if (additions.length) updated = `${updated.trimEnd()}\n\n${additions.join("\n\n")}\n`;
+  if (additions.length) {
+    updated = appendBoundStyle(updated, extension, additions.join("\n\n"));
+  }
   const revision = await persistSnapshotRevision({
     sessionId,
     path: resolved.relative,

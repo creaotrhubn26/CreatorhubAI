@@ -235,6 +235,7 @@ try {
     );
   await page.getByRole("button", { name: "Start workflow" }).click();
   await page.getByText("Continuously saved · revision 1").waitFor();
+  await page.getByText(/Baseline locked/).waitFor();
 
   await page.getByRole("button", { name: "Select element" }).click();
   const preview = page.frameLocator('iframe[title="Live app preview"]');
@@ -327,19 +328,36 @@ try {
   await page.getByRole("button", { name: "Structure mode" }).click();
   await page.getByText(/DOM elements/).waitFor();
   await page.getByRole("searchbox", { name: "Search Navigator" }).fill("settings");
-  await page.getByRole("button", { name: "Select h1" }).waitFor();
+  await page.getByRole("button", { name: "Select h1" }).click();
+  await page
+    .locator(".live-design-bridge__selection-title strong")
+    .filter({ hasText: "h1" })
+    .waitFor();
   await page.getByRole("button", { name: "Lock", exact: true }).click();
   if (!(await page.getByRole("button", { name: "Move selected element down" }).isDisabled())) {
     throw new Error("navigator lock did not prevent structural movement");
   }
   await page.getByRole("button", { name: "Unlock", exact: true }).click();
   await page.getByRole("button", { name: "Hide", exact: true }).click();
-  await waitForCondition(
-    async () =>
-      (await preview.locator("h1.title").evaluate((node) => getComputedStyle(node).visibility)) ===
-      "hidden",
-    "navigator preview visibility to hide the selected heading",
-  );
+  await page.getByRole("button", { name: "Show", exact: true }).waitFor();
+  try {
+    await waitForCondition(
+      async () =>
+        (await preview
+          .locator("h1.title")
+          .evaluate((node) => getComputedStyle(node).visibility)) === "hidden",
+      "navigator preview visibility to hide the selected heading",
+    );
+  } catch (error) {
+    const diagnostics = await preview.locator("h1.title").evaluate((node) => ({
+      visibility: getComputedStyle(node).visibility,
+      inlineStyle: node.getAttribute("style"),
+    }));
+    throw new Error(
+      `${error instanceof Error ? error.message : error}: ${JSON.stringify(diagnostics)}`,
+      { cause: error },
+    );
+  }
   await page.getByRole("button", { name: "Show", exact: true }).click();
   await page.getByRole("searchbox", { name: "Search Navigator" }).fill("");
   await page.getByRole("combobox", { name: "Element" }).selectOption("paragraph");
@@ -566,9 +584,19 @@ try {
   await page.getByRole("button", { name: "Save layout to source" }).waitFor();
   await page.screenshot({ path: designerArtifact, fullPage: true });
 
+  const freshCaptureTime = new Date();
+  await Promise.all([
+    fs.utimes(path.join(visualDir, "mobile.png"), freshCaptureTime, freshCaptureTime),
+    fs.utimes(path.join(visualDir, "desktop.png"), freshCaptureTime, freshCaptureTime),
+  ]);
   await page.getByRole("button", { name: "Verify across viewports →" }).click();
-  await page.getByText("390x844 · initial").waitFor();
-  await page.getByText("1280x720 · initial").waitFor();
+  await page.getByText("390x844 · initial").first().waitFor();
+  await page.getByText("1280x720 · initial").first().waitFor();
+  await page.getByText("✓ Gate passed").waitFor();
+  await page
+    .getByText(/0\.000%/)
+    .first()
+    .waitFor();
   await page.getByRole("button", { name: "Mark delivered →" }).click();
   await page.getByText("Delivered", { exact: true }).waitFor();
   await page.screenshot({ path: artifact, fullPage: true });

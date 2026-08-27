@@ -6,7 +6,9 @@ import type {
   DesignWorkflowTransitionAction,
   LiveDesignElement,
   VisualCapture,
+  VisualRegressionEvidence,
 } from "@glimmer/shared";
+import { glimmerApi } from "../../api/client";
 
 const STEPS = ["Brief", "Explore", "Edit", "Compare", "Review", "Implement", "Verify", "Deliver"];
 
@@ -52,12 +54,16 @@ interface Props {
   route: string;
   selected: LiveDesignElement | null;
   capture?: VisualCapture;
+  regression?: VisualRegressionEvidence;
+  regressionLoading: boolean;
   busy: boolean;
   error: string;
   onCreate: (input: Omit<DesignChangeSetCreateRequest, "expectedRevision">) => void;
   onActivate: (changeSetId: string) => void;
   onTransition: (action: DesignWorkflowTransitionAction, note?: string) => void;
   onVerify: () => void;
+  onCaptureBaseline: () => void;
+  onCompareRegression: () => void;
   onRollback: () => void;
 }
 
@@ -66,12 +72,16 @@ export function DesignWorkflowPanel({
   route,
   selected,
   capture,
+  regression,
+  regressionLoading,
   busy,
   error,
   onCreate,
   onActivate,
   onTransition,
   onVerify,
+  onCaptureBaseline,
+  onCompareRegression,
   onRollback,
 }: Props) {
   const [showCreate, setShowCreate] = useState(false);
@@ -263,11 +273,81 @@ export function DesignWorkflowPanel({
                   </strong>
                   {viewport.viewport} · {viewport.state}
                   {viewport.findingCount ? ` · ${viewport.findingCount} finding(s)` : ""}
+                  {viewport.visualDifferenceRatio !== undefined
+                    ? ` · ${(viewport.visualDifferenceRatio * 100).toFixed(3)}% changed`
+                    : ""}
                 </span>
               ))}
               {active.verification.summary && <p>{active.verification.summary}</p>}
             </div>
           )}
+
+          <div className="design-workflow__regression" aria-label="Visual regression gate">
+            <div>
+              <span>Screenshot regression gate</span>
+              {regressionLoading ? (
+                <p>Loading saved baseline…</p>
+              ) : regression?.baseline ? (
+                <p>
+                  Baseline locked {new Date(regression.baseline.createdAt).toLocaleString()} · fails
+                  above {(regression.baseline.differenceThreshold * 100).toFixed(2)}%
+                </p>
+              ) : (
+                <p>
+                  No baseline yet. Capture the current verified viewports before changing source.
+                </p>
+              )}
+            </div>
+            {!regressionLoading && !regression?.baseline && activeRevisionCount === 0 && (
+              <button type="button" disabled={busy} onClick={onCaptureBaseline}>
+                Capture current baseline
+              </button>
+            )}
+            {regression?.baseline && activeRevisionCount > 0 && (
+              <button type="button" disabled={busy} onClick={onCompareRegression}>
+                Compare latest captures
+              </button>
+            )}
+            {regression?.report && (
+              <div
+                className="design-workflow__regression-report"
+                data-status={regression.report.status}
+              >
+                <strong>
+                  {regression.report.status === "passed" ? "✓ Gate passed" : "× Gate blocked"}
+                </strong>
+                <span>{regression.report.summary}</span>
+                <div>
+                  {regression.report.comparisons.map((comparison) => (
+                    <span
+                      key={`${comparison.viewport}-${comparison.state}`}
+                      data-status={comparison.status}
+                    >
+                      {comparison.viewport} · {comparison.state} ·{" "}
+                      {(comparison.differenceRatio * 100).toFixed(3)}%
+                      {comparison.diffScreenshot && (
+                        <>
+                          {" · "}
+                          <a
+                            href={glimmerApi.visualRegressionImageUrl(
+                              regression.report!.sessionId,
+                              regression.report!.changeSetId,
+                              "diff",
+                              comparison.diffScreenshot,
+                            )}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Open diff
+                          </a>
+                        </>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
 
           {(active.status === "in_review" || active.status === "rejected") && (
             <label className="design-workflow__decision-input">

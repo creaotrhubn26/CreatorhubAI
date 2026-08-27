@@ -78,6 +78,7 @@ import type {
   DesignWorkflowLinkRequest,
   DesignWorkflowMutationRequest,
   DesignWorkflowRollbackResponse,
+  VisualRegressionEvidence,
 } from "@glimmer/shared";
 import { tauriGlobal } from "../state/desktopNotify";
 
@@ -396,6 +397,27 @@ export const glimmerApi = {
       `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/verify`,
       { method: "POST", body: JSON.stringify(input) },
     ),
+  getVisualRegression: (id: string, changeSetId: string) =>
+    request<VisualRegressionEvidence>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/visual-regression`,
+    ),
+  captureVisualRegressionBaseline: (id: string, changeSetId: string) =>
+    request<VisualRegressionEvidence>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/visual-regression/baseline`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
+  compareVisualRegression: (id: string, changeSetId: string) =>
+    request<VisualRegressionEvidence>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/visual-regression/compare`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
+  visualRegressionImageUrl: (
+    id: string,
+    changeSetId: string,
+    kind: "baseline" | "diff",
+    file: string,
+  ) =>
+    `${API_BASE}/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/visual-regression/images/${kind}/${encodeURIComponent(file)}`,
   rollbackDesignChangeSet: (
     id: string,
     changeSetId: string,

@@ -157,6 +157,7 @@ function isVerification(value: unknown): value is DesignChangeSetVerification {
       "checkedAt",
       "manifestStatus",
       "findingsStatus",
+      "regressionStatus",
       "viewports",
       "summary",
     ]) ||
@@ -168,6 +169,8 @@ function isVerification(value: unknown): value is DesignChangeSetVerification {
       !["NOT_RUN", "PASS", "FAIL", "BLOCKED", "PASS_WITH_WARNINGS"].includes(
         String(raw.findingsStatus),
       )) ||
+    (raw.regressionStatus !== undefined &&
+      !["not_configured", "passed", "failed"].includes(String(raw.regressionStatus))) ||
     !Array.isArray(raw.viewports) ||
     raw.viewports.length > 100 ||
     (raw.summary !== undefined && text(raw.summary, 1_000, true) === null)
@@ -178,14 +181,36 @@ function isVerification(value: unknown): value is DesignChangeSetVerification {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
     const viewport = entry as Record<string, unknown>;
     return (
-      exactKeys(viewport, ["viewport", "state", "status", "findingCount", "message"]) &&
+      exactKeys(viewport, [
+        "viewport",
+        "state",
+        "status",
+        "findingCount",
+        "message",
+        "visualDifferenceRatio",
+        "visualDifferenceThreshold",
+        "visualDiffScreenshot",
+      ]) &&
       text(viewport.viewport, 100) !== null &&
       text(viewport.state, 100) !== null &&
       ["passed", "warning", "failed"].includes(String(viewport.status)) &&
       Number.isInteger(viewport.findingCount) &&
       Number(viewport.findingCount) >= 0 &&
       Number(viewport.findingCount) <= 10_000 &&
-      (viewport.message === undefined || text(viewport.message, 500, true) !== null)
+      (viewport.message === undefined || text(viewport.message, 500, true) !== null) &&
+      (viewport.visualDifferenceRatio === undefined ||
+        (typeof viewport.visualDifferenceRatio === "number" &&
+          Number.isFinite(viewport.visualDifferenceRatio) &&
+          viewport.visualDifferenceRatio >= 0 &&
+          viewport.visualDifferenceRatio <= 1)) &&
+      (viewport.visualDifferenceThreshold === undefined ||
+        (typeof viewport.visualDifferenceThreshold === "number" &&
+          Number.isFinite(viewport.visualDifferenceThreshold) &&
+          viewport.visualDifferenceThreshold >= 0 &&
+          viewport.visualDifferenceThreshold <= 1)) &&
+      (viewport.visualDiffScreenshot === undefined ||
+        (typeof viewport.visualDiffScreenshot === "string" &&
+          /^diff-[a-f0-9]{16}-[A-Za-z0-9x-]{1,180}\.png$/.test(viewport.visualDiffScreenshot)))
     );
   });
 }

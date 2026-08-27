@@ -33,6 +33,7 @@ import type {
   LiveDesignCmsReference,
   LiveDesignAuditFinding,
   VisualCapture,
+  VisualRegressionEvidence,
 } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { DesignWorkflowPanel } from "./DesignWorkflowPanel";
@@ -1393,6 +1394,12 @@ export function LiveDesignBridge({ sessionId, route, capture }: Props) {
   const activeChangeSet = workflow.data?.changeSets.find(
     (item) => item.id === workflow.data?.activeChangeSetId,
   );
+  const visualRegression = useQuery<VisualRegressionEvidence>({
+    queryKey: ["visual-regression", sessionId, activeChangeSet?.id],
+    queryFn: () => glimmerApi.getVisualRegression(sessionId, activeChangeSet!.id),
+    enabled: Boolean(activeChangeSet?.id),
+    retry: false,
+  });
   const setWorkflow = useCallback(
     (document: DesignWorkflowDocument) => {
       queryClient.setQueryData(["design-workflow", sessionId], document);
@@ -1701,7 +1708,43 @@ export function LiveDesignBridge({ sessionId, route, capture }: Props) {
     },
     onSuccess: (document) => {
       setWorkflow(document);
-      setNotice("Viewport evidence attached to the change set.");
+      if (activeChangeSet) {
+        void queryClient.invalidateQueries({
+          queryKey: ["visual-regression", sessionId, activeChangeSet.id],
+        });
+      }
+      setNotice(
+        document.changeSets.find((item) => item.id === document.activeChangeSetId)?.verification
+          .regressionStatus === "failed"
+          ? "Visual regression gate blocked delivery. Review the screenshot diff."
+          : "Viewport evidence and screenshot regression results attached to the change set.",
+      );
+    },
+    onError: (error: Error) => setWorkflowError(error.message),
+  });
+  const captureBaselineMutation = useMutation({
+    mutationFn: () => {
+      if (!activeChangeSet) throw new Error("No active change set.");
+      return glimmerApi.captureVisualRegressionBaseline(sessionId, activeChangeSet.id);
+    },
+    onSuccess: (evidence) => {
+      queryClient.setQueryData(["visual-regression", sessionId, activeChangeSet?.id], evidence);
+      setNotice("Locked the current viewport captures as this change set's visual baseline.");
+    },
+    onError: (error: Error) => setWorkflowError(error.message),
+  });
+  const compareRegressionMutation = useMutation({
+    mutationFn: () => {
+      if (!activeChangeSet) throw new Error("No active change set.");
+      return glimmerApi.compareVisualRegression(sessionId, activeChangeSet.id);
+    },
+    onSuccess: (evidence) => {
+      queryClient.setQueryData(["visual-regression", sessionId, activeChangeSet?.id], evidence);
+      setNotice(
+        evidence.report?.status === "failed"
+          ? "Screenshot difference exceeds the visual regression threshold."
+          : "Latest viewport captures stay within the visual regression threshold.",
+      );
     },
     onError: (error: Error) => setWorkflowError(error.message),
   });
@@ -2338,11 +2381,11 @@ export function LiveDesignBridge({ sessionId, route, capture }: Props) {
     resolution?.candidates.find(
       (item) =>
         item.confidence === "exact" &&
-        /\.(?:css|scss|less)$/i.test(item.path) &&
+        /\.(?:css|scss|less|vue|svelte)$/i.test(item.path) &&
         item.kind === "css-declaration",
     ) ??
     resolution?.candidates.find(
-      (item) => item.confidence === "exact" && /\.(?:css|scss|less)$/i.test(item.path),
+      (item) => item.confidence === "exact" && /\.(?:css|scss|less|vue|svelte)$/i.test(item.path),
     );
   const styleSourceEdits =
     draft && originalDraft ? sourceStyleEdits(draft, originalDraft, resolution) : [];
@@ -2777,7 +2820,9 @@ export function LiveDesignBridge({ sessionId, route, capture }: Props) {
     activateWorkflowMutation.isPending ||
     transitionWorkflowMutation.isPending ||
     verifyWorkflowMutation.isPending ||
-    rollbackWorkflowMutation.isPending;
+    rollbackWorkflowMutation.isPending ||
+    captureBaselineMutation.isPending ||
+    compareRegressionMutation.isPending;
   const annotationReady =
     annotationPoints.length > 0 &&
     (!["rectangle", "ellipse", "arrow"].includes(annotationTool) || annotationPoints.length === 2);
@@ -2870,12 +2915,16 @@ export function LiveDesignBridge({ sessionId, route, capture }: Props) {
           route={route}
           selected={selected}
           capture={capture}
+          regression={visualRegression.data}
+          regressionLoading={visualRegression.isLoading}
           busy={workflowBusy}
           error={workflowError || (workflow.error instanceof Error ? workflow.error.message : "")}
           onCreate={(input) => createWorkflowMutation.mutate(input)}
           onActivate={(changeSetId) => activateWorkflowMutation.mutate(changeSetId)}
           onTransition={(action, note) => transitionWorkflowMutation.mutate({ action, note })}
           onVerify={() => verifyWorkflowMutation.mutate()}
+          onCaptureBaseline={() => captureBaselineMutation.mutate()}
+          onCompareRegression={() => compareRegressionMutation.mutate()}
           onRollback={() => rollbackWorkflowMutation.mutate()}
         />
       )}
