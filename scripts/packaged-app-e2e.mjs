@@ -10,6 +10,8 @@ const options = Object.fromEntries(
 const baseUrl = options.gateway ?? "http://127.0.0.1:4317";
 const workspace = options.workspace;
 const timeoutMs = Number(options.timeout ?? 60_000);
+const capability = options.capability;
+const expectedInstance = options.instance;
 const origin = "http://127.0.0.1:5183";
 if (!workspace) throw new Error("--workspace=<isolated glimmer/* git worktree> is required");
 
@@ -20,7 +22,12 @@ function assert(condition, message) {
 async function api(path, init = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", Origin: origin, ...(init.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      Origin: origin,
+      ...(capability ? { "X-Glimmer-Capability": capability } : {}),
+      ...(init.headers ?? {}),
+    },
   });
   const body = await response.json().catch(() => null);
   if (!response.ok) {
@@ -93,8 +100,21 @@ async function createAndRun(objective, { cancel = false } = {}) {
   return { id: session.id, status: session.status };
 }
 
-const health = await api("/api/health");
+let health;
+const healthDeadline = Date.now() + timeoutMs;
+while (Date.now() < healthDeadline) {
+  try {
+    health = await api("/api/health");
+    if (!expectedInstance || health.instanceId === expectedInstance) break;
+  } catch {
+    // The real app may still be starting its bundled gateway.
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+}
+assert(health, "gateway never became healthy");
 assert(health.service === "glimmer-gateway", "health endpoint is not the Glimmer gateway");
+assert(typeof health.instanceId === "string", "health endpoint has no app instance identity");
+if (expectedInstance) assert(health.instanceId === expectedInstance, "wrong gateway instance");
 const readiness = await api("/api/ready");
 assert(readiness.coreReady === true, "packaged runtime is not core-ready");
 
@@ -105,6 +125,9 @@ const diagnostics = await api("/api/diagnostics");
 assert(diagnostics.readiness.coreReady === true, "diagnostics disagree with readiness");
 const repair = await api("/api/diagnostics/repair", { method: "POST" });
 assert(repair.reinstallRequired === false, "repair reported a corrupt packaged runtime");
+assert(typeof repair.backupPath === "string", "repair did not create a recovery backup");
+const smoke = await api("/api/diagnostics/smoke", { method: "POST" });
+assert(smoke.status === "passed", "deep recovery smoke failed");
 const support = await api("/api/diagnostics/support-bundle", { method: "POST" });
 assert(
   support.privacy?.credentialsIncluded === false,
@@ -120,7 +143,8 @@ process.stdout.write(
       readiness: readiness.status,
       workflow: { first, cancelled, restarted },
       repair: { repaired: repair.repaired, reinstallRequired: repair.reinstallRequired },
-      support: { sessions: support.sessions.length, logs: support.logs.length },
+      smoke: { status: smoke.status, checks: smoke.checks.length },
+      support: { sessions: support.sessions.length, sessionLogs: support.sessionLogs.length },
     },
     null,
     2,

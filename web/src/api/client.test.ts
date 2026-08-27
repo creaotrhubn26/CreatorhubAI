@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { glimmerApi, API_BASE } from "./client";
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  delete (window as any).__TAURI__;
+});
 
 describe("glimmerApi", () => {
   it("reads health, readiness and diagnostics contracts", async () => {
@@ -102,6 +105,24 @@ describe("glimmerApi", () => {
       taskContract: { objective: "x" },
       workspace: "/ws",
     });
+  });
+
+  it("adds the native app instance capability to state-changing requests", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      baseUrl: API_BASE,
+      instanceId: "instance-1",
+      capabilityToken: "native-secret",
+    });
+    (window as any).__TAURI__ = { core: { invoke } };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: "s1" }), { status: 201 }));
+
+    await glimmerApi.createSession({ objective: "x" } as any, "/ws");
+
+    expect(invoke).toHaveBeenCalledWith("gateway_access", {});
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(headers.get("X-Glimmer-Capability")).toBe("native-secret");
   });
 
   it("posts hunk accept/reject decisions without sending patch text", async () => {

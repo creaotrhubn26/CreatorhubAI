@@ -1,7 +1,27 @@
 import { createApp } from "./app.js";
 import { CONFIG } from "./config.js";
+import { reconcileActiveRunsOnStartup } from "./routes/sessions.js";
 
 const app = createApp();
+
+if (CONFIG.parentPid) {
+  const parentPid = CONFIG.parentPid;
+  const parentWatchdog = setInterval(() => {
+    try {
+      process.kill(parentPid, 0);
+    } catch (error: any) {
+      if (error?.code === "EPERM") return;
+      console.error(`[gateway] parent process ${parentPid} is gone; exiting for safe restart.`);
+      process.exit(0);
+    }
+  }, 1_000);
+  parentWatchdog.unref();
+}
+
+const recovery = await reconcileActiveRunsOnStartup();
+if (recovery.reattached || recovery.interrupted || recovery.completed) {
+  console.log(`[gateway] startup recovery=${JSON.stringify(recovery)}`);
+}
 // Loopback only: this API can spawn processes, so it must never be reachable
 // from other hosts on the network.
 app.listen(CONFIG.port, "127.0.0.1", () => {

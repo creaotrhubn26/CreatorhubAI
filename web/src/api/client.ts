@@ -40,15 +40,41 @@ import type {
   GatewayHealth,
   GatewayReadiness,
   RepairResult,
+  SessionPage,
+  RecoverySmokeResult,
+  IntegrationProfilePreview,
+  IntegrationProfileApplyResult,
+  IntegrationProfileRollbackResult,
 } from "@glimmer/shared";
+import { tauriGlobal } from "../state/desktopNotify";
 
 export const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "http://127.0.0.1:4317";
 
+interface GatewayAccess {
+  baseUrl: string;
+  instanceId: string;
+  capabilityToken: string;
+}
+
+let gatewayAccessPromise: Promise<GatewayAccess> | null = null;
+
+async function gatewayFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method ?? "GET").toUpperCase();
+  const headers = new Headers(init.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    const tauri = tauriGlobal();
+    if (tauri) {
+      gatewayAccessPromise ??= tauri.core.invoke("gateway_access", {}) as Promise<GatewayAccess>;
+      const access = await gatewayAccessPromise;
+      headers.set("X-Glimmer-Capability", access.capabilityToken);
+    }
+  }
+  return fetch(input, { ...init, headers });
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
+  const res = await gatewayFetch(`${API_BASE}${path}`, init);
   if (!res.ok) {
     // Preserve the gateway's actionable explanation (for example, that a
     // task workspace is on `main` instead of an isolated `glimmer/*`
@@ -73,7 +99,7 @@ export type ModelControlResult = ModelStatus & {
 };
 
 async function modelControl(action: "start" | "stop"): Promise<ModelControlResult> {
-  const res = await fetch(`${API_BASE}/api/model/${action}`, {
+  const res = await gatewayFetch(`${API_BASE}/api/model/${action}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -94,7 +120,7 @@ async function streamAssistant(
   body: unknown,
   onDelta: (delta: string) => void,
 ): Promise<string> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await gatewayFetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -152,8 +178,10 @@ export const glimmerApi = {
   getReadiness: () => request<GatewayReadiness>("/api/ready"),
   getDiagnostics: () => request<DiagnosticsStatus>("/api/diagnostics"),
   repairInstallation: () => request<RepairResult>("/api/diagnostics/repair", { method: "POST" }),
+  runRecoverySmoke: () =>
+    request<RecoverySmokeResult>("/api/diagnostics/smoke", { method: "POST" }),
   downloadSupportBundle: async () => {
-    const response = await fetch(`${API_BASE}/api/diagnostics/support-bundle`, {
+    const response = await gatewayFetch(`${API_BASE}/api/diagnostics/support-bundle`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
@@ -175,6 +203,17 @@ export const glimmerApi = {
   getStatus: () => request<DashboardStatus>("/api/status"),
   getCliIntegrations: () => request<CliIntegrationsStatus>("/api/integrations/cli"),
   getDeveloperClients: () => request<DeveloperClientsStatus>("/api/integrations/developer-clients"),
+  getIntegrationProfile: () => request<IntegrationProfilePreview>("/api/integrations/profile"),
+  applyIntegrationProfile: (expectedVersion: string) =>
+    request<IntegrationProfileApplyResult>("/api/integrations/profile/apply", {
+      method: "POST",
+      body: JSON.stringify({ expectedVersion }),
+    }),
+  rollbackIntegrationProfile: (backupId: string) =>
+    request<IntegrationProfileRollbackResult>("/api/integrations/profile/rollback", {
+      method: "POST",
+      body: JSON.stringify({ backupId }),
+    }),
   openWorkspace: (clientId: WorkspaceHandoffClientId, workspace: string) =>
     request<WorkspaceHandoffResult>("/api/workspaces/open", {
       method: "POST",
@@ -190,7 +229,13 @@ export const glimmerApi = {
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>
     request<ModelRegistry>("/api/models/config", { method: "PUT", body: JSON.stringify(registry) }),
-  listSessions: () => request<GlimmerSession[]>("/api/sessions"),
+  listSessionPage: (cursor?: string, limit = 100) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    return request<SessionPage>(`/api/sessions?${query.toString()}`);
+  },
+  listSessions: async () =>
+    (await glimmerApi.listSessionPage(undefined, 100)).sessions as GlimmerSession[],
   getSession: (id: string) => request<GlimmerSession>(`/api/sessions/${id}`),
   getSessionDiff: (id: string) => request<SessionDiff>(`/api/sessions/${id}/diff`),
   getSessionAnalysis: (id: string) => request<SessionAnalysis>(`/api/sessions/${id}/analysis`),
@@ -240,7 +285,7 @@ export const glimmerApi = {
   // glimmer-visual.py" case a panel needs to render as "Not run", not an
   // error to surface.
   getVisualVerification: async (id: string): Promise<VisualVerification | null> => {
-    const res = await fetch(`${API_BASE}/api/sessions/${id}/visual/manifest`);
+    const res = await gatewayFetch(`${API_BASE}/api/sessions/${id}/visual/manifest`);
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`GET /api/sessions/${id}/visual/manifest failed: ${res.status}`);
     return res.json() as Promise<VisualVerification>;
@@ -275,7 +320,7 @@ export const glimmerApi = {
   // actually read from) so the screen can label it instead of presenting a
   // "first found" graph as unambiguously "this repository".
   getDocGraph: async (): Promise<(DocGraph & { source: DocGraphSource }) | null> => {
-    const res = await fetch(`${API_BASE}/api/repository/doc-graph`);
+    const res = await gatewayFetch(`${API_BASE}/api/repository/doc-graph`);
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`GET /api/repository/doc-graph failed: ${res.status}`);
     return res.json() as Promise<DocGraph & { source: DocGraphSource }>;
@@ -289,7 +334,7 @@ export const glimmerApi = {
   // response, which would silently drop that half-created-state detail the
   // user needs to see.
   createWorkspace: async (taskName: string): Promise<CreateWorkspaceResult> => {
-    const res = await fetch(`${API_BASE}/api/workspaces`, {
+    const res = await gatewayFetch(`${API_BASE}/api/workspaces`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ taskName }),
@@ -316,6 +361,11 @@ export const glimmerApi = {
     request<{ started: boolean }>(`/api/sessions/${id}/run`, { method: "POST" }),
   cancelSession: (id: string) =>
     request<{ cancelled: boolean }>(`/api/sessions/${id}/cancel`, { method: "POST" }),
+  acknowledgeSessionRecovery: (id: string) =>
+    request<{ acknowledged: boolean; progressPreserved: boolean; changedFiles: unknown[] }>(
+      `/api/sessions/${id}/recovery/acknowledge`,
+      { method: "POST" },
+    ),
   revertFile: (id: string, path: string) =>
     request<{ reverted: string }>(`/api/sessions/${id}/revert-file`, {
       method: "POST",
@@ -378,7 +428,7 @@ export const glimmerApi = {
     if (params.path) query.set("path", params.path);
     if (params.root) query.set("root", params.root);
     if (params.includeFiles) query.set("includeFiles", "1");
-    const res = await fetch(`${API_BASE}/api/fs/dirs?${query.toString()}`);
+    const res = await gatewayFetch(`${API_BASE}/api/fs/dirs?${query.toString()}`);
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || `GET /api/fs/dirs failed: ${res.status}`);
     return body as FsListing;
@@ -393,7 +443,7 @@ export const glimmerApi = {
   // what boundary a content read is checked against.
   readFile: async (params: { path: string }): Promise<FsFile> => {
     const query = new URLSearchParams({ path: params.path });
-    const res = await fetch(`${API_BASE}/api/fs/file?${query.toString()}`);
+    const res = await gatewayFetch(`${API_BASE}/api/fs/file?${query.toString()}`);
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || `GET /api/fs/file failed: ${res.status}`);
     return body as FsFile;

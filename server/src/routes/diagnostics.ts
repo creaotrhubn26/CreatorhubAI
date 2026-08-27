@@ -5,6 +5,7 @@ import {
   gatewayHealth,
   probeRuntimeReadiness,
   repairInstallation,
+  runRecoverySmoke,
 } from "../lib/diagnostics.js";
 
 export const diagnosticsRouter = Router();
@@ -33,6 +34,15 @@ diagnosticsRouter.get("/diagnostics", async (_req, res, next) => {
 diagnosticsRouter.post("/diagnostics/repair", async (_req, res, next) => {
   try {
     res.json(await repairInstallation());
+  } catch (error) {
+    next(error);
+  }
+});
+
+diagnosticsRouter.post("/diagnostics/smoke", async (_req, res, next) => {
+  try {
+    const smoke = await runRecoverySmoke();
+    res.json(smoke);
   } catch (error) {
     next(error);
   }

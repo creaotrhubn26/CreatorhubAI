@@ -99,8 +99,36 @@ vi.mock("../lib/mcpIntegrations.js", () => ({
   saveCuratedMcpConfig: vi.fn().mockResolvedValue(undefined),
 }));
 
+const profile = {
+  profile: "creatorhub-engineering",
+  checkedAt: "now",
+  desiredVersion: "0.3.1",
+  canApply: true,
+  targets: [],
+  policy: {
+    previewRequired: true,
+    backupBeforeApply: true,
+    credentialsInspected: false,
+    arbitraryCommandsExecuted: false,
+  },
+};
+vi.mock("../lib/integrationProfile.js", () => ({
+  previewIntegrationProfile: vi.fn().mockResolvedValue(profile),
+  applyIntegrationProfile: vi.fn().mockResolvedValue({
+    backupId: "20260827T080000-1234abcd",
+    appliedTargets: ["claude", "glimmer"],
+    preview: { ...profile, canApply: false },
+  }),
+  rollbackIntegrationProfile: vi.fn().mockResolvedValue({
+    backupId: "20260827T080000-1234abcd",
+    rolledBack: true,
+    preview: profile,
+  }),
+}));
+
 const { createApp } = await import("../app.js");
 const mcp = await import("../lib/mcpIntegrations.js");
+const integrationProfile = await import("../lib/integrationProfile.js");
 
 describe("GET /api/integrations/cli", () => {
   it("returns read-only typed integration diagnostics", async () => {
@@ -167,5 +195,25 @@ describe("MCP integration routes", () => {
       .send({ enabled: ["context7"], command: "arbitrary" });
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: "only the enabled field is accepted" });
+  });
+});
+
+describe("CreatorHub integration profile routes", () => {
+  it("requires a preview version and applies only through the guarded write route", async () => {
+    const preview = await request(createApp()).get("/api/integrations/profile");
+    expect(preview.body.desiredVersion).toBe("0.3.1");
+
+    const rejected = await request(createApp())
+      .post("/api/integrations/profile/apply")
+      .set("Origin", "http://localhost:5183")
+      .send({});
+    expect(rejected.status).toBe(400);
+
+    const applied = await request(createApp())
+      .post("/api/integrations/profile/apply")
+      .set("Origin", "http://localhost:5183")
+      .send({ expectedVersion: "0.3.1" });
+    expect(applied.status).toBe(200);
+    expect(integrationProfile.applyIntegrationProfile).toHaveBeenCalledWith("0.3.1");
   });
 });

@@ -1,4 +1,4 @@
-import type { TaskContract } from "@glimmer/shared";
+import type { TaskContract, TaskIntent } from "@glimmer/shared";
 
 type ToolchainMode = NonNullable<NonNullable<TaskContract["advanced"]>["toolchainMode"]>;
 
@@ -6,6 +6,7 @@ const DEFAULT_TOOLCHAIN_MODE: ToolchainMode = "path";
 
 export interface TaskComposerFormState {
   objective: string;
+  intentKind: "auto" | TaskIntent["kind"];
   scopePackage: TaskContract["scope"]["package"];
   scopeArea?: string;
   mode: TaskContract["mode"];
@@ -51,6 +52,9 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
 
   return {
     objective: form.objective,
+    ...(form.intentKind !== "auto"
+      ? { intent: { kind: form.intentKind, source: "explicit" as const } }
+      : {}),
     scope: { package: form.scopePackage, ...scopePaths(form) },
     mode: form.mode,
     constraints: {

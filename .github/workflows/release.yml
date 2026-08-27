@@ -142,3 +142,71 @@ jobs:
           xcrun stapler validate "${app_path}"
           spctl -a -vvv -t install "${app_path}"
           npm run release:verify -- "${updater_archive}"
+
+      - name: Create isolated release-gate worktree
+        run: |
+          e2e_workspace="${RUNNER_TEMP}/glimmer-release-worktree"
+          git worktree add -b "glimmer/release-e2e-${GITHUB_RUN_ID}" "${e2e_workspace}" HEAD
+          echo "E2E_WORKSPACE=${e2e_workspace}" >> "${GITHUB_ENV}"
+
+      - name: Exercise the built frontend with Playwright
+        run: |
+          ui_state="${RUNNER_TEMP}/glimmer-ui-state"
+          mkdir -p "${ui_state}"
+          GLIMMER_STATE_ROOT="${ui_state}" \
+          GLIMMER_V2_PATH="${GITHUB_WORKSPACE}/scripts/fixtures/glimmer-v2-e2e.mjs" \
+          GLIMMER_INSTANCE_ID="release-ui-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          GLIMMER_UI_ORIGIN="http://127.0.0.1:5184" \
+          GLIMMER_MODEL_URL="http://127.0.0.1:1" \
+          node server/dist/index.js > "${RUNNER_TEMP}/ui-gateway.log" 2>&1 &
+          gateway_pid=$!
+          npm --prefix web run preview -- --host 127.0.0.1 --port 5184 \
+            > "${RUNNER_TEMP}/ui-preview.log" 2>&1 &
+          preview_pid=$!
+          cleanup() {
+            kill "${preview_pid}" "${gateway_pid}" 2>/dev/null || true
+            wait "${preview_pid}" "${gateway_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          npm run packaged:ui-e2e -- \
+            --workspace="${E2E_WORKSPACE}" \
+            --app="http://127.0.0.1:5184" \
+            --instance="release-ui-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup
+          trap - EXIT
+
+      - name: Exercise the signed native app and bundled gateway
+        run: |
+          app_path="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Glimmer Control Center.app"
+          app_binary="${app_path}/Contents/MacOS/glimmer-control-center"
+          native_state="${RUNNER_TEMP}/glimmer-native-state"
+          native_instance="release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          native_capability="release-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${native_state}"
+          GLIMMER_STATE_ROOT="${native_state}" \
+          GLIMMER_V2_PATH="${GITHUB_WORKSPACE}/scripts/fixtures/glimmer-v2-e2e.mjs" \
+          GLIMMER_INSTANCE_ID="${native_instance}" \
+          GLIMMER_CAPABILITY_TOKEN="${native_capability}" \
+          GLIMMER_MODEL_URL="http://127.0.0.1:1" \
+          "${app_binary}" > "${RUNNER_TEMP}/native-app.log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            kill "${app_pid}" 2>/dev/null || true
+            wait "${app_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          npm run packaged:e2e -- \
+            --workspace="${E2E_WORKSPACE}" \
+            --instance="${native_instance}" \
+            --capability="${native_capability}"
+          cleanup
+          trap - EXIT
+
+      - name: Verify Force Quit recovery in the signed native app
+        run: |
+          app_binary="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Glimmer Control Center.app/Contents/MacOS/glimmer-control-center"
+          npm run packaged:force-quit-e2e -- \
+            --app="${app_binary}" \
+            --workspace="${E2E_WORKSPACE}" \
+            --state="${RUNNER_TEMP}/glimmer-force-quit-state" \
+            --fixture="${GITHUB_WORKSPACE}/scripts/fixtures/glimmer-v2-e2e.mjs"

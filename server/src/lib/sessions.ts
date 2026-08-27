@@ -834,6 +834,21 @@ export async function readSession(
   let session = parseManifest(raw, real);
   const taskContract = await readGatewayContract(real);
   if (!session.taskContract && taskContract) session = { ...session, taskContract };
+  const gatewayRun = await readGatewayRun(real);
+  // The gateway-owned interruption record is newer than an in-flight
+  // manifest left behind by a killed orchestrator. Merge it instead of
+  // returning the stale pre-crash status with no recovery controls.
+  if (gatewayRun?.state === "interrupted" && gatewayRun.recovery) {
+    session = {
+      ...session,
+      status: "needs_review",
+      completedAt: gatewayRun.completedAt ?? session.completedAt,
+      changedFiles: gatewayRun.recovery.changedFiles,
+      recovery: gatewayRun.recovery,
+      verification: { ...session.verification, overall: "NEEDS_REVIEW" },
+      finalStatus: { ...session.finalStatus, functional: "NEEDS_REVIEW" },
+    };
+  }
   const humanAcceptance = await readHumanAcceptance(real);
   if (humanAcceptance) session = { ...session, humanAcceptance };
   // V7 §22.17: the one finalStatus leg that needs I/O -- composeFinalStatus

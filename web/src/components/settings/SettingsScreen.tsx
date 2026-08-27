@@ -7,6 +7,7 @@ import { DeveloperClientsSettings } from "./DeveloperClientsSettings";
 import { McpIntegrationsSettings } from "./McpIntegrationsSettings";
 import { AppUpdateSettings } from "./AppUpdateSettings";
 import { DiagnosticsSettings } from "./DiagnosticsSettings";
+import { IntegrationProfileSettings } from "./IntegrationProfileSettings";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -84,6 +85,8 @@ export function SettingsScreen() {
       <CliIntegrationsSettings />
 
       <DeveloperClientsSettings />
+
+      <IntegrationProfileSettings />
 
       <McpIntegrationsSettings />
 

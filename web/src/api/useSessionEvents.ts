@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { GlimmerEvent } from "@glimmer/shared";
 import { isGlimmerEvent } from "@glimmer/shared";
 import { API_BASE } from "./client";
@@ -29,9 +29,11 @@ export function useSharedLastEventAt(): number | null {
 
 export function useSessionEvents(sessionId: string): GlimmerEvent[] {
   const [events, setEvents] = useState<GlimmerEvent[]>([]);
+  const eventIds = useRef(new Set<string>());
 
   useEffect(() => {
     setEvents([]);
+    eventIds.current.clear();
     // No session selected (e.g. the IDE shell mounts this hook on every
     // route, not just a session view) — nothing to stream, and an empty id
     // would 404 against `/api/sessions//events` and auto-reconnect forever.
@@ -40,7 +42,10 @@ export function useSessionEvents(sessionId: string): GlimmerEvent[] {
     source.onmessage = (ev) => {
       try {
         const parsed = JSON.parse(ev.data);
-        if (isGlimmerEvent(parsed)) setEvents((prev) => [...prev, parsed]);
+        if (isGlimmerEvent(parsed) && !eventIds.current.has(parsed.id)) {
+          eventIds.current.add(parsed.id);
+          setEvents((prev) => [...prev, parsed]);
+        }
       } catch {
         /* ignore malformed frame */
       }

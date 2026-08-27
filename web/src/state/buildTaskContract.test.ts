@@ -3,6 +3,7 @@ import { buildTaskContract, type TaskComposerFormState } from "./buildTaskContra
 
 const BASE: TaskComposerFormState = {
   objective: "Fix dialog state restoration",
+  intentKind: "auto",
   scopePackage: "frontend",
   scopeArea: "role-room",
   mode: "implement",
@@ -34,6 +35,14 @@ describe("buildTaskContract", () => {
     expect(contract.scope).toEqual({ package: "frontend", area: "role-room" });
     expect(contract.mode).toBe("implement");
     expect(contract.verification).toEqual(["frontend-typecheck", "targeted-test"]);
+  });
+
+  it("records a manual interpretation as explicit and leaves auto-detection to the caller", () => {
+    expect(buildTaskContract(BASE).intent).toBeUndefined();
+    expect(buildTaskContract({ ...BASE, intentKind: "improvement-assessment" }).intent).toEqual({
+      kind: "improvement-assessment",
+      source: "explicit",
+    });
   });
 
   // §7 Advanced controls: an untouched composer must produce zero behavior

@@ -1,5 +1,5 @@
 import { Link, useNavigate } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
 import { EmptyState } from "../common/EmptyState";
@@ -11,15 +11,20 @@ import {
 } from "../../state/sessionListMeta";
 
 export function SessionHistoryScreen() {
-  const { data, isError, isPending } = useQuery({
-    queryKey: ["sessions"],
-    queryFn: glimmerApi.listSessions,
-  });
+  const { data, isError, isPending, hasNextPage, fetchNextPage, isFetchingNextPage } =
+    useInfiniteQuery({
+      queryKey: ["sessions", "history"],
+      queryFn: ({ pageParam }) => glimmerApi.listSessionPage(pageParam),
+      initialPageParam: undefined as string | undefined,
+      getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    });
   const navigate = useNavigate();
 
   // pending-* rows are transient adopted-workspace placeholders — a
   // duplicate of the real session once it appears, not a second session.
-  const sessions = (data ?? []).filter((s) => !isPendingSessionId(s.id));
+  const sessions = (data?.pages.flatMap((page) => page.sessions) ?? []).filter(
+    (s) => !isPendingSessionId(s.id),
+  );
   const groups = groupSessionsByDay(sessions);
 
   return (
@@ -57,6 +62,11 @@ export function SessionHistoryScreen() {
           </ul>
         </div>
       ))}
+      {hasNextPage && (
+        <button type="button" onClick={() => fetchNextPage()} disabled={isFetchingNextPage}>
+          {isFetchingNextPage ? "Loading…" : "Load older sessions"}
+        </button>
+      )}
     </div>
   );
 }

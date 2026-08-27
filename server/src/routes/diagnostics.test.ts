@@ -26,6 +26,11 @@ const diagnostics = vi.hoisted(() => ({
   createSupportBundle: vi.fn(async () => ({
     privacy: { credentialsIncluded: false, taskPromptsIncluded: false },
   })),
+  runRecoverySmoke: vi.fn(async () => ({
+    status: "passed",
+    checkedAt: "now",
+    checks: [],
+  })),
 }));
 
 vi.mock("../lib/diagnostics.js", () => diagnostics);
@@ -71,5 +76,14 @@ describe("diagnostics routes", () => {
     expect(response.headers["content-disposition"]).toMatch(/^attachment; filename=/);
     expect(response.headers["access-control-expose-headers"]).toContain("Content-Disposition");
     expect(response.body.privacy.credentialsIncluded).toBe(false);
+  });
+
+  it("runs the deep state recovery smoke behind the write guard", async () => {
+    const response = await request(createApp())
+      .post("/api/diagnostics/smoke")
+      .set("Origin", "tauri://localhost");
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe("passed");
+    expect(diagnostics.runRecoverySmoke).toHaveBeenCalled();
   });
 });

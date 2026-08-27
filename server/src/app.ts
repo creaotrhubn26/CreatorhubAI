@@ -1,4 +1,5 @@
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
+import { timingSafeEqual } from "node:crypto";
 import cors from "cors";
 import { statusRouter } from "./routes/status.js";
 import { sessionsRouter } from "./routes/sessions.js";
@@ -8,17 +9,42 @@ import { repositoryRouter } from "./routes/repository.js";
 import { taskIntelligenceRouter } from "./routes/taskIntelligence.js";
 import { integrationsRouter } from "./routes/integrations.js";
 import { diagnosticsRouter } from "./routes/diagnostics.js";
+import { CONFIG } from "./config.js";
 
 // The only origins allowed to reach this API: the local web dev server
 // (web/vite.config.ts port 5183, either loopback spelling) and the packaged
 // Tauri desktop shell's webview. `tauri://localhost` is not a guess — it is
 // what the installed app actually puts on the wire (captured live from the
 // notarized bundle in /Applications, along with `Host: 127.0.0.1:4317`).
+function configuredLoopbackOrigin(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "http:" ||
+      !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash
+    ) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
 const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:5183",
   "http://localhost:5183",
   "tauri://localhost",
   "https://tauri.localhost",
+  ...(configuredLoopbackOrigin(CONFIG.uiOrigin)
+    ? [configuredLoopbackOrigin(CONFIG.uiOrigin)!]
+    : []),
 ]);
 
 // Loopback spellings only. Anything else in the Host header means the request
@@ -29,6 +55,14 @@ const ALLOWED_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
 // Methods that don't change state. Everything else must prove where it came from.
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function matchesCapability(presented: string | undefined): boolean {
+  if (!CONFIG.capabilityToken) return true;
+  if (!presented) return false;
+  const expected = Buffer.from(CONFIG.capabilityToken);
+  const actual = Buffer.from(presented);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
 
 /// CSRF + DNS-rebinding guard for the whole gateway, not just one router.
 ///
@@ -62,6 +96,11 @@ export function localOnlyGuard(req: Request, res: Response, next: NextFunction) 
       error: origin
         ? `request rejected: origin "${origin}" may not make state-changing requests`
         : "request rejected: state-changing requests must carry an allowed Origin header",
+    });
+  }
+  if (!matchesCapability(req.get("X-Glimmer-Capability"))) {
+    return res.status(403).json({
+      error: "request rejected: this app instance did not authorize the state-changing request",
     });
   }
   next();

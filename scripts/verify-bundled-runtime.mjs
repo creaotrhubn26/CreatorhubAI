@@ -8,6 +8,11 @@ import process from "node:process";
 import crypto from "node:crypto";
 
 const EXPECTED_ORCHESTRATOR_COMMIT = "0ec371d9dc5f76ec68b6463585183f19ddb6180d";
+const EXPECTED_ORCHESTRATOR_OVERLAY = {
+  id: "durable-journal-v1",
+  patchSha256: "3c8375dddccd0000a36b1e38f6b643e9d62a54f006bf9f0d86910a78eb17d3d1",
+  moduleSha256: "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
+};
 const EXPECTED_PYTHON_FILES = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
   "lib/python3.13/ssl.py": "538bb1cb334bebb9cd45b58503473ba7fd99cc9a5b769b2ff5caea81876227c3",
@@ -17,9 +22,10 @@ const EXPECTED_PYTHON_FILES = {
     "6e956d2166e24ccf36fef21ad63d06a5dd8f7b674aca6c81ea91eacca6b85b01",
 };
 const EXPECTED_ORCHESTRATOR_FILES = {
-  "glimmer-v2.py": "3a09e47002b129063b56da89ca4602e56c5b07ee443e44a22c64a897d13b7c65",
-  "glimmer-engineer.py": "f337bae58b458252e30e0cc330575aafeb3d87959b142950bc107e49bdf1bd34",
-  "glimmer_events.py": "0e2e6978de1de562d5580e331bab1e93acfadab130de85a57bd5201d4ccad1d5",
+  "glimmer-v2.py": "5e52137fd07ac0a538b519fdd50fb5e5bac8c258c9eeb28d4b0f58035b7cf88b",
+  "glimmer-engineer.py": "d6da291640495392d5330bb4d0c6ae996879dd8a7a185b00f1e7ef03e447a5cb",
+  "glimmer_events.py": "5756d4280378ba351a75605109fcb4f84231e03b8cf9dcb63722173fc865b71e",
+  "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
   "glimmer_models.py": "bf84fe821df6ce7e21babdeecc3dab3f053519ecf1edc467b4df83434b9ff6ee",
   "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
@@ -53,6 +59,7 @@ const requiredFiles = [
   path.join(orchestratorRoot, "glimmer-engineer.py"),
   path.join(orchestratorRoot, "glimmer-visual.py"),
   path.join(orchestratorRoot, "glimmer_events.py"),
+  path.join(orchestratorRoot, "glimmer_journal.py"),
   path.join(orchestratorRoot, "glimmer_models.py"),
   path.join(orchestratorRoot, "run-github-mcp.sh"),
   path.join(orchestratorRoot, "ORIGIN.json"),
@@ -86,6 +93,14 @@ for (const [name, expected] of Object.entries(EXPECTED_PYTHON_FILES)) {
 const origin = JSON.parse(fs.readFileSync(path.join(orchestratorRoot, "ORIGIN.json"), "utf8"));
 if (origin.commit !== EXPECTED_ORCHESTRATOR_COMMIT) {
   throw new Error(`unexpected bundled orchestrator commit: ${origin.commit}`);
+}
+if (
+  !origin.overlay ||
+  origin.overlay.id !== EXPECTED_ORCHESTRATOR_OVERLAY.id ||
+  origin.overlay.patchSha256 !== EXPECTED_ORCHESTRATOR_OVERLAY.patchSha256 ||
+  origin.overlay.moduleSha256 !== EXPECTED_ORCHESTRATOR_OVERLAY.moduleSha256
+) {
+  throw new Error("unexpected bundled orchestrator durability overlay provenance");
 }
 if (!origin.files || typeof origin.files !== "object") {
   throw new Error("bundled orchestrator integrity manifest has no file checksums");
@@ -137,7 +152,7 @@ try {
     preparedPython,
     [
       "-c",
-      "import json, ssl, subprocess, urllib.request; import glimmer_events, glimmer_models; print(__import__('sys').version)",
+      "import json, ssl, sqlite3, subprocess, urllib.request; import glimmer_events, glimmer_journal, glimmer_models; print(__import__('sys').version)",
     ],
     "bundled Python import self-test",
   );
@@ -160,5 +175,5 @@ try {
 }
 
 console.log(
-  `bundled runtime valid: Python 3.13.15 + orchestrator ${EXPECTED_ORCHESTRATOR_COMMIT}${appPath ? ` in ${appPath}` : ""}`,
+  `bundled runtime valid: Python 3.13.15 + orchestrator ${EXPECTED_ORCHESTRATOR_COMMIT} + ${EXPECTED_ORCHESTRATOR_OVERLAY.id}${appPath ? ` in ${appPath}` : ""}`,
 );

@@ -3,7 +3,6 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { CONFIG, gatewayRunLogsDir, sessionsDir } from "../config.js";
 import {
-  listSessionIds,
   readSession,
   readManifestRaw,
   isValidSessionId,
@@ -36,6 +35,7 @@ import {
   gitStatus,
   parseGitDiffHunks,
   GitHunkReviewError,
+  gitChangedFilesSince,
 } from "../lib/git.js";
 import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
@@ -60,14 +60,25 @@ import {
 } from "@glimmer/shared";
 import {
   createGatewayRun,
+  isRecordedProcessAlive,
+  listGatewayRunIds,
+  readDurableCheckpoint,
   readGatewayRun,
   terminateRecordedProcess,
   updateGatewayRun,
 } from "../lib/runState.js";
+import {
+  acquireWorkspaceLease,
+  releaseWorkspaceLease,
+  updateWorkspaceLease,
+  WorkspaceLeaseConflictError,
+} from "../lib/workspaceLeases.js";
+import { readSessionPage } from "../lib/sessionRegistry.js";
 
 export const sessionsRouter = Router();
 
 const activeRuns = new Map<string, { cancel(): void }>();
+const recoveredRunMonitors = new Map<string, ReturnType<typeof setInterval>>();
 const TASK_MODES = new Set(["inspect", "plan", "implement", "debug", "test", "review", "refactor"]);
 const TASK_INTENTS = new Set(["direct", "improvement-assessment"]);
 const TASK_INTENT_SOURCES = new Set(["explicit", "deterministic-inference"]);
@@ -108,6 +119,53 @@ export async function readSessionEventsBatch(id: string): Promise<GlimmerEvent[]
     }
   }
   return events;
+}
+
+const EVENT_CHUNK_BYTES = 1024 * 1024;
+
+export async function readSessionEventsChunk(
+  id: string,
+  offset: number,
+  pending: Buffer = Buffer.alloc(0),
+): Promise<{ events: GlimmerEvent[]; offset: number; pending: Buffer }> {
+  const eventsPath = path.join(sessionsDir(), resolveSessionId(id), "events.jsonl");
+  let size: number;
+  try {
+    size = (await fs.stat(eventsPath)).size;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { events: [], offset, pending };
+    throw error;
+  }
+  if (size < offset) {
+    offset = 0;
+    pending = Buffer.alloc(0);
+  }
+  const length = Math.min(EVENT_CHUNK_BYTES, size - offset);
+  if (length <= 0) return { events: [], offset, pending };
+  const handle = await fs.open(eventsPath, "r");
+  const chunk = Buffer.allocUnsafe(length);
+  const { bytesRead } = await handle.read(chunk, 0, length, offset).finally(() => handle.close());
+  const combined = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+  const lastNewline = combined.lastIndexOf(0x0a);
+  if (lastNewline < 0) {
+    return { events: [], offset: offset + bytesRead, pending: combined };
+  }
+  const complete = combined.subarray(0, lastNewline).toString("utf8");
+  const events: GlimmerEvent[] = [];
+  for (const line of complete.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (isGlimmerEvent(event)) events.push(event);
+    } catch {
+      // A completed malformed line is ignored; an incomplete final line is retained above.
+    }
+  }
+  return {
+    events,
+    offset: offset + bytesRead,
+    pending: combined.subarray(lastNewline + 1),
+  };
 }
 
 const MAX_REPOSITORY_SELECTION_LINES = 400;
@@ -235,13 +293,16 @@ sessionsRouter.post("/repository/ask", async (req, res) => {
   }
 });
 
-sessionsRouter.get("/sessions", async (_req, res) => {
-  const ids = await listSessionIds();
-  // V7 §20: deliberately NOT { computeStale: true } here -- see readSession's
-  // own comment. This is a polled list endpoint; per-session git spawns here
-  // would scale with session count on every poll interval.
-  const sessions = (await Promise.all(ids.map((id) => readSession(id)))).filter(Boolean);
-  res.json(sessions);
+sessionsRouter.get("/sessions", async (req, res) => {
+  const limit = req.query.limit === undefined ? 100 : Number(req.query.limit);
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+    return res.status(400).json({ error: "limit must be an integer between 1 and 200" });
+  }
+  if (cursor && !isValidSessionId(cursor)) {
+    return res.status(400).json({ error: "invalid session cursor" });
+  }
+  res.json(await readSessionPage({ limit, cursor }));
 });
 
 sessionsRouter.get("/sessions/:id", async (req, res) => {
@@ -266,20 +327,29 @@ sessionsRouter.get("/sessions/:id/events", async (req, res) => {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
-    let lastCount = 0;
-    const interval = setInterval(async () => {
+    let offset = 0;
+    let pending: Buffer = Buffer.alloc(0);
+    let sequence = 0;
+    let pumping = false;
+    const pump = async () => {
+      if (pumping) return;
+      pumping = true;
       try {
-        // Re-read the canonical session's append-only events file on every
-        // tick, so a stale lastCount never outruns the file — it only grows.
-        const events = await readSessionEventsBatch(req.params.id);
-        for (const evt of events.slice(lastCount)) {
-          res.write(`data: ${JSON.stringify(evt)}\n\n`);
+        const chunk = await readSessionEventsChunk(req.params.id, offset, pending);
+        offset = chunk.offset;
+        pending = chunk.pending;
+        for (const evt of chunk.events) {
+          sequence += 1;
+          res.write(`id: ${sequence}\ndata: ${JSON.stringify(evt)}\n\n`);
         }
-        lastCount = events.length;
       } catch {
         /* events.jsonl not written yet */
+      } finally {
+        pumping = false;
       }
-    }, 1000);
+    };
+    void pump();
+    const interval = setInterval(pump, 1000);
     req.on("close", () => clearInterval(interval));
     return;
   }
@@ -425,6 +495,19 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   }
 
   try {
+    await acquireWorkspaceLease(record.workspace, req.params.id);
+  } catch (error) {
+    if (error instanceof WorkspaceLeaseConflictError) {
+      return res.status(409).json({
+        error: `Workspace is already in use by session ${error.lease.sessionId}. Finish, cancel, or recover that session before starting another task here.`,
+        ownerSessionId: error.lease.sessionId,
+        leaseState: error.lease.state,
+      });
+    }
+    throw error;
+  }
+
+  try {
     await updateGatewayRun(req.params.id, (current) => {
       if (current.state !== "created") throw new Error("already-started");
       return {
@@ -436,6 +519,7 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
       };
     });
   } catch (err: any) {
+    await releaseWorkspaceLease(record.workspace, req.params.id);
     if (err?.message === "already-started")
       return res.status(409).json({ error: "session has already been started" });
     throw err;
@@ -450,6 +534,7 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
     ["--engineer", CONFIG.engineerPath, ...args],
     (code) => {
       activeRuns.delete(req.params.id);
+      void releaseWorkspaceLease(record.workspace, req.params.id);
       void updateGatewayRun(req.params.id, (current) => ({
         ...current,
         state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
@@ -459,6 +544,7 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
     },
   );
   if (handle.pid <= 1) {
+    await releaseWorkspaceLease(record.workspace, req.params.id);
     await updateGatewayRun(req.params.id, (current) => ({
       ...current,
       state: "start_failed",
@@ -468,11 +554,14 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
     return res.status(500).json({ error: "orchestrator process did not start" });
   }
   activeRuns.set(req.params.id, handle);
-  await updateGatewayRun(req.params.id, (current) => ({
-    ...current,
+  await updateGatewayRun(req.params.id, (current) =>
+    current.state === "starting" ? { ...current, state: "running", pid: handle.pid } : current,
+  );
+  await updateWorkspaceLease(record.workspace, req.params.id, {
     state: "running",
     pid: handle.pid,
-  }));
+    detail: "The orchestrator is running. Worktree edits and session artifacts are durable.",
+  });
   res.json({ started: true, pid: handle.pid });
 });
 
@@ -506,6 +595,171 @@ sessionsRouter.post("/sessions/:id/cancel", async (req, res) => {
   }));
   res.json({ cancelled: true });
 });
+
+sessionsRouter.post("/sessions/:id/recovery/acknowledge", async (req, res) => {
+  const record = await readGatewayRun(req.params.id);
+  if (!record) return res.status(404).json({ error: "not found" });
+  if (record.state !== "interrupted" || !record.recovery) {
+    return res.status(409).json({ error: "session does not require interruption recovery" });
+  }
+  await releaseWorkspaceLease(record.workspace, record.id);
+  const acknowledgedAt = new Date().toISOString();
+  await updateGatewayRun(record.id, (current) => ({
+    ...current,
+    recovery: current.recovery ? { ...current.recovery, acknowledgedAt } : current.recovery,
+  }));
+  res.json({
+    acknowledged: true,
+    progressPreserved: record.recovery.progressPreserved,
+    changedFiles: record.recovery.changedFiles,
+  });
+});
+
+/**
+ * Reconciles durable run records after a gateway/app crash.
+ *
+ * A live detached orchestrator is re-attached to cancellation/status monitoring.
+ * A dead process is marked needs_review and its current Git changes are preserved;
+ * no reset, checkout, or cleanup command is issued from this path.
+ */
+export async function reconcileActiveRunsOnStartup(): Promise<{
+  reattached: number;
+  interrupted: number;
+  completed: number;
+}> {
+  const result = { reattached: 0, interrupted: 0, completed: 0 };
+  for (const id of await listGatewayRunIds()) {
+    const record = await readGatewayRun(id);
+    if (!record || (record.state !== "running" && record.state !== "starting")) continue;
+
+    if (await isRecordedProcessAlive(record)) {
+      await acquireWorkspaceLease(record.workspace, record.id).catch((error) => {
+        if (!(error instanceof WorkspaceLeaseConflictError)) throw error;
+      });
+      await updateWorkspaceLease(record.workspace, record.id, {
+        state: "running",
+        pid: record.pid,
+        detail: "Re-attached after the gateway restarted; the orchestrator kept running.",
+      });
+      activeRuns.set(record.id, {
+        cancel: () => void terminateRecordedProcess(record),
+      });
+      if (!recoveredRunMonitors.has(record.id)) {
+        const timer = setInterval(async () => {
+          const latest = await readGatewayRun(record.id);
+          if (!latest || (await isRecordedProcessAlive(latest))) return;
+          clearInterval(timer);
+          recoveredRunMonitors.delete(record.id);
+          activeRuns.delete(record.id);
+          await updateGatewayRun(record.id, (current) => ({
+            ...current,
+            state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+            completedAt: current.completedAt ?? new Date().toISOString(),
+          }));
+          await releaseWorkspaceLease(record.workspace, record.id);
+        }, 2_000);
+        timer.unref();
+        recoveredRunMonitors.set(record.id, timer);
+      }
+      result.reattached += 1;
+      continue;
+    }
+
+    const session = await readSession(record.id);
+    if (
+      session &&
+      !new Set([
+        "created",
+        "preflight",
+        "understanding",
+        "discovery",
+        "candidate_selection",
+        "implementing",
+        "verifying",
+        "repairing",
+        "waiting_for_approval",
+      ]).has(session.status)
+    ) {
+      await updateGatewayRun(record.id, (current) => ({
+        ...current,
+        state: "exited",
+        completedAt: current.completedAt ?? new Date().toISOString(),
+      }));
+      await releaseWorkspaceLease(record.workspace, record.id);
+      result.completed += 1;
+      continue;
+    }
+
+    const workspaceStatus = await gitStatus(record.workspace).catch(() => null);
+    const checkpointFiles =
+      workspaceStatus && record.baselineSha && workspaceStatus.headSha !== record.baselineSha
+        ? await gitChangedFilesSince(record.workspace, record.baselineSha).catch(() => [])
+        : [];
+    const changedFiles = [
+      ...new Map(
+        [...checkpointFiles, ...(workspaceStatus?.changedFiles ?? [])].map((file) => [
+          file.path,
+          file,
+        ]),
+      ).values(),
+    ];
+    const sessionArtifactsPreserved = await fs
+      .stat(path.join(sessionsDir(), record.id))
+      .then((stat) => stat.isDirectory())
+      .catch(() => false);
+    const durableCheckpoint = await readDurableCheckpoint(record.id, record.workspace);
+    const progressLocation =
+      (workspaceStatus?.changedFiles.length ?? 0) > 0
+        ? "worktree"
+        : checkpointFiles.length > 0
+          ? "checkpoint"
+          : durableCheckpoint?.snapshotCommit
+            ? "durable_snapshot"
+            : sessionArtifactsPreserved
+              ? "session_artifacts"
+              : undefined;
+    const detectedAt = new Date().toISOString();
+    await updateGatewayRun(record.id, (current) => ({
+      ...current,
+      state: "interrupted",
+      completedAt: current.completedAt ?? detectedAt,
+      recovery: {
+        detectedAt,
+        reason: durableCheckpoint?.pendingTool
+          ? `The process stopped during ${durableCheckpoint.pendingTool.tool}; the last completed checkpoint and workspace snapshot were preserved.`
+          : durableCheckpoint?.snapshotCommit
+            ? "The process stopped before a terminal result; transactional model/tool progress and workspace snapshots were preserved."
+            : durableCheckpoint
+              ? "The process stopped before a terminal result; transactional model and tool progress was preserved."
+              : "The app or gateway stopped before the orchestrator recorded a terminal result.",
+        progressPreserved: progressLocation !== undefined || durableCheckpoint !== null,
+        ...(progressLocation ? { progressLocation } : {}),
+        changedFiles,
+        ...(durableCheckpoint ? { durableCheckpoint } : {}),
+      },
+    }));
+    await acquireWorkspaceLease(record.workspace, record.id).catch((error) => {
+      if (!(error instanceof WorkspaceLeaseConflictError)) throw error;
+    });
+    await updateWorkspaceLease(record.workspace, record.id, {
+      state: "recovery_required",
+      detail:
+        progressLocation === "worktree"
+          ? "Interrupted work is preserved in the Git worktree and must be reviewed."
+          : progressLocation === "checkpoint"
+            ? "Interrupted work is preserved in local checkpoint commits and must be reviewed."
+            : progressLocation === "durable_snapshot"
+              ? "Interrupted work is preserved in a private durable snapshot and must be reviewed."
+              : progressLocation === "session_artifacts"
+                ? durableCheckpoint
+                  ? "Transactional conversation and tool progress are preserved for review."
+                  : "Interrupted session artifacts are preserved for review."
+                : "The interrupted session must be acknowledged before this workspace is reused.",
+    });
+    result.interrupted += 1;
+  }
+  return result;
+}
 
 sessionsRouter.get("/sessions/:id/analysis", async (req, res) => {
   try {

@@ -51,6 +51,31 @@ export async function gitStatus(workspace: string) {
   return { branch, headSha, baselineSha: null, dirty: changedFiles.length > 0, changedFiles };
 }
 
+/** Files captured in local commits after a run's immutable baseline. */
+export async function gitChangedFilesSince(
+  workspace: string,
+  baselineSha: string,
+): Promise<ChangedFile[]> {
+  if (!/^[a-f0-9]{40,64}$/i.test(baselineSha)) throw new Error("invalid baseline sha");
+  const output = await git(workspace, [
+    "diff",
+    "--name-status",
+    "-M",
+    `${baselineSha}..HEAD`,
+    "--",
+  ]);
+  return output
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const fields = line.split("\t");
+      const code = fields[0].charAt(0);
+      const filePath = code === "R" ? fields[2] : fields[1];
+      return { path: filePath, status: STATUS_CODE_MAP[code] ?? "modified" };
+    })
+    .filter((file): file is ChangedFile => typeof file.path === "string" && file.path.length > 0);
+}
+
 async function isUntracked(cwd: string, filePath: string): Promise<boolean> {
   const out = await git(cwd, ["status", "--porcelain", "--", filePath]);
   return out.split("\n").some((line) => line.startsWith("??"));

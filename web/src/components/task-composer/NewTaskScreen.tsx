@@ -1,7 +1,12 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
-import { taskModeAllowsWrites, type TaskIntelligence } from "@glimmer/shared";
+import {
+  inferTaskIntent,
+  taskModeAllowsWrites,
+  type TaskIntelligence,
+  type TaskIntent,
+} from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
 import {
@@ -9,12 +14,18 @@ import {
   deriveVerificationLevel,
   ARCHITECT_RISK_THRESHOLD,
 } from "../../state/architectRisk";
-import { interpretObjectiveIntent } from "../../state/objectiveIntent";
+import { explainTaskIntent } from "../../state/objectiveIntent";
+import {
+  clearTaskComposerDraft,
+  loadTaskComposerDraft,
+  saveTaskComposerDraft,
+} from "../../state/taskComposerDraft";
 import { PathPicker } from "../common/PathPicker";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
   objective: "",
+  intentKind: "auto",
   scopePackage: "repository",
   scopeArea: "",
   mode: "implement",
@@ -77,6 +88,30 @@ function buildArchitectRiskLine(form: TaskComposerFormState): string | null {
   return `Architect mode will auto-trigger (score ${risk.score}: ${risk.signals.join(", ")})`;
 }
 
+function executionPlan(form: TaskComposerFormState, intent: TaskIntent): string[] {
+  const steps = [
+    intent.kind === "improvement-assessment"
+      ? "Inspect the selected scope and gather evidence from real code; do not search for the words in the question."
+      : "Locate the code directly relevant to the literal objective and confirm the current behavior.",
+  ];
+  if (!taskModeAllowsWrites(form.mode)) {
+    steps.push(
+      form.mode === "plan"
+        ? "Prioritize concrete findings and produce an implementation plan without modifying files."
+        : "Report prioritized, evidence-backed findings without modifying files.",
+    );
+    return steps;
+  }
+  if (intent.kind === "improvement-assessment") {
+    steps.push("Choose one concrete, bounded improvement before modifying files.");
+  }
+  steps.push("Make only the scoped change, then run the selected verification checks.");
+  steps.push(
+    "Leave the resulting diff in the worktree for human review; never commit, push, or deploy.",
+  );
+  return steps;
+}
+
 // Task 4c(3): scope paths are stored (and submitted) workspace-RELATIVE —
 // that's the form the backend's scope guard compares changed-file paths in.
 // A path the user picked outside the chosen workspace has no relative form at
@@ -118,6 +153,11 @@ export function NewTaskScreen() {
   const selectionScopePath = selectionDraft
     ? toWorkspaceRelative(selectionDraft.workspace, selectionDraft.path)
     : null;
+  // A Force Quit can happen before Run is clicked too. A route-provided draft
+  // remains authoritative; otherwise restore the last locally saved composer.
+  const persistedDraft = useRef(
+    selectionDraft || prefillObjective ? null : loadTaskComposerDraft(),
+  ).current;
   const [form, setForm] = useState<TaskComposerFormState>(() =>
     selectionDraft
       ? {
@@ -128,13 +168,18 @@ export function NewTaskScreen() {
         }
       : prefillObjective
         ? { ...DEFAULT_FORM, objective: prefillObjective }
-        : DEFAULT_FORM,
+        : (persistedDraft?.form ?? DEFAULT_FORM),
   );
-  const [workspace, setWorkspace] = useState(selectionDraft?.workspace ?? "");
-  const [newTaskName, setNewTaskName] = useState("");
+  const [workspace, setWorkspace] = useState(
+    selectionDraft?.workspace ?? persistedDraft?.workspace ?? "",
+  );
+  const [newTaskName, setNewTaskName] = useState(persistedDraft?.newTaskName ?? "");
   const [scopePickError, setScopePickError] = useState<string | null>(null);
   const navigate = useNavigate();
   const selectionDefaultsApplied = useRef(false);
+  useEffect(() => {
+    saveTaskComposerDraft(form, workspace, newTaskName);
+  }, [form, workspace, newTaskName]);
   const applySelectionIntelligence = useCallback(
     (data: TaskIntelligence) => {
       if (!selectionDraft || selectionDefaultsApplied.current) return;
@@ -181,13 +226,14 @@ export function NewTaskScreen() {
   // state is now rare, not the default outcome of picking these scope types.
   const needsScopePath = PATH_SCOPED_PACKAGES.has(form.scopePackage);
   const scopePathMissing = needsScopePath && !form.scopeArea?.trim();
-  const objectiveInterpretation = interpretObjectiveIntent(form.objective, form.mode);
+  const resolvedIntent: TaskIntent =
+    form.intentKind === "auto"
+      ? inferTaskIntent(form.objective)
+      : { kind: form.intentKind, source: "explicit" };
   // Preserve the human's exact wording as the source objective. A separate,
   // typed intent tells every executor how to interpret an open question.
   const baseContract = buildTaskContract(form);
-  const effectiveContract = objectiveInterpretation
-    ? { ...baseContract, intent: objectiveInterpretation.intent }
-    : baseContract;
+  const effectiveContract = { ...baseContract, intent: resolvedIntent };
 
   const runMutation = useMutation({
     mutationFn: async () => {
@@ -195,13 +241,17 @@ export function NewTaskScreen() {
       await glimmerApi.runSession(session.id);
       return session;
     },
-    onSuccess: (session) => navigate(`/sessions/${session.id}`),
+    onSuccess: (session) => {
+      clearTaskComposerDraft();
+      navigate(`/sessions/${session.id}`);
+    },
   });
 
   return (
     <div className="composer">
       <div className="composer__scroll">
         <h1>What should Glimmer work on?</h1>
+        <p className="muted">Draft text and settings are saved locally until the task starts.</p>
         {selectionDraft && (
           <p role="status" className="composer__selection-draft">
             Drafted from <span className="mono">{selectionDraft.path}</span>, lines{" "}
@@ -216,11 +266,9 @@ export function NewTaskScreen() {
               onChange={(e) => setForm({ ...form, objective: e.target.value })}
               placeholder="What should Glimmer work on?"
             />
-            {objectiveInterpretation && (
-              <p role="status" className="composer__intent">
-                {objectiveInterpretation.explanation}
-              </p>
-            )}
+            <p role="status" className="composer__intent">
+              {explainTaskIntent(resolvedIntent.kind, form.mode)}
+            </p>
             <label>
               Workspace path
               <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} />
@@ -390,6 +438,43 @@ export function NewTaskScreen() {
               candidateCount={effectiveContract.scope.paths?.length}
               onIntelligence={selectionDraft ? applySelectionIntelligence : undefined}
             />
+
+            <fieldset>
+              <legend>Interpretation</legend>
+              <label>
+                Task interpretation
+                <select
+                  aria-label="Task interpretation"
+                  value={form.intentKind}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      intentKind: event.target.value as TaskComposerFormState["intentKind"],
+                    })
+                  }
+                >
+                  <option value="auto">Auto-detect</option>
+                  <option value="direct">Direct task</option>
+                  <option value="improvement-assessment">Improvement assessment</option>
+                </select>
+              </label>
+              <small>
+                Resolved as {resolvedIntent.kind.replace("-", " ")} · {resolvedIntent.source}
+              </small>
+            </fieldset>
+
+            <fieldset className="composer__execution-preview">
+              <legend>Execution preview</legend>
+              <ol>
+                {executionPlan(form, resolvedIntent).map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+              <p>
+                One task may own this worktree at a time. If Glimmer is force-quit, existing file
+                changes remain in Git and the workspace is locked for recovery review.
+              </p>
+            </fieldset>
 
             <fieldset>
               <legend>Permissions</legend>

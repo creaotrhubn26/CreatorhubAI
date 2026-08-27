@@ -1,0 +1,932 @@
+diff --git a/glimmer-engineer.py b/glimmer-engineer.py
+index ff25c2f..f40ed31 100755
+--- a/glimmer-engineer.py
++++ b/glimmer-engineer.py
+@@ -19,6 +19,7 @@ from pathlib import Path
+ from urllib import error, request
+ 
+ from glimmer_events import emit as emit_event
++from glimmer_journal import DurableJournal, append_jsonl_durable, atomic_write_json
+ from glimmer_models import load_model_registry, model_for_role
+ 
+ GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
+@@ -29,6 +30,12 @@ GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
+ # that count is > 0. See _plan_aware_discovery_budget below.
+ GLIMMER_PLAN_CANDIDATES = os.environ.get("GLIMMER_PLAN_CANDIDATES")
+ 
++# Set only by run_engineer when it has a real session directory. Keeping the
++# journal optional preserves standalone/architect/consult behavior while the
++# main write-capable loop gains transactional model/tool checkpoints.
++_DURABLE_JOURNAL = None
++_DURABLE_MODEL_TURN = None
++
+ # Task 2.4 (V7 §5.5 second half): the normalized ArchitecturePlan dict
+ # loaded once at run_engineer startup (None when no plan exists), read by
+ # execute_tool's consult_architect interception. Module-level (same
+@@ -296,7 +303,7 @@ def record_blocked_command(workspace, command, reason) -> None:
+         entries = entries[-BLOCKED_COMMANDS_CAP:]
+ 
+         path.parent.mkdir(parents=True, exist_ok=True)
+-        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
++        atomic_write_json(path, entries)
+     except Exception as exc:  # never-raises: best-effort memory only.
+         print(f"[ENGINEER] WARN: failed to record blocked command in memory: {exc}")
+ 
+@@ -596,6 +603,138 @@ def model_http_json(provider, method, endpoint, payload=None, extra_headers=None
+     )
+ 
+ 
++class StreamingUnsupported(RuntimeError):
++    """The provider rejected streaming before returning any model output."""
++
++
++def _streaming_chat_at(provider, payload, timeout_s, on_progress):
++    """Read OpenAI-compatible SSE and assemble the normal response shape.
++
++    ``on_progress`` receives the complete API-visible content/tool-call state
++    after each delta. It never sees authentication headers or hidden provider
++    state. A provider that rejects streaming before producing a delta can be
++    retried once through the existing non-streaming transport without risking
++    duplicate tool execution.
++    """
++    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
++    if provider.api_key_path is not None:
++        key = Path(provider.api_key_path).read_text(encoding="utf-8").strip()
++        if key:
++            headers["Authorization"] = f"Bearer {key}"
++
++    stream_payload = dict(payload)
++    stream_payload["stream"] = True
++    req = request.Request(
++        _model_endpoint_url(provider.base_url, "/v1/chat/completions"),
++        data=json.dumps(stream_payload).encode("utf-8"),
++        headers=headers,
++        method="POST",
++    )
++
++    try:
++        response = request.urlopen(req, timeout=timeout_s)
++    except error.HTTPError as exc:
++        body = exc.read().decode("utf-8", errors="replace")
++        if exc.code in {400, 404, 405, 415, 422}:
++            raise StreamingUnsupported(f"HTTP {exc.code}: {body[-1000:]}") from exc
++        raise RuntimeError(f"HTTP {exc.code} /v1/chat/completions\n{body}") from exc
++
++    content_parts = []
++    tool_parts = {}
++    usage = None
++    finish_reason = None
++    response_id = None
++    saw_sse = False
++    saw_choice = False
++    non_sse = []
++
++    with response:
++        for raw_line in response:
++            line = raw_line.decode("utf-8", errors="replace").strip()
++            if not line:
++                continue
++            if not line.startswith("data:"):
++                non_sse.append(line)
++                continue
++            saw_sse = True
++            data = line[5:].strip()
++            if data == "[DONE]":
++                break
++            try:
++                chunk = json.loads(data)
++            except ValueError as exc:
++                raise RuntimeError(f"Malformed streaming model response: {data[:500]}") from exc
++            if not isinstance(chunk, dict):
++                continue
++            if chunk.get("error"):
++                raise RuntimeError(
++                    "Streaming model error: " + json.dumps(chunk["error"], ensure_ascii=False)[:2000]
++                )
++            response_id = chunk.get("id") or response_id
++            if isinstance(chunk.get("usage"), dict):
++                usage = chunk["usage"]
++            choices = chunk.get("choices") or []
++            if not choices:
++                continue
++            saw_choice = True
++            choice = choices[0] if isinstance(choices[0], dict) else {}
++            finish_reason = choice.get("finish_reason") or finish_reason
++            delta = choice.get("delta") or {}
++            delta_content = delta.get("content")
++            if isinstance(delta_content, str):
++                content_parts.append(delta_content)
++            for position, tool_delta in enumerate(delta.get("tool_calls") or []):
++                if not isinstance(tool_delta, dict):
++                    continue
++                index = tool_delta.get("index")
++                if not isinstance(index, int):
++                    index = position
++                assembled = tool_parts.setdefault(
++                    index,
++                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
++                )
++                if isinstance(tool_delta.get("id"), str):
++                    assembled["id"] += tool_delta["id"]
++                if isinstance(tool_delta.get("type"), str):
++                    assembled["type"] = tool_delta["type"]
++                function_delta = tool_delta.get("function") or {}
++                if isinstance(function_delta.get("name"), str):
++                    assembled["function"]["name"] += function_delta["name"]
++                if isinstance(function_delta.get("arguments"), str):
++                    assembled["function"]["arguments"] += function_delta["arguments"]
++
++            on_progress("".join(content_parts), [tool_parts[key] for key in sorted(tool_parts)])
++
++    if not saw_sse:
++        raw = "\n".join(non_sse)
++        try:
++            parsed = json.loads(raw)
++        except ValueError as exc:
++            raise StreamingUnsupported("provider returned neither SSE nor a JSON response") from exc
++        if not isinstance(parsed, dict):
++            raise StreamingUnsupported("provider returned an unsupported streaming response")
++        return parsed
++
++    if not saw_choice:
++        raise RuntimeError("Streaming model response ended without a completion choice")
++
++    message = {
++        "role": "assistant",
++        "content": "".join(content_parts) or None,
++    }
++    assembled_tools = [tool_parts[key] for key in sorted(tool_parts)]
++    if assembled_tools:
++        message["tool_calls"] = assembled_tools
++    result = {
++        "id": response_id,
++        "object": "chat.completion",
++        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
++    }
++    if usage is not None:
++        result["usage"] = usage
++    return result
++
++
+ # ============================================================
+ # MODEL PROVIDER (V7 §16 Model Runtime, §31 Model routing)
+ # ============================================================
+@@ -652,10 +791,7 @@ def _write_model_usage_file():
+         return
+     try:
+         path = Path(GLIMMER_EVENTS_PATH).parent / "model-usage.json"
+-        path.write_text(
+-            json.dumps(_MODEL_USAGE_TOTALS, indent=2, ensure_ascii=False),
+-            encoding="utf-8",
+-        )
++        atomic_write_json(path, _MODEL_USAGE_TOTALS)
+     except OSError:
+         pass
+ 
+@@ -722,17 +858,47 @@ class ModelProvider:
+                 modelId=self.model_id,
+             )
+ 
++            journal = _DURABLE_JOURNAL
++            journal_turn = _DURABLE_MODEL_TURN if _DURABLE_MODEL_TURN is not None else -1
++            if journal is not None:
++                journal.begin_model(this_id, journal_turn)
++
+             try:
+-                response = model_http_json(
+-                    self, "POST", "/v1/chat/completions", request_payload, **kwargs
+-                )
++                if journal is not None:
++                    try:
++                        response = _streaming_chat_at(
++                            self,
++                            request_payload,
++                            timeout_s if timeout_s is not None else 3600,
++                            lambda content, calls: journal.update_model(
++                                this_id, journal_turn, content, calls
++                            ),
++                        )
++                    except StreamingUnsupported as exc:
++                        journal.append(
++                            "model_streaming_fallback",
++                            {"reason": str(exc)[:1000]},
++                            turn=journal_turn,
++                            request_id=this_id,
++                        )
++                        response = model_http_json(
++                            self, "POST", "/v1/chat/completions", request_payload, **kwargs
++                        )
++                else:
++                    response = model_http_json(
++                        self, "POST", "/v1/chat/completions", request_payload, **kwargs
++                    )
+             except RuntimeError as exc:
+                 # HTTP 4xx/5xx: http_json already converted the response
+                 # into this RuntimeError -- never retried (see
+                 # _is_retryable_network_error's docstring).
++                if journal is not None:
++                    journal.fail_model(this_id, journal_turn, str(exc))
+                 print(f"[ModelProvider:{self.role}] request {this_id} failed: {exc}")
+                 raise
+             except Exception as exc:
++                if journal is not None:
++                    journal.fail_model(this_id, journal_turn, str(exc))
+                 if attempt_no == 1 and _is_retryable_network_error(exc):
+                     print(
+                         f"[ModelProvider:{self.role}] request {this_id} "
+@@ -744,6 +910,13 @@ class ModelProvider:
+             else:
+                 usage = response.get("usage") if isinstance(response, dict) else None
+                 _accumulate_usage(self.role, self.model_id, usage)
++                if journal is not None:
++                    try:
++                        response_message = response["choices"][0]["message"]
++                    except (KeyError, IndexError, TypeError):
++                        response_message = {"content": "", "tool_calls": []}
++                    journal.complete_model(this_id, journal_turn, response_message)
++                    _write_model_usage_file()
+                 return response
+ 
+     def health(self):
+@@ -1051,6 +1224,88 @@ def _model_provider_selfcheck() -> None:
+     print("model-provider self-check: PASS")
+ 
+ 
++def _streaming_transport_selfcheck() -> None:
++    """Prove fragmented content/tool deltas assemble and checkpoint correctly."""
++    import sqlite3
++    import tempfile
++
++    chunks = [
++        {"id": "stream-1", "choices": [{"delta": {"content": "hel"}}]},
++        {"choices": [{"delta": {"content": "lo", "tool_calls": [{
++            "index": 0, "id": "call_", "type": "function",
++            "function": {"name": "write_", "arguments": "{\"path\":\"x"},
++        }]}}]},
++        {"choices": [{"delta": {"tool_calls": [{
++            "index": 0, "id": "1", "function": {"name": "file", "arguments": ".txt\"}"},
++        }]}, "finish_reason": "tool_calls"}]},
++    ]
++
++    class FakeResponse:
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *_args):
++            return False
++
++        def __iter__(self):
++            lines = [("data: " + json.dumps(chunk) + "\n").encode("utf-8") for chunk in chunks]
++            return iter(lines + [b"data: [DONE]\n"])
++
++    seen_payload = {}
++    real_urlopen = request.urlopen
++
++    def fake_urlopen(req, timeout=None):
++        seen_payload.update(json.loads(req.data.decode("utf-8")))
++        assert timeout == 5
++        return FakeResponse()
++
++    request.urlopen = fake_urlopen
++    try:
++        with tempfile.TemporaryDirectory() as td:
++            journal = DurableJournal(Path(td), "stream-selfcheck")
++            journal.begin_model("request-1", 3)
++            provider = ModelProvider(
++                "http://127.0.0.1:1", None, "engineer", "test-model"
++            )
++            result = _streaming_chat_at(
++                provider,
++                {"messages": []},
++                5,
++                lambda content, calls: journal.update_model(
++                    "request-1", 3, content, calls, force=True
++                ),
++            )
++            message = result["choices"][0]["message"]
++            assert message["content"] == "hello"
++            assert message["tool_calls"][0] == {
++                "id": "call_1",
++                "type": "function",
++                "function": {"name": "write_file", "arguments": '{"path":"x.txt"}'},
++            }
++            journal.complete_model("request-1", 3, message)
++            journal.close("completed")
++            db = sqlite3.connect(str(Path(td) / "runtime.sqlite3"))
++            row = db.execute(
++                "SELECT status, content, tool_calls_json FROM model_streams WHERE request_id=?",
++                ("request-1",),
++            ).fetchone()
++            db.close()
++            assert row[0] == "completed" and row[1] == "hello"
++            assert json.loads(row[2])[0]["function"]["name"] == "write_file"
++            assert seen_payload["stream"] is True
++
++            chunks[:] = [{"error": {"message": "provider failed"}}]
++            try:
++                _streaming_chat_at(provider, {"messages": []}, 5, lambda *_args: None)
++                assert False, "an SSE error object must never become an empty successful response"
++            except RuntimeError as exc:
++                assert "provider failed" in str(exc)
++    finally:
++        request.urlopen = real_urlopen
++
++    print("streaming transport self-check: PASS")
++
++
+ # ============================================================
+ # LOCAL SAFE GIT HELPERS
+ # ============================================================
+@@ -2011,9 +2266,7 @@ def _atomic_write_json(path: Path, data) -> None:
+     this process's own next poll) to trip over. os.replace is atomic on
+     the same filesystem, and the temp file lives in the same directory so
+     it always is."""
+-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+-    os.replace(tmp, path)
++    atomic_write_json(path, data)
+ 
+ 
+ def _approvals_path(session_dir) -> Path:
+@@ -2769,8 +3022,7 @@ def _persist_evidence(tool_name, arguments, content):
+         "content": _head_tail_cap(content, MAX_EVIDENCE_RESULT, "EVIDENCE COMPACTED"),
+     }
+     try:
+-        with path.open("a", encoding="utf-8") as f:
+-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
++        append_jsonl_durable(path, record)
+     except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
+         print(f"[glimmer-engineer] failed to persist evidence: {exc}", flush=True)
+ 
+@@ -2906,12 +3158,7 @@ def _append_evidence_index_entry(evidence_id, kind, tool_name, path_value, relat
+         # read back as corrupt/empty. os.replace is atomic on both POSIX
+         # and Windows (same discipline control-center's task-overrides.json
+         # write already uses).
+-        tmp_path = idx_path.with_name(f"{idx_path.name}.tmp-{os.getpid()}")
+-        tmp_path.write_text(
+-            json.dumps(existing, ensure_ascii=False, indent=2),
+-            encoding="utf-8",
+-        )
+-        os.replace(tmp_path, idx_path)
++        atomic_write_json(idx_path, existing)
+     except Exception as exc:  # noqa: BLE001 - index is best-effort only
+         print(f"[glimmer-engineer] failed to update evidence index: {exc}")
+ 
+@@ -4335,8 +4582,7 @@ def _persist_tool_envelope(envelope):
+     record["timestamp"] = datetime.now(timezone.utc).isoformat()
+ 
+     try:
+-        with path.open("a", encoding="utf-8") as f:
+-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
++        append_jsonl_durable(path, record)
+     except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
+         print(f"[glimmer-engineer] failed to persist tool envelope: {exc}", flush=True)
+ 
+@@ -7272,10 +7518,7 @@ def _write_architecture_plan_file(output):
+         return None
+ 
+     try:
+-        path.write_text(
+-            json.dumps(output, indent=2, ensure_ascii=False),
+-            encoding="utf-8",
+-        )
++        atomic_write_json(path, output)
+         print(f"Wrote: {path}")
+         return path
+     except OSError as exc:
+@@ -7553,7 +7796,7 @@ def _write_task_report_file(output):
+         return None
+     path = Path(GLIMMER_EVENTS_PATH).parent / "task-report.json"
+     try:
+-        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
++        atomic_write_json(path, output)
+         print(f"Wrote: {path}")
+         return path
+     except OSError as exc:
+@@ -7764,7 +8007,7 @@ def _write_architect_review_file(output, iteration, review_round):
+         )
+         return None
+     try:
+-        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
++        atomic_write_json(path, output)
+         print(f"Wrote: {path}")
+         return path
+     except OSError as exc:
+@@ -8486,10 +8729,7 @@ def _write_delivery_review_file(output):
+         return None
+ 
+     try:
+-        path.write_text(
+-            json.dumps(output, indent=2, ensure_ascii=False),
+-            encoding="utf-8",
+-        )
++        atomic_write_json(path, output)
+         print(f"Wrote: {path}")
+         return path
+     except OSError as exc:
+@@ -8808,10 +9048,7 @@ def _write_escalation_file(output):
+         )
+         return None
+     try:
+-        path.write_text(
+-            json.dumps(output, indent=2, ensure_ascii=False),
+-            encoding="utf-8",
+-        )
++        atomic_write_json(path, output)
+         print(f"Wrote: {path}")
+         return path
+     except OSError as exc:
+@@ -10048,6 +10285,7 @@ def run_engineer(
+     # triggers (regardless of architect_consult_enabled) and, gated by
+     # that flag too, whether consult_architect is offered at all.
+     global _loaded_architecture_plan, _architect_consult_enabled, _contract_scope_prefixes
++    global _DURABLE_JOURNAL, _DURABLE_MODEL_TURN
+     _loaded_architecture_plan = _load_architecture_plan_for_engineer()
+     architecture_plan = _loaded_architecture_plan
+     _architect_consult_enabled = architect_consult_enabled
+@@ -10166,6 +10404,8 @@ def run_engineer(
+             "new Glimmer write session."
+         )
+ 
++    recovery_baseline = git_local(workspace, "rev-parse", "HEAD")
++
+     baseline_preview = "\n".join(
+         dirty[:100]
+     )
+@@ -10293,6 +10533,18 @@ def run_engineer(
+         },
+     ]
+ 
++    # The event path is the existing, trusted session-directory handoff from
++    # glimmer-v2.py. Standalone runs remain unchanged; gateway/v2 sessions get
++    # an immediate durable Tier-0 checkpoint before the first model request.
++    if GLIMMER_EVENTS_PATH and GLIMMER_SESSION_ID:
++        _DURABLE_JOURNAL = DurableJournal(
++            Path(GLIMMER_EVENTS_PATH).parent,
++            GLIMMER_SESSION_ID,
++            process_name="engineer",
++        )
++        atexit.register(_DURABLE_JOURNAL.close)
++        _DURABLE_JOURNAL.checkpoint_conversation(messages, -1, "initialized")
++
+     approvals = {
+         "approve_all": auto_yes,
+     }
+@@ -10382,6 +10634,8 @@ def run_engineer(
+ 
+     for turn in range(max_turns):
+ 
++        _DURABLE_MODEL_TURN = turn
++
+         used_final_synthesis = False
+ 
+         active_tools = tools
+@@ -10582,6 +10836,11 @@ def run_engineer(
+                     "final answer postponed."
+                 )
+ 
++                if _DURABLE_JOURNAL is not None:
++                    _DURABLE_JOURNAL.checkpoint_conversation(
++                        messages, turn, "verification_gate"
++                    )
++
+                 continue
+ 
+             print()
+@@ -10595,6 +10854,13 @@ def run_engineer(
+             print()
+             print(content)
+ 
++            if _DURABLE_JOURNAL is not None:
++                _DURABLE_JOURNAL.checkpoint_conversation(
++                    messages + [{"role": "assistant", "content": content}],
++                    turn,
++                    "final_response",
++                )
++
+             # C6 (glimmer-v7, V7 §23.7): DeliveryReview companion to the
+             # prose report just printed above. Runs for both success and
+             # failure outcomes of the engineer loop (§23.12 wants failed
+@@ -10626,6 +10892,9 @@ def run_engineer(
+ 
+             postflight(workspace)
+ 
++            if _DURABLE_JOURNAL is not None:
++                _DURABLE_JOURNAL.close("completed")
++
+             return
+ 
+         # ----------------------------------------------------
+@@ -10650,6 +10919,11 @@ def run_engineer(
+             }
+         )
+ 
++        if _DURABLE_JOURNAL is not None:
++            _DURABLE_JOURNAL.checkpoint_conversation(
++                messages, turn, "assistant_tool_calls"
++            )
++
+         for call in tool_calls:
+ 
+             function = (
+@@ -10662,6 +10936,17 @@ def run_engineer(
+                 or ""
+             )
+ 
++            changed = False
++            arguments = function.get("arguments") or {}
++            try:
++                journal_arguments = parse_arguments(arguments)
++            except Exception:  # malformed arguments are still a durable intent fact
++                journal_arguments = arguments
++            if _DURABLE_JOURNAL is not None:
++                _DURABLE_JOURNAL.begin_tool(
++                    call["id"], turn, tool_name, journal_arguments
++                )
++
+             # Task 5.1: reset every call iteration so a call that never
+             # reaches the real execute_tool() below (unknown tool,
+             # repository-write-frozen block, exception) can never
+@@ -10890,6 +11175,31 @@ def run_engineer(
+                         + result
+                     )
+ 
++            snapshot = None
++            if _DURABLE_JOURNAL is not None and changed:
++                try:
++                    snapshot = _DURABLE_JOURNAL.snapshot_worktree(
++                        workspace, recovery_baseline, turn, call["id"]
++                    )
++                except Exception as exc:  # journal failure is visible, never hidden
++                    _DURABLE_JOURNAL.append(
++                        "worktree_snapshot_failed",
++                        {"error": str(exc)[:2000]},
++                        turn=turn,
++                        call_id=call["id"],
++                    )
++                    print(f"[glimmer-engineer] recovery snapshot failed: {exc}", flush=True)
++
++            if _DURABLE_JOURNAL is not None:
++                _DURABLE_JOURNAL.complete_tool(
++                    call["id"],
++                    turn,
++                    tool_name,
++                    result,
++                    changed=changed,
++                    snapshot=snapshot,
++                )
++
+             messages.append(
+                 {
+                     "role": "tool",
+@@ -10903,6 +11213,11 @@ def run_engineer(
+                 }
+             )
+ 
++            if _DURABLE_JOURNAL is not None:
++                _DURABLE_JOURNAL.checkpoint_conversation(
++                    messages, turn, "tool_result"
++                )
++
+             # Task 5.1: remember which evidence id (if any) this tool
+             # message's own content can be swapped for later, so
+             # _compact_tier1_to_tier2 (below) can move it to Tier2
+@@ -11061,6 +11376,11 @@ def run_engineer(
+                 "Next action must be edit_file, write_file, or finish."
+             )
+ 
++        if _DURABLE_JOURNAL is not None:
++            _DURABLE_JOURNAL.checkpoint_conversation(
++                messages, turn, "turn_complete"
++            )
++
+     raise RuntimeError(
+         "Engineering agent reached "
+         f"max turns ({max_turns})."
+@@ -12074,6 +12394,10 @@ if __name__ == "__main__":
+         _model_provider_selfcheck()
+         sys.exit(0)
+ 
++    if sys.argv[1:] == ["--streaming-transport-selfcheck"]:
++        _streaming_transport_selfcheck()
++        sys.exit(0)
++
+     if sys.argv[1:] == ["--recovery-ladder-selfcheck"]:
+         _recovery_ladder_selfcheck()
+         sys.exit(0)
+diff --git a/glimmer-v2.py b/glimmer-v2.py
+index 2804ce6..9380aad 100755
+--- a/glimmer-v2.py
++++ b/glimmer-v2.py
+@@ -22,6 +22,7 @@ import urllib.request
+ from pathlib import Path
+ 
+ from glimmer_events import emit as emit_event
++from glimmer_journal import atomic_write_bytes, atomic_write_json
+ from glimmer_models import load_model_registry, model_for_role
+ 
+ ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
+@@ -246,7 +247,7 @@ def _resolve_orphaned_pending_approval(session_dir) -> None:
+             record["resolvedAt"] = resolved_at
+             approvals[approval_id] = record
+             try:
+-                approvals_path.write_text(json.dumps(approvals, indent=2), encoding="utf-8")
++                atomic_write_json(approvals_path, approvals)
+             except OSError:
+                 pass
+             print(f"[V2] orphaned YELLOW approval {approval_id!r} resolved: denied ({resolved_by})")
+@@ -259,7 +260,7 @@ def _resolve_orphaned_pending_approval(session_dir) -> None:
+         on_disk["state"] = canonical_session_state(on_disk.get("status") or "")
+     on_disk.pop("pendingApproval", None)
+     try:
+-        manifest_path.write_text(json.dumps(on_disk, indent=2), encoding="utf-8")
++        atomic_write_json(manifest_path, on_disk)
+     except OSError:
+         pass
+ 
+@@ -1567,9 +1568,7 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
+             # and whether fail_fast stops at the first failure.
+             result["tier"] = tier
+             results.append(result)
+-            (session / f"verify-{iteration:02d}-{i:02d}.json").write_text(
+-                json.dumps(result, indent=2), encoding="utf-8"
+-            )
++            atomic_write_json(session / f"verify-{iteration:02d}-{i:02d}.json", result)
+             if events_path is not None:
+                 emit_event(events_path, "verification_completed", session_id, check=label,
+                            status=result["status"], baselineAware=bool(result.get("baseline")),
+@@ -2729,6 +2728,10 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
+     if scope_prefixes:
+         env["GLIMMER_CONTRACT_SCOPE"] = json.dumps(list(scope_prefixes))
+     with log_path.open("w", encoding="utf-8") as log:
++        try:
++            os.chmod(log_path, 0o600)
++        except OSError:
++            pass
+         # Round 8 whole-round review (MJ4): `start_new_session` only when a
+         # `timeout` is actually set (only run_architect_escalation ever
+         # passes one -- every other caller is unaffected) -- puts this
+@@ -2752,12 +2755,19 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
+         timer = threading.Timer(timeout, _kill_on_timeout) if timeout else None
+         if timer is not None:
+             timer.start()
++        last_log_sync = time.monotonic()
+         try:
+             for line in p.stdout:
+                 sys.stdout.write(line)
+                 log.write(line)
++                log.flush()
++                if time.monotonic() - last_log_sync >= 0.5:
++                    os.fsync(log.fileno())
++                    last_log_sync = time.monotonic()
+             return p.wait()
+         finally:
++            log.flush()
++            os.fsync(log.fileno())
+             if timer is not None:
+                 timer.cancel()
+ 
+@@ -2917,7 +2927,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
+ 
+     try:
+         architect_prompt = make_architect_prompt(contract, summary, ws)
+-        (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
++        atomic_write_bytes(session / "architect-prompt.txt", architect_prompt.encode("utf-8"))
+ 
+         rc = invoke_engineer(
+             engineer, ws, architect_prompt,
+@@ -2972,7 +2982,7 @@ def load_task_report(session_dir):
+ def run_read_only_task(engineer, ws, contract, summary, session, events_path, sid):
+     """Run inspect/plan/review through Architect's structurally read-only loop."""
+     prompt = make_architect_prompt(contract, summary, ws)
+-    (session / "task-report-prompt.txt").write_text(prompt, encoding="utf-8")
++    atomic_write_bytes(session / "task-report-prompt.txt", prompt.encode("utf-8"))
+     rc = invoke_engineer(
+         engineer, ws, prompt, True, None,
+         session / "task-report.log", events_path, sid,
+@@ -3044,7 +3054,10 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path,
+ 
+     try:
+         replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version, ws)
+-        (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
++        atomic_write_bytes(
++            session / f"architect-replan-{to_version}-prompt.txt",
++            replan_prompt.encode("utf-8"),
++        )
+ 
+         # Fix round 1 (HIGH): architecture-plan.json already holds
+         # v{from_version} (record_architecture_plan_version wrote it there
+@@ -3113,10 +3126,9 @@ def record_architecture_plan_version(session, manifest, plan):
+     defaults to 1 defensively if somehow missing.
+     """
+     version = plan.get("version", 1)
+-    text = json.dumps(plan, indent=2)
+     versioned_name = f"architecture-plan-v{version}.json"
+-    (Path(session) / versioned_name).write_text(text, encoding="utf-8")
+-    (Path(session) / "architecture-plan.json").write_text(text, encoding="utf-8")
++    atomic_write_json(Path(session) / versioned_name, plan)
++    atomic_write_json(Path(session) / "architecture-plan.json", plan)
+     manifest.setdefault("architectPlans", []).append({
+         "version": version,
+         "path": versioned_name,
+@@ -3577,7 +3589,7 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
+ 
+         request = make_review_request(plan, files, change_types, diff_text, iteration, review_round,
+                                        task_list=task_list, matched_adr_ids=matched_adr_ids)
+-        request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
++        atomic_write_json(request_path, request)
+ 
+         rc = invoke_engineer(
+             engineer, ws,
+@@ -3875,8 +3887,9 @@ def save_tasks(session_dir, tasks) -> None:
+     write failure here (permissions, full disk) must degrade to a log
+     line, never take down an otherwise-successful engineering session."""
+     try:
+-        (Path(session_dir) / "tasks.json").write_text(
+-            json.dumps({"schemaVersion": 2, "tasks": tasks}, indent=2), encoding="utf-8")
++        atomic_write_json(
++            Path(session_dir) / "tasks.json", {"schemaVersion": 2, "tasks": tasks}
++        )
+     except OSError as exc:
+         print(f"[V2] WARN: failed to write tasks.json: {exc}")
+ 
+@@ -4445,9 +4458,10 @@ def _write_doc_graph(ws, graph: dict) -> None:
+         if path.is_file() and path.read_text(encoding="utf-8") == serialized:
+             return
+         path.parent.mkdir(parents=True, exist_ok=True)
+-        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+-        tmp.write_text(serialized, encoding="utf-8")
+-        os.replace(tmp, path)
++        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
++        atomic_write_bytes(
++            path, serialized.encode("utf-8"), mode=mode, private_parent=False
++        )
+     except OSError as exc:
+         print(f"[V2] WARN: failed to write {DOC_GRAPH_RELATIVE_PATH}: {exc}")
+ 
+@@ -5180,18 +5194,15 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
+ 
+     def _write_escalation_record(record) -> None:
+         try:
+-            escalation_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
++            atomic_write_json(escalation_path, record)
+         except OSError as write_exc:
+             print(f"[V2] WARN: failed to write architect-escalation.json: {write_exc}")
+ 
+     try:
+-        request_path.write_text(
+-            json.dumps({
+-                "architecturePlan": architecture_plan,
+-                "question": build_escalation_question(delivery_review),
+-            }, indent=2),
+-            encoding="utf-8",
+-        )
++        atomic_write_json(request_path, {
++            "architecturePlan": architecture_plan,
++            "question": build_escalation_question(delivery_review),
++        })
+         rc = invoke_engineer(
+             engineer, ws,
+             "Answer the architect escalation question in --consult-request.",
+@@ -5420,11 +5431,9 @@ def write_delivery_packet(manifest, session_dir, delivery_review):
+     any, is already on disk by the time this reads it."""
+     packet = compute_delivery_packet(manifest, delivery_review, load_architect_escalation(session_dir))
+     try:
+-        (Path(session_dir) / "delivery-packet.json").write_text(
+-            json.dumps(packet, indent=2, ensure_ascii=False), encoding="utf-8"
+-        )
+-        (Path(session_dir) / "packet-summary.txt").write_text(
+-            render_packet_summary(packet), encoding="utf-8"
++        atomic_write_json(Path(session_dir) / "delivery-packet.json", packet)
++        atomic_write_bytes(
++            Path(session_dir) / "packet-summary.txt", render_packet_summary(packet).encode("utf-8")
+         )
+     except OSError as exc:
+         print(f"[V2] WARN: failed to write delivery packet: {exc}")
+@@ -5734,13 +5743,18 @@ def _docs_bootstrap(workspace) -> int:
+     graph = build_docs_bootstrap_graph(repo_map)
+ 
+     graph_path.parent.mkdir(parents=True, exist_ok=True)
+-    graph_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
++    atomic_write_json(graph_path, graph, mode=0o644, private_parent=False)
+ 
+     (ws / ADR_DECISIONS_RELATIVE_DIR).mkdir(parents=True, exist_ok=True)
+ 
+     readme_path = ws / DOCS_README_RELATIVE_PATH
+     if not readme_path.exists():
+-        readme_path.write_text(_DOCS_README_STUB, encoding="utf-8")
++        atomic_write_bytes(
++            readme_path,
++            _DOCS_README_STUB.encode("utf-8"),
++            mode=0o644,
++            private_parent=False,
++        )
+ 
+     by_type = {}
+     for n in graph["nodes"]:
+@@ -6138,13 +6152,17 @@ def main():
+     legacy_sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+     sid = args.session_id or legacy_sid
+     session = STATE_ROOT / (sid if args.session_id else f"{sid}-{b.replace('/', '-')}")
+-    session.mkdir()
++    session.mkdir(mode=0o700)
++    try:
++        os.chmod(session, 0o700)
++    except OSError:
++        pass
+     events_path = session / "events.jsonl"
+     emit_event(events_path, "session_created", sid,
+                taskSummary=_truncate_bytes(task, 500, "..."), workspace=str(ws))
+ 
+     repo = build_repo_map(ws)
+-    (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
++    atomic_write_json(session / "repo-map.json", repo)
+     summary = repo_summary(repo)
+ 
+     # Task 1.2: skill_loaded events, once per session -- separate from (and
+@@ -6272,7 +6290,7 @@ def main():
+ 
+     def save():
+         # SINGLE-WRITER INVARIANT (8.3 review fix-round, M3, V7 §14/§35):
+-        # this is a bare non-atomic write_text of the FULL in-memory
++        # this is an atomic, fsync-backed write of the FULL in-memory
+         # `manifest` dict -- safe ONLY because this process never calls
+         # save() while a glimmer-engineer.py subprocess is running
+         # (invoke_engineer's `for line in p.stdout: ...` loop blocks this
+@@ -6297,7 +6315,7 @@ def main():
+         # across sequential invoke_engineer calls).
+         _merge_engineer_owned_keys(manifest, manifest_path)
+         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
++        atomic_write_json(manifest_path, manifest)
+ 
+     save()
+     # Task 1.2: session_created (emitted right after session.mkdir() above)
+@@ -6532,7 +6550,9 @@ def main():
+             prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
+                                  plan=architecture_plan, evidence=candidate_evidence,
+                                  repair_contract=repair_contract, tasks=tasks)
+-            (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
++            atomic_write_bytes(
++                session / f"prompt-{iteration:02d}.txt", prompt.encode("utf-8")
++            )
+             # C3: spawn -- deterministic evidence point 1/3. The engineer
+             # subprocess is about to execute the whole implementationPlan
+             # in one run (no per-task pointer, see the C3 module docstring
+@@ -6915,8 +6935,10 @@ def main():
+                         checkpoint_sha=checkpoint_sha, plan=architecture_plan, evidence=candidate_evidence,
+                         tasks=tasks,
+                     )
+-                    (session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt").write_text(
+-                        revise_prompt, encoding="utf-8")
++                    atomic_write_bytes(
++                        session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt",
++                        revise_prompt.encode("utf-8"),
++                    )
+                     # C3: a REVISE_IMPLEMENTATION round re-invokes the
+                     # engineer directly (outside the outer repair loop) --
+                     # implementation tasks go back to in_progress for this
+@@ -7259,8 +7281,9 @@ def main():
+             # follows just above.
+             repair_contract = build_repair_contract(iteration + 1, results, files, ws)
+             manifest["attempts"][-1]["repairContract"] = repair_contract
+-            (session / f"repair-{iteration + 1:02d}.json").write_text(
+-                json.dumps({"repair": repair_contract}, indent=2), encoding="utf-8"
++            atomic_write_json(
++                session / f"repair-{iteration + 1:02d}.json",
++                {"repair": repair_contract},
+             )
+             # Task 4.1: auto-create a repair task for this round, in the same
+             # tasks.json the architect-plan-derived tasks live in -- only
+diff --git a/glimmer_events.py b/glimmer_events.py
+index 305bf57..4ae5424 100644
+--- a/glimmer_events.py
++++ b/glimmer_events.py
+@@ -17,6 +17,9 @@ import json
+ import os
+ import uuid
+ from datetime import datetime, timezone
++from pathlib import Path
++
++from glimmer_journal import append_jsonl_durable
+ 
+ EVENT_TYPES = {
+     "tool_started", "tool_completed", "tool_blocked", "file_changed",
+@@ -83,13 +86,10 @@ def emit(events_path: str, event_type: str, session_id: str, **fields) -> None:
+             "type": event_type,
+             **fields,
+         }
+-        line = json.dumps(record, ensure_ascii=False) + "\n"
+-        # O_APPEND write() atomicity is the guarantee described in the module docstring.
+-        fd = os.open(events_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+-        try:
+-            os.write(fd, line.encode("utf-8"))
+-        finally:
+-            os.close(fd)
++        # The helper retains O_APPEND single-write atomicity and adds fsync,
++        # so a completed event survives an app/process/machine crash instead
++        # of lingering only in the OS page cache.
++        append_jsonl_durable(Path(events_path), record)
+     except Exception as exc:  # noqa: BLE001 - deliberate: event emission must never break the session
+         print(f"[glimmer_events] failed to emit {event_type!r}: {exc}", flush=True)
+ 

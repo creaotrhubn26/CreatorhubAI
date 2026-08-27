@@ -4,13 +4,19 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import type { GlimmerSession, GlimmerSessionStatus, TaskContract } from "@glimmer/shared";
-import { gatewayRunsDir } from "../config.js";
+import { gatewayRunsDir, sessionsDir } from "../config.js";
 
 const execFileAsync = promisify(execFile);
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
 export type GatewayRunState =
-  "created" | "starting" | "running" | "cancel_requested" | "exited" | "start_failed";
+  | "created"
+  | "starting"
+  | "running"
+  | "cancel_requested"
+  | "exited"
+  | "start_failed"
+  | "interrupted";
 
 export interface GatewayRunRecord {
   version: 1;
@@ -26,6 +32,9 @@ export interface GatewayRunRecord {
   pid?: number;
   exitCode?: number | null;
   error?: string;
+  updatedAt?: string;
+  heartbeatAt?: string;
+  recovery?: NonNullable<GlimmerSession["recovery"]>;
 }
 
 const updateQueues = new Map<string, Promise<unknown>>();
@@ -40,8 +49,112 @@ async function atomicWrite(record: GatewayRunRecord): Promise<void> {
   if (!target) throw new Error("invalid gateway run id");
   await fs.mkdir(gatewayRunsDir(), { recursive: true });
   const temp = `${target}.${randomUUID()}.tmp`;
+  record.updatedAt = new Date().toISOString();
   await fs.writeFile(temp, JSON.stringify(record, null, 2), { encoding: "utf8", mode: 0o600 });
+  const tempHandle = await fs.open(temp, "r");
+  try {
+    await tempHandle.sync();
+  } finally {
+    await tempHandle.close();
+  }
   await fs.rename(temp, target);
+  const directoryHandle = await fs.open(gatewayRunsDir(), "r");
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+type DurableCheckpoint = NonNullable<NonNullable<GlimmerSession["recovery"]>["durableCheckpoint"]>;
+
+function safeGitPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096) return false;
+  if (path.isAbsolute(value)) return false;
+  return !value.split(/[\\/]/).includes("..");
+}
+
+/** Read the deliberately small JSON projection of runtime.sqlite3. */
+export async function readDurableCheckpoint(
+  id: string,
+  workspace?: string,
+): Promise<DurableCheckpoint | null> {
+  if (!SAFE_ID.test(id) || id === "." || id === "..") return null;
+  try {
+    const parsed = JSON.parse(
+      await fs.readFile(path.join(sessionsDir(), id, "recovery-state.json"), "utf8"),
+    ) as Record<string, unknown>;
+    if (
+      parsed.schemaVersion !== 1 ||
+      parsed.sessionId !== id ||
+      parsed.durable !== true ||
+      typeof parsed.lastDurableAt !== "string" ||
+      !Number.isFinite(Date.parse(parsed.lastDurableAt)) ||
+      typeof parsed.phase !== "string" ||
+      parsed.phase.length > 100
+    ) {
+      return null;
+    }
+    const checkpoint: DurableCheckpoint = {
+      lastDurableAt: parsed.lastDurableAt,
+      phase: parsed.phase,
+    };
+    if (Number.isInteger(parsed.turn) && Number(parsed.turn) >= -1)
+      checkpoint.turn = Number(parsed.turn);
+    if (Number.isInteger(parsed.durableMessageCount) && Number(parsed.durableMessageCount) >= 0)
+      checkpoint.durableMessageCount = Number(parsed.durableMessageCount);
+    if (
+      Number.isInteger(parsed.partialModelCharacters) &&
+      Number(parsed.partialModelCharacters) >= 0
+    )
+      checkpoint.partialModelCharacters = Number(parsed.partialModelCharacters);
+
+    const pending = parsed.pendingTool as Record<string, unknown> | null;
+    if (
+      pending &&
+      typeof pending.callId === "string" &&
+      pending.callId.length <= 200 &&
+      typeof pending.tool === "string" &&
+      pending.tool.length <= 100
+    ) {
+      checkpoint.pendingTool = {
+        callId: pending.callId,
+        tool: pending.tool,
+        ...(safeGitPath(pending.path) ? { path: pending.path } : {}),
+      };
+    }
+
+    const snapshot = parsed.snapshot as Record<string, unknown> | null;
+    if (
+      snapshot &&
+      typeof snapshot.commit === "string" &&
+      /^[a-f0-9]{40,64}$/.test(snapshot.commit)
+    ) {
+      let commitExists = true;
+      if (workspace) {
+        try {
+          await execFileAsync("git", ["cat-file", "-e", `${snapshot.commit}^{commit}`], {
+            cwd: workspace,
+          });
+        } catch {
+          commitExists = false;
+        }
+      }
+      if (commitExists) {
+        checkpoint.snapshotCommit = snapshot.commit;
+        if (Array.isArray(snapshot.changedFiles)) {
+          checkpoint.snapshotChangedFiles = snapshot.changedFiles.filter(safeGitPath).slice(0, 500);
+        }
+      }
+    }
+    return checkpoint;
+  } catch (error: any) {
+    if (error?.code !== "ENOENT")
+      console.warn(
+        `[gateway-runs] unreadable durable checkpoint ${id}: ${error?.message ?? error}`,
+      );
+    return null;
+  }
 }
 
 export function createCanonicalSessionId(now = new Date()): string {
@@ -103,9 +216,10 @@ export function updateGatewayRun(
       return updated;
     });
   updateQueues.set(id, next);
-  void next.finally(() => {
+  const cleanup = () => {
     if (updateQueues.get(id) === next) updateQueues.delete(id);
-  });
+  };
+  void next.then(cleanup, cleanup);
   return next;
 }
 
@@ -152,7 +266,8 @@ export function gatewayRunToSession(record: GatewayRunRecord): GlimmerSession {
   if (record.state === "starting" || record.state === "running") status = "preflight";
   if (record.state === "cancel_requested") status = "cancelled";
   if (record.state === "exited" || record.state === "start_failed") status = "failed";
-  const terminal = status === "cancelled" || status === "failed";
+  if (record.state === "interrupted") status = "needs_review";
+  const terminal = status === "cancelled" || status === "failed" || status === "needs_review";
   return {
     id: record.id,
     task: record.contract.objective,
@@ -163,12 +278,16 @@ export function gatewayRunToSession(record: GatewayRunRecord): GlimmerSession {
     baselineSha: record.baselineSha ?? "Unavailable",
     startedAt: record.startedAt,
     completedAt: terminal ? record.completedAt : undefined,
-    changedFiles: [],
-    verification: { overall: "NOT_RUN", checks: [] },
+    changedFiles: record.recovery?.changedFiles ?? [],
+    ...(record.recovery ? { recovery: record.recovery } : {}),
+    verification: {
+      overall: record.state === "interrupted" ? "NEEDS_REVIEW" : "NOT_RUN",
+      checks: [],
+    },
     repairsUsed: 0,
     repairBudget: record.contract.repairBudget,
     finalStatus: {
-      functional: "NOT_RUN",
+      functional: record.state === "interrupted" ? "NEEDS_REVIEW" : "NOT_RUN",
       visual: "not_run",
       architecture: "not_run",
       documentation: "not_run",

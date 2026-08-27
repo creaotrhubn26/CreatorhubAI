@@ -23,6 +23,7 @@ async function writeBundledOrchestrator() {
     "glimmer-v2.py",
     "glimmer-engineer.py",
     "glimmer_events.py",
+    "glimmer_journal.py",
     "glimmer_models.py",
     "glimmer-visual.py",
     "run-github-mcp.sh",
@@ -33,7 +34,7 @@ async function writeBundledOrchestrator() {
   }
   await fs.writeFile(
     path.join(root, "ORIGIN.json"),
-    JSON.stringify({ commit: "0123456789abcdef", files }),
+    JSON.stringify({ commit: "0123456789abcdef", overlay: { id: "durable-test" }, files }),
   );
   return files;
 }
@@ -85,6 +86,9 @@ describe("runtime diagnostics", () => {
     expect(readiness.coreReady).toBe(true);
     expect(readiness.status).toBe("degraded");
     expect(readiness.components.find((item) => item.id === "python")?.version).toBe("3.13.15");
+    expect(readiness.components.find((item) => item.id === "orchestrator")?.version).toBe(
+      "0123456789ab+durable-test",
+    );
     expect(readiness.components.find((item) => item.id === "model")?.required).toBe(false);
   });
 

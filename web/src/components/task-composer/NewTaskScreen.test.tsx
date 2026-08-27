@@ -31,6 +31,7 @@ function withQuery(
 
 describe("NewTaskScreen", () => {
   beforeEach(() => {
+    window.localStorage?.clear();
     // NewTaskScreen now renders TaskIntelligencePanel, which fetches on mount.
     // Stub it so these tests exercise the composer form, not the network.
     vi.spyOn(client.glimmerApi, "getTaskIntelligence").mockImplementation(
@@ -144,6 +145,30 @@ describe("NewTaskScreen", () => {
     expect(screen.getByLabelText("Modify files")).not.toBeChecked();
   });
 
+  it("lets the user override auto-detection and previews the exact execution policy", async () => {
+    const createSpy = vi
+      .spyOn(client.glimmerApi, "createSession")
+      .mockResolvedValue({ id: "s-explicit" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+    render(withQuery(<NewTaskScreen />));
+
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Hva kan bli bedre?" },
+    });
+    fireEvent.change(screen.getByLabelText("Task interpretation"), {
+      target: { value: "direct" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+
+    expect(screen.getByText(/follow the literal objective/i)).toBeInTheDocument();
+    expect(screen.getByText(/one task may own this worktree/i)).toBeInTheDocument();
+    expect(screen.queryByText(/choose one concrete, bounded improvement/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await waitFor(() => expect(createSpy).toHaveBeenCalled());
+    expect(createSpy.mock.calls[0][0].intent).toEqual({ kind: "direct", source: "explicit" });
+  });
+
   it("lets the user toggle a verification checkbox on", () => {
     render(withQuery(<NewTaskScreen />));
     const box = screen.getByLabelText("Frontend typecheck") as HTMLInputElement;
@@ -172,6 +197,44 @@ describe("NewTaskScreen", () => {
   it("defaults the objective to empty when arriving with no router state", () => {
     render(withQuery(<NewTaskScreen />));
     expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue("");
+  });
+
+  it("restores an unsubmitted local draft after the composer remounts", async () => {
+    const first = render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText("What should Glimmer work on?"), {
+      target: { value: "Preserve this draft after Force Quit" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), {
+      target: { value: "/tmp/glimmer-draft" },
+    });
+    await waitFor(() =>
+      expect(window.localStorage?.getItem("glimmer.task-composer-draft.v1")).toContain(
+        "Preserve this draft after Force Quit",
+      ),
+    );
+    first.unmount();
+
+    render(withQuery(<NewTaskScreen />));
+    expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue(
+      "Preserve this draft after Force Quit",
+    );
+    expect(screen.getByLabelText("Workspace path")).toHaveValue("/tmp/glimmer-draft");
+  });
+
+  it("clears the local draft only after the task actually starts", async () => {
+    vi.spyOn(client.glimmerApi, "createSession").mockResolvedValue({ id: "draft-started" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+    render(withQuery(<NewTaskScreen />));
+    fireEvent.change(screen.getByPlaceholderText("What should Glimmer work on?"), {
+      target: { value: "Start this safely" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("location-probe")).toHaveTextContent("/sessions/draft-started"),
+    );
+    expect(window.localStorage?.getItem("glimmer.task-composer-draft.v1")).toBeNull();
   });
 
   it("prefills a selection draft with workspace, file scope, and task-intelligence verification defaults", async () => {

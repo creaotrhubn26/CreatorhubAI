@@ -25,6 +25,11 @@ export const CONFIG = {
   pythonPath: process.env.GLIMMER_PYTHON_PATH ?? "python3",
   pythonBundled: process.env.GLIMMER_PYTHON_BUNDLED === "1",
   appVersion: process.env.GLIMMER_APP_VERSION ?? "development",
+  instanceId: process.env.GLIMMER_INSTANCE_ID ?? "development",
+  parentPid: Number(process.env.GLIMMER_PARENT_PID ?? 0) || undefined,
+  capabilityToken: process.env.GLIMMER_CAPABILITY_TOKEN,
+  gatewayLogPath: process.env.GLIMMER_GATEWAY_LOG_PATH,
+  uiOrigin: process.env.GLIMMER_UI_ORIGIN,
   modelConfigPath: process.env.GLIMMER_MODEL_CONFIG ?? path.join(stateRoot, "models.json"),
   modelKeysDir: path.join(stateRoot, "model-keys"),
   glimmerV2Path,
@@ -52,3 +57,6 @@ export const CONFIG = {
 export const sessionsDir = () => path.join(CONFIG.stateRoot, "sessions");
 export const gatewayRunsDir = () => path.join(CONFIG.stateRoot, "gateway-runs");
 export const gatewayRunLogsDir = () => path.join(CONFIG.stateRoot, "gateway-run-logs");
+export const workspaceLeasesDir = () => path.join(CONFIG.stateRoot, "workspace-leases");
+export const recoveryBackupsDir = () => path.join(CONFIG.stateRoot, "recovery-backups");
+export const sessionIndexPath = () => path.join(CONFIG.stateRoot, "session-index.json");

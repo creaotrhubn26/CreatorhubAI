@@ -1,4 +1,4 @@
-import type { GatewayReadiness } from "@glimmer/shared";
+import type { GatewayReadiness, RecoverySmokeResult } from "@glimmer/shared";
 import { glimmerApi } from "../api/client";
 import {
   clearPendingUpdateSmoke,
@@ -15,6 +15,7 @@ export type PostUpdateSmokeResult =
 export interface PostUpdateSmokeDependencies {
   getVersion?: () => Promise<string | null>;
   getReadiness?: () => Promise<GatewayReadiness>;
+  getSmoke?: () => Promise<RecoverySmokeResult>;
   readMarker?: () => PendingUpdateSmoke | null;
   clearMarker?: () => void;
   wait?: (milliseconds: number) => Promise<void>;
@@ -39,7 +40,26 @@ export async function runPostUpdateSmoke(
   if (!marker) return null;
 
   const getVersion = dependencies.getVersion ?? getInstalledAppVersion;
-  const getReadiness = dependencies.getReadiness ?? glimmerApi.getReadiness;
+  const getSmoke =
+    dependencies.getSmoke ??
+    (dependencies.getReadiness
+      ? async () => {
+          const readiness = await dependencies.getReadiness!();
+          return {
+            status: readiness.coreReady ? "passed" : "failed",
+            checkedAt: readiness.checkedAt,
+            checks: [
+              {
+                id: "runtime",
+                ok: readiness.coreReady,
+                detail: readiness.coreReady
+                  ? "Required runtime components are ready."
+                  : "A required runtime component is unavailable.",
+              },
+            ],
+          } satisfies RecoverySmokeResult;
+        }
+      : glimmerApi.runRecoverySmoke);
   const wait =
     dependencies.wait ??
     ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
@@ -56,8 +76,11 @@ export async function runPostUpdateSmoke(
     let lastError: unknown;
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
-        const readiness = await getReadiness();
-        if (!readiness.coreReady) throw new Error("a required runtime component is unavailable");
+        const smoke = await getSmoke();
+        if (smoke.status !== "passed") {
+          const failed = smoke.checks.filter((check) => !check.ok).map((check) => check.detail);
+          throw new Error(failed.join("; ") || "the recovery smoke test failed");
+        }
         (dependencies.clearMarker ?? clearPendingUpdateSmoke)();
         return {
           status: "success",

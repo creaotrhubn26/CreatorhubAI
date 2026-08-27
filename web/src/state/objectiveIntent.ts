@@ -6,7 +6,10 @@ export interface ObjectiveInterpretation {
   explanation: string;
 }
 
-function explanationForMode(mode: TaskContract["mode"]): string {
+export function explainTaskIntent(kind: TaskIntent["kind"], mode: TaskContract["mode"]): string {
+  if (kind === "direct") {
+    return "Interpreted as a direct task: Glimmer will follow the literal objective and inspect only the code needed to carry it out.";
+  }
   if (mode === "inspect" || mode === "review") {
     return "Interpreted as an improvement review: Glimmer will inspect real code and report prioritized findings, not search for those words.";
   }
@@ -26,6 +29,6 @@ export function interpretObjectiveIntent(
   return {
     kind: "improvement-assessment",
     intent,
-    explanation: explanationForMode(mode),
+    explanation: explainTaskIntent(intent.kind, mode),
   };
 }

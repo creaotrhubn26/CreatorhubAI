@@ -207,6 +207,26 @@ export interface GlimmerSession {
   startedAt?: string;
   completedAt?: string;
   changedFiles: ChangedFile[];
+  /** Durable Force Quit recovery facts from the gateway-owned run record. */
+  recovery?: {
+    detectedAt: string;
+    reason: string;
+    progressPreserved: boolean;
+    progressLocation?: "worktree" | "checkpoint" | "durable_snapshot" | "session_artifacts";
+    changedFiles: ChangedFile[];
+    /** Transactional model/tool state written by glimmer_journal.py. */
+    durableCheckpoint?: {
+      lastDurableAt: string;
+      phase: string;
+      turn?: number;
+      durableMessageCount?: number;
+      partialModelCharacters?: number;
+      pendingTool?: { callId: string; tool: string; path?: string };
+      snapshotCommit?: string;
+      snapshotChangedFiles?: string[];
+    };
+    acknowledgedAt?: string;
+  };
   verification: VerificationSummary;
   // V7 §18: the latest attempt's required/recommended command split.
   // Optional -- absent on manifests predating this task.
@@ -318,6 +338,12 @@ export interface GlimmerSession {
   // resolves (approved/denied/timeout), when the engineer process patches
   // manifest.json back to its prior status/state.
   pendingApproval?: ApprovalRequest & { approvalId: string };
+}
+
+/** Cursor-paginated, registry-backed session list. */
+export interface SessionPage {
+  sessions: GlimmerSession[];
+  nextCursor: string | null;
 }
 
 export interface HumanAcceptance {
@@ -1331,6 +1357,45 @@ export interface DeveloperClientsStatus {
   };
 }
 
+export type IntegrationProfileTargetId = "codex" | "claude" | "glimmer";
+export type IntegrationProfileTargetState = "in_sync" | "drift" | "missing";
+
+export interface IntegrationProfilePreview {
+  profile: "creatorhub-engineering";
+  checkedAt: string;
+  desiredVersion: string | null;
+  sourcePath?: string;
+  canApply: boolean;
+  latestRollbackId?: string;
+  targets: Array<{
+    id: IntegrationProfileTargetId;
+    name: string;
+    state: IntegrationProfileTargetState;
+    currentVersion?: string;
+    desiredVersion?: string;
+    path: string;
+    action: string;
+  }>;
+  policy: {
+    previewRequired: true;
+    backupBeforeApply: true;
+    credentialsInspected: false;
+    arbitraryCommandsExecuted: false;
+  };
+}
+
+export interface IntegrationProfileApplyResult {
+  backupId: string | null;
+  appliedTargets: IntegrationProfileTargetId[];
+  preview: IntegrationProfilePreview;
+}
+
+export interface IntegrationProfileRollbackResult {
+  backupId: string;
+  rolledBack: true;
+  preview: IntegrationProfilePreview;
+}
+
 export type McpIntegrationId = "context7" | "playwright" | "github";
 
 export type McpIntegrationState =
@@ -1398,6 +1463,8 @@ export interface GatewayHealth {
   service: "glimmer-gateway";
   status: "ok";
   version: string;
+  instanceId: string;
+  parentPid?: number;
   timestamp: string;
   uptimeSeconds: number;
 }
@@ -1427,6 +1494,18 @@ export interface RepairResult {
   reinstallRequired: boolean;
   checks: RepairCheck[];
   actions: string[];
+  backupPath?: string;
+  recovery?: { reattached: number; interrupted: number; completed: number };
+}
+
+export interface RecoverySmokeResult {
+  status: "passed" | "failed";
+  checkedAt: string;
+  checks: Array<{
+    id: "runtime" | "state-write" | "session-index" | "workspace-leases";
+    ok: boolean;
+    detail: string;
+  }>;
 }
 
 export type ModelRole = "engineer" | "architect" | "consult" | "vision";

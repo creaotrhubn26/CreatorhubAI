@@ -52,7 +52,14 @@ function writeManifest(patch) {
 
 writeManifest({});
 
-if (run.contract.objective.includes("[cancel]")) {
+if (run.contract.objective.includes("[force-quit]")) {
+  writeFileSync(path.join(workspace, "force-quit-progress.txt"), "progress survives force quit\n");
+}
+
+if (
+  run.contract.objective.includes("[cancel]") ||
+  run.contract.objective.includes("[force-quit]")
+) {
   process.on("SIGTERM", () => {
     writeManifest({ status: "cancelled-sigterm", updatedAt: new Date().toISOString() });
     process.exit(0);

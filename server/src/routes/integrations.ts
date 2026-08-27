@@ -6,6 +6,11 @@ import {
   probeMcpIntegrations,
   saveCuratedMcpConfig,
 } from "../lib/mcpIntegrations.js";
+import {
+  applyIntegrationProfile,
+  previewIntegrationProfile,
+  rollbackIntegrationProfile,
+} from "../lib/integrationProfile.js";
 
 export const integrationsRouter = Router();
 
@@ -25,6 +30,34 @@ integrationsRouter.get("/integrations/developer-clients", async (_req, res) => {
 
 integrationsRouter.get("/integrations/mcp", async (_req, res) => {
   res.json(await probeMcpIntegrations());
+});
+
+integrationsRouter.get("/integrations/profile", async (_req, res) => {
+  res.json(await previewIntegrationProfile());
+});
+
+integrationsRouter.post("/integrations/profile/apply", async (req, res) => {
+  const expectedVersion = req.body?.expectedVersion;
+  if (typeof expectedVersion !== "string" || !/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(expectedVersion)) {
+    return res.status(400).json({ error: "expectedVersion from the current preview is required" });
+  }
+  try {
+    res.json(await applyIntegrationProfile(expectedVersion));
+  } catch (error) {
+    res.status(409).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+integrationsRouter.post("/integrations/profile/rollback", async (req, res) => {
+  const backupId = req.body?.backupId;
+  if (typeof backupId !== "string") {
+    return res.status(400).json({ error: "backupId is required" });
+  }
+  try {
+    res.json(await rollbackIntegrationProfile(backupId));
+  } catch (error) {
+    res.status(409).json({ error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 // This write surface accepts only a closed set of curated ids. It cannot

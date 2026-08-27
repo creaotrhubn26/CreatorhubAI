@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,21 +9,32 @@ import type {
   GatewayReadiness,
   RepairCheck,
   RepairResult,
+  RecoverySmokeResult,
   RuntimeComponentCheck,
 } from "@glimmer/shared";
-import { CONFIG, gatewayRunLogsDir, gatewayRunsDir, sessionsDir } from "../config.js";
+import {
+  CONFIG,
+  gatewayRunLogsDir,
+  gatewayRunsDir,
+  recoveryBackupsDir,
+  sessionIndexPath,
+  sessionsDir,
+  workspaceLeasesDir,
+} from "../config.js";
 import { probeCliIntegrations } from "./cliIntegrations.js";
 import { probeMcpIntegrations } from "./mcpIntegrations.js";
 import { probeModel } from "./modelStatus.js";
-import { listSessionIds, readSession } from "./sessions.js";
+import { listWorkspaceLeases } from "./workspaceLeases.js";
+import { readSessionPage } from "./sessionRegistry.js";
 
 const startTime = Date.now();
 const SUPPORT_LOG_BYTES = 16 * 1024;
 const SUPPORT_LOG_SESSIONS = 3;
 const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
-  "glimmer-v2.py": "3a09e47002b129063b56da89ca4602e56c5b07ee443e44a22c64a897d13b7c65",
-  "glimmer-engineer.py": "f337bae58b458252e30e0cc330575aafeb3d87959b142950bc107e49bdf1bd34",
-  "glimmer_events.py": "0e2e6978de1de562d5580e331bab1e93acfadab130de85a57bd5201d4ccad1d5",
+  "glimmer-v2.py": "5e52137fd07ac0a538b519fdd50fb5e5bac8c258c9eeb28d4b0f58035b7cf88b",
+  "glimmer-engineer.py": "d6da291640495392d5330bb4d0c6ae996879dd8a7a185b00f1e7ef03e447a5cb",
+  "glimmer_events.py": "5756d4280378ba351a75605109fcb4f84231e03b8cf9dcb63722173fc865b71e",
+  "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
   "glimmer_models.py": "bf84fe821df6ce7e21babdeecc3dab3f053519ecf1edc467b4df83434b9ff6ee",
   "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
@@ -146,7 +157,14 @@ async function probePython(options: RuntimeProbeOptions): Promise<RuntimeCompone
 
 interface OrchestratorOrigin {
   commit?: unknown;
+  overlay?: { id?: unknown };
   files?: unknown;
+}
+
+function orchestratorVersion(origin: OrchestratorOrigin | null): string | undefined {
+  if (typeof origin?.commit !== "string") return undefined;
+  const base = origin.commit.slice(0, 12);
+  return typeof origin.overlay?.id === "string" ? `${base}+${origin.overlay.id}` : base;
 }
 
 async function probeOrchestrator(options: RuntimeProbeOptions): Promise<RuntimeComponentCheck> {
@@ -219,7 +237,7 @@ async function probeOrchestrator(options: RuntimeProbeOptions): Promise<RuntimeC
         state: "unavailable",
         required: true,
         source: "bundled",
-        version: typeof origin.commit === "string" ? origin.commit.slice(0, 12) : undefined,
+        version: orchestratorVersion(origin),
         detail: `Integrity check failed: ${mismatches.join(", ")}.`,
       };
     }
@@ -231,7 +249,7 @@ async function probeOrchestrator(options: RuntimeProbeOptions): Promise<RuntimeC
     state: "ready",
     required: true,
     source: bundled ? "bundled" : "configured",
-    version: typeof origin?.commit === "string" ? origin.commit.slice(0, 12) : undefined,
+    version: orchestratorVersion(origin),
     detail: bundled
       ? "All bundled files match the signed integrity manifest."
       : "Core scripts are readable.",
@@ -243,6 +261,8 @@ export function gatewayHealth(): GatewayHealth {
     service: "glimmer-gateway",
     status: "ok",
     version: CONFIG.appVersion,
+    instanceId: CONFIG.instanceId,
+    ...(CONFIG.parentPid ? { parentPid: CONFIG.parentPid } : {}),
     timestamp: new Date().toISOString(),
     uptimeSeconds: Math.max(0, Math.floor((Date.now() - startTime) / 1000)),
   };
@@ -300,13 +320,63 @@ export async function collectDiagnostics(): Promise<DiagnosticsStatus> {
   return { health: gatewayHealth(), readiness, cli, mcp };
 }
 
-export async function repairInstallation(): Promise<RepairResult> {
+const STALE_TEMP_AGE_MS = 5 * 60 * 1000;
+
+async function backupJsonDirectory(source: string, target: string): Promise<number> {
+  const entries = await fs.readdir(source, { withFileTypes: true }).catch(() => []);
+  let copied = 0;
+  await fs.mkdir(target, { recursive: true, mode: 0o700 });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    await fs.copyFile(path.join(source, entry.name), path.join(target, entry.name));
+    await fs.chmod(path.join(target, entry.name), 0o600);
+    copied += 1;
+  }
+  return copied;
+}
+
+async function createRecoveryBackup(): Promise<string> {
+  const name = `${new Date().toISOString().replaceAll(":", "-")}-${randomUUID().slice(0, 8)}`;
+  const target = path.join(recoveryBackupsDir(), name);
+  await fs.mkdir(target, { recursive: true, mode: 0o700 });
+  await Promise.all([
+    backupJsonDirectory(gatewayRunsDir(), path.join(target, "gateway-runs")),
+    backupJsonDirectory(workspaceLeasesDir(), path.join(target, "workspace-leases")),
+  ]);
+  try {
+    await fs.copyFile(sessionIndexPath(), path.join(target, "session-index.json"));
+    await fs.chmod(path.join(target, "session-index.json"), 0o600);
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return target;
+}
+
+async function cleanStaleTemporaryFiles(directory: string): Promise<number> {
+  const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+  let cleaned = 0;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".tmp")) continue;
+    const target = path.join(directory, entry.name);
+    const stat = await fs.lstat(target);
+    if (!stat.isFile() || Date.now() - stat.mtimeMs < STALE_TEMP_AGE_MS) continue;
+    await fs.unlink(target);
+    cleaned += 1;
+  }
+  return cleaned;
+}
+
+export async function repairInstallation(
+  recovery?: RepairResult["recovery"],
+): Promise<RepairResult> {
   const actions: string[] = [];
   const writableDirectories = [
     CONFIG.stateRoot,
     sessionsDir(),
     gatewayRunsDir(),
     gatewayRunLogsDir(),
+    workspaceLeasesDir(),
+    recoveryBackupsDir(),
     CONFIG.modelKeysDir,
   ];
   for (const directory of writableDirectories) {
@@ -320,6 +390,17 @@ export async function repairInstallation(): Promise<RepairResult> {
     await fs.chmod(directory, 0o700).catch(() => undefined);
     if (!existed) actions.push(`Created writable state directory: ${sanitizeText(directory)}`);
   }
+  const backupPath = await createRecoveryBackup();
+  actions.push(`Created a private recovery backup: ${sanitizeText(backupPath)}`);
+  const cleaned =
+    (await cleanStaleTemporaryFiles(gatewayRunsDir())) +
+    (await cleanStaleTemporaryFiles(workspaceLeasesDir()));
+  if (cleaned > 0) actions.push(`Removed ${cleaned} stale atomic-write temporary file(s).`);
+  if (recovery && (recovery.reattached || recovery.interrupted || recovery.completed)) {
+    actions.push(
+      `Reconciled sessions: ${recovery.reattached} running, ${recovery.interrupted} interrupted, ${recovery.completed} completed.`,
+    );
+  }
   const readiness = await probeRuntimeReadiness();
   const checks: RepairCheck[] = readiness.components.map((component) => ({
     ...component,
@@ -328,7 +409,6 @@ export async function repairInstallation(): Promise<RepairResult> {
   const reinstallRequired = checks.some(
     (check) => check.required && check.state === "unavailable" && check.source === "bundled",
   );
-  if (actions.length === 0) actions.push("Writable application state was already healthy.");
   if (reinstallRequired) {
     actions.push(
       "A signed bundled component is damaged; install the current signed release again.",
@@ -336,10 +416,74 @@ export async function repairInstallation(): Promise<RepairResult> {
   }
   return {
     checkedAt: new Date().toISOString(),
-    repaired: actions.some((action) => action.startsWith("Created")),
+    repaired: actions.some(
+      (action) => action.startsWith("Created writable") || action.startsWith("Removed"),
+    ),
     reinstallRequired,
     checks,
     actions,
+    backupPath,
+    ...(recovery ? { recovery } : {}),
+  };
+}
+
+export async function runRecoverySmoke(): Promise<RecoverySmokeResult> {
+  const checks: RecoverySmokeResult["checks"] = [];
+  const readiness = await probeRuntimeReadiness();
+  checks.push({
+    id: "runtime",
+    ok: readiness.coreReady,
+    detail: readiness.coreReady
+      ? "Required runtime components are ready."
+      : "A required runtime component is unavailable.",
+  });
+
+  const smokeFile = path.join(CONFIG.stateRoot, `.smoke-${randomUUID()}.tmp`);
+  try {
+    const payload = randomUUID();
+    await fs.mkdir(CONFIG.stateRoot, { recursive: true, mode: 0o700 });
+    await fs.writeFile(smokeFile, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    const readBack = await fs.readFile(smokeFile, "utf8");
+    checks.push({
+      id: "state-write",
+      ok: readBack === payload,
+      detail:
+        readBack === payload ? "Atomic state write/read passed." : "State read-back differed.",
+    });
+  } catch (error) {
+    checks.push({
+      id: "state-write",
+      ok: false,
+      detail: `State write/read failed: ${sanitizeText(error instanceof Error ? error.message : String(error))}`,
+    });
+  } finally {
+    await fs.unlink(smokeFile).catch(() => undefined);
+  }
+
+  try {
+    await readSessionPage({ limit: 1 });
+    checks.push({ id: "session-index", ok: true, detail: "Session registry read passed." });
+  } catch (error) {
+    checks.push({
+      id: "session-index",
+      ok: false,
+      detail: `Session registry read failed: ${sanitizeText(error instanceof Error ? error.message : String(error))}`,
+    });
+  }
+  try {
+    await listWorkspaceLeases();
+    checks.push({ id: "workspace-leases", ok: true, detail: "Workspace lease scan passed." });
+  } catch (error) {
+    checks.push({
+      id: "workspace-leases",
+      ok: false,
+      detail: `Workspace lease scan failed: ${sanitizeText(error instanceof Error ? error.message : String(error))}`,
+    });
+  }
+  return {
+    status: checks.every((check) => check.ok) ? "passed" : "failed",
+    checkedAt: new Date().toISOString(),
+    checks,
   };
 }
 
@@ -402,7 +546,7 @@ async function readLogTail(file: string): Promise<string> {
   }
 }
 
-async function collectLogTails() {
+async function collectSessionLogInventory() {
   let sessionDirs: string[];
   try {
     sessionDirs = (await fs.readdir(gatewayRunLogsDir(), { withFileTypes: true }))
@@ -414,7 +558,7 @@ async function collectLogTails() {
   } catch {
     return [];
   }
-  const logs: Array<{ sessionId: string; file: string; tail: string }> = [];
+  const logs: Array<{ sessionId: string; file: string; sizeBytes: number }> = [];
   for (const sessionId of sessionDirs) {
     const directory = path.join(gatewayRunLogsDir(), sessionId);
     const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
@@ -424,7 +568,7 @@ async function collectLogTails() {
       logs.push({
         sessionId,
         file: entry.name,
-        tail: await readLogTail(path.join(directory, entry.name)),
+        sizeBytes: (await fs.stat(path.join(directory, entry.name))).size,
       });
     }
   }
@@ -432,20 +576,27 @@ async function collectLogTails() {
 }
 
 export async function createSupportBundle() {
-  const [diagnostics, ids, logs] = await Promise.all([
+  const [diagnostics, sessionPage, sessionLogs, leases, gatewayLog] = await Promise.all([
     collectDiagnostics(),
-    listSessionIds(),
-    collectLogTails(),
+    readSessionPage({ limit: 10 }),
+    collectSessionLogInventory(),
+    listWorkspaceLeases(),
+    CONFIG.gatewayLogPath ? readLogTail(CONFIG.gatewayLogPath) : Promise.resolve(null),
   ]);
-  const sessions = (await Promise.all(ids.slice(0, 20).map((id) => readSession(id))))
-    .filter((session): session is NonNullable<typeof session> => session !== null)
-    .slice(0, 10)
-    .map((session) => ({
-      id: session.id,
-      status: session.status,
-      startedAt: session.startedAt,
-      completedAt: session.completedAt,
-    }));
+  const sessions = sessionPage.sessions.map((session) => ({
+    id: session.id,
+    status: session.status,
+    startedAt: session.startedAt,
+    completedAt: session.completedAt,
+    recovery: session.recovery
+      ? {
+          detectedAt: session.recovery.detectedAt,
+          progressPreserved: session.recovery.progressPreserved,
+          changedFileCount: session.recovery.changedFiles.length,
+          acknowledgedAt: session.recovery.acknowledgedAt,
+        }
+      : undefined,
+  }));
   return {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
@@ -456,6 +607,14 @@ export async function createSupportBundle() {
     },
     diagnostics: sanitizeValue(diagnostics),
     sessions,
-    logs,
+    gatewayLog,
+    sessionLogs,
+    workspaceLeases: leases.map((lease) => ({
+      sessionId: lease.sessionId,
+      state: lease.state,
+      workspace: sanitizeText(lease.workspace),
+      updatedAt: lease.updatedAt,
+      pid: lease.pid,
+    })),
   };
 }

@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
-import path from "node:path";
+import { chromium } from "playwright";
 
 const options = Object.fromEntries(
   process.argv.slice(2).map((argument) => {
@@ -12,20 +10,26 @@ const options = Object.fromEntries(
 );
 const appUrl = options.app ?? "http://127.0.0.1:5183";
 const gatewayUrl = options.gateway ?? "http://127.0.0.1:4317";
+const expectedInstance = options.instance;
 const workspace = options.workspace;
 if (!workspace) throw new Error("--workspace=<isolated glimmer/* git worktree> is required");
 
-const require = createRequire(import.meta.url);
-let chromium;
-try {
-  ({ chromium } = require("playwright"));
-} catch {
-  const globalModules = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-  ({ chromium } = require(path.join(globalModules, "playwright")));
-}
-
 function assert(condition, message) {
   if (!condition) throw new Error(`packaged UI E2E assertion failed: ${message}`);
+}
+
+async function waitForHttp(url, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return response;
+    } catch {
+      // Preview server or gateway is still starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`${url} did not become ready`);
 }
 
 async function readSession(id) {
@@ -47,9 +51,31 @@ async function waitForStatus(id, expected, timeoutMs = 20_000) {
 
 const browser = await chromium.launch({ channel: "chrome", headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-const healthResponse = await fetch(`${gatewayUrl}/api/health`);
+await waitForHttp(appUrl);
+const healthResponse = await waitForHttp(`${gatewayUrl}/api/health`);
 assert(healthResponse.ok, `gateway health failed with ${healthResponse.status}`);
 const health = await healthResponse.json();
+if (expectedInstance) {
+  assert(health.instanceId === expectedInstance, `wrong gateway instance ${health.instanceId}`);
+}
+
+// A reload exercises the same persistent webview storage boundary that a
+// Force Quit crosses before the user has clicked Run.
+await page.goto(`${appUrl}/tasks/new`);
+await page
+  .getByPlaceholder("What should Glimmer work on?")
+  .fill("[ui-e2e] restore unsubmitted draft");
+await page.getByLabel("Workspace path").fill(workspace);
+await page.reload();
+assert(
+  (await page.getByPlaceholder("What should Glimmer work on?").inputValue()) ===
+    "[ui-e2e] restore unsubmitted draft",
+  "unsubmitted task draft was not restored after reload",
+);
+assert(
+  (await page.getByLabel("Workspace path").inputValue()) === workspace,
+  "unsubmitted workspace draft was not restored after reload",
+);
 
 async function composeAndRun(objective) {
   await page.goto(`${appUrl}/tasks/new`);
@@ -118,6 +144,7 @@ try {
           restarted: { id: restartedId, status: "completed" },
         },
         diagnostics: { repair: "healthy", supportExport: download.suggestedFilename() },
+        draftRecovery: "restored",
       },
       null,
       2,

@@ -197,6 +197,14 @@ export function ActiveSessionScreen() {
       queryClient.invalidateQueries({ queryKey: ["session-analysis", id] });
     },
   });
+  const recoveryMutation = useMutation({
+    mutationFn: () => glimmerApi.acknowledgeSessionRecovery(id!),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["session", id] });
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    },
+  });
   const sessionQuery = useQuery({
     queryKey: ["session", id],
     queryFn: () => glimmerApi.getSession(id!),
@@ -245,6 +253,61 @@ export function ActiveSessionScreen() {
 
   return (
     <div>
+      {session.recovery && (
+        <div className="failure-banner" style={{ ["--badge-color" as any]: "var(--amber)" }}>
+          <p className="failure-banner__title">Interrupted — work preserved</p>
+          <p className="failure-banner__detail">
+            {session.recovery.changedFiles.length > 0
+              ? `${session.recovery.changedFiles.length} changed file${session.recovery.changedFiles.length === 1 ? "" : "s"} ${session.recovery.progressLocation === "checkpoint" ? "remain in local checkpoint commits" : session.recovery.progressLocation === "durable_snapshot" ? "remain in a private recovery snapshot" : "remain in the Git worktree"} after Force Quit or a gateway crash.`
+              : session.recovery.progressLocation === "session_artifacts"
+                ? session.recovery.durableCheckpoint
+                  ? "The conversation and tool journal were preserved even though no Git changes were found."
+                  : "Session artifacts were preserved even though no Git changes were found."
+                : "No changed files were detected, but the interrupted run was recovered from durable state."}
+          </p>
+          {session.recovery.durableCheckpoint && (
+            <p className="failure-banner__detail">
+              Last durable checkpoint:{" "}
+              {new Date(session.recovery.durableCheckpoint.lastDurableAt).toLocaleString()}
+              {session.recovery.durableCheckpoint.turn !== undefined
+                ? ` · turn ${session.recovery.durableCheckpoint.turn + 1}`
+                : ""}
+              {session.recovery.durableCheckpoint.durableMessageCount !== undefined
+                ? ` · ${session.recovery.durableCheckpoint.durableMessageCount} messages`
+                : ""}
+              . Phase: {session.recovery.durableCheckpoint.phase}.
+              {session.recovery.durableCheckpoint.pendingTool
+                ? ` ${session.recovery.durableCheckpoint.pendingTool.tool} may have been interrupted and must be reviewed before retrying.`
+                : session.recovery.durableCheckpoint.partialModelCharacters
+                  ? ` ${session.recovery.durableCheckpoint.partialModelCharacters} visible model characters were journaled; partial output is evidence only and was never executed.`
+                  : ""}
+            </p>
+          )}
+          {session.recovery.durableCheckpoint?.snapshotCommit && (
+            <p className="failure-banner__detail">
+              A private Git recovery snapshot preserves the last completed write without moving HEAD
+              or staging files.
+            </p>
+          )}
+          <p className="failure-banner__detail">
+            Glimmer has not reset, cleaned, or overwritten the workspace.
+          </p>
+          {!session.recovery.acknowledgedAt && (
+            <button
+              type="button"
+              onClick={() => recoveryMutation.mutate()}
+              disabled={recoveryMutation.isPending}
+            >
+              {recoveryMutation.isPending ? "Unlocking…" : "Keep work and unlock workspace"}
+            </button>
+          )}
+          {recoveryMutation.isError && (
+            <p role="alert">
+              Could not unlock recovery — {(recoveryMutation.error as Error).message}
+            </p>
+          )}
+        </div>
+      )}
       {showFailureBanner && (
         <div
           className="failure-banner"

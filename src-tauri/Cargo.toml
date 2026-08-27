@@ -1,6 +1,6 @@
 [package]
 name = "glimmer-control-center"
-version = "0.2.3"
+version = "0.2.4"
 description = "Glimmer Control Center — desktop shell for the local Glimmer gateway"
 authors = ["Creatorhubn"]
 edition = "2024"
@@ -23,3 +23,4 @@ tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3"

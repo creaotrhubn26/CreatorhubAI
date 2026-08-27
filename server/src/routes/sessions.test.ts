@@ -24,6 +24,9 @@ let app: Express;
 let workspace: string;
 let stateRoot: string;
 let readSessionEventsBatch: typeof import("./sessions.js").readSessionEventsBatch;
+let readSessionEventsChunk: typeof import("./sessions.js").readSessionEventsChunk;
+let reconcileActiveRunsOnStartup: typeof import("./sessions.js").reconcileActiveRunsOnStartup;
+let listWorkspaceLeases: typeof import("../lib/workspaceLeases.js").listWorkspaceLeases;
 // computeDiffHash comes from lib/git.js, which imports config.js -- like
 // app.js/sessions.js above, this MUST be a dynamic import done after
 // GLIMMER_STATE_ROOT is set below, never a static top-of-file import: a
@@ -48,7 +51,9 @@ beforeAll(async () => {
 
   const { createApp } = await import("../app.js");
   app = createApp();
-  ({ readSessionEventsBatch } = await import("./sessions.js"));
+  ({ readSessionEventsBatch, readSessionEventsChunk, reconcileActiveRunsOnStartup } =
+    await import("./sessions.js"));
+  ({ listWorkspaceLeases } = await import("../lib/workspaceLeases.js"));
   ({ computeDiffHash } = await import("../lib/git.js"));
 
   // A workspace directory that exists but is not a git repo — `git diff`
@@ -316,6 +321,38 @@ describe("readSessionEventsBatch", () => {
     const dir = path.join(stateRoot, "sessions", id);
     await fs.mkdir(dir, { recursive: true });
     expect(await readSessionEventsBatch(id)).toEqual([]);
+  });
+
+  it("tails only newly appended bytes and retains an incomplete final line", async () => {
+    const id = "20260817-000042-glimmer-events-incremental";
+    const dir = path.join(stateRoot, "sessions", id);
+    await fs.mkdir(dir, { recursive: true });
+    const first = JSON.stringify({
+      id: "incremental_1",
+      sessionId: id,
+      timestamp: "2026-08-17T00:00:00.000Z",
+      type: "tool_started",
+      tool: "read_file",
+      args: {},
+    });
+    const second = JSON.stringify({
+      id: "incremental_2",
+      sessionId: id,
+      timestamp: "2026-08-17T00:00:01.000Z",
+      type: "tool_completed",
+      tool: "read_file",
+      resultSummary: "ok",
+    });
+    await fs.writeFile(path.join(dir, "events.jsonl"), `${first}\n${second.slice(0, 20)}`);
+
+    const initial = await readSessionEventsChunk(id, 0);
+    expect(initial.events.map((event) => event.id)).toEqual(["incremental_1"]);
+    expect(initial.pending.length).toBeGreaterThan(0);
+
+    await fs.appendFile(path.join(dir, "events.jsonl"), `${second.slice(20)}\n`);
+    const appended = await readSessionEventsChunk(id, initial.offset, initial.pending);
+    expect(appended.events.map((event) => event.id)).toEqual(["incremental_2"]);
+    expect(appended.pending).toHaveLength(0);
   });
 });
 
@@ -748,6 +785,250 @@ describe("POST /api/sessions/:id/run replay protection", () => {
       expect(typeof record.completedAt).toBe("string");
     } finally {
       orphan?.kill("SIGTERM");
+    }
+  });
+
+  it("preserves interrupted work after a hard stop and unlocks only after acknowledgement", async () => {
+    const id = "20260825-000004-force-quit-recovery";
+    const recoveryWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-force-quit-"));
+    try {
+      await execGit("git", ["init", "-q"], { cwd: recoveryWorkspace });
+      await execGit("git", ["config", "user.email", "t@t.com"], { cwd: recoveryWorkspace });
+      await execGit("git", ["config", "user.name", "t"], { cwd: recoveryWorkspace });
+      await fs.writeFile(path.join(recoveryWorkspace, "progress.txt"), "baseline\n");
+      await execGit("git", ["add", "progress.txt"], { cwd: recoveryWorkspace });
+      await execGit("git", ["commit", "-q", "-m", "baseline"], { cwd: recoveryWorkspace });
+      await execGit("git", ["switch", "-q", "-c", "glimmer/force-quit-recovery"], {
+        cwd: recoveryWorkspace,
+      });
+      await fs.writeFile(path.join(recoveryWorkspace, "progress.txt"), "preserved progress\n");
+
+      await fs.mkdir(path.join(stateRoot, "gateway-runs"), { recursive: true });
+      await fs.writeFile(
+        path.join(stateRoot, "gateway-runs", `${id}.json`),
+        JSON.stringify({
+          version: 1,
+          id,
+          contract: validContract,
+          workspace: recoveryWorkspace,
+          state: "running",
+          createdAt: new Date().toISOString(),
+          startedAt: new Date().toISOString(),
+          pid: 2_147_000_001,
+        }),
+      );
+
+      const reconciled = await reconcileActiveRunsOnStartup();
+      expect(reconciled.interrupted).toBeGreaterThanOrEqual(1);
+
+      const session = await request(app).get(`/api/sessions/${id}`);
+      expect(session.status).toBe(200);
+      expect(session.body).toMatchObject({
+        status: "needs_review",
+        recovery: { progressPreserved: true, progressLocation: "worktree" },
+      });
+      expect(session.body.recovery.changedFiles).toEqual(
+        expect.arrayContaining([expect.objectContaining({ path: "progress.txt" })]),
+      );
+      expect(await fs.readFile(path.join(recoveryWorkspace, "progress.txt"), "utf8")).toBe(
+        "preserved progress\n",
+      );
+
+      const heldLease = (await listWorkspaceLeases()).find((lease) => lease.sessionId === id);
+      expect(heldLease?.state).toBe("recovery_required");
+
+      const acknowledged = await request(app)
+        .post(`/api/sessions/${id}/recovery/acknowledge`)
+        .set("Origin", UI_ORIGIN);
+      expect(acknowledged.status).toBe(200);
+      expect(acknowledged.body.progressPreserved).toBe(true);
+      expect((await listWorkspaceLeases()).some((lease) => lease.sessionId === id)).toBe(false);
+      expect(await fs.readFile(path.join(recoveryWorkspace, "progress.txt"), "utf8")).toBe(
+        "preserved progress\n",
+      );
+    } finally {
+      await fs.rm(recoveryWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("detects progress preserved in a local checkpoint commit after a hard stop", async () => {
+    const id = "20260825-000005-checkpoint-recovery";
+    const checkpointWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-checkpoint-"));
+    try {
+      await execGit("git", ["init", "-q"], { cwd: checkpointWorkspace });
+      await execGit("git", ["config", "user.email", "t@t.com"], { cwd: checkpointWorkspace });
+      await execGit("git", ["config", "user.name", "t"], { cwd: checkpointWorkspace });
+      await fs.writeFile(path.join(checkpointWorkspace, "base.txt"), "baseline\n");
+      await execGit("git", ["add", "base.txt"], { cwd: checkpointWorkspace });
+      await execGit("git", ["commit", "-q", "-m", "baseline"], { cwd: checkpointWorkspace });
+      const baselineSha = (
+        await execGit("git", ["rev-parse", "HEAD"], { cwd: checkpointWorkspace })
+      ).stdout.trim();
+      await execGit("git", ["switch", "-q", "-c", "glimmer/checkpoint-recovery"], {
+        cwd: checkpointWorkspace,
+      });
+      await fs.writeFile(path.join(checkpointWorkspace, "checkpoint.txt"), "checkpoint progress\n");
+      await execGit("git", ["add", "checkpoint.txt"], { cwd: checkpointWorkspace });
+      await execGit("git", ["commit", "-q", "-m", "glimmer-v2 checkpoint 1"], {
+        cwd: checkpointWorkspace,
+      });
+      await fs.writeFile(
+        path.join(stateRoot, "gateway-runs", `${id}.json`),
+        JSON.stringify({
+          version: 1,
+          id,
+          contract: validContract,
+          workspace: checkpointWorkspace,
+          state: "running",
+          createdAt: new Date().toISOString(),
+          startedAt: new Date().toISOString(),
+          baselineSha,
+          pid: 2_147_000_002,
+        }),
+      );
+
+      await reconcileActiveRunsOnStartup();
+      const session = await request(app).get(`/api/sessions/${id}`);
+      expect(session.body.recovery).toMatchObject({
+        progressPreserved: true,
+        progressLocation: "checkpoint",
+      });
+      expect(session.body.recovery.changedFiles).toEqual(
+        expect.arrayContaining([expect.objectContaining({ path: "checkpoint.txt" })]),
+      );
+      expect(
+        (
+          await execGit("git", ["log", "-1", "--pretty=%s"], { cwd: checkpointWorkspace })
+        ).stdout.trim(),
+      ).toBe("glimmer-v2 checkpoint 1");
+      await request(app).post(`/api/sessions/${id}/recovery/acknowledge`).set("Origin", UI_ORIGIN);
+    } finally {
+      await fs.rm(checkpointWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the last transactional checkpoint and private snapshot after a hard stop", async () => {
+    const id = "20260825-000006-durable-journal-recovery";
+    const recoveryWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-journal-"));
+    try {
+      await execGit("git", ["init", "-q"], { cwd: recoveryWorkspace });
+      await execGit("git", ["config", "user.email", "t@t.com"], { cwd: recoveryWorkspace });
+      await execGit("git", ["config", "user.name", "t"], { cwd: recoveryWorkspace });
+      await fs.writeFile(path.join(recoveryWorkspace, "base.txt"), "baseline\n");
+      await execGit("git", ["add", "base.txt"], { cwd: recoveryWorkspace });
+      await execGit("git", ["commit", "-q", "-m", "baseline"], { cwd: recoveryWorkspace });
+      const baselineSha = (
+        await execGit("git", ["rev-parse", "HEAD"], { cwd: recoveryWorkspace })
+      ).stdout.trim();
+      const baselineTree = (
+        await execGit("git", ["rev-parse", `${baselineSha}^{tree}`], { cwd: recoveryWorkspace })
+      ).stdout.trim();
+      const snapshotCommit = (
+        await execGit(
+          "git",
+          ["commit-tree", baselineTree, "-p", baselineSha, "-m", "private recovery snapshot"],
+          { cwd: recoveryWorkspace },
+        )
+      ).stdout.trim();
+
+      await fs.mkdir(path.join(stateRoot, "gateway-runs"), { recursive: true });
+      await fs.writeFile(
+        path.join(stateRoot, "gateway-runs", `${id}.json`),
+        JSON.stringify({
+          version: 1,
+          id,
+          contract: validContract,
+          workspace: recoveryWorkspace,
+          state: "running",
+          createdAt: new Date().toISOString(),
+          startedAt: new Date().toISOString(),
+          baselineSha,
+          pid: 2_147_000_003,
+        }),
+      );
+      const sessionDir = path.join(stateRoot, "sessions", id);
+      await fs.mkdir(sessionDir, { recursive: true });
+      await fs.writeFile(
+        path.join(sessionDir, "manifest.json"),
+        JSON.stringify({
+          task: validContract.objective,
+          contract: validContract,
+          status: "initialized",
+          state: "preflight",
+          workspace: recoveryWorkspace,
+          branch: "glimmer/durable-recovery",
+          baseline: baselineSha,
+          attempts: [],
+        }),
+      );
+      await fs.writeFile(
+        path.join(sessionDir, "recovery-state.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          sessionId: id,
+          durable: true,
+          lastDurableAt: "2026-08-27T08:30:00.000Z",
+          phase: "tool_running",
+          turn: 4,
+          durableMessageCount: 12,
+          pendingTool: { callId: "call-4", tool: "edit_file", path: "src/app.ts" },
+          snapshot: { commit: snapshotCommit, changedFiles: ["src/app.ts"] },
+        }),
+      );
+
+      await reconcileActiveRunsOnStartup();
+      const session = await request(app).get(`/api/sessions/${id}`);
+      expect(session.status).toBe(200);
+      expect(session.body.recovery).toMatchObject({
+        progressPreserved: true,
+        progressLocation: "durable_snapshot",
+        durableCheckpoint: {
+          lastDurableAt: "2026-08-27T08:30:00.000Z",
+          phase: "tool_running",
+          turn: 4,
+          durableMessageCount: 12,
+          pendingTool: { callId: "call-4", tool: "edit_file", path: "src/app.ts" },
+          snapshotCommit,
+          snapshotChangedFiles: ["src/app.ts"],
+        },
+      });
+      expect(session.body.recovery.reason).toContain("edit_file");
+      await request(app).post(`/api/sessions/${id}/recovery/acknowledge`).set("Origin", UI_ORIGIN);
+    } finally {
+      await fs.rm(recoveryWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a second session while the first session owns the workspace lease", async () => {
+    process.env.GLIMMER_FAKE_REAL_ID = "stay-running";
+    let firstId: string | undefined;
+    try {
+      const first = await request(app)
+        .post("/api/sessions")
+        .set("Origin", UI_ORIGIN)
+        .send({ taskContract: validContract, workspace: runWorkspace });
+      firstId = first.body.id;
+      expect(
+        (await request(app).post(`/api/sessions/${firstId}/run`).set("Origin", UI_ORIGIN)).status,
+      ).toBe(200);
+
+      const second = await request(app)
+        .post("/api/sessions")
+        .set("Origin", UI_ORIGIN)
+        .send({ taskContract: validContract, workspace: runWorkspace });
+      const blocked = await request(app)
+        .post(`/api/sessions/${second.body.id}/run`)
+        .set("Origin", UI_ORIGIN);
+      expect(blocked.status).toBe(409);
+      expect(blocked.body).toMatchObject({
+        ownerSessionId: firstId,
+        leaseState: "running",
+      });
+    } finally {
+      if (firstId) {
+        await request(app).post(`/api/sessions/${firstId}/cancel`).set("Origin", UI_ORIGIN);
+      }
+      delete process.env.GLIMMER_FAKE_REAL_ID;
     }
   });
 
@@ -2243,11 +2524,26 @@ describe("stale verified-session detection (V7 §20)", () => {
       }),
     );
 
-    const res = await request(app).get("/api/sessions");
+    const res = await request(app).get("/api/sessions?limit=200");
     expect(res.status).toBe(200);
-    const row = res.body.find((s: { id: string }) => s.id === id);
+    const row = res.body.sessions.find((s: { id: string }) => s.id === id);
     expect(row?.status).toBe("verified");
 
     await fs.writeFile(path.join(staleWorkspace, "a.txt"), POST_COLLAPSE_CONTENT); // restore
+  });
+
+  it("GET /sessions returns stable cursor pages instead of an unbounded array", async () => {
+    const first = await request(app).get("/api/sessions?limit=2");
+    expect(first.status).toBe(200);
+    expect(first.body.sessions.length).toBeLessThanOrEqual(2);
+    expect(first.body.nextCursor).toEqual(expect.any(String));
+
+    const second = await request(app).get(
+      `/api/sessions?limit=2&cursor=${encodeURIComponent(first.body.nextCursor)}`,
+    );
+    expect(second.status).toBe(200);
+    expect(second.body.sessions.map((session: { id: string }) => session.id)).not.toEqual(
+      expect.arrayContaining(first.body.sessions.map((session: { id: string }) => session.id)),
+    );
   });
 });

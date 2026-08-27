@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -26,17 +26,24 @@ beforeEach(() => {
 
 describe("RuntimeBanner", () => {
   it("surfaces a native port conflict even when HTTP queries cannot reach the gateway", async () => {
+    const invoke = vi.fn().mockImplementation((command: string) =>
+      Promise.resolve(
+        command === "gateway_supervisor_status"
+          ? {
+              state: "port_conflict",
+              detail: "Port 4317 is occupied by another service.",
+              restartCount: 0,
+            }
+          : undefined,
+      ),
+    );
     mocks.tauriGlobal.mockReturnValue({
-      core: {
-        invoke: vi.fn().mockResolvedValue({
-          state: "port_conflict",
-          detail: "Port 4317 is occupied by another service.",
-          restartCount: 0,
-        }),
-      },
+      core: { invoke },
     });
     render(<RuntimeBanner />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Port 4317 is occupied");
+    fireEvent.click(screen.getByRole("button", { name: "Retry gateway" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("gateway_restart", {}));
   });
 
   it("shows a signed previous-release link when post-update smoke fails", async () => {

@@ -68,6 +68,44 @@ describe("durable gateway run state", () => {
     expect((await runState.readGatewayRun(created.id))?.state).toBe("exited");
   });
 
+  it("validates the crash-safe journal projection without trusting artifact paths", async () => {
+    const created = await runState.createGatewayRun(CONTRACT, "/tmp/workspace");
+    const sessionDir = path.join(stateRoot, "sessions", created.id);
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sessionDir, "recovery-state.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: created.id,
+        durable: true,
+        lastDurableAt: "2026-08-27T08:00:00.000Z",
+        phase: "tool_running",
+        turn: 2,
+        durableMessageCount: 7,
+        partialModelCharacters: 321,
+        pendingTool: { callId: "call-2", tool: "edit_file", path: "src/app.ts" },
+        snapshot: {
+          commit: "a".repeat(40),
+          changedFiles: ["src/app.ts", "../outside", "/absolute"],
+        },
+      }),
+    );
+
+    expect(await runState.readDurableCheckpoint(created.id)).toEqual({
+      lastDurableAt: "2026-08-27T08:00:00.000Z",
+      phase: "tool_running",
+      turn: 2,
+      durableMessageCount: 7,
+      partialModelCharacters: 321,
+      pendingTool: { callId: "call-2", tool: "edit_file", path: "src/app.ts" },
+      snapshotCommit: "a".repeat(40),
+      snapshotChangedFiles: ["src/app.ts"],
+    });
+    expect(await runState.readDurableCheckpoint(created.id, stateRoot)).not.toHaveProperty(
+      "snapshotCommit",
+    );
+  });
+
   it("recognizes only a live process carrying this exact canonical session id", async () => {
     const created = await runState.createGatewayRun(CONTRACT, "/tmp/workspace");
     const fixture = path.join(

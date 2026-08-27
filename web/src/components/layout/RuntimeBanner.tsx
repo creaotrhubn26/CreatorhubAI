@@ -13,6 +13,7 @@ interface GatewaySupervisorStatus {
 export function RuntimeBanner() {
   const [supervisor, setSupervisor] = useState<GatewaySupervisorStatus | null>(null);
   const [updateSmoke, setUpdateSmoke] = useState<PostUpdateSmokeResult>(null);
+  const [retrying, setRetrying] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -54,7 +55,7 @@ export function RuntimeBanner() {
   }, []);
 
   const supervisorProblem =
-    supervisor && ["port_conflict", "error", "restarting"].includes(supervisor.state)
+    supervisor && ["port_conflict", "error", "restarting", "paused"].includes(supervisor.state)
       ? supervisor
       : null;
   if (!supervisorProblem && !updateSmoke) return null;
@@ -65,6 +66,28 @@ export function RuntimeBanner() {
         <div className="runtime-banner" data-state="warning" role="alert">
           <strong>Gateway: {supervisorProblem.state.replaceAll("_", " ")}</strong>
           <span>{supervisorProblem.detail}</span>
+          <button
+            type="button"
+            disabled={retrying}
+            onClick={async () => {
+              const tauri = tauriGlobal();
+              if (!tauri) return;
+              setRetrying(true);
+              try {
+                await tauri.core.invoke("gateway_restart", {});
+              } catch (error) {
+                setSupervisor({
+                  state: "error",
+                  detail: `Could not retry the gateway: ${error instanceof Error ? error.message : String(error)}`,
+                  restartCount: supervisorProblem.restartCount,
+                });
+              } finally {
+                setRetrying(false);
+              }
+            }}
+          >
+            {retrying ? "Retrying…" : "Retry gateway"}
+          </button>
         </div>
       )}
       {updateSmoke && (

@@ -10,28 +10,59 @@ import type { Express } from "express";
 // they are tested against the real app, not the middleware in isolation.
 let app: Express;
 let stateRoot: string;
+const CAPABILITY = "test-app-instance-capability";
 
 beforeAll(async () => {
   stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-app-guard-root-"));
   process.env.GLIMMER_STATE_ROOT = stateRoot;
   process.env.GLIMMER_MODEL_URL = "http://127.0.0.1:1"; // nothing listens here
+  process.env.GLIMMER_CAPABILITY_TOKEN = CAPABILITY;
+  process.env.GLIMMER_UI_ORIGIN = "http://127.0.0.1:5199";
   const { createApp } = await import("./app.js");
   app = createApp();
 });
 
 afterAll(async () => {
+  delete process.env.GLIMMER_CAPABILITY_TOKEN;
+  delete process.env.GLIMMER_UI_ORIGIN;
   await fs.rm(stateRoot, { recursive: true, force: true });
 });
 
 describe("localOnlyGuard", () => {
   it("lets a write from the packaged Tauri webview's real origin through", async () => {
     // Captured from the notarized bundle in /Applications, not assumed.
-    const res = await request(app).post("/api/model/stop").set("Origin", "tauri://localhost");
+    const res = await request(app)
+      .post("/api/model/stop")
+      .set("Origin", "tauri://localhost")
+      .set("X-Glimmer-Capability", CAPABILITY);
     expect(res.status).not.toBe(403);
   });
 
   it("lets a write from the dev web origin through", async () => {
-    const res = await request(app).post("/api/model/stop").set("Origin", "http://127.0.0.1:5183");
+    const res = await request(app)
+      .post("/api/model/stop")
+      .set("Origin", "http://127.0.0.1:5183")
+      .set("X-Glimmer-Capability", CAPABILITY);
+    expect(res.status).not.toBe(403);
+  });
+
+  it("requires the per-launch capability even for an allowed origin", async () => {
+    const missing = await request(app).post("/api/model/stop").set("Origin", "tauri://localhost");
+    expect(missing.status).toBe(403);
+    expect(missing.body.error).toContain("app instance");
+
+    const wrong = await request(app)
+      .post("/api/model/stop")
+      .set("Origin", "tauri://localhost")
+      .set("X-Glimmer-Capability", "wrong");
+    expect(wrong.status).toBe(403);
+  });
+
+  it("accepts one explicitly configured loopback UI origin", async () => {
+    const res = await request(app)
+      .post("/api/model/stop")
+      .set("Origin", "http://127.0.0.1:5199")
+      .set("X-Glimmer-Capability", CAPABILITY);
     expect(res.status).not.toBe(403);
   });
 
