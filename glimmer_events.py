@@ -17,6 +17,9 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+
+from glimmer_journal import append_jsonl_durable
 
 EVENT_TYPES = {
     "tool_started", "tool_completed", "tool_blocked", "file_changed",
@@ -83,13 +86,10 @@ def emit(events_path: str, event_type: str, session_id: str, **fields) -> None:
             "type": event_type,
             **fields,
         }
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        # O_APPEND write() atomicity is the guarantee described in the module docstring.
-        fd = os.open(events_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
-        try:
-            os.write(fd, line.encode("utf-8"))
-        finally:
-            os.close(fd)
+        # The helper retains O_APPEND single-write atomicity and adds fsync,
+        # so a completed event survives an app/process/machine crash instead
+        # of lingering only in the OS page cache.
+        append_jsonl_durable(Path(events_path), record)
     except Exception as exc:  # noqa: BLE001 - deliberate: event emission must never break the session
         print(f"[glimmer_events] failed to emit {event_type!r}: {exc}", flush=True)
 

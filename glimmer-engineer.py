@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib import error, request
 
 from glimmer_events import emit as emit_event
+from glimmer_journal import DurableJournal, append_jsonl_durable, atomic_write_json
 from glimmer_models import load_model_registry, model_for_role
 
 GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
@@ -28,6 +29,12 @@ GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
 # it successfully pre-read and embedded in this run's prompt — only when
 # that count is > 0. See _plan_aware_discovery_budget below.
 GLIMMER_PLAN_CANDIDATES = os.environ.get("GLIMMER_PLAN_CANDIDATES")
+
+# Set only by run_engineer when it has a real session directory. Keeping the
+# journal optional preserves standalone/architect/consult behavior while the
+# main write-capable loop gains transactional model/tool checkpoints.
+_DURABLE_JOURNAL = None
+_DURABLE_MODEL_TURN = None
 
 # Task 2.4 (V7 §5.5 second half): the normalized ArchitecturePlan dict
 # loaded once at run_engineer startup (None when no plan exists), read by
@@ -296,7 +303,7 @@ def record_blocked_command(workspace, command, reason) -> None:
         entries = entries[-BLOCKED_COMMANDS_CAP:]
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        atomic_write_json(path, entries)
     except Exception as exc:  # never-raises: best-effort memory only.
         print(f"[ENGINEER] WARN: failed to record blocked command in memory: {exc}")
 
@@ -596,6 +603,138 @@ def model_http_json(provider, method, endpoint, payload=None, extra_headers=None
     )
 
 
+class StreamingUnsupported(RuntimeError):
+    """The provider rejected streaming before returning any model output."""
+
+
+def _streaming_chat_at(provider, payload, timeout_s, on_progress):
+    """Read OpenAI-compatible SSE and assemble the normal response shape.
+
+    ``on_progress`` receives the complete API-visible content/tool-call state
+    after each delta. It never sees authentication headers or hidden provider
+    state. A provider that rejects streaming before producing a delta can be
+    retried once through the existing non-streaming transport without risking
+    duplicate tool execution.
+    """
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    if provider.api_key_path is not None:
+        key = Path(provider.api_key_path).read_text(encoding="utf-8").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    req = request.Request(
+        _model_endpoint_url(provider.base_url, "/v1/chat/completions"),
+        data=json.dumps(stream_payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        response = request.urlopen(req, timeout=timeout_s)
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        if exc.code in {400, 404, 405, 415, 422}:
+            raise StreamingUnsupported(f"HTTP {exc.code}: {body[-1000:]}") from exc
+        raise RuntimeError(f"HTTP {exc.code} /v1/chat/completions\n{body}") from exc
+
+    content_parts = []
+    tool_parts = {}
+    usage = None
+    finish_reason = None
+    response_id = None
+    saw_sse = False
+    saw_choice = False
+    non_sse = []
+
+    with response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                non_sse.append(line)
+                continue
+            saw_sse = True
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError as exc:
+                raise RuntimeError(f"Malformed streaming model response: {data[:500]}") from exc
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                raise RuntimeError(
+                    "Streaming model error: " + json.dumps(chunk["error"], ensure_ascii=False)[:2000]
+                )
+            response_id = chunk.get("id") or response_id
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            saw_choice = True
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            finish_reason = choice.get("finish_reason") or finish_reason
+            delta = choice.get("delta") or {}
+            delta_content = delta.get("content")
+            if isinstance(delta_content, str):
+                content_parts.append(delta_content)
+            for position, tool_delta in enumerate(delta.get("tool_calls") or []):
+                if not isinstance(tool_delta, dict):
+                    continue
+                index = tool_delta.get("index")
+                if not isinstance(index, int):
+                    index = position
+                assembled = tool_parts.setdefault(
+                    index,
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if isinstance(tool_delta.get("id"), str):
+                    assembled["id"] += tool_delta["id"]
+                if isinstance(tool_delta.get("type"), str):
+                    assembled["type"] = tool_delta["type"]
+                function_delta = tool_delta.get("function") or {}
+                if isinstance(function_delta.get("name"), str):
+                    assembled["function"]["name"] += function_delta["name"]
+                if isinstance(function_delta.get("arguments"), str):
+                    assembled["function"]["arguments"] += function_delta["arguments"]
+
+            on_progress("".join(content_parts), [tool_parts[key] for key in sorted(tool_parts)])
+
+    if not saw_sse:
+        raw = "\n".join(non_sse)
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            raise StreamingUnsupported("provider returned neither SSE nor a JSON response") from exc
+        if not isinstance(parsed, dict):
+            raise StreamingUnsupported("provider returned an unsupported streaming response")
+        return parsed
+
+    if not saw_choice:
+        raise RuntimeError("Streaming model response ended without a completion choice")
+
+    message = {
+        "role": "assistant",
+        "content": "".join(content_parts) or None,
+    }
+    assembled_tools = [tool_parts[key] for key in sorted(tool_parts)]
+    if assembled_tools:
+        message["tool_calls"] = assembled_tools
+    result = {
+        "id": response_id,
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+    if usage is not None:
+        result["usage"] = usage
+    return result
+
+
 # ============================================================
 # MODEL PROVIDER (V7 §16 Model Runtime, §31 Model routing)
 # ============================================================
@@ -652,10 +791,7 @@ def _write_model_usage_file():
         return
     try:
         path = Path(GLIMMER_EVENTS_PATH).parent / "model-usage.json"
-        path.write_text(
-            json.dumps(_MODEL_USAGE_TOTALS, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, _MODEL_USAGE_TOTALS)
     except OSError:
         pass
 
@@ -722,17 +858,47 @@ class ModelProvider:
                 modelId=self.model_id,
             )
 
+            journal = _DURABLE_JOURNAL
+            journal_turn = _DURABLE_MODEL_TURN if _DURABLE_MODEL_TURN is not None else -1
+            if journal is not None:
+                journal.begin_model(this_id, journal_turn)
+
             try:
-                response = model_http_json(
-                    self, "POST", "/v1/chat/completions", request_payload, **kwargs
-                )
+                if journal is not None:
+                    try:
+                        response = _streaming_chat_at(
+                            self,
+                            request_payload,
+                            timeout_s if timeout_s is not None else 3600,
+                            lambda content, calls: journal.update_model(
+                                this_id, journal_turn, content, calls
+                            ),
+                        )
+                    except StreamingUnsupported as exc:
+                        journal.append(
+                            "model_streaming_fallback",
+                            {"reason": str(exc)[:1000]},
+                            turn=journal_turn,
+                            request_id=this_id,
+                        )
+                        response = model_http_json(
+                            self, "POST", "/v1/chat/completions", request_payload, **kwargs
+                        )
+                else:
+                    response = model_http_json(
+                        self, "POST", "/v1/chat/completions", request_payload, **kwargs
+                    )
             except RuntimeError as exc:
                 # HTTP 4xx/5xx: http_json already converted the response
                 # into this RuntimeError -- never retried (see
                 # _is_retryable_network_error's docstring).
+                if journal is not None:
+                    journal.fail_model(this_id, journal_turn, str(exc))
                 print(f"[ModelProvider:{self.role}] request {this_id} failed: {exc}")
                 raise
             except Exception as exc:
+                if journal is not None:
+                    journal.fail_model(this_id, journal_turn, str(exc))
                 if attempt_no == 1 and _is_retryable_network_error(exc):
                     print(
                         f"[ModelProvider:{self.role}] request {this_id} "
@@ -744,6 +910,13 @@ class ModelProvider:
             else:
                 usage = response.get("usage") if isinstance(response, dict) else None
                 _accumulate_usage(self.role, self.model_id, usage)
+                if journal is not None:
+                    try:
+                        response_message = response["choices"][0]["message"]
+                    except (KeyError, IndexError, TypeError):
+                        response_message = {"content": "", "tool_calls": []}
+                    journal.complete_model(this_id, journal_turn, response_message)
+                    _write_model_usage_file()
                 return response
 
     def health(self):
@@ -1049,6 +1222,88 @@ def _model_provider_selfcheck() -> None:
         _MODEL_USAGE_TOTALS.update(real_totals)
 
     print("model-provider self-check: PASS")
+
+
+def _streaming_transport_selfcheck() -> None:
+    """Prove fragmented content/tool deltas assemble and checkpoint correctly."""
+    import sqlite3
+    import tempfile
+
+    chunks = [
+        {"id": "stream-1", "choices": [{"delta": {"content": "hel"}}]},
+        {"choices": [{"delta": {"content": "lo", "tool_calls": [{
+            "index": 0, "id": "call_", "type": "function",
+            "function": {"name": "write_", "arguments": "{\"path\":\"x"},
+        }]}}]},
+        {"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "1", "function": {"name": "file", "arguments": ".txt\"}"},
+        }]}, "finish_reason": "tool_calls"}]},
+    ]
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def __iter__(self):
+            lines = [("data: " + json.dumps(chunk) + "\n").encode("utf-8") for chunk in chunks]
+            return iter(lines + [b"data: [DONE]\n"])
+
+    seen_payload = {}
+    real_urlopen = request.urlopen
+
+    def fake_urlopen(req, timeout=None):
+        seen_payload.update(json.loads(req.data.decode("utf-8")))
+        assert timeout == 5
+        return FakeResponse()
+
+    request.urlopen = fake_urlopen
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            journal = DurableJournal(Path(td), "stream-selfcheck")
+            journal.begin_model("request-1", 3)
+            provider = ModelProvider(
+                "http://127.0.0.1:1", None, "engineer", "test-model"
+            )
+            result = _streaming_chat_at(
+                provider,
+                {"messages": []},
+                5,
+                lambda content, calls: journal.update_model(
+                    "request-1", 3, content, calls, force=True
+                ),
+            )
+            message = result["choices"][0]["message"]
+            assert message["content"] == "hello"
+            assert message["tool_calls"][0] == {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": '{"path":"x.txt"}'},
+            }
+            journal.complete_model("request-1", 3, message)
+            journal.close("completed")
+            db = sqlite3.connect(str(Path(td) / "runtime.sqlite3"))
+            row = db.execute(
+                "SELECT status, content, tool_calls_json FROM model_streams WHERE request_id=?",
+                ("request-1",),
+            ).fetchone()
+            db.close()
+            assert row[0] == "completed" and row[1] == "hello"
+            assert json.loads(row[2])[0]["function"]["name"] == "write_file"
+            assert seen_payload["stream"] is True
+
+            chunks[:] = [{"error": {"message": "provider failed"}}]
+            try:
+                _streaming_chat_at(provider, {"messages": []}, 5, lambda *_args: None)
+                assert False, "an SSE error object must never become an empty successful response"
+            except RuntimeError as exc:
+                assert "provider failed" in str(exc)
+    finally:
+        request.urlopen = real_urlopen
+
+    print("streaming transport self-check: PASS")
 
 
 # ============================================================
@@ -2011,9 +2266,7 @@ def _atomic_write_json(path: Path, data) -> None:
     this process's own next poll) to trip over. os.replace is atomic on
     the same filesystem, and the temp file lives in the same directory so
     it always is."""
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_json(path, data)
 
 
 def _approvals_path(session_dir) -> Path:
@@ -2769,8 +3022,7 @@ def _persist_evidence(tool_name, arguments, content):
         "content": _head_tail_cap(content, MAX_EVIDENCE_RESULT, "EVIDENCE COMPACTED"),
     }
     try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_durable(path, record)
     except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
         print(f"[glimmer-engineer] failed to persist evidence: {exc}", flush=True)
 
@@ -2906,12 +3158,7 @@ def _append_evidence_index_entry(evidence_id, kind, tool_name, path_value, relat
         # read back as corrupt/empty. os.replace is atomic on both POSIX
         # and Windows (same discipline control-center's task-overrides.json
         # write already uses).
-        tmp_path = idx_path.with_name(f"{idx_path.name}.tmp-{os.getpid()}")
-        tmp_path.write_text(
-            json.dumps(existing, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp_path, idx_path)
+        atomic_write_json(idx_path, existing)
     except Exception as exc:  # noqa: BLE001 - index is best-effort only
         print(f"[glimmer-engineer] failed to update evidence index: {exc}")
 
@@ -4335,8 +4582,7 @@ def _persist_tool_envelope(envelope):
     record["timestamp"] = datetime.now(timezone.utc).isoformat()
 
     try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl_durable(path, record)
     except OSError as exc:  # noqa: BLE001 - evidence persistence must never break the session
         print(f"[glimmer-engineer] failed to persist tool envelope: {exc}", flush=True)
 
@@ -7272,10 +7518,7 @@ def _write_architecture_plan_file(output):
         return None
 
     try:
-        path.write_text(
-            json.dumps(output, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, output)
         print(f"Wrote: {path}")
         return path
     except OSError as exc:
@@ -7553,7 +7796,7 @@ def _write_task_report_file(output):
         return None
     path = Path(GLIMMER_EVENTS_PATH).parent / "task-report.json"
     try:
-        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, output)
         print(f"Wrote: {path}")
         return path
     except OSError as exc:
@@ -7764,7 +8007,7 @@ def _write_architect_review_file(output, iteration, review_round):
         )
         return None
     try:
-        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(path, output)
         print(f"Wrote: {path}")
         return path
     except OSError as exc:
@@ -8486,10 +8729,7 @@ def _write_delivery_review_file(output):
         return None
 
     try:
-        path.write_text(
-            json.dumps(output, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, output)
         print(f"Wrote: {path}")
         return path
     except OSError as exc:
@@ -8808,10 +9048,7 @@ def _write_escalation_file(output):
         )
         return None
     try:
-        path.write_text(
-            json.dumps(output, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        atomic_write_json(path, output)
         print(f"Wrote: {path}")
         return path
     except OSError as exc:
@@ -10048,6 +10285,7 @@ def run_engineer(
     # triggers (regardless of architect_consult_enabled) and, gated by
     # that flag too, whether consult_architect is offered at all.
     global _loaded_architecture_plan, _architect_consult_enabled, _contract_scope_prefixes
+    global _DURABLE_JOURNAL, _DURABLE_MODEL_TURN
     _loaded_architecture_plan = _load_architecture_plan_for_engineer()
     architecture_plan = _loaded_architecture_plan
     _architect_consult_enabled = architect_consult_enabled
@@ -10165,6 +10403,8 @@ def run_engineer(
             "resolve existing changes before starting a "
             "new Glimmer write session."
         )
+
+    recovery_baseline = git_local(workspace, "rev-parse", "HEAD")
 
     baseline_preview = "\n".join(
         dirty[:100]
@@ -10293,6 +10533,18 @@ def run_engineer(
         },
     ]
 
+    # The event path is the existing, trusted session-directory handoff from
+    # glimmer-v2.py. Standalone runs remain unchanged; gateway/v2 sessions get
+    # an immediate durable Tier-0 checkpoint before the first model request.
+    if GLIMMER_EVENTS_PATH and GLIMMER_SESSION_ID:
+        _DURABLE_JOURNAL = DurableJournal(
+            Path(GLIMMER_EVENTS_PATH).parent,
+            GLIMMER_SESSION_ID,
+            process_name="engineer",
+        )
+        atexit.register(_DURABLE_JOURNAL.close)
+        _DURABLE_JOURNAL.checkpoint_conversation(messages, -1, "initialized")
+
     approvals = {
         "approve_all": auto_yes,
     }
@@ -10381,6 +10633,8 @@ def run_engineer(
     used_final_synthesis = False
 
     for turn in range(max_turns):
+
+        _DURABLE_MODEL_TURN = turn
 
         used_final_synthesis = False
 
@@ -10582,6 +10836,11 @@ def run_engineer(
                     "final answer postponed."
                 )
 
+                if _DURABLE_JOURNAL is not None:
+                    _DURABLE_JOURNAL.checkpoint_conversation(
+                        messages, turn, "verification_gate"
+                    )
+
                 continue
 
             print()
@@ -10594,6 +10853,13 @@ def run_engineer(
             )
             print()
             print(content)
+
+            if _DURABLE_JOURNAL is not None:
+                _DURABLE_JOURNAL.checkpoint_conversation(
+                    messages + [{"role": "assistant", "content": content}],
+                    turn,
+                    "final_response",
+                )
 
             # C6 (glimmer-v7, V7 §23.7): DeliveryReview companion to the
             # prose report just printed above. Runs for both success and
@@ -10626,6 +10892,9 @@ def run_engineer(
 
             postflight(workspace)
 
+            if _DURABLE_JOURNAL is not None:
+                _DURABLE_JOURNAL.close("completed")
+
             return
 
         # ----------------------------------------------------
@@ -10650,6 +10919,11 @@ def run_engineer(
             }
         )
 
+        if _DURABLE_JOURNAL is not None:
+            _DURABLE_JOURNAL.checkpoint_conversation(
+                messages, turn, "assistant_tool_calls"
+            )
+
         for call in tool_calls:
 
             function = (
@@ -10661,6 +10935,17 @@ def run_engineer(
                 function.get("name")
                 or ""
             )
+
+            changed = False
+            arguments = function.get("arguments") or {}
+            try:
+                journal_arguments = parse_arguments(arguments)
+            except Exception:  # malformed arguments are still a durable intent fact
+                journal_arguments = arguments
+            if _DURABLE_JOURNAL is not None:
+                _DURABLE_JOURNAL.begin_tool(
+                    call["id"], turn, tool_name, journal_arguments
+                )
 
             # Task 5.1: reset every call iteration so a call that never
             # reaches the real execute_tool() below (unknown tool,
@@ -10890,6 +11175,31 @@ def run_engineer(
                         + result
                     )
 
+            snapshot = None
+            if _DURABLE_JOURNAL is not None and changed:
+                try:
+                    snapshot = _DURABLE_JOURNAL.snapshot_worktree(
+                        workspace, recovery_baseline, turn, call["id"]
+                    )
+                except Exception as exc:  # journal failure is visible, never hidden
+                    _DURABLE_JOURNAL.append(
+                        "worktree_snapshot_failed",
+                        {"error": str(exc)[:2000]},
+                        turn=turn,
+                        call_id=call["id"],
+                    )
+                    print(f"[glimmer-engineer] recovery snapshot failed: {exc}", flush=True)
+
+            if _DURABLE_JOURNAL is not None:
+                _DURABLE_JOURNAL.complete_tool(
+                    call["id"],
+                    turn,
+                    tool_name,
+                    result,
+                    changed=changed,
+                    snapshot=snapshot,
+                )
+
             messages.append(
                 {
                     "role": "tool",
@@ -10902,6 +11212,11 @@ def run_engineer(
                         ),
                 }
             )
+
+            if _DURABLE_JOURNAL is not None:
+                _DURABLE_JOURNAL.checkpoint_conversation(
+                    messages, turn, "tool_result"
+                )
 
             # Task 5.1: remember which evidence id (if any) this tool
             # message's own content can be swapped for later, so
@@ -11059,6 +11374,11 @@ def run_engineer(
                 f"{post_gate_inspection_calls} post-gate "
                 "inspection calls used. "
                 "Next action must be edit_file, write_file, or finish."
+            )
+
+        if _DURABLE_JOURNAL is not None:
+            _DURABLE_JOURNAL.checkpoint_conversation(
+                messages, turn, "turn_complete"
             )
 
     raise RuntimeError(
@@ -12072,6 +12392,10 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--model-provider-selfcheck"]:
         _model_provider_selfcheck()
+        sys.exit(0)
+
+    if sys.argv[1:] == ["--streaming-transport-selfcheck"]:
+        _streaming_transport_selfcheck()
         sys.exit(0)
 
     if sys.argv[1:] == ["--recovery-ladder-selfcheck"]:

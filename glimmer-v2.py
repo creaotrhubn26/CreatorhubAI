@@ -22,6 +22,7 @@ import urllib.request
 from pathlib import Path
 
 from glimmer_events import emit as emit_event
+from glimmer_journal import atomic_write_bytes, atomic_write_json
 from glimmer_models import load_model_registry, model_for_role
 
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
@@ -246,7 +247,7 @@ def _resolve_orphaned_pending_approval(session_dir) -> None:
             record["resolvedAt"] = resolved_at
             approvals[approval_id] = record
             try:
-                approvals_path.write_text(json.dumps(approvals, indent=2), encoding="utf-8")
+                atomic_write_json(approvals_path, approvals)
             except OSError:
                 pass
             print(f"[V2] orphaned YELLOW approval {approval_id!r} resolved: denied ({resolved_by})")
@@ -259,7 +260,7 @@ def _resolve_orphaned_pending_approval(session_dir) -> None:
         on_disk["state"] = canonical_session_state(on_disk.get("status") or "")
     on_disk.pop("pendingApproval", None)
     try:
-        manifest_path.write_text(json.dumps(on_disk, indent=2), encoding="utf-8")
+        atomic_write_json(manifest_path, on_disk)
     except OSError:
         pass
 
@@ -1567,9 +1568,7 @@ def verify(ws, commands, timeout, session, iteration, repo_map, source_root, bas
             # and whether fail_fast stops at the first failure.
             result["tier"] = tier
             results.append(result)
-            (session / f"verify-{iteration:02d}-{i:02d}.json").write_text(
-                json.dumps(result, indent=2), encoding="utf-8"
-            )
+            atomic_write_json(session / f"verify-{iteration:02d}-{i:02d}.json", result)
             if events_path is not None:
                 emit_event(events_path, "verification_completed", session_id, check=label,
                            status=result["status"], baselineAware=bool(result.get("baseline")),
@@ -2729,6 +2728,10 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     if scope_prefixes:
         env["GLIMMER_CONTRACT_SCOPE"] = json.dumps(list(scope_prefixes))
     with log_path.open("w", encoding="utf-8") as log:
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
         # Round 8 whole-round review (MJ4): `start_new_session` only when a
         # `timeout` is actually set (only run_architect_escalation ever
         # passes one -- every other caller is unaffected) -- puts this
@@ -2752,12 +2755,19 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
         timer = threading.Timer(timeout, _kill_on_timeout) if timeout else None
         if timer is not None:
             timer.start()
+        last_log_sync = time.monotonic()
         try:
             for line in p.stdout:
                 sys.stdout.write(line)
                 log.write(line)
+                log.flush()
+                if time.monotonic() - last_log_sync >= 0.5:
+                    os.fsync(log.fileno())
+                    last_log_sync = time.monotonic()
             return p.wait()
         finally:
+            log.flush()
+            os.fsync(log.fileno())
             if timer is not None:
                 timer.cancel()
 
@@ -2917,7 +2927,7 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
 
     try:
         architect_prompt = make_architect_prompt(contract, summary, ws)
-        (session / "architect-prompt.txt").write_text(architect_prompt, encoding="utf-8")
+        atomic_write_bytes(session / "architect-prompt.txt", architect_prompt.encode("utf-8"))
 
         rc = invoke_engineer(
             engineer, ws, architect_prompt,
@@ -2972,7 +2982,7 @@ def load_task_report(session_dir):
 def run_read_only_task(engineer, ws, contract, summary, session, events_path, sid):
     """Run inspect/plan/review through Architect's structurally read-only loop."""
     prompt = make_architect_prompt(contract, summary, ws)
-    (session / "task-report-prompt.txt").write_text(prompt, encoding="utf-8")
+    atomic_write_bytes(session / "task-report-prompt.txt", prompt.encode("utf-8"))
     rc = invoke_engineer(
         engineer, ws, prompt, True, None,
         session / "task-report.log", events_path, sid,
@@ -3044,7 +3054,10 @@ def run_architect_replan(engineer, ws, contract, summary, session, events_path, 
 
     try:
         replan_prompt = make_architect_replan_prompt(contract, summary, review, from_version, ws)
-        (session / f"architect-replan-{to_version}-prompt.txt").write_text(replan_prompt, encoding="utf-8")
+        atomic_write_bytes(
+            session / f"architect-replan-{to_version}-prompt.txt",
+            replan_prompt.encode("utf-8"),
+        )
 
         # Fix round 1 (HIGH): architecture-plan.json already holds
         # v{from_version} (record_architecture_plan_version wrote it there
@@ -3113,10 +3126,9 @@ def record_architecture_plan_version(session, manifest, plan):
     defaults to 1 defensively if somehow missing.
     """
     version = plan.get("version", 1)
-    text = json.dumps(plan, indent=2)
     versioned_name = f"architecture-plan-v{version}.json"
-    (Path(session) / versioned_name).write_text(text, encoding="utf-8")
-    (Path(session) / "architecture-plan.json").write_text(text, encoding="utf-8")
+    atomic_write_json(Path(session) / versioned_name, plan)
+    atomic_write_json(Path(session) / "architecture-plan.json", plan)
     manifest.setdefault("architectPlans", []).append({
         "version": version,
         "path": versioned_name,
@@ -3577,7 +3589,7 @@ def run_architect_review(engineer, ws, plan, files, change_types, baseline, sess
 
         request = make_review_request(plan, files, change_types, diff_text, iteration, review_round,
                                        task_list=task_list, matched_adr_ids=matched_adr_ids)
-        request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
+        atomic_write_json(request_path, request)
 
         rc = invoke_engineer(
             engineer, ws,
@@ -3875,8 +3887,9 @@ def save_tasks(session_dir, tasks) -> None:
     write failure here (permissions, full disk) must degrade to a log
     line, never take down an otherwise-successful engineering session."""
     try:
-        (Path(session_dir) / "tasks.json").write_text(
-            json.dumps({"schemaVersion": 2, "tasks": tasks}, indent=2), encoding="utf-8")
+        atomic_write_json(
+            Path(session_dir) / "tasks.json", {"schemaVersion": 2, "tasks": tasks}
+        )
     except OSError as exc:
         print(f"[V2] WARN: failed to write tasks.json: {exc}")
 
@@ -4445,9 +4458,10 @@ def _write_doc_graph(ws, graph: dict) -> None:
         if path.is_file() and path.read_text(encoding="utf-8") == serialized:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-        tmp.write_text(serialized, encoding="utf-8")
-        os.replace(tmp, path)
+        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+        atomic_write_bytes(
+            path, serialized.encode("utf-8"), mode=mode, private_parent=False
+        )
     except OSError as exc:
         print(f"[V2] WARN: failed to write {DOC_GRAPH_RELATIVE_PATH}: {exc}")
 
@@ -5180,18 +5194,15 @@ def run_architect_escalation(engineer, ws, architecture_plan, delivery_review, s
 
     def _write_escalation_record(record) -> None:
         try:
-            escalation_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            atomic_write_json(escalation_path, record)
         except OSError as write_exc:
             print(f"[V2] WARN: failed to write architect-escalation.json: {write_exc}")
 
     try:
-        request_path.write_text(
-            json.dumps({
-                "architecturePlan": architecture_plan,
-                "question": build_escalation_question(delivery_review),
-            }, indent=2),
-            encoding="utf-8",
-        )
+        atomic_write_json(request_path, {
+            "architecturePlan": architecture_plan,
+            "question": build_escalation_question(delivery_review),
+        })
         rc = invoke_engineer(
             engineer, ws,
             "Answer the architect escalation question in --consult-request.",
@@ -5420,11 +5431,9 @@ def write_delivery_packet(manifest, session_dir, delivery_review):
     any, is already on disk by the time this reads it."""
     packet = compute_delivery_packet(manifest, delivery_review, load_architect_escalation(session_dir))
     try:
-        (Path(session_dir) / "delivery-packet.json").write_text(
-            json.dumps(packet, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        (Path(session_dir) / "packet-summary.txt").write_text(
-            render_packet_summary(packet), encoding="utf-8"
+        atomic_write_json(Path(session_dir) / "delivery-packet.json", packet)
+        atomic_write_bytes(
+            Path(session_dir) / "packet-summary.txt", render_packet_summary(packet).encode("utf-8")
         )
     except OSError as exc:
         print(f"[V2] WARN: failed to write delivery packet: {exc}")
@@ -5734,13 +5743,18 @@ def _docs_bootstrap(workspace) -> int:
     graph = build_docs_bootstrap_graph(repo_map)
 
     graph_path.parent.mkdir(parents=True, exist_ok=True)
-    graph_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+    atomic_write_json(graph_path, graph, mode=0o644, private_parent=False)
 
     (ws / ADR_DECISIONS_RELATIVE_DIR).mkdir(parents=True, exist_ok=True)
 
     readme_path = ws / DOCS_README_RELATIVE_PATH
     if not readme_path.exists():
-        readme_path.write_text(_DOCS_README_STUB, encoding="utf-8")
+        atomic_write_bytes(
+            readme_path,
+            _DOCS_README_STUB.encode("utf-8"),
+            mode=0o644,
+            private_parent=False,
+        )
 
     by_type = {}
     for n in graph["nodes"]:
@@ -6138,13 +6152,17 @@ def main():
     legacy_sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     sid = args.session_id or legacy_sid
     session = STATE_ROOT / (sid if args.session_id else f"{sid}-{b.replace('/', '-')}")
-    session.mkdir()
+    session.mkdir(mode=0o700)
+    try:
+        os.chmod(session, 0o700)
+    except OSError:
+        pass
     events_path = session / "events.jsonl"
     emit_event(events_path, "session_created", sid,
                taskSummary=_truncate_bytes(task, 500, "..."), workspace=str(ws))
 
     repo = build_repo_map(ws)
-    (session / "repo-map.json").write_text(json.dumps(repo, indent=2), encoding="utf-8")
+    atomic_write_json(session / "repo-map.json", repo)
     summary = repo_summary(repo)
 
     # Task 1.2: skill_loaded events, once per session -- separate from (and
@@ -6272,7 +6290,7 @@ def main():
 
     def save():
         # SINGLE-WRITER INVARIANT (8.3 review fix-round, M3, V7 §14/§35):
-        # this is a bare non-atomic write_text of the FULL in-memory
+        # this is an atomic, fsync-backed write of the FULL in-memory
         # `manifest` dict -- safe ONLY because this process never calls
         # save() while a glimmer-engineer.py subprocess is running
         # (invoke_engineer's `for line in p.stdout: ...` loop blocks this
@@ -6297,7 +6315,7 @@ def main():
         # across sequential invoke_engineer calls).
         _merge_engineer_owned_keys(manifest, manifest_path)
         manifest["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        atomic_write_json(manifest_path, manifest)
 
     save()
     # Task 1.2: session_created (emitted right after session.mkdir() above)
@@ -6532,7 +6550,9 @@ def main():
             prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
                                  plan=architecture_plan, evidence=candidate_evidence,
                                  repair_contract=repair_contract, tasks=tasks)
-            (session / f"prompt-{iteration:02d}.txt").write_text(prompt, encoding="utf-8")
+            atomic_write_bytes(
+                session / f"prompt-{iteration:02d}.txt", prompt.encode("utf-8")
+            )
             # C3: spawn -- deterministic evidence point 1/3. The engineer
             # subprocess is about to execute the whole implementationPlan
             # in one run (no per-task pointer, see the C3 module docstring
@@ -6915,8 +6935,10 @@ def main():
                         checkpoint_sha=checkpoint_sha, plan=architecture_plan, evidence=candidate_evidence,
                         tasks=tasks,
                     )
-                    (session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt").write_text(
-                        revise_prompt, encoding="utf-8")
+                    atomic_write_bytes(
+                        session / f"architect-revise-{iteration:02d}-{review_round:02d}.txt",
+                        revise_prompt.encode("utf-8"),
+                    )
                     # C3: a REVISE_IMPLEMENTATION round re-invokes the
                     # engineer directly (outside the outer repair loop) --
                     # implementation tasks go back to in_progress for this
@@ -7259,8 +7281,9 @@ def main():
             # follows just above.
             repair_contract = build_repair_contract(iteration + 1, results, files, ws)
             manifest["attempts"][-1]["repairContract"] = repair_contract
-            (session / f"repair-{iteration + 1:02d}.json").write_text(
-                json.dumps({"repair": repair_contract}, indent=2), encoding="utf-8"
+            atomic_write_json(
+                session / f"repair-{iteration + 1:02d}.json",
+                {"repair": repair_contract},
             )
             # Task 4.1: auto-create a repair task for this round, in the same
             # tasks.json the architect-plan-derived tasks live in -- only
