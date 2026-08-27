@@ -1,10 +1,11 @@
 import type { TaskContract, TaskIntent } from "@glimmer/shared";
+import { buildDesignContract, type DesignComposerFields } from "./designContract";
 
 type ToolchainMode = NonNullable<NonNullable<TaskContract["advanced"]>["toolchainMode"]>;
 
 const DEFAULT_TOOLCHAIN_MODE: ToolchainMode = "path";
 
-export interface TaskComposerFormState {
+export interface TaskComposerFormState extends DesignComposerFields {
   objective: string;
   intentKind: "auto" | TaskIntent["kind"];
   scopePackage: TaskContract["scope"]["package"];
@@ -42,13 +43,18 @@ function scopePaths(form: TaskComposerFormState): { area?: string; paths?: strin
 }
 
 export function buildTaskContract(form: TaskComposerFormState): TaskContract {
+  const design = buildDesignContract(form);
   const advanced: NonNullable<TaskContract["advanced"]> = {};
   if (form.timeoutSeconds !== undefined) advanced.timeoutSeconds = form.timeoutSeconds;
   if (form.toolchainMode !== undefined && form.toolchainMode !== DEFAULT_TOOLCHAIN_MODE) {
     advanced.toolchainMode = form.toolchainMode;
   }
   if (form.modelReadinessUrl?.trim()) advanced.modelReadinessUrl = form.modelReadinessUrl.trim();
-  if (form.architectFirst) advanced.architectFirst = true;
+  if (form.architectFirst || design) advanced.architectFirst = true;
+
+  const verification = [...form.verification];
+  if (design?.targetUrl && !verification.includes("visual")) verification.push("visual");
+  const writeMode = form.mode !== "inspect" && form.mode !== "plan" && form.mode !== "review";
 
   return {
     objective: form.objective,
@@ -64,7 +70,8 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
       noDeploy: true,
       noDependencyInstall: true,
     },
-    verification: form.verification,
+    verification,
+    ...(design ? { design } : {}),
     repairBudget: Math.min(5, Math.max(0, form.repairBudget)),
     maxTurns: form.maxTurns,
     // Omitted entirely when nothing was touched — orchestrator defaults apply.
@@ -72,5 +79,13 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
       ? { budgets: { maxChangedFiles: form.maxChangedFiles } }
       : {}),
     ...(Object.keys(advanced).length > 0 ? { advanced } : {}),
+    ...(design && writeMode
+      ? {
+          qualityGates: {
+            customerReadinessRequired: true,
+            minimumCustomerReadiness: "ready_with_known_limitations" as const,
+          },
+        }
+      : {}),
   };
 }

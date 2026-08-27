@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { buildTaskContract, type TaskComposerFormState } from "./buildTaskContract";
+import { DEFAULT_DESIGN_FORM } from "./designContract";
 
 const BASE: TaskComposerFormState = {
+  ...DEFAULT_DESIGN_FORM,
   objective: "Fix dialog state restoration",
   intentKind: "auto",
   scopePackage: "frontend",
@@ -121,5 +123,72 @@ describe("buildTaskContract", () => {
     const contract = buildTaskContract({ ...BASE, maxTurns: 15 });
     expect(contract.maxTurns).toBe(15);
     expect(contract.advanced).toBeUndefined();
+  });
+
+  it("builds a CMS/token-aware design contract and enables architect, visual, and readiness gates", () => {
+    const contract = buildTaskContract({
+      ...BASE,
+      designEnabled: true,
+      designKind: "reference-match",
+      designTargetUrl: "http://localhost:5173/settings",
+      designAudience: "content editors",
+      designPrimaryAction: "publish",
+      designRequirements: "Primary action remains visible\nErrors explain recovery",
+      designReferenceImages: "Settings | design/settings.png",
+      allowReferenceImageModelUpload: true,
+      designStates: "dialog-open | click | [aria-label='Settings'] | dialog is visible",
+      cmsStrategy: "existing",
+      cmsProviderHint: "Sanity",
+      cmsSchemaPaths: "cms/schema",
+      cmsRequirements: "Hero copy remains editor-managed",
+      cmsLocalizationRequired: true,
+      designTokenStrategy: "existing",
+      designTokenSourcePaths: "src/theme.css",
+      designTokenRequirements: "Reuse semantic color tokens",
+      designElementEdits: [
+        {
+          id: "edit-1",
+          target: "settings title",
+          screenshot: "1440x900-initial.png",
+          viewport: "1440x900",
+          state: "initial",
+          region: { x: 0.1, y: 0.2 },
+          text: "Workspace settings",
+          style: {},
+          createdAt: "2026-08-27T10:00:00.000Z",
+        },
+      ],
+      designAssetRequests: [
+        {
+          id: "asset-1",
+          kind: "vector",
+          prompt: "Geometric settings illustration",
+          outputPath: "public/generated/settings.svg",
+          aspectRatio: "4:3",
+          animated: false,
+          referenceImages: [],
+          referenceUploadPolicy: "local-only",
+          createdAt: "2026-08-27T10:00:00.000Z",
+        },
+      ],
+    });
+    expect(contract.verification).toContain("visual");
+    expect(contract.advanced?.architectFirst).toBe(true);
+    expect(contract.qualityGates).toEqual({
+      customerReadinessRequired: true,
+      minimumCustomerReadiness: "ready_with_known_limitations",
+    });
+    expect(contract.design).toMatchObject({
+      targetUrl: "http://localhost:5173/settings",
+      referenceImagePolicy: "vision-model",
+      cms: { strategy: "existing", providerHint: "Sanity", localizationRequired: true },
+      designTokens: { strategy: "existing", allowNewTokens: false },
+      elementEdits: [{ target: "settings title" }],
+      assetRequests: [{ kind: "vector", outputPath: "public/generated/settings.svg" }],
+    });
+    expect(contract.design?.states[0].actions[0]).toEqual({
+      action: "click",
+      selector: "[aria-label='Settings']",
+    });
   });
 });

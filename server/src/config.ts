@@ -38,6 +38,8 @@ export const CONFIG = {
   modelBaseUrl: process.env.GLIMMER_MODEL_URL ?? "http://127.0.0.1:8080",
   modelApiKeyFile: process.env.GLIMMER_API_KEY_FILE ?? selectWritableRuntimeConfig("api-key.txt"),
   mcpConfigPath: process.env.GLIMMER_MCP_CONFIG ?? selectWritableRuntimeConfig("mcp-servers.json"),
+  mobbinApiKeyFile:
+    process.env.GLIMMER_MOBBIN_API_KEY_FILE ?? path.join(stateRoot, "mobbin-api-key.txt"),
   // The only two commands POST /api/model/{start,stop} may ever run: fixed
   // absolute paths, executed as argv with no arguments and no shell (see
   // lib/modelServer.ts). Nothing from a request body reaches a process.

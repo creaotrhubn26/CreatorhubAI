@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
-import type { TaskContract } from "@glimmer/shared";
+import type { DesignContract, TaskContract } from "@glimmer/shared";
 import { CONFIG } from "../config.js";
 
 // Closed allowlist: `--verify` values are executed verbatim by glimmer-v2.py
@@ -12,6 +13,7 @@ const VERIFICATION_COMMANDS: Record<string, string> = {
   "frontend-typecheck": "npm --prefix frontend run typecheck",
   "targeted-test": "npm --prefix frontend run test:unit",
 };
+const VISUAL_VERIFICATION = "visual";
 
 // §7 Advanced controls. Closed enum for toolchainMode — same discipline as
 // VERIFICATION_COMMANDS above: a value outside this set is dropped, never
@@ -77,6 +79,20 @@ function isValidModelReadinessUrl(value: string): boolean {
   }
 }
 
+function isValidLoopbackUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      !url.username &&
+      !url.password &&
+      ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function isInRange(n: unknown, range: { min: number; max: number }): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= range.min && n <= range.max;
 }
@@ -130,7 +146,12 @@ export function validateAdvanced(contract: TaskContract): string | null {
   return null;
 }
 
-export function buildArgs(contract: TaskContract, workspace: string, sessionId?: string): string[] {
+export function buildArgs(
+  contract: TaskContract,
+  workspace: string,
+  sessionId?: string,
+  designContractPath?: string,
+): string[] {
   const args = ["--workspace", workspace];
   if (sessionId && /^[A-Za-z0-9._-]+$/.test(sessionId)) {
     args.push("--session-id", sessionId);
@@ -141,6 +162,10 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   } else {
     args.push("--verification-level", "standard");
     for (const v of contract.verification) {
+      if (v === VISUAL_VERIFICATION) {
+        args.push("--verify", VISUAL_VERIFICATION);
+        continue;
+      }
       const cmd = VERIFICATION_COMMANDS[v];
       if (cmd) args.push("--verify", cmd); // unrecognized names are dropped, never forwarded
     }
@@ -208,8 +233,14 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   ) {
     args.push("--model-readiness-url", advanced.modelReadinessUrl);
   }
-  if (advanced?.architectFirst === true) {
+  if (advanced?.architectFirst === true || contract.design) {
     args.push("--architect-first");
+  }
+  if (contract.design?.targetUrl && isValidLoopbackUrl(contract.design.targetUrl)) {
+    args.push("--visual-url", contract.design.targetUrl);
+  }
+  if (contract.design && designContractPath && path.isAbsolute(designContractPath)) {
+    args.push("--design-contract", designContractPath);
   }
 
   // Task 8.1 (V7 §23.10): qualityGates -- same duplicated-boundary posture
@@ -240,6 +271,26 @@ export function buildArgs(contract: TaskContract, workspace: string, sessionId?:
   // even if a client submits an objective like "--engineer=...".
   args.push("--", contract.objective);
   return args;
+}
+
+/** Writes the validated design input outside the not-yet-created session dir. */
+export async function writeDesignContractInput(
+  directory: string,
+  design?: DesignContract,
+): Promise<string | undefined> {
+  if (!design) return undefined;
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const target = path.join(directory, "design-contract.input.json");
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify(design, null, 2), { encoding: "utf8", mode: 0o600 });
+  const handle = await fs.open(temporary, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fs.rename(temporary, target);
+  return target;
 }
 
 export function runtimeCommand(

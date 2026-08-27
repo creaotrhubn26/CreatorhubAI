@@ -11,3 +11,6 @@ src-tauri/resources/gateway/
 
 # Gateway run logs — runtime output, not source
 .gateway.log
+.opencode
+.DS_Store
+/artifacts/

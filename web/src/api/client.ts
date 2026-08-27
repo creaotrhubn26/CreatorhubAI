@@ -45,6 +45,39 @@ import type {
   IntegrationProfilePreview,
   IntegrationProfileApplyResult,
   IntegrationProfileRollbackResult,
+  DesignFeedbackDocument,
+  DesignFeedbackUpdate,
+  MobbinCredentialUpdate,
+  MobbinIntegrationStatus,
+  MobbinSearchRequest,
+  MobbinSearchResult,
+  LiveDesignResolveRequest,
+  LiveDesignResolveResponse,
+  LiveDesignProposalRequest,
+  LiveDesignProposalResponse,
+  LiveDesignDraftJournal,
+  LiveDesignDraftUpdate,
+  LiveDesignApplyRequest,
+  LiveDesignApplyResponse,
+  LiveDesignRollbackResponse,
+  LiveDesignTransactionRequest,
+  LiveDesignTransactionResponse,
+  LiveDesignHistoryResponse,
+  LiveDesignBridgeInstallRequest,
+  LiveDesignBridgeInstallResponse,
+  LiveDesignResponsiveOverrideRequest,
+  LiveDesignResponsiveOverrideResponse,
+  LiveDesignStructureOperationRequest,
+  LiveDesignStructureOperationResponse,
+  LiveDesignStyleOverrideRequest,
+  LiveDesignStyleOverrideResponse,
+  DesignWorkflowDocument,
+  DesignChangeSetCreateRequest,
+  DesignChangeSetUpdateRequest,
+  DesignWorkflowTransitionRequest,
+  DesignWorkflowLinkRequest,
+  DesignWorkflowMutationRequest,
+  DesignWorkflowRollbackResponse,
 } from "@glimmer/shared";
 import { tauriGlobal } from "../state/desktopNotify";
 
@@ -225,6 +258,19 @@ export const glimmerApi = {
       method: "PUT",
       body: JSON.stringify(update),
     }),
+  getMobbinIntegration: () => request<MobbinIntegrationStatus>("/api/integrations/mobbin"),
+  saveMobbinCredential: (update: MobbinCredentialUpdate) =>
+    request<MobbinIntegrationStatus>("/api/integrations/mobbin/credential", {
+      method: "PUT",
+      body: JSON.stringify(update),
+    }),
+  searchMobbin: (input: MobbinSearchRequest) =>
+    request<MobbinSearchResult>("/api/integrations/mobbin/search", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  mobbinImageUrl: (imageToken: string) =>
+    `${API_BASE}/api/integrations/mobbin/image/${encodeURIComponent(imageToken)}`,
   getModelStatus: () => request<ModelStatus>("/api/model/status"),
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>
@@ -290,10 +336,140 @@ export const glimmerApi = {
     if (!res.ok) throw new Error(`GET /api/sessions/${id}/visual/manifest failed: ${res.status}`);
     return res.json() as Promise<VisualVerification>;
   },
+  getDesignFeedback: async (id: string): Promise<DesignFeedbackDocument | null> => {
+    const res = await gatewayFetch(`${API_BASE}/api/sessions/${id}/visual/feedback`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`GET /api/sessions/${id}/visual/feedback failed: ${res.status}`);
+    return res.json() as Promise<DesignFeedbackDocument>;
+  },
+  saveDesignFeedback: (id: string, update: DesignFeedbackUpdate) =>
+    request<DesignFeedbackDocument>(`/api/sessions/${id}/visual/feedback`, {
+      method: "PUT",
+      body: JSON.stringify(update),
+    }),
+  getDesignWorkflow: (id: string) =>
+    request<DesignWorkflowDocument>(`/api/sessions/${id}/design-workflow`),
+  createDesignChangeSet: (id: string, input: DesignChangeSetCreateRequest) =>
+    request<DesignWorkflowDocument>(`/api/sessions/${id}/design-workflow/change-sets`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateDesignChangeSet: (id: string, changeSetId: string, input: DesignChangeSetUpdateRequest) =>
+    request<DesignWorkflowDocument>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}`,
+      { method: "PUT", body: JSON.stringify(input) },
+    ),
+  activateDesignChangeSet: (
+    id: string,
+    changeSetId: string,
+    input: DesignWorkflowMutationRequest,
+  ) =>
+    request<DesignWorkflowDocument>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/activate`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  transitionDesignChangeSet: (
+    id: string,
+    changeSetId: string,
+    input: DesignWorkflowTransitionRequest,
+  ) =>
+    request<DesignWorkflowDocument>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/transition`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  linkDesignWorkflowFeedback: (id: string, changeSetId: string, input: DesignWorkflowLinkRequest) =>
+    request<DesignWorkflowDocument>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/link-feedback`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  unlinkDesignWorkflowFeedback: (
+    id: string,
+    changeSetId: string,
+    input: DesignWorkflowLinkRequest,
+  ) =>
+    request<DesignWorkflowDocument>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/unlink-feedback`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  verifyDesignChangeSet: (id: string, changeSetId: string, input: DesignWorkflowMutationRequest) =>
+    request<DesignWorkflowDocument>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/verify`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  rollbackDesignChangeSet: (
+    id: string,
+    changeSetId: string,
+    input: DesignWorkflowMutationRequest,
+  ) =>
+    request<DesignWorkflowRollbackResponse>(
+      `/api/sessions/${id}/design-workflow/change-sets/${encodeURIComponent(changeSetId)}/rollback`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  liveDesignBridgeClientUrl: () => `${API_BASE}/api/design-bridge/client.js`,
+  resolveLiveDesignElement: (id: string, input: LiveDesignResolveRequest) =>
+    request<LiveDesignResolveResponse>(`/api/sessions/${id}/design-bridge/resolve`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  proposeLiveDesignChange: (id: string, input: LiveDesignProposalRequest) =>
+    request<LiveDesignProposalResponse>(`/api/sessions/${id}/design-bridge/proposal`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getLiveDesignDraft: (id: string) =>
+    request<LiveDesignDraftJournal | null>(`/api/sessions/${id}/design-bridge/draft`),
+  saveLiveDesignDraft: (id: string, input: LiveDesignDraftUpdate) =>
+    request<LiveDesignDraftJournal>(`/api/sessions/${id}/design-bridge/draft`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  clearLiveDesignDraft: (id: string) =>
+    request<{ cleared: true }>(`/api/sessions/${id}/design-bridge/draft`, {
+      method: "DELETE",
+    }),
+  applyLiveDesignEdit: (id: string, input: LiveDesignApplyRequest) =>
+    request<LiveDesignApplyResponse>(`/api/sessions/${id}/design-bridge/apply`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyLiveDesignTransaction: (id: string, input: LiveDesignTransactionRequest) =>
+    request<LiveDesignTransactionResponse>(`/api/sessions/${id}/design-bridge/transaction`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyLiveDesignStructure: (id: string, input: LiveDesignStructureOperationRequest) =>
+    request<LiveDesignStructureOperationResponse>(`/api/sessions/${id}/design-bridge/structure`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyLiveDesignResponsiveOverride: (id: string, input: LiveDesignResponsiveOverrideRequest) =>
+    request<LiveDesignResponsiveOverrideResponse>(`/api/sessions/${id}/design-bridge/responsive`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getLiveDesignHistory: (id: string) =>
+    request<LiveDesignHistoryResponse>(`/api/sessions/${id}/design-bridge/history`),
+  installLiveDesignBridge: (id: string, input: LiveDesignBridgeInstallRequest) =>
+    request<LiveDesignBridgeInstallResponse>(`/api/sessions/${id}/design-bridge/install`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  rollbackLiveDesignEdit: (id: string, revisionId: string) =>
+    request<LiveDesignRollbackResponse>(
+      `/api/sessions/${id}/design-bridge/revisions/${encodeURIComponent(revisionId)}/rollback`,
+      { method: "POST" },
+    ),
+  applyLiveDesignStyleOverride: (id: string, input: LiveDesignStyleOverrideRequest) =>
+    request<LiveDesignStyleOverrideResponse>(`/api/sessions/${id}/design-bridge/style-override`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   // Full-size screenshot URL — opened directly (new tab / <img src>), never
   // fetched through request().
   visualScreenshotUrl: (id: string, file: string) =>
     `${API_BASE}/api/sessions/${id}/visual/screenshot/${encodeURIComponent(file)}`,
+  visualReferenceUrl: (id: string, file: string) =>
+    `${API_BASE}/api/sessions/${id}/visual/reference/${encodeURIComponent(file)}`,
   askSession: (id: string, question: string) =>
     request<SessionAssistantAnswer>(`/api/sessions/${id}/ask`, {
       method: "POST",

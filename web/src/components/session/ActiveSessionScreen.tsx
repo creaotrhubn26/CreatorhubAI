@@ -396,7 +396,14 @@ export function ActiveSessionScreen() {
       {id && !readOnlyMode && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
       {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} />}
       {id && !readOnlyMode && <DeliveryPacketPanel sessionId={id} />}
-      {id && !readOnlyMode && <VisualVerificationPanel sessionId={id} />}
+      {id && !readOnlyMode && (
+        <VisualVerificationPanel
+          sessionId={id}
+          workspace={session.workspace}
+          initialInspirations={session.taskContract?.design?.inspirations ?? []}
+          initialReferenceImages={session.taskContract?.design?.referenceImages ?? []}
+        />
+      )}
       {id && !readOnlyMode && <EvidencePanel sessionId={id} />}
     </div>
   );

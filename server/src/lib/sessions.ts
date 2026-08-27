@@ -23,6 +23,8 @@ import type {
   FinalGateStatus,
   VisualManifest,
   VisualFindings,
+  DesignFeedbackDocument,
+  DesignFeedbackUpdate,
   TaskOverride,
   EvidenceIndexEntry,
   EvidenceEntryResponse,
@@ -529,6 +531,43 @@ export function readVisualManifest(id: string): Promise<VisualManifest | null> {
 
 export function readVisualFindings(id: string): Promise<VisualFindings | null> {
   return readSessionJsonFile<VisualFindings>(id, path.join("visual", "findings.json"));
+}
+
+// Human-authored visual feedback is gateway-owned and crash-safe. The
+// orchestrator owns captures/findings; this sidecar owns annotations, element
+// edits, variant/asset requests, and selected inspiration. A temp file +
+// rename prevents a Force Quit from replacing the last valid document with
+// torn JSON.
+export function readDesignFeedback(id: string): Promise<DesignFeedbackDocument | null> {
+  return readSessionJsonFile<DesignFeedbackDocument>(id, "design-feedback.json");
+}
+
+export async function writeDesignFeedback(
+  id: string,
+  update: DesignFeedbackUpdate,
+): Promise<DesignFeedbackDocument> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
+  const document: DesignFeedbackDocument = {
+    version: 1,
+    sessionId: real,
+    updatedAt: new Date().toISOString(),
+    ...update,
+  };
+  const finalPath = path.join(sessionsDir(), real, "design-feedback.json");
+  const temporaryPath = `${finalPath}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporaryPath, `${JSON.stringify(document, null, 2)}\n`, {
+    encoding: "utf-8",
+    mode: 0o600,
+  });
+  const handle = await fs.open(temporaryPath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fs.rename(temporaryPath, finalPath);
+  return document;
 }
 
 const KNOWN_VISUAL_FINDINGS_STATUSES = new Set([

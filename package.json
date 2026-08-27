@@ -30,7 +30,9 @@
     "dogfood:e2e": "node scripts/dogfood-session.mjs",
     "packaged:e2e": "node scripts/packaged-app-e2e.mjs",
     "packaged:ui-e2e": "node scripts/packaged-ui-e2e.mjs",
-    "packaged:force-quit-e2e": "node scripts/native-force-quit-e2e.mjs"
+    "packaged:force-quit-e2e": "node scripts/native-force-quit-e2e.mjs",
+    "design-workflow:e2e": "node scripts/design-workflow-e2e.mjs",
+    "structure-mode:e2e": "node scripts/design-workflow-e2e.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

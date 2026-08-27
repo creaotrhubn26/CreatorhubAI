@@ -8,6 +8,7 @@ import { McpIntegrationsSettings } from "./McpIntegrationsSettings";
 import { AppUpdateSettings } from "./AppUpdateSettings";
 import { DiagnosticsSettings } from "./DiagnosticsSettings";
 import { IntegrationProfileSettings } from "./IntegrationProfileSettings";
+import { MobbinIntegrationSettings } from "./MobbinIntegrationSettings";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -89,6 +90,8 @@ export function SettingsScreen() {
       <IntegrationProfileSettings />
 
       <McpIntegrationsSettings />
+
+      <MobbinIntegrationSettings />
 
       <DiagnosticsSettings />
 

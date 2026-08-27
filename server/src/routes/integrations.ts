@@ -11,6 +11,13 @@ import {
   previewIntegrationProfile,
   rollbackIntegrationProfile,
 } from "../lib/integrationProfile.js";
+import {
+  MobbinIntegrationError,
+  mobbinStatus,
+  readMobbinImage,
+  saveMobbinApiKey,
+  searchMobbin,
+} from "../lib/mobbin.js";
 
 export const integrationsRouter = Router();
 
@@ -30,6 +37,46 @@ integrationsRouter.get("/integrations/developer-clients", async (_req, res) => {
 
 integrationsRouter.get("/integrations/mcp", async (_req, res) => {
   res.json(await probeMcpIntegrations());
+});
+
+integrationsRouter.get("/integrations/mobbin", async (_req, res) => {
+  res.json(await mobbinStatus());
+});
+
+integrationsRouter.put("/integrations/mobbin/credential", async (req, res) => {
+  try {
+    await saveMobbinApiKey(req.body);
+    res.json(await mobbinStatus());
+  } catch (error) {
+    if (error instanceof MobbinIntegrationError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+});
+
+integrationsRouter.post("/integrations/mobbin/search", async (req, res) => {
+  try {
+    res.json(await searchMobbin(req.body));
+  } catch (error) {
+    if (error instanceof MobbinIntegrationError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+});
+
+integrationsRouter.get("/integrations/mobbin/image/:token", async (req, res) => {
+  try {
+    const image = await readMobbinImage(req.params.token);
+    res.set("Cache-Control", "private, max-age=300");
+    res.type(image.contentType).send(image.bytes);
+  } catch (error) {
+    if (error instanceof MobbinIntegrationError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
 });
 
 integrationsRouter.get("/integrations/profile", async (_req, res) => {

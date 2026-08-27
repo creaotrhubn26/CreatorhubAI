@@ -6,6 +6,10 @@ import {
   taskModeAllowsWrites,
   type TaskIntelligence,
   type TaskIntent,
+  type DesignInspiration,
+  type DesignVariantRequest,
+  type DesignElementEdit,
+  type DesignAssetRequest,
 } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { buildTaskContract, type TaskComposerFormState } from "../../state/buildTaskContract";
@@ -20,10 +24,13 @@ import {
   loadTaskComposerDraft,
   saveTaskComposerDraft,
 } from "../../state/taskComposerDraft";
+import { DEFAULT_DESIGN_FORM, designComposerError } from "../../state/designContract";
 import { PathPicker } from "../common/PathPicker";
+import { DesignContextFields } from "./DesignContextFields";
 import { TaskIntelligencePanel } from "./TaskIntelligencePanel";
 
 const DEFAULT_FORM: TaskComposerFormState = {
+  ...DEFAULT_DESIGN_FORM,
   objective: "",
   intentKind: "auto",
   scopePackage: "repository",
@@ -59,6 +66,15 @@ interface SelectionDraftState {
 
 interface ComposerRouteState {
   objective?: string;
+  workspace?: string;
+  designDraft?: {
+    designTargetUrl?: string;
+    designRequirements?: string;
+    designInspirations?: DesignInspiration[];
+    designVariants?: DesignVariantRequest[];
+    designElementEdits?: DesignElementEdit[];
+    designAssetRequests?: DesignAssetRequest[];
+  };
   selectionDraft?: SelectionDraftState;
 }
 
@@ -69,12 +85,13 @@ function buildSummaryLine(form: TaskComposerFormState): string {
     PATH_SCOPED_PACKAGES.has(form.scopePackage) && form.scopeArea?.trim()
       ? `${SCOPE_LABEL[form.scopePackage]} (${form.scopeArea.trim()})`
       : SCOPE_LABEL[form.scopePackage];
+  const verificationCount = buildTaskContract(form).verification.length;
   const verification =
-    form.verification.length === 0
+    verificationCount === 0
       ? "no verification checks"
-      : `${form.verification.length} verification check${form.verification.length === 1 ? "" : "s"}`;
+      : `${verificationCount} verification check${verificationCount === 1 ? "" : "s"}`;
   const repairs = `${form.repairBudget} repair${form.repairBudget === 1 ? "" : "s"}`;
-  return `${form.mode} · ${scope} · ${verification} · ${repairs}`;
+  return `${form.mode} · ${scope} · ${verification} · ${repairs}${form.designEnabled ? " · design-aware" : ""}`;
 }
 
 // Task 2.1 fix round 1 (V7 §5.5): deterministic preview of the
@@ -104,6 +121,11 @@ function executionPlan(form: TaskComposerFormState, intent: TaskIntent): string[
   }
   if (intent.kind === "improvement-assessment") {
     steps.push("Choose one concrete, bounded improvement before modifying files.");
+  }
+  if (form.designEnabled) {
+    steps.push(
+      "Inspect the existing CMS/content model and design-token source before changing UI, then verify the declared states and viewports.",
+    );
   }
   steps.push("Make only the scoped change, then run the selected verification checks.");
   steps.push(
@@ -150,6 +172,7 @@ export function NewTaskScreen() {
       ? rawSelectionDraft
       : undefined;
   const prefillObjective = selectionDraft?.objective ?? routeState?.objective;
+  const designDraft = routeState?.designDraft;
   const selectionScopePath = selectionDraft
     ? toWorkspaceRelative(selectionDraft.workspace, selectionDraft.path)
     : null;
@@ -167,11 +190,26 @@ export function NewTaskScreen() {
           scopeArea: selectionScopePath ?? "",
         }
       : prefillObjective
-        ? { ...DEFAULT_FORM, objective: prefillObjective }
+        ? {
+            ...DEFAULT_FORM,
+            objective: prefillObjective,
+            ...(designDraft
+              ? {
+                  designEnabled: true,
+                  designKind: "improve" as const,
+                  designTargetUrl: designDraft.designTargetUrl ?? "",
+                  designRequirements: designDraft.designRequirements ?? "",
+                  designInspirations: designDraft.designInspirations ?? [],
+                  designVariants: designDraft.designVariants ?? [],
+                  designElementEdits: designDraft.designElementEdits ?? [],
+                  designAssetRequests: designDraft.designAssetRequests ?? [],
+                }
+              : {}),
+          }
         : (persistedDraft?.form ?? DEFAULT_FORM),
   );
   const [workspace, setWorkspace] = useState(
-    selectionDraft?.workspace ?? persistedDraft?.workspace ?? "",
+    selectionDraft?.workspace ?? routeState?.workspace ?? persistedDraft?.workspace ?? "",
   );
   const [newTaskName, setNewTaskName] = useState(persistedDraft?.newTaskName ?? "");
   const [scopePickError, setScopePickError] = useState<string | null>(null);
@@ -226,6 +264,7 @@ export function NewTaskScreen() {
   // state is now rare, not the default outcome of picking these scope types.
   const needsScopePath = PATH_SCOPED_PACKAGES.has(form.scopePackage);
   const scopePathMissing = needsScopePath && !form.scopeArea?.trim();
+  const designError = designComposerError(form);
   const resolvedIntent: TaskIntent =
     form.intentKind === "auto"
       ? inferTaskIntent(form.objective)
@@ -386,6 +425,8 @@ export function NewTaskScreen() {
               </select>
             </fieldset>
 
+            <DesignContextFields form={form} setForm={setForm} />
+
             <fieldset>
               <legend>Verification</legend>
               <label>
@@ -417,6 +458,15 @@ export function NewTaskScreen() {
                   }
                 />
                 Targeted test
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={effectiveContract.verification.includes("visual")}
+                  readOnly
+                  disabled
+                />
+                Visual UX review (automatic with a local preview URL)
               </label>
             </fieldset>
           </div>
@@ -614,7 +664,13 @@ export function NewTaskScreen() {
         <button
           className="btn-primary"
           onClick={() => runMutation.mutate()}
-          disabled={!form.objective || !workspace || scopePathMissing || runMutation.isPending}
+          disabled={
+            !form.objective ||
+            !workspace ||
+            scopePathMissing ||
+            !!designError ||
+            runMutation.isPending
+          }
         >
           RUN GLIMMER
         </button>

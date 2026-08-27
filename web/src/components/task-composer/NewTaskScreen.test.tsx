@@ -47,6 +47,18 @@ describe("NewTaskScreen", () => {
       entries: [{ name: "src", isDir: true }],
       truncated: false,
     });
+    vi.spyOn(client.glimmerApi, "getMobbinIntegration").mockResolvedValue({
+      configured: false,
+      keyPath: "/tmp/mobbin-api-key.txt",
+      docsUrl: "https://docs.mobbin.com/api/quickstart",
+      availability: "team-enterprise-api",
+      policy: {
+        credentialsReturnedByApi: false,
+        fixedApiOrigin: "https://api.mobbin.com",
+        imageUrlsAreRemoteAndExpiring: true,
+        imagesProxiedThroughGateway: true,
+      },
+    });
   });
 
   it("renders commit/push/deploy/install as permanently disabled and unchecked", () => {
@@ -177,6 +189,49 @@ describe("NewTaskScreen", () => {
     expect(box.checked).toBe(true);
   });
 
+  it("submits design, CMS, token, and visual context as one task contract", async () => {
+    const createSpy = vi
+      .spyOn(client.glimmerApi, "createSession")
+      .mockResolvedValue({ id: "design-session" } as any);
+    vi.spyOn(client.glimmerApi, "runSession").mockResolvedValue({ started: true } as any);
+    render(withQuery(<NewTaskScreen />));
+
+    fireEvent.change(screen.getByPlaceholderText(/what should glimmer work on/i), {
+      target: { value: "Improve the settings experience" },
+    });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/tmp/ws" } });
+    fireEvent.click(screen.getByLabelText("Enable design-aware implementation"));
+    fireEvent.change(screen.getByPlaceholderText("http://localhost:5173/settings"), {
+      target: { value: "http://localhost:5173/settings" },
+    });
+    fireEvent.change(screen.getByLabelText("Audience"), {
+      target: { value: "content editors" },
+    });
+    fireEvent.change(screen.getByLabelText("CMS strategy"), { target: { value: "existing" } });
+    fireEvent.change(screen.getByLabelText("CMS/provider hint"), {
+      target: { value: "Sanity" },
+    });
+    fireEvent.change(screen.getByLabelText("Token source paths"), {
+      target: { value: "src/theme.css" },
+    });
+    fireEvent.change(screen.getByLabelText("Reference images"), {
+      target: { value: "Settings | design/settings.png" },
+    });
+    fireEvent.click(screen.getByLabelText(/Send reference images to the configured Vision model/i));
+    fireEvent.click(screen.getByRole("button", { name: "RUN GLIMMER" }));
+
+    await waitFor(() => expect(createSpy).toHaveBeenCalled());
+    const [contract] = createSpy.mock.calls[0];
+    expect(contract.verification).toContain("visual");
+    expect(contract.advanced?.architectFirst).toBe(true);
+    expect(contract.design).toMatchObject({
+      audience: "content editors",
+      referenceImagePolicy: "vision-model",
+      cms: { strategy: "existing", providerHint: "Sanity" },
+      designTokens: { sourcePaths: ["src/theme.css"] },
+    });
+  });
+
   // Task 8.2 (V7 §23.14): DeliveryReviewPanel's "convert next step to task"
   // action navigates here with router state { objective } — a DRAFT prefill
   // only. Nothing runs automatically: the objective field is pre-filled,
@@ -191,6 +246,71 @@ describe("NewTaskScreen", () => {
     expect(screen.getByPlaceholderText("What should Glimmer work on?")).toHaveValue(
       "Add restoration progress state",
     );
+    expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
+  });
+
+  it("prefills a saved visual-feedback draft without starting it", () => {
+    render(
+      withQuery(<NewTaskScreen />, [
+        {
+          pathname: "/tasks/new",
+          state: {
+            objective: "Implement approved visual feedback",
+            workspace: "/tmp/design-worktree",
+            designDraft: {
+              designTargetUrl: "http://localhost:5173/settings",
+              designRequirements: "Keep the primary action visible",
+              designVariants: [
+                {
+                  id: "variant-1",
+                  target: "settings header",
+                  count: 3,
+                  directions: ["compact", "editorial"],
+                },
+              ],
+              designInspirations: [],
+              designElementEdits: [
+                {
+                  id: "edit-1",
+                  target: "settings title",
+                  screenshot: "1440x900-initial.png",
+                  viewport: "1440x900",
+                  state: "initial",
+                  region: { x: 0.1, y: 0.2 },
+                  text: "Workspace settings",
+                  style: {},
+                  createdAt: "2026-08-27T10:00:00.000Z",
+                },
+              ],
+              designAssetRequests: [
+                {
+                  id: "asset-1",
+                  kind: "vector",
+                  prompt: "Geometric settings illustration",
+                  outputPath: "public/generated/settings.svg",
+                  aspectRatio: "4:3",
+                  animated: false,
+                  referenceImages: [],
+                  referenceUploadPolicy: "local-only",
+                  createdAt: "2026-08-27T10:00:00.000Z",
+                },
+              ],
+            },
+          },
+        },
+      ]),
+    );
+    expect(screen.getByLabelText("Workspace path")).toHaveValue("/tmp/design-worktree");
+    expect(screen.getByLabelText("Enable design-aware implementation")).toBeChecked();
+    expect(screen.getByPlaceholderText("http://localhost:5173/settings")).toHaveValue(
+      "http://localhost:5173/settings",
+    );
+    expect(screen.getByPlaceholderText(/Primary action remains visible/)).toHaveValue(
+      "Keep the primary action visible",
+    );
+    expect(screen.getByText(/settings header · 3 variants/i)).toBeInTheDocument();
+    expect(screen.getByText("settings title")).toBeInTheDocument();
+    expect(screen.getByText(/vector · 4:3 · public\/generated\/settings.svg/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "RUN GLIMMER" })).toBeInTheDocument();
   });
 

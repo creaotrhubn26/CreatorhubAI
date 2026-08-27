@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { CONFIG, gatewayRunLogsDir, sessionsDir } from "../config.js";
 import {
@@ -16,6 +16,8 @@ import {
   clearHumanAcceptance,
   readVisualManifest,
   readVisualFindings,
+  readDesignFeedback,
+  writeDesignFeedback,
   readTaskOverrides,
   writeTaskOverride,
   applyTaskOverrides,
@@ -37,7 +39,14 @@ import {
   GitHunkReviewError,
   gitChangedFilesSince,
 } from "../lib/git.js";
-import { runGlimmer, buildArgs, validateAdvanced } from "../lib/runner.js";
+import {
+  runGlimmer,
+  buildArgs,
+  validateAdvanced,
+  writeDesignContractInput,
+} from "../lib/runner.js";
+import { validateDesignContract } from "../lib/designContract.js";
+import { validateDesignFeedbackUpdate } from "../lib/designFeedback.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
 import {
@@ -457,10 +466,13 @@ sessionsRouter.post("/sessions", async (req, res) => {
   // to the API must 400 the same way a malformed core field does.
   const advancedError = validateAdvanced(contract);
   if (advancedError) return res.status(400).json({ error: advancedError });
+  const design = validateDesignContract(contract.design);
+  if (design.error) return res.status(400).json({ error: design.error });
 
   const normalizedContract: TaskContract = {
     ...contract,
     intent: contract.intent ?? inferTaskIntent(contract.objective),
+    ...(design.value ? { design: design.value } : {}),
   };
   const record = await createGatewayRun(normalizedContract, workspace);
   const session = await readSession(record.id);
@@ -526,8 +538,22 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   }
 
   const logDir = path.join(gatewayRunLogsDir(), req.params.id);
-  await fs.mkdir(logDir, { recursive: true });
-  const args = buildArgs(record.contract, record.workspace, req.params.id);
+  let designContractPath: string | undefined;
+  try {
+    await fs.mkdir(logDir, { recursive: true });
+    designContractPath = await writeDesignContractInput(logDir, record.contract.design);
+  } catch {
+    await releaseWorkspaceLease(record.workspace, req.params.id);
+    await updateGatewayRun(req.params.id, (current) => ({
+      ...current,
+      state: "start_failed",
+      completedAt: new Date().toISOString(),
+    }));
+    return res.status(500).json({
+      error: "Could not persist the validated design contract; the workspace lease was released.",
+    });
+  }
+  const args = buildArgs(record.contract, record.workspace, req.params.id, designContractPath);
   const handle = runGlimmer(
     logDir,
     CONFIG.glimmerV2Path,
@@ -986,6 +1012,49 @@ sessionsRouter.get("/sessions/:id/visual/manifest", async (req, res) => {
   }
 });
 
+sessionsRouter.get("/sessions/:id/visual/feedback", async (req, res) => {
+  try {
+    const feedback = await readDesignFeedback(req.params.id);
+    if (!feedback) return res.status(404).json({ error: "not found" });
+    const manifest = await readVisualManifest(req.params.id);
+    if (!manifest) return res.status(409).json({ error: "visual manifest is unavailable" });
+    const screenshots = manifest.captures.flatMap((capture) =>
+      capture.status === "captured" && capture.screenshot ? [capture.screenshot] : [],
+    );
+    const validation = validateDesignFeedbackUpdate(
+      {
+        annotations: feedback.annotations ?? [],
+        variants: feedback.variants ?? [],
+        inspirations: feedback.inspirations ?? [],
+        elementEdits: feedback.elementEdits ?? [],
+        assetRequests: feedback.assetRequests ?? [],
+      },
+      screenshots,
+    );
+    if (!validation.value) {
+      return res.status(409).json({ error: "stored design feedback is invalid" });
+    }
+    res.json({ ...feedback, ...validation.value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.put("/sessions/:id/visual/feedback", async (req, res) => {
+  try {
+    const manifest = await readVisualManifest(req.params.id);
+    if (!manifest) return res.status(404).json({ error: "not found" });
+    const screenshots = manifest.captures.flatMap((capture) =>
+      capture.status === "captured" && capture.screenshot ? [capture.screenshot] : [],
+    );
+    const validation = validateDesignFeedbackUpdate(req.body, screenshots);
+    if (!validation.value) return res.status(400).json({ error: validation.error });
+    res.json(await writeDesignFeedback(req.params.id, validation.value));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Screenshot filenames are exactly what glimmer-visual.py writes:
 // "{viewport}.png" or "{viewport}-{state}.png", e.g. "1440x900.png" /
 // "1440x900-dialogopen.png" -- letters, digits, and "-" only. This is a
@@ -1018,6 +1087,39 @@ sessionsRouter.get("/sessions/:id/visual/screenshot/:file", async (req, res) => 
   } catch (err: any) {
     if (err.code === "ENOENT") return res.status(404).json({ error: "not found" });
     res.status(500).json({ error: err.message });
+  }
+});
+
+const VISUAL_REFERENCE_FILENAME_RE = /^reference-\d{2}\.(?:png|jpg|jpeg|webp)$/;
+
+function resolveVisualReferencePath(visualDir: string, file: string): string | null {
+  if (!VISUAL_REFERENCE_FILENAME_RE.test(file)) return null;
+  const resolvedDir = path.resolve(visualDir, "references");
+  const resolved = path.resolve(resolvedDir, file);
+  if (resolved !== path.join(resolvedDir, file) || !resolved.startsWith(resolvedDir + path.sep))
+    return null;
+  return resolved;
+}
+
+sessionsRouter.get("/sessions/:id/visual/reference/:file", async (req, res) => {
+  const real = resolveSessionId(req.params.id);
+  if (!isValidSessionId(real)) return res.status(404).json({ error: "not found" });
+  const visualDir = path.join(sessionsDir(), real, "visual");
+  const resolved = resolveVisualReferencePath(visualDir, req.params.file);
+  if (!resolved) return res.status(400).json({ error: "invalid filename" });
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(resolved, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!(await handle.stat()).isFile()) return res.status(404).json({ error: "not found" });
+    const bytes = await handle.readFile();
+    res.type(path.extname(resolved)).send(bytes);
+  } catch (err: any) {
+    if (err.code === "ENOENT" || err.code === "ELOOP") {
+      return res.status(404).json({ error: "not found" });
+    }
+    res.status(500).json({ error: err.message });
+  } finally {
+    await handle?.close();
   }
 });
 

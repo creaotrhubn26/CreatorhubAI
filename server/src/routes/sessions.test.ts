@@ -494,6 +494,111 @@ describe("POST /api/sessions", () => {
       source: "deterministic-inference",
     });
   });
+
+  it("accepts and persists a validated design/CMS/token contract", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: {
+          objective: "Improve the CMS editor",
+          scope: { package: "frontend" },
+          mode: "implement",
+          constraints: {
+            minimalChange: true,
+            noCommit: true,
+            noPush: true,
+            noDeploy: true,
+            noDependencyInstall: true,
+          },
+          verification: ["visual"],
+          repairBudget: 2,
+          design: {
+            kind: "improve",
+            targetUrl: "http://localhost:5173/editor",
+            requirements: ["primary action remains visible"],
+            referenceImages: [{ path: "design/editor.png" }],
+            referenceImagePolicy: "local-only",
+            states: [],
+            viewports: ["1440x900", "390x844"],
+            inspirations: [],
+            variants: [],
+            elementEdits: [],
+            assetRequests: [],
+            cms: {
+              strategy: "existing",
+              providerHint: "Sanity",
+              schemaPaths: ["cms/schema"],
+              requirements: ["copy remains editor-managed"],
+              localizationRequired: true,
+            },
+            designTokens: {
+              strategy: "detect",
+              sourcePaths: ["src/theme.css"],
+              requirements: ["reuse semantic tokens"],
+              allowNewTokens: false,
+            },
+          },
+        },
+        workspace: "/tmp/ws",
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.taskContract.design).toMatchObject({
+      targetUrl: "http://localhost:5173/editor",
+      cms: { strategy: "existing", localizationRequired: true },
+      designTokens: { strategy: "detect", allowNewTokens: false },
+    });
+  });
+
+  it("rejects external visual targets in a design contract", async () => {
+    const res = await request(app)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({
+        taskContract: {
+          objective: "Inspect remote UI",
+          scope: { package: "frontend" },
+          mode: "implement",
+          constraints: {
+            minimalChange: true,
+            noCommit: true,
+            noPush: true,
+            noDeploy: true,
+            noDependencyInstall: true,
+          },
+          verification: ["visual"],
+          repairBudget: 1,
+          design: {
+            kind: "audit",
+            targetUrl: "https://example.com",
+            requirements: [],
+            referenceImages: [],
+            referenceImagePolicy: "local-only",
+            states: [],
+            viewports: ["1440x900"],
+            inspirations: [],
+            variants: [],
+            elementEdits: [],
+            assetRequests: [],
+            cms: {
+              strategy: "none",
+              schemaPaths: [],
+              requirements: [],
+              localizationRequired: false,
+            },
+            designTokens: {
+              strategy: "detect",
+              sourcePaths: [],
+              requirements: [],
+              allowNewTokens: false,
+            },
+          },
+        },
+        workspace: "/tmp/ws",
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/loopback/i);
+  });
 });
 
 describe("GET /api/sessions/:id/task-report", () => {
@@ -2072,6 +2177,173 @@ describe("GET /api/sessions/:id/visual/manifest", () => {
   });
 });
 
+describe("session visual feedback routes", () => {
+  const id = "20260827-000063-glimmer-visual-feedback";
+  const screenshot = "1440x900-initial.png";
+
+  beforeAll(async () => {
+    const dir = path.join(stateRoot, "sessions", id, "visual");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "visual-manifest.json"),
+      JSON.stringify({
+        route: "http://localhost:5183/settings",
+        viewports: ["1440x900"],
+        states: ["initial"],
+        status: "pass",
+        captures: [
+          { viewport: "1440x900", state: "initial", screenshot, status: "captured", error: null },
+        ],
+      }),
+    );
+  });
+
+  it("atomically persists and reads structured annotations and variants", async () => {
+    const update = {
+      annotations: [
+        {
+          id: "note-1",
+          screenshot,
+          viewport: "1440x900",
+          state: "initial",
+          tool: "layout",
+          points: [{ x: 0.2, y: 0.3 }],
+          comment: "Keep the primary action visible",
+          value: "sticky action row using existing spacing tokens",
+          createdAt: "2026-08-27T10:00:00.000Z",
+        },
+      ],
+      variants: [
+        {
+          id: "variant-1",
+          target: "action row",
+          count: 3,
+          directions: ["compact", "editorial"],
+          screenshot,
+          region: { x: 0.2, y: 0.3 },
+        },
+      ],
+      inspirations: [],
+      elementEdits: [
+        {
+          id: "edit-1",
+          target: "action row",
+          screenshot,
+          viewport: "1440x900",
+          state: "initial",
+          region: { x: 0.2, y: 0.3, width: 0.4, height: 0.2 },
+          text: "Save workspace",
+          style: { backgroundColor: "#123456", paddingPx: 16 },
+          createdAt: "2026-08-27T10:00:00.000Z",
+        },
+      ],
+      assetRequests: [
+        {
+          id: "asset-1",
+          kind: "vector",
+          prompt: "A restrained settings empty-state illustration",
+          outputPath: "public/generated/settings.svg",
+          aspectRatio: "4:3",
+          animated: false,
+          referenceImages: [],
+          referenceUploadPolicy: "local-only",
+          screenshot,
+          createdAt: "2026-08-27T10:00:00.000Z",
+        },
+      ],
+    };
+    const saved = await request(app)
+      .put(`/api/sessions/${id}/visual/feedback`)
+      .set("Origin", UI_ORIGIN)
+      .send(update);
+    expect(saved.status).toBe(200);
+    expect(saved.body).toMatchObject({ version: 1, sessionId: id, ...update });
+
+    const read = await request(app).get(`/api/sessions/${id}/visual/feedback`);
+    expect(read.status).toBe(200);
+    expect(read.body.annotations[0].tool).toBe("layout");
+    expect(read.body.elementEdits[0].text).toBe("Save workspace");
+    expect(read.body.assetRequests[0].outputPath).toBe("public/generated/settings.svg");
+    expect(
+      await fs.readFile(path.join(stateRoot, "sessions", id, "design-feedback.json"), "utf8"),
+    ).toContain("sticky action row");
+  });
+
+  it("rejects feedback for a screenshot the session never captured", async () => {
+    const response = await request(app)
+      .put(`/api/sessions/${id}/visual/feedback`)
+      .set("Origin", UI_ORIGIN)
+      .send({
+        annotations: [
+          {
+            id: "note-2",
+            screenshot: "unknown.png",
+            viewport: "1440x900",
+            state: "initial",
+            tool: "comment",
+            points: [{ x: 0.2, y: 0.3 }],
+            comment: "not allowed",
+            createdAt: "2026-08-27T10:00:00.000Z",
+          },
+        ],
+        variants: [],
+        inspirations: [],
+        elementEdits: [],
+        assetRequests: [],
+      });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/annotations/i);
+  });
+
+  it("hydrates older stored feedback with empty visual action arrays", async () => {
+    await fs.writeFile(
+      path.join(stateRoot, "sessions", id, "design-feedback.json"),
+      JSON.stringify({
+        version: 1,
+        sessionId: id,
+        updatedAt: "2026-08-27T10:00:00.000Z",
+        annotations: [],
+        variants: [],
+        inspirations: [],
+      }),
+    );
+    const response = await request(app).get(`/api/sessions/${id}/visual/feedback`);
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ elementEdits: [], assetRequests: [] });
+  });
+
+  it("fails closed when stored feedback has been tampered with", async () => {
+    await fs.writeFile(
+      path.join(stateRoot, "sessions", id, "design-feedback.json"),
+      JSON.stringify({
+        version: 1,
+        sessionId: id,
+        updatedAt: "2026-08-27T10:00:00.000Z",
+        annotations: [],
+        variants: [],
+        inspirations: [],
+        elementEdits: [],
+        assetRequests: [
+          {
+            id: "asset-unsafe",
+            kind: "image",
+            prompt: "unsafe",
+            outputPath: "../outside.png",
+            aspectRatio: "1:1",
+            size: "1K",
+            referenceImages: [],
+            referenceUploadPolicy: "local-only",
+            createdAt: "2026-08-27T10:00:00.000Z",
+          },
+        ],
+      }),
+    );
+    const response = await request(app).get(`/api/sessions/${id}/visual/feedback`);
+    expect(response.status).toBe(409);
+    expect(response.body.error).toMatch(/invalid/i);
+  });
+});
+
 describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
   it("serves the PNG bytes with an image/png content type", async () => {
     const id = "20260822-000064-glimmer-screenshot-found";
@@ -2126,6 +2398,47 @@ describe("GET /api/sessions/:id/visual/screenshot/:file", () => {
     const res = await request(app).get(`/api/sessions/${id}/visual/screenshot/1440x900.png`);
     expect(res.status).toBe(500);
     expect(res.body).toHaveProperty("error");
+  });
+});
+
+describe("GET /api/sessions/:id/visual/reference/:file", () => {
+  it("serves only normalized reference evidence from visual/references", async () => {
+    const id = "20260827-000064-glimmer-reference-found";
+    const dir = path.join(stateRoot, "sessions", id, "visual", "references");
+    await fs.mkdir(dir, { recursive: true });
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    await fs.writeFile(path.join(dir, "reference-01.png"), bytes);
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/reference/reference-01.png`);
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/image\/png/);
+    expect(Buffer.from(res.body)).toEqual(bytes);
+  });
+
+  it("rejects source paths, traversal payloads, and unnormalized names", async () => {
+    const id = "20260827-000065-glimmer-reference-rejected";
+    await fs.mkdir(path.join(stateRoot, "sessions", id, "visual", "references"), {
+      recursive: true,
+    });
+    expect(
+      (await request(app).get(`/api/sessions/${id}/visual/reference/settings.png`)).status,
+    ).toBe(400);
+    expect(
+      (await request(app).get(`/api/sessions/${id}/visual/reference/..%2Fsecrets.png`)).status,
+    ).not.toBe(200);
+  });
+
+  it("does not follow a normalized reference filename when it is a symlink", async () => {
+    const id = "20260827-000066-glimmer-reference-symlink";
+    const dir = path.join(stateRoot, "sessions", id, "visual", "references");
+    await fs.mkdir(dir, { recursive: true });
+    const outside = path.join(stateRoot, "reference-secret.png");
+    await fs.writeFile(outside, "must-not-be-served");
+    await fs.symlink(outside, path.join(dir, "reference-01.png"));
+
+    const res = await request(app).get(`/api/sessions/${id}/visual/reference/reference-01.png`);
+    expect(res.status).toBe(404);
+    expect(String(res.text ?? "")).not.toContain("must-not-be-served");
   });
 });
 

@@ -99,6 +99,43 @@ vi.mock("../lib/mcpIntegrations.js", () => ({
   saveCuratedMcpConfig: vi.fn().mockResolvedValue(undefined),
 }));
 
+const mobbinStatus = {
+  configured: true,
+  keyPath: "/tmp/mobbin-api-key.txt",
+  docsUrl: "https://docs.mobbin.com/api/quickstart",
+  availability: "team-enterprise-api",
+  policy: {
+    credentialsReturnedByApi: false,
+    fixedApiOrigin: "https://api.mobbin.com",
+    imageUrlsAreRemoteAndExpiring: true,
+    imagesProxiedThroughGateway: true,
+  },
+};
+
+vi.mock("../lib/mobbin.js", () => ({
+  MobbinIntegrationError: class MobbinIntegrationError extends Error {
+    status = 400;
+  },
+  mobbinStatus: vi.fn().mockResolvedValue(mobbinStatus),
+  saveMobbinApiKey: vi.fn().mockResolvedValue(undefined),
+  readMobbinImage: vi.fn().mockResolvedValue({
+    bytes: Buffer.from([137, 80, 78, 71]),
+    contentType: "image/png",
+  }),
+  searchMobbin: vi.fn().mockResolvedValue({
+    query: "checkout with Apple Pay",
+    platform: "web",
+    screens: [
+      {
+        id: "screen-1",
+        imageToken: "00000000-0000-4000-8000-000000000001",
+        appName: "Example",
+        platform: "web",
+      },
+    ],
+  }),
+}));
+
 const profile = {
   profile: "creatorhub-engineering",
   checkedAt: "now",
@@ -128,6 +165,7 @@ vi.mock("../lib/integrationProfile.js", () => ({
 
 const { createApp } = await import("../app.js");
 const mcp = await import("../lib/mcpIntegrations.js");
+const mobbin = await import("../lib/mobbin.js");
 const integrationProfile = await import("../lib/integrationProfile.js");
 
 describe("GET /api/integrations/cli", () => {
@@ -195,6 +233,45 @@ describe("MCP integration routes", () => {
       .send({ enabled: ["context7"], command: "arbitrary" });
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: "only the enabled field is accepted" });
+  });
+});
+
+describe("Mobbin integration routes", () => {
+  it("returns connection status without credential contents", async () => {
+    const response = await request(createApp()).get("/api/integrations/mobbin");
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ configured: true, availability: "team-enterprise-api" });
+    expect(JSON.stringify(response.body)).not.toContain("actual-mobbin-secret");
+  });
+
+  it("stores a credential through the guarded route and never echoes it", async () => {
+    const response = await request(createApp())
+      .put("/api/integrations/mobbin/credential")
+      .set("Origin", "http://localhost:5183")
+      .send({ apiKey: "actual-mobbin-secret" });
+    expect(response.status).toBe(200);
+    expect(mobbin.saveMobbinApiKey).toHaveBeenCalledWith({ apiKey: "actual-mobbin-secret" });
+    expect(JSON.stringify(response.body)).not.toContain("actual-mobbin-secret");
+  });
+
+  it("forwards only the bounded search contract", async () => {
+    const search = { query: "checkout with Apple Pay", platform: "web", limit: 8 };
+    const response = await request(createApp())
+      .post("/api/integrations/mobbin/search")
+      .set("Origin", "http://localhost:5183")
+      .send(search);
+    expect(response.status).toBe(200);
+    expect(mobbin.searchMobbin).toHaveBeenCalledWith(search);
+    expect(response.body.screens[0].id).toBe("screen-1");
+  });
+
+  it("serves an opaque Mobbin preview token through the local gateway", async () => {
+    const token = "00000000-0000-4000-8000-000000000001";
+    const response = await request(createApp()).get(`/api/integrations/mobbin/image/${token}`);
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toMatch(/^image\/png/);
+    expect(response.headers["cache-control"]).toBe("private, max-age=300");
+    expect(mobbin.readMobbinImage).toHaveBeenCalledWith(token);
   });
 });
 

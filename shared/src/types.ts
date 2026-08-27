@@ -99,6 +99,149 @@ export interface FinalStatus {
   documentation: FinalGateStatus;
 }
 
+export type DesignTaskKind = "build" | "improve" | "audit" | "reference-match";
+export type DesignContextStrategy = "detect" | "existing" | "required" | "none";
+
+export interface DesignReferenceImage {
+  /** Workspace-relative path. The orchestrator resolves it symlink-safely. */
+  path: string;
+  label?: string;
+}
+
+export type DesignStateAction =
+  { action: "click"; selector: string } | { action: "wait"; ms: number };
+
+export interface DesignState {
+  name: string;
+  actions: DesignStateAction[];
+  expectations: string[];
+}
+
+export interface CmsDesignContext {
+  strategy: DesignContextStrategy;
+  providerHint?: string;
+  /** Workspace-relative schema/model/content paths to inspect and preserve. */
+  schemaPaths: string[];
+  requirements: string[];
+  localizationRequired: boolean;
+}
+
+export interface DesignTokenContext {
+  strategy: DesignContextStrategy;
+  /** Workspace-relative token/theme/config paths that remain the source of truth. */
+  sourcePaths: string[];
+  requirements: string[];
+  allowNewTokens: boolean;
+}
+
+export interface DesignInspiration {
+  source: "mobbin";
+  screenId: string;
+  appName: string;
+  platform: "ios" | "web";
+  mobbinUrl: string;
+  /** The human's search intent is durable even when Mobbin's signed image URL expires. */
+  query: string;
+  notes?: string;
+}
+
+export interface DesignRegion {
+  /** Coordinates are normalized to the captured image, from 0 through 1. */
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+}
+
+export interface DesignVariantRequest {
+  id: string;
+  target: string;
+  count: 2 | 3 | 4;
+  directions: string[];
+  screenshot?: string;
+  region?: DesignRegion;
+}
+
+export interface DesignElementStyleEdit {
+  textColor?: string;
+  backgroundColor?: string;
+  fontFamily?: string;
+  fontSizePx?: number;
+  fontWeight?: number;
+  lineHeight?: number;
+  paddingPx?: number;
+  marginPx?: number;
+  gapPx?: number;
+  borderColor?: string;
+  borderWidthPx?: number;
+  borderRadiusPx?: number;
+  opacity?: number;
+  direction?: "row" | "column";
+  align?: "start" | "center" | "end" | "space-between";
+}
+
+/** A visual, element-scoped edit request. It contains intent, never executable CSS or JS. */
+export interface DesignElementEdit {
+  id: string;
+  target: string;
+  screenshot: string;
+  viewport: string;
+  state: string;
+  region: DesignRegion;
+  selectorHint?: string;
+  sourcePathHint?: string;
+  expectedText?: string;
+  text?: string;
+  imageSource?: string;
+  style: DesignElementStyleEdit;
+  createdAt: string;
+}
+
+export type DesignAssetKind = "image" | "video" | "vector";
+export type DesignAssetAspectRatio = "1:1" | "16:9" | "9:16" | "4:3" | "3:4";
+
+/** A bounded generation request. Glimmer must report BLOCKED if no real media tool is available. */
+export interface DesignAssetRequest {
+  id: string;
+  kind: DesignAssetKind;
+  prompt: string;
+  outputPath: string;
+  aspectRatio: DesignAssetAspectRatio;
+  size?: "1K" | "2K" | "4K";
+  resolution?: "720p" | "1080p";
+  durationSeconds?: 2 | 4 | 6 | 8;
+  audio?: boolean;
+  animated?: boolean;
+  referenceImages: DesignReferenceImage[];
+  referenceUploadPolicy: "local-only" | "generation-model";
+  screenshot?: string;
+  createdAt: string;
+}
+
+/**
+ * Optional design/UX extension of TaskContract. It is deliberately declarative:
+ * no arbitrary commands or JavaScript can travel from the composer to Playwright.
+ */
+export interface DesignContract {
+  kind: DesignTaskKind;
+  /** Local preview URL only; the gateway rejects non-loopback hosts. */
+  targetUrl?: string;
+  audience?: string;
+  primaryAction?: string;
+  requirements: string[];
+  referenceImages: DesignReferenceImage[];
+  /** Explicit per-task consent boundary; local-only is the safe default. */
+  referenceImagePolicy: "local-only" | "vision-model";
+  states: DesignState[];
+  viewports: string[];
+  inspirations: DesignInspiration[];
+  variants: DesignVariantRequest[];
+  elementEdits: DesignElementEdit[];
+  assetRequests: DesignAssetRequest[];
+  cms: CmsDesignContext;
+  designTokens: DesignTokenContext;
+}
+
 export interface TaskContract {
   objective: string;
   // The human's objective above is immutable source text. intent records a
@@ -118,6 +261,7 @@ export interface TaskContract {
     noDependencyInstall: true;
   };
   verification: string[];
+  design?: DesignContract;
   repairBudget: number;
   maxTurns?: number;
   // Task 1.4 (V7 §6/§40): TaskContract budgets. Only maxChangedFiles today —
@@ -443,6 +587,12 @@ export interface ArchitecturePlan {
   // one at 20 entries / 300 chars each, since it feeds an automation
   // contract file rather than just prompt text.
   visualRequirements?: string[];
+  /** Interaction, state, accessibility, and responsive behavior requirements. */
+  uxRequirements?: string[];
+  /** CMS/content-model/editorial workflow requirements grounded in repository evidence. */
+  cmsRequirements?: string[];
+  /** Existing-token reuse and any explicitly justified new-token requirements. */
+  designTokenRequirements?: string[];
 }
 
 // V7 §5.7 ArchitectReview — pre-verification review decision, written to
@@ -610,12 +760,21 @@ export interface VisualCapture {
 // viewport captured; "partial" when some did; "failed" when none did.
 export type VisualManifestStatus = "pass" | "partial" | "failed";
 
+export interface VisualReference {
+  file: string;
+  label: string;
+  sourcePath?: string | null;
+  modelReviewed: boolean;
+}
+
 export interface VisualManifest {
   route: string;
   viewports: string[];
   states: string[];
   status: VisualManifestStatus;
   captures: VisualCapture[];
+  checks?: string[];
+  references?: VisualReference[];
 }
 
 // findings.json (build_findings). "NOT_RUN" means capture succeeded but
@@ -645,6 +804,11 @@ export interface VisualFindings {
   reviewed?: string[];
   blocked?: string[];
   findings: VisualFinding[];
+  modelId?: string;
+  references?: VisualReference[];
+  referenceImagePolicy?: "local-only" | "vision-model";
+  referencesSentToModel?: string[];
+  referencesReviewedByModel?: string[];
 }
 
 // GET /api/sessions/:id/visual/manifest response body -- combines both
@@ -656,6 +820,666 @@ export interface VisualVerification {
   manifest: VisualManifest;
   findings: VisualFindings | null;
 }
+
+export interface DesignFeedbackPoint {
+  x: number;
+  y: number;
+}
+
+export type DesignFeedbackTool =
+  | "comment"
+  | "draw"
+  | "rectangle"
+  | "ellipse"
+  | "arrow"
+  | "sticky"
+  | "color"
+  | "typography"
+  | "layout";
+
+export interface DesignFeedbackAnnotation {
+  id: string;
+  screenshot: string;
+  viewport: string;
+  state: string;
+  tool: DesignFeedbackTool;
+  points: DesignFeedbackPoint[];
+  comment: string;
+  /** Structured design intent, never executable CSS or script. */
+  value?: string;
+  strokeColor?: string;
+  fillColor?: string;
+  strokeWidth?: 1 | 2 | 4 | 8;
+  /** Stable live-preview binding when the annotation was created on the running app. */
+  selectorHint?: string;
+  sourcePathHint?: string;
+  createdAt: string;
+}
+
+export interface DesignFeedbackDocument {
+  version: 1;
+  sessionId: string;
+  updatedAt: string;
+  annotations: DesignFeedbackAnnotation[];
+  variants: DesignVariantRequest[];
+  inspirations: DesignInspiration[];
+  elementEdits: DesignElementEdit[];
+  assetRequests: DesignAssetRequest[];
+}
+
+export interface DesignFeedbackUpdate {
+  annotations: DesignFeedbackAnnotation[];
+  variants: DesignVariantRequest[];
+  inspirations: DesignInspiration[];
+  elementEdits: DesignElementEdit[];
+  assetRequests: DesignAssetRequest[];
+}
+
+export type DesignChangeSetStatus =
+  | "draft"
+  | "in_review"
+  | "approved"
+  | "implementing"
+  | "verifying"
+  | "verified"
+  | "blocked"
+  | "delivered"
+  | "rejected";
+
+export type DesignWorkflowTransitionAction =
+  "submit_review" | "approve" | "reject" | "return_to_draft" | "deliver" | "reopen";
+
+export interface DesignChangeSetFeedbackRefs {
+  annotationIds: string[];
+  variantIds: string[];
+  inspirationIds: string[];
+  elementEditIds: string[];
+  assetRequestIds: string[];
+}
+
+export interface DesignChangeSetDecision {
+  outcome: "approved" | "rejected";
+  decidedAt: string;
+  note?: string;
+}
+
+export interface DesignChangeSetVerificationViewport {
+  viewport: string;
+  state: string;
+  status: "passed" | "warning" | "failed";
+  findingCount: number;
+  message?: string;
+}
+
+export interface DesignChangeSetVerification {
+  status: "not_run" | "passed" | "passed_with_warnings" | "failed";
+  checkedAt?: string;
+  manifestStatus?: VisualManifestStatus;
+  findingsStatus?: VisualFindingsStatus;
+  viewports: DesignChangeSetVerificationViewport[];
+  summary?: string;
+}
+
+export interface DesignChangeSetEvent {
+  id: string;
+  type:
+    | "created"
+    | "updated"
+    | "feedback_linked"
+    | "feedback_unlinked"
+    | "submitted_for_review"
+    | "approved"
+    | "rejected"
+    | "returned_to_draft"
+    | "source_applied"
+    | "verification_completed"
+    | "rollback_completed"
+    | "rollback_blocked"
+    | "delivered"
+    | "reopened";
+  at: string;
+  note?: string;
+}
+
+/** Durable, resumable unit of work for the Live Design workflow. */
+export interface DesignChangeSet {
+  id: string;
+  title: string;
+  goal: string;
+  route: string;
+  status: DesignChangeSetStatus;
+  createdAt: string;
+  updatedAt: string;
+  componentName?: string;
+  selector?: string;
+  sourcePath?: string;
+  viewport?: string;
+  decision?: DesignChangeSetDecision;
+  feedbackRefs: DesignChangeSetFeedbackRefs;
+  revisionIds: string[];
+  rolledBackRevisionIds: string[];
+  verification: DesignChangeSetVerification;
+  events: DesignChangeSetEvent[];
+}
+
+export interface DesignWorkflowDocument {
+  version: 1;
+  revision: number;
+  sessionId: string;
+  updatedAt: string;
+  activeChangeSetId?: string;
+  changeSets: DesignChangeSet[];
+}
+
+export interface DesignChangeSetCreateRequest {
+  expectedRevision: number;
+  title: string;
+  goal: string;
+  route: string;
+  componentName?: string;
+  selector?: string;
+  sourcePath?: string;
+  viewport?: string;
+}
+
+export interface DesignChangeSetUpdateRequest {
+  expectedRevision: number;
+  title?: string;
+  goal?: string;
+  componentName?: string;
+  selector?: string;
+  sourcePath?: string;
+  viewport?: string;
+}
+
+export interface DesignWorkflowTransitionRequest {
+  expectedRevision: number;
+  action: DesignWorkflowTransitionAction;
+  note?: string;
+}
+
+export interface DesignWorkflowLinkRequest {
+  expectedRevision: number;
+  refs: Partial<DesignChangeSetFeedbackRefs>;
+}
+
+export interface DesignWorkflowMutationRequest {
+  expectedRevision: number;
+}
+
+export interface DesignWorkflowRollbackResponse {
+  workflow: DesignWorkflowDocument;
+  rolledBackRevisionIds: string[];
+  skippedRevisionIds: string[];
+}
+
+export interface LiveDesignRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  viewportWidth: number;
+  viewportHeight: number;
+}
+
+export interface LiveDesignTokenReference {
+  name: string;
+  value: string;
+  property: string;
+}
+
+export type LiveDesignFramework = "html" | "react" | "vue" | "svelte" | "unknown";
+
+export interface LiveDesignBreadcrumb {
+  tagName: string;
+  selector: string;
+  label: string;
+}
+
+export interface LiveDesignStyleDeclarationSource {
+  property: string;
+  value: string;
+  important: boolean;
+}
+
+/** One matched cascade layer reported by the isolated localhost preview. */
+export interface LiveDesignStyleSource {
+  selector: string;
+  source: string;
+  specificity: string;
+  inherited: boolean;
+  declarations: LiveDesignStyleDeclarationSource[];
+}
+
+/** Metadata selected inside a local preview. Values are descriptive and never executable. */
+export interface LiveDesignElement {
+  selector: string;
+  tagName: string;
+  text: string;
+  attributes: Record<string, string>;
+  styles: {
+    color: string;
+    backgroundColor: string;
+    fontFamily: string;
+    fontSize: string;
+    fontWeight: string;
+    lineHeight: string;
+    padding: string;
+    margin: string;
+    gap: string;
+    borderColor: string;
+    borderWidth: string;
+    borderRadius: string;
+    opacity: string;
+    display: string;
+    flexDirection: string;
+    flexWrap: string;
+    alignItems: string;
+    alignContent: string;
+    justifyContent: string;
+    width: string;
+    height: string;
+    minWidth: string;
+    maxWidth: string;
+    minHeight: string;
+    maxHeight: string;
+    position: string;
+    top: string;
+    right: string;
+    bottom: string;
+    left: string;
+    zIndex: string;
+    gridTemplateColumns: string;
+    gridTemplateRows: string;
+    gridAutoFlow: string;
+    gridColumn: string;
+    gridRow: string;
+    order: string;
+    flex: string;
+    boxSizing: string;
+  };
+  rect: LiveDesignRect;
+  sourcePathHint?: string;
+  tokens: LiveDesignTokenReference[];
+  framework?: LiveDesignFramework;
+  componentName?: string;
+  stableId?: string;
+  breadcrumbs?: LiveDesignBreadcrumb[];
+  styleSources?: LiveDesignStyleSource[];
+}
+
+export type LiveDesignProposalField =
+  | "text"
+  | "imageSource"
+  | "textColor"
+  | "backgroundColor"
+  | "fontFamily"
+  | "fontSizePx"
+  | "fontWeight"
+  | "lineHeight"
+  | "paddingPx"
+  | "marginPx"
+  | "gapPx"
+  | "borderColor"
+  | "borderWidthPx"
+  | "borderRadiusPx"
+  | "opacity"
+  | "direction"
+  | "align"
+  | "display"
+  | "flexWrap"
+  | "alignItemsValue"
+  | "alignContent"
+  | "width"
+  | "height"
+  | "minWidth"
+  | "maxWidth"
+  | "minHeight"
+  | "maxHeight"
+  | "position"
+  | "top"
+  | "right"
+  | "bottom"
+  | "left"
+  | "zIndex"
+  | "gridTemplateColumns"
+  | "gridTemplateRows"
+  | "gridAutoFlow"
+  | "gridColumn"
+  | "gridRow"
+  | "order"
+  | "flex"
+  | "boxSizing";
+
+export interface LiveDesignProposalChange {
+  field: LiveDesignProposalField;
+  label: string;
+  before: string;
+  after: string;
+  reason: string;
+}
+
+export interface LiveDesignProposalRequest {
+  element: LiveDesignElement;
+  prompt: string;
+}
+
+export interface LiveDesignProposalResponse {
+  id: string;
+  prompt: string;
+  summary: string;
+  changes: LiveDesignProposalChange[];
+  provenance: "model-output" | "deterministic-fallback";
+  createdAt: string;
+}
+
+export interface LiveDesignStructureTarget {
+  selector: string;
+  tagName: string;
+  text: string;
+  attributes: Record<string, string>;
+  sourcePathHint?: string;
+  framework?: LiveDesignFramework;
+  componentName?: string;
+}
+
+export interface LiveDesignStructureNode extends LiveDesignStructureTarget {
+  label: string;
+  canHaveChildren: boolean;
+  hidden: boolean;
+  children: LiveDesignStructureNode[];
+}
+
+export interface LiveDesignStructureSnapshot {
+  roots: LiveDesignStructureNode[];
+  total: number;
+  truncated: boolean;
+}
+
+export type LiveDesignInsertPreset = "section" | "heading" | "paragraph" | "button" | "divider";
+
+export type LiveDesignStructureOperationRequest =
+  | {
+      kind: "reorder";
+      moving: LiveDesignStructureTarget;
+      anchor: LiveDesignStructureTarget;
+      placement: "before" | "after";
+      changeSetId?: string;
+    }
+  | {
+      kind: "reparent";
+      moving: LiveDesignStructureTarget;
+      target: LiveDesignStructureTarget;
+      placement: "inside-start" | "inside-end";
+      changeSetId?: string;
+    }
+  | {
+      kind: "insert";
+      target: LiveDesignStructureTarget;
+      placement: "inside-start" | "inside-end" | "before" | "after";
+      preset: LiveDesignInsertPreset;
+      text: string;
+      changeSetId?: string;
+    };
+
+export type LiveDesignBreakpoint = "mobile" | "tablet" | "desktop";
+
+export type LiveDesignResponsiveProperty =
+  | "color"
+  | "background-color"
+  | "font-size"
+  | "font-weight"
+  | "line-height"
+  | "padding"
+  | "margin"
+  | "gap"
+  | "border-width"
+  | "border-radius"
+  | "opacity"
+  | "flex-direction"
+  | "align-items"
+  | "justify-content";
+
+export interface LiveDesignResponsiveOverrideRequest {
+  element: LiveDesignElement;
+  source: LiveDesignSourceCandidate;
+  breakpoint: LiveDesignBreakpoint;
+  property: LiveDesignResponsiveProperty;
+  value: string;
+  changeSetId?: string;
+}
+
+export type LiveDesignStyleScope = "instance" | "component";
+
+export type LiveDesignStyleProperty =
+  | "display"
+  | "width"
+  | "height"
+  | "min-width"
+  | "max-width"
+  | "min-height"
+  | "max-height"
+  | "position"
+  | "top"
+  | "right"
+  | "bottom"
+  | "left"
+  | "z-index"
+  | "grid-template-columns"
+  | "grid-template-rows"
+  | "grid-auto-flow"
+  | "grid-column"
+  | "grid-row"
+  | "flex-direction"
+  | "flex-wrap"
+  | "align-items"
+  | "align-content"
+  | "justify-content"
+  | "order"
+  | "flex"
+  | "gap"
+  | "padding"
+  | "margin"
+  | "box-sizing";
+
+export interface LiveDesignStyleOverrideRequest {
+  element: LiveDesignElement;
+  source: LiveDesignSourceCandidate;
+  scope: LiveDesignStyleScope;
+  /** Optional existing class chosen from element.attributes.class. */
+  className?: string;
+  declarations: Partial<Record<LiveDesignStyleProperty, string>>;
+  changeSetId?: string;
+}
+
+export type LiveDesignSourceCandidateKind = "text-node" | "css-token" | "css-declaration";
+
+/** Versioned source binding returned by the gateway and revalidated before every write. */
+export interface LiveDesignSourceCandidate {
+  id: string;
+  path: string;
+  line: number;
+  column: number;
+  offset: number;
+  kind: LiveDesignSourceCandidateKind;
+  expected: string;
+  fileHash: string;
+  excerpt: string;
+  tokenName?: string;
+  property?: string;
+  confidence?: "exact" | "hint" | "ambiguous";
+  reason?: string;
+}
+
+export interface LiveDesignTokenNode {
+  name: string;
+  value: string;
+  path: string;
+  line: number;
+  aliases: string[];
+  referencedBy: string[];
+}
+
+export interface LiveDesignCmsReference {
+  path: string;
+  field: string;
+  line: number;
+  value: string;
+}
+
+export interface LiveDesignAuditFinding {
+  id: string;
+  severity: "info" | "warning" | "error";
+  category: "accessibility" | "responsive" | "design-system" | "content";
+  message: string;
+  suggestion: string;
+}
+
+export interface LiveDesignResolveRequest {
+  element: LiveDesignElement;
+}
+
+export interface LiveDesignResolveResponse {
+  candidates: LiveDesignSourceCandidate[];
+  branch: string;
+  directApplyAllowed: boolean;
+  directApplyReason?: string;
+  scannedFiles: number;
+  truncated: boolean;
+  tokenGraph?: LiveDesignTokenNode[];
+  cmsReferences?: LiveDesignCmsReference[];
+  auditFindings?: LiveDesignAuditFinding[];
+}
+
+export interface LiveDesignApplyRequest {
+  candidate: LiveDesignSourceCandidate;
+  replacement: string;
+  changeSetId?: string;
+}
+
+export type LiveDesignRevisionKind =
+  | LiveDesignSourceCandidateKind
+  | "bridge-install"
+  | "transaction"
+  | "structure-insert"
+  | "structure-reorder"
+  | "structure-reparent"
+  | "responsive-override"
+  | "style-override";
+
+export interface LiveDesignRevision {
+  id: string;
+  path: string;
+  kind: LiveDesignRevisionKind;
+  before: string;
+  after: string;
+  createdAt: string;
+  rolledBackAt?: string;
+  changeCount?: number;
+  changeSetId?: string;
+}
+
+export interface LiveDesignApplyResponse {
+  applied: true;
+  revision: LiveDesignRevision;
+}
+
+export interface LiveDesignRollbackResponse {
+  rolledBack: true;
+  revision: LiveDesignRevision;
+}
+
+export interface LiveDesignTransactionEdit {
+  candidate: LiveDesignSourceCandidate;
+  replacement: string;
+}
+
+export interface LiveDesignTransactionRequest {
+  edits: LiveDesignTransactionEdit[];
+  changeSetId?: string;
+}
+
+export interface LiveDesignTransactionResponse {
+  applied: true;
+  revision: LiveDesignRevision;
+}
+
+export interface LiveDesignStructureOperationResponse {
+  applied: true;
+  revision: LiveDesignRevision;
+}
+
+export interface LiveDesignResponsiveOverrideResponse {
+  applied: true;
+  revision: LiveDesignRevision;
+}
+
+export interface LiveDesignStyleOverrideResponse {
+  applied: true;
+  revision: LiveDesignRevision;
+  selector: string;
+}
+
+export interface LiveDesignHistoryResponse {
+  revisions: LiveDesignRevision[];
+}
+
+export interface LiveDesignBridgeInstallRequest {
+  scriptUrl: string;
+  parentOrigin: string;
+}
+
+export interface LiveDesignBridgeInstallResponse {
+  installed: true;
+  path: string;
+  revision: LiveDesignRevision;
+}
+
+/** Crash-recovery journal for unsaved Live Design UI and preview state. */
+export interface LiveDesignDraftJournal {
+  version: 1;
+  sessionId: string;
+  route: string;
+  updatedAt: string;
+  sequence: number;
+  selectedSelector?: string;
+  selectedSelectors: string[];
+  lockedSelectors: string[];
+  hiddenSelectors: string[];
+  activeTab: string;
+  viewportId: string;
+  zoom: number;
+  inspectorWidth: number;
+  elementPrompt: string;
+  annotationComment: string;
+  annotationTool: DesignFeedbackTool;
+  annotationPoints: DesignFeedbackPoint[];
+  annotating?: boolean;
+  assetPrompt?: string;
+  assetPath?: string;
+  previewMode?: boolean;
+  resizeMode?: boolean;
+  responsiveBreakpoint: LiveDesignBreakpoint;
+  responsiveProperty: LiveDesignResponsiveProperty;
+  responsiveValue: string;
+  responsiveOverrides: Record<string, string>;
+  responsivePreviewed?: boolean;
+  styleScope: LiveDesignStyleScope;
+  selectedClass?: string;
+  textCandidateId?: string;
+  tokenCandidateId?: string;
+  tokenReplacement?: string;
+  tokenBindingProperty?: string;
+  draft?: Partial<Record<LiveDesignProposalField, string>>;
+  originalDraft?: Partial<Record<LiveDesignProposalField, string>>;
+  pendingStructure?: LiveDesignStructureOperationRequest;
+  proposal?: LiveDesignProposalResponse;
+}
+
+export type LiveDesignDraftUpdate = Omit<
+  LiveDesignDraftJournal,
+  "version" | "sessionId" | "updatedAt"
+>;
 
 // Task 5.2 (V7 §26/§46): one node in evidence-index.json's graph-lite
 // list, built incrementally by glimmer-engineer.py as evidence persists
@@ -1443,6 +2267,51 @@ export interface McpIntegrationsStatus {
 
 export interface McpConfigUpdate {
   enabled: McpIntegrationId[];
+}
+
+export type MobbinPlatform = "ios" | "web";
+export type MobbinSearchMode = "standard" | "deep";
+
+export interface MobbinIntegrationStatus {
+  configured: boolean;
+  keyPath: string;
+  docsUrl: string;
+  availability: "team-enterprise-api";
+  policy: {
+    credentialsReturnedByApi: false;
+    fixedApiOrigin: "https://api.mobbin.com";
+    imageUrlsAreRemoteAndExpiring: true;
+    imagesProxiedThroughGateway: true;
+  };
+}
+
+export interface MobbinCredentialUpdate {
+  apiKey: string;
+}
+
+export interface MobbinSearchRequest {
+  query: string;
+  platform: MobbinPlatform;
+  mode?: MobbinSearchMode;
+  limit?: number;
+}
+
+export interface MobbinScreen {
+  id: string;
+  /** Opaque, short-lived handle for the gateway's validated image proxy. */
+  imageToken: string;
+  imageWidth?: number;
+  imageHeight?: number;
+  imageExpiresAt?: string;
+  mobbinUrl: string;
+  appName: string;
+  platform: MobbinPlatform;
+}
+
+export interface MobbinSearchResult {
+  query: string;
+  platform: MobbinPlatform;
+  screens: MobbinScreen[];
 }
 
 export type RuntimeComponentId = "gateway" | "python" | "orchestrator" | "model";

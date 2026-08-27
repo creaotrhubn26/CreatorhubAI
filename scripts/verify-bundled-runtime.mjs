@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 const EXPECTED_ORCHESTRATOR_COMMIT = "0ec371d9dc5f76ec68b6463585183f19ddb6180d";
 const EXPECTED_ORCHESTRATOR_OVERLAY = {
   id: "durable-journal-v1",
-  patchSha256: "3c8375dddccd0000a36b1e38f6b643e9d62a54f006bf9f0d86910a78eb17d3d1",
+  patchSha256: "d12e37c0cec0186d01234d04fae52f096a120ac4a346c83844ae54babcdf8c0b",
   moduleSha256: "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
 };
 const EXPECTED_PYTHON_FILES = {
@@ -22,12 +22,12 @@ const EXPECTED_PYTHON_FILES = {
     "6e956d2166e24ccf36fef21ad63d06a5dd8f7b674aca6c81ea91eacca6b85b01",
 };
 const EXPECTED_ORCHESTRATOR_FILES = {
-  "glimmer-v2.py": "5e52137fd07ac0a538b519fdd50fb5e5bac8c258c9eeb28d4b0f58035b7cf88b",
-  "glimmer-engineer.py": "d6da291640495392d5330bb4d0c6ae996879dd8a7a185b00f1e7ef03e447a5cb",
+  "glimmer-v2.py": "1a7e1d8b16237bcc9af4cd4a8d7d85b5b5c01ced35b3c2bd5be69156ddfd5a2d",
+  "glimmer-engineer.py": "fe11fa79dae76877761de1ee2b1318099de48a94c46473919046b8b69b4ebcc8",
   "glimmer_events.py": "5756d4280378ba351a75605109fcb4f84231e03b8cf9dcb63722173fc865b71e",
   "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
   "glimmer_models.py": "bf84fe821df6ce7e21babdeecc3dab3f053519ecf1edc467b4df83434b9ff6ee",
-  "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
+  "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
 };
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;

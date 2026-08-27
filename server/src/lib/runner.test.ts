@@ -1,5 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { buildArgs, runGlimmer, runtimeCommand, validateAdvanced } from "./runner.js";
+import {
+  buildArgs,
+  runGlimmer,
+  runtimeCommand,
+  validateAdvanced,
+  writeDesignContractInput,
+} from "./runner.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -21,6 +27,32 @@ const CONTRACT = {
   },
   verification: ["frontend-typecheck"],
   repairBudget: 2,
+};
+
+const DESIGN = {
+  kind: "improve" as const,
+  targetUrl: "http://localhost:5173/settings",
+  requirements: ["primary action remains visible"],
+  referenceImages: [{ path: "design/settings.png" }],
+  referenceImagePolicy: "local-only" as const,
+  states: [],
+  viewports: ["1440x900", "390x844"],
+  inspirations: [],
+  variants: [],
+  elementEdits: [],
+  assetRequests: [],
+  cms: {
+    strategy: "detect" as const,
+    schemaPaths: ["cms/schema"],
+    requirements: ["copy remains editor-managed"],
+    localizationRequired: true,
+  },
+  designTokens: {
+    strategy: "existing" as const,
+    sourcePaths: ["src/theme.css"],
+    requirements: ["reuse semantic tokens"],
+    allowNewTokens: false,
+  },
 };
 
 describe("buildArgs", () => {
@@ -88,6 +120,31 @@ describe("buildArgs", () => {
     expect(args).toContain("npm --prefix frontend run typecheck");
     expect(args).toContain("npm --prefix frontend run test:unit");
     expect(args.filter((a) => a === "--verify")).toHaveLength(2);
+  });
+
+  it("forwards a validated design contract, visual target, and visual verification safely", () => {
+    const designPath = "/tmp/glimmer/design-contract.input.json";
+    const args = buildArgs(
+      { ...CONTRACT, design: DESIGN, verification: ["visual"] },
+      "/tmp/ws",
+      "design-session",
+      designPath,
+    );
+    expect(args[args.indexOf("--design-contract") + 1]).toBe(designPath);
+    expect(args[args.indexOf("--visual-url") + 1]).toBe(DESIGN.targetUrl);
+    expect(args).toContain("--architect-first");
+    expect(args).toContain("visual");
+  });
+
+  it("does not forward an external design target or relative design artifact path", () => {
+    const args = buildArgs(
+      { ...CONTRACT, design: { ...DESIGN, targetUrl: "https://example.com" } },
+      "/tmp/ws",
+      "design-session",
+      "relative/design.json",
+    );
+    expect(args).not.toContain("--visual-url");
+    expect(args).not.toContain("--design-contract");
   });
 
   it("drops unrecognized verification values instead of forwarding them to shlex.split", () => {
@@ -518,5 +575,14 @@ describe("runGlimmer", () => {
     expect(code).toBe(0);
     const log = await fs.readFile(path.join(dir, "engineer-00.log"), "utf-8");
     expect(log).toContain("FAKE ENGINEER RUNNING");
+  });
+});
+
+describe("writeDesignContractInput", () => {
+  it("persists the normalized design input with private permissions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-design-contract-"));
+    const target = await writeDesignContractInput(dir, DESIGN);
+    expect(JSON.parse(await fs.readFile(target!, "utf8"))).toEqual(DESIGN);
+    expect((await fs.stat(target!)).mode & 0o777).toBe(0o600);
   });
 });
