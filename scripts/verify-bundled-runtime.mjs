@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 const EXPECTED_ORCHESTRATOR_COMMIT = "0ec371d9dc5f76ec68b6463585183f19ddb6180d";
 const EXPECTED_ORCHESTRATOR_OVERLAY = {
   id: "durable-journal-v1",
-  patchSha256: "d12e37c0cec0186d01234d04fae52f096a120ac4a346c83844ae54babcdf8c0b",
+  patchSha256: "107319c6b58b0161686eb12f010af9c66f893737c51fb219c162a5d421d13073",
   moduleSha256: "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
 };
 const EXPECTED_PYTHON_FILES = {
