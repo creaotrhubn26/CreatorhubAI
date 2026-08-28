@@ -214,12 +214,30 @@ describe("computeDiffHash — cross-language contract with glimmer-v2.py's diff_
 describe("computeDiffHash — bounded timeout", () => {
   // MED (review round 1): this runs on a route a session screen polls every
   // 4s -- a hung mount/filesystem must error out fast, not hang the request
-  // forever. A 1ms timeout can't complete even a trivial `git diff`
-  // spawn+exec, so this proves the timeoutMs option actually reaches the
-  // underlying process (both the diff spawn and the ls-files spawn), rather
-  // than just being accepted and ignored.
+  // forever. Use a repository-local external diff that deliberately blocks,
+  // rather than assuming a real `git diff` must take longer than 1ms: fast CI
+  // runners can legitimately complete that command before such a timer fires.
+  // A short timeout against a controlled slow child proves timeoutMs reaches
+  // the underlying process instead of merely being accepted and ignored.
   it("rejects instead of hanging when timeoutMs is too small for the git process to complete", async () => {
-    await expect(computeDiffHash(repo, "HEAD", { timeoutMs: 1 })).rejects.toThrow();
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-diffhash-timeout-"));
+    try {
+      await exec("git", ["init", "-q"], { cwd: ws });
+      await exec("git", ["config", "user.email", "t@t.com"], { cwd: ws });
+      await exec("git", ["config", "user.name", "t"], { cwd: ws });
+      await fs.writeFile(path.join(ws, "tracked.txt"), "before\n");
+      await exec("git", ["add", "tracked.txt"], { cwd: ws });
+      await exec("git", ["commit", "-q", "-m", "baseline"], { cwd: ws });
+      await fs.writeFile(path.join(ws, "tracked.txt"), "after\n");
+
+      const slowDiff = path.join(ws, "slow-diff.sh");
+      await fs.writeFile(slowDiff, "#!/bin/sh\nsleep 10\n", { mode: 0o700 });
+      await exec("git", ["config", "diff.external", slowDiff], { cwd: ws });
+
+      await expect(computeDiffHash(ws, "HEAD", { timeoutMs: 50 })).rejects.toThrow();
+    } finally {
+      await fs.rm(ws, { recursive: true, force: true });
+    }
   });
 });
 
