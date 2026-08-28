@@ -209,7 +209,7 @@ beforeAll(async () => {
     path.join(workspace, "content", "settings.json"),
     JSON.stringify({ page: { heading: "Settings" } }, null, 2),
   );
-  await exec("git", ["init", "-q"], { cwd: workspace });
+  await exec("git", ["init", "-q", "-b", "main"], { cwd: workspace });
   await exec("git", ["config", "user.email", "test@example.com"], { cwd: workspace });
   await exec("git", ["config", "user.name", "Test"], { cwd: workspace });
   await exec("git", ["add", "src", "content", "index.html"], { cwd: workspace });
