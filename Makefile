@@ -58,4 +58,5 @@ remote-test:
 	$(PYTHON) -m unittest tests.test_glimmer_remote tests.test_runpod_worker
 
 image-contract:
+	$(PYTHON) scripts/verify-runpod-workflow.py
 	scripts/verify-runpod-image.sh
