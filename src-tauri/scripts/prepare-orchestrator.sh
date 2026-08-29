@@ -7,8 +7,9 @@
 # network; each final file must match its release SHA-256 before output.
 set -euo pipefail
 
-ORCHESTRATOR_REF="84f17cb4d3916573778fc90d131cc93cca8fad57"
+ORCHESTRATOR_REF="f66229eaad0acaf90be40075288fa0efbb31f247"
 SNAPSHOT_ID="glimmer-runpod-r2"
+RUNPOD_WORKFLOW_SHA="c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952"
 
 cd "$(dirname "$0")/.."
 OUT="binaries/runtime/orchestrator"
@@ -60,6 +61,8 @@ if [[ "$SOURCE_COMMIT" != "$ORCHESTRATOR_REF" ]]; then
   echo "orchestrator source must be exact commit $ORCHESTRATOR_REF (got ${SOURCE_COMMIT:-unavailable})" >&2
   exit 1
 fi
+printf '%s  %s\n' "$RUNPOD_WORKFLOW_SHA" "$SOURCE/.github/workflows/runpod-image.yml" | shasum -a 256 -c -
+printf '%s  %s\n' "$RUNPOD_WORKFLOW_SHA" "../.github/workflows/runpod-image.yml" | shasum -a 256 -c -
 for index in "${!FILES[@]}"; do
   file="${FILES[$index]}"
   printf '%s  %s\n' "${SHAS[$index]}" "$SOURCE/$file" | shasum -a 256 -c -

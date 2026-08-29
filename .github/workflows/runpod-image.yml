@@ -1,0 +1,184 @@
+name: RunPod worker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_image:
+        description: Publish the verified image and its OCI attestations to GHCR
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: glimmer-runpod-worker-image
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/glimmer-runpod-worker
+  CACHE_SCOPE: glimmer-runpod-worker-linux-amd64-v1
+
+jobs:
+  validate:
+    if: ${{ inputs.publish_image == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the orchestrator release branch
+        id: checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: glimmer-orchestrator-main
+          persist-credentials: false
+
+      - name: Resolve immutable image identity
+        id: image
+        env:
+          SOURCE_COMMIT: ${{ steps.checkout.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          repository="$(printf '%s' "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          [[ "$repository" =~ ^ghcr\.io/[a-z0-9._-]+/glimmer-runpod-worker$ ]]
+          build_id="r2-${SOURCE_COMMIT:0:12}"
+          {
+            printf 'repository=%s\n' "$repository"
+            printf 'tag=%s:%s\n' "$repository" "$build_id"
+            printf 'build_id=%s\n' "$build_id"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify source and image contracts
+        run: make image-contract
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile.runpod
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          pull: true
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: |
+            SOURCE_COMMIT=${{ steps.checkout.outputs.commit }}
+            BUILD_ID=${{ steps.image.outputs.build_id }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
+          cache-to: type=gha,mode=min,scope=${{ env.CACHE_SCOPE }}
+
+      - name: Verify the built image runtime
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.checkout.outputs.commit }}
+          BUILD_ID: ${{ steps.image.outputs.build_id }}
+        run: scripts/verify-runpod-image.sh "$IMAGE_TAG" "$SOURCE_COMMIT" "$BUILD_ID"
+
+      - name: Record validation result
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          {
+            printf '### RunPod worker image validated\n\n'
+            printf -- '- Image: `%s`\n' "$IMAGE_TAG"
+            printf -- '- Platform: `linux/amd64`\n'
+            printf -- '- Published: `false`\n'
+            printf -- '- OCI provenance/SBOM: created only by an explicit publish run\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    if: ${{ inputs.publish_image && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out the orchestrator release branch
+        id: checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: glimmer-orchestrator-main
+          persist-credentials: false
+
+      - name: Resolve immutable image identity
+        id: image
+        env:
+          SOURCE_COMMIT: ${{ steps.checkout.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          repository="$(printf '%s' "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          [[ "$repository" =~ ^ghcr\.io/[a-z0-9._-]+/glimmer-runpod-worker$ ]]
+          build_id="r2-${SOURCE_COMMIT:0:12}"
+          {
+            printf 'repository=%s\n' "$repository"
+            printf 'tag=%s:%s\n' "$repository" "$build_id"
+            printf 'build_id=%s\n' "$build_id"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify source and image contracts
+        run: make image-contract
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and publish commit-scoped image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile.runpod
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          pull: true
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.image.outputs.build_id }}
+          build-args: |
+            SOURCE_COMMIT=${{ steps.checkout.outputs.commit }}
+            BUILD_ID=${{ steps.image.outputs.build_id }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
+          cache-to: type=gha,mode=min,scope=${{ env.CACHE_SCOPE }}
+
+      - name: Pull and verify the published image runtime
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.checkout.outputs.commit }}
+          BUILD_ID: ${{ steps.image.outputs.build_id }}
+        run: |
+          docker pull "$IMAGE_TAG"
+          scripts/verify-runpod-image.sh "$IMAGE_TAG" "$SOURCE_COMMIT" "$BUILD_ID"
+
+      - name: Record published digest
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          {
+            printf '### RunPod worker image published\n\n'
+            printf -- '- Image: `%s`\n' "$IMAGE_TAG"
+            printf -- '- Digest: `%s`\n' "$IMAGE_DIGEST"
+            printf -- '- Platform: `linux/amd64`\n'
+            printf -- '- OCI provenance: `mode=max`\n'
+            printf -- '- OCI SBOM: `enabled`\n'
+          } >> "$GITHUB_STEP_SUMMARY"

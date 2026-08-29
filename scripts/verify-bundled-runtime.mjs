@@ -7,8 +7,10 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "84f17cb4d3916573778fc90d131cc93cca8fad57";
+const EXPECTED_ORCHESTRATOR_COMMIT = "f66229eaad0acaf90be40075288fa0efbb31f247";
 const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-runpod-r2";
+const EXPECTED_RUNPOD_WORKFLOW_SHA =
+  "c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952";
 const EXPECTED_PYTHON_FILES = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
   "lib/python3.13/ssl.py": "538bb1cb334bebb9cd45b58503473ba7fd99cc9a5b769b2ff5caea81876227c3",
@@ -43,6 +45,17 @@ const EXPECTED_ORCHESTRATOR_FILES = {
     "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
 };
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
+
+if (!appPath) {
+  const workflowPath = path.resolve(".github/workflows/runpod-image.yml");
+  const workflowSha = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(workflowPath))
+    .digest("hex");
+  if (workflowSha !== EXPECTED_RUNPOD_WORKFLOW_SHA) {
+    throw new Error(`RunPod image workflow checksum mismatch: ${workflowPath}`);
+  }
+}
 
 function preparedTriple() {
   if (process.platform !== "darwin") {
