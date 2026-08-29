@@ -7375,6 +7375,12 @@ ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS = (
 # length cap the fields above don't have.
 MAX_VISUAL_REQUIREMENTS = 20
 MAX_VISUAL_REQUIREMENT_CHARS = 300
+ARCHITECT_DESIGN_REQUIREMENT_FIELDS = (
+    "visualRequirements",
+    "uxRequirements",
+    "cmsRequirements",
+    "designTokenRequirements",
+)
 
 ARCHITECT_SYSTEM_PROMPT = (
     "Reasoning strength: high. "
@@ -7409,6 +7415,30 @@ ARCHITECT_SYSTEM_PROMPT = (
     "you have checked whether an appropriate mechanism already exists. "
     "Record uncertainties instead of inventing missing facts.\n\n"
 
+    "When TASK CONTRACT contains design, treat it as authoritative design "
+    "intent. Trace the primary user action and every declared interaction "
+    "state. Inspect the repository's existing CMS/content model before "
+    "proposing content changes: preserve its source of truth, editorial "
+    "workflow, preview/draft semantics, localization, empty/loading/error "
+    "states, and avoid hardcoded editor-managed copy. Inspect existing "
+    "design-token/theme sources before proposing styles: reuse semantic "
+    "tokens and components, preserve theme mappings, and propose a new token "
+    "only when design.designTokens.allowNewTokens is true and existing tokens "
+    "cannot express the requirement. Treat design.inspirations as reference "
+    "patterns, never permission to copy brand assets. For design.variants, "
+    "produce the declared bounded alternatives for the named target and keep "
+    "each alternative compatible with the existing component, CMS, responsive, "
+    "accessibility, and token architecture. For design.elementEdits, treat the "
+    "captured region and requested properties as authoritative intent, but verify "
+    "the actual owning component and current literal: selectorHint and sourcePathHint "
+    "are navigation hints, not proof, and must never trigger broad replacement. For "
+    "design.assetRequests, identify a genuinely installed/configured generator and "
+    "the declared output path. Never plan placeholder bytes, renamed unrelated media, "
+    "or a success claim without a real generated artifact. Respect local-only versus "
+    "generation-model reference policy; when the required capability or credentials "
+    "are absent, plan an explicit BLOCKED result naming that prerequisite. Ground each "
+    "CMS/token/tool-availability claim in files.\n\n"
+
     "When you are done exploring, your FINAL answer must be exactly one "
     "JSON object and nothing else — no prose before or after it, no "
     "markdown code fence — matching this shape:\n\n"
@@ -7425,6 +7455,10 @@ ARCHITECT_SYSTEM_PROMPT = (
     '  "constraints": ["reuse existing X", "avoid a second Y"],\n'
     '  "implementationPlan": ["step 1", "step 2"],\n'
     '  "verificationPlan": ["typecheck", "targeted_unit_tests"],\n'
+    '  "visualRequirements": ["visible design checks"],\n'
+    '  "uxRequirements": ["interaction, state, responsive and accessibility behavior"],\n'
+    '  "cmsRequirements": ["content model and editorial workflow requirements"],\n'
+    '  "designTokenRequirements": ["token reuse or justified token additions"],\n'
     '  "risk": "low|medium|high|critical (REQUIRED)",\n'
     '  "expectedScope": {"minFiles": 1, "maxFiles": 4},\n'
     '  "uncertainties": ["anything you could not confirm"]\n'
@@ -7469,7 +7503,8 @@ def _fallback_architecture_plan(objective, reason):
 
     for field in ARCHITECT_PLAN_OPTIONAL_ARRAY_FIELDS:
         plan[field] = []
-    plan["visualRequirements"] = []  # same shape as a successful plan (see validate_architecture_plan)
+    for field in ARCHITECT_DESIGN_REQUIREMENT_FIELDS:
+        plan[field] = []
 
     return plan
 
@@ -7580,13 +7615,14 @@ def validate_architecture_plan(data):
     # through, and the whole list is capped (count + per-item length) so
     # one runaway model response can't blow up the contract file. Absent
     # entirely -> [], same convention as every other optional array field.
-    visual_requirements_raw = data.get("visualRequirements", [])
-    visual_requirements = []
-    if isinstance(visual_requirements_raw, list):
-        for item in visual_requirements_raw[:MAX_VISUAL_REQUIREMENTS]:
-            if isinstance(item, str) and item.strip():
-                visual_requirements.append(item.strip()[:MAX_VISUAL_REQUIREMENT_CHARS])
-    normalized["visualRequirements"] = visual_requirements
+    for field in ARCHITECT_DESIGN_REQUIREMENT_FIELDS:
+        requirements_raw = data.get(field, [])
+        requirements = []
+        if isinstance(requirements_raw, list):
+            for item in requirements_raw[:MAX_VISUAL_REQUIREMENTS]:
+                if isinstance(item, str) and item.strip():
+                    requirements.append(item.strip()[:MAX_VISUAL_REQUIREMENT_CHARS])
+        normalized[field] = requirements
 
     expected_scope = data.get("expectedScope")
     if isinstance(expected_scope, dict):

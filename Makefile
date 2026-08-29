@@ -1,6 +1,7 @@
 PYTHON ?= python3
-RUFF ?= ruff
-MYPY ?= mypy
+VENV_BIN ?= .venv/bin
+RUFF ?= $(if $(wildcard $(VENV_BIN)/ruff),$(VENV_BIN)/ruff,ruff)
+MYPY ?= $(if $(wildcard $(VENV_BIN)/mypy),$(VENV_BIN)/mypy,mypy)
 
 PYTHON_FILES := \
 	glimmer-agent.py \

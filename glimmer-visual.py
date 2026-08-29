@@ -21,10 +21,13 @@ when the literal token "visual" is in contract.verification / --verify. It
 is not a second pipeline; the existing repair loop drives repairs the same
 way it does for typecheck/test/build failures.
 
-REAL PREREQUISITE TO ACTUALLY RUN THIS (not required to import or
-py_compile it, and not installed in this environment as of this pass):
+RUNTIME CAPTURE OPTIONS:
 
-    pip install playwright && playwright install
+* Python Playwright provides full multi-state click/wait capture.
+* The signed stdlib-only desktop runtime falls back to an installed
+  Chrome/Chromium-family browser for initial-state screenshots. Additional
+  declared interaction states are reported as blocked when Playwright is
+  unavailable; they are never fabricated from repeated initial captures.
 
 Exit code: 0 whenever the script runs its capture mechanics to completion,
 even if every individual viewport capture failed -- per-viewport failures
@@ -40,8 +43,13 @@ JSON output instead.
 import argparse
 import base64
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import traceback
 from pathlib import Path
 from urllib import request
@@ -77,6 +85,14 @@ SEVERITY_VALUES = ("low", "medium", "high", "critical")
 MAX_STATES = 10
 MAX_ACTIONS_PER_STATE = 10
 STATE_ACTIONS = ("click", "wait")
+MAX_REFERENCE_IMAGES = 5
+MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
+REFERENCE_IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
 
 VISION_SYSTEM_PROMPT = (
     "You are a read-only visual verifier for a web UI screenshot. You "
@@ -84,7 +100,10 @@ VISION_SYSTEM_PROMPT = (
     "that are not visible in the image (V7 §22.2). Judge only what is "
     "actually visible in the screenshot: clipping, overflow, overlapping "
     "elements, unreadable/illegible text, elements rendered outside the "
-    "viewport, broken layout, hidden or obscured primary actions. Do not "
+    "viewport, broken layout, hidden or obscured primary actions, unclear "
+    "visual hierarchy, ambiguous affordances, inconsistent component/token "
+    "usage, and visible states that do not communicate progress, errors or "
+    "the next action. Do not "
     "speculate about code, data, or behavior you cannot see.\n\n"
     "Respond with ONLY a single JSON object, no prose, no markdown fence:\n"
     '{"findings": [{"severity": "low|medium|high|critical", "category": '
@@ -103,7 +122,15 @@ def parse_viewport(spec):
 
 
 def _default_capture(url, width, height, out_path, timeout_ms=30000):
-    """Real Playwright capture -- launches a browser, sets the viewport,
+    """Capture with Python Playwright, or a packaged-runtime Chrome fallback.
+
+    The signed desktop Python is intentionally stdlib-only. When the optional
+    Python Playwright module is unavailable, invoke a locally installed
+    Chromium-family browser directly in headless screenshot mode. Arguments
+    are passed as an argv list (never a shell), and an isolated temporary
+    profile is removed on return.
+
+    The preferred Playwright path launches a browser, sets the viewport,
     navigates to `url`, and screenshots to `out_path`. Imported lazily
     (rather than at module scope) so that argument parsing, manifest/
     findings-shape logic, and this module's own --selfcheck all work
@@ -111,7 +138,10 @@ def _default_capture(url, width, height, out_path, timeout_ms=30000):
     requires the dependency. `capture_viewport` injects a different
     `capture_fn` in the self-check to prove the surrounding logic without
     a real browser."""
-    from playwright.sync_api import sync_playwright  # pip install playwright && playwright install
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return _chrome_cli_capture(url, width, height, out_path, timeout_ms=timeout_ms)
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -121,6 +151,101 @@ def _default_capture(url, width, height, out_path, timeout_ms=30000):
             page.screenshot(path=str(out_path))
         finally:
             browser.close()
+
+
+def _find_chrome_executable():
+    configured = os.environ.get("GLIMMER_CHROME_PATH")
+    candidates = [
+        configured,
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate).resolve())
+    raise RuntimeError(
+        "visual capture requires Python Playwright or a local Chrome/Chromium-family browser"
+    )
+
+
+def _chrome_cli_capture(url, width, height, out_path, timeout_ms=30000,
+                        run_fn=None, chrome=None):
+    """Stdlib-only initial-state capture for the packaged desktop runtime."""
+    chrome = chrome or _find_chrome_executable()
+    out_path = Path(out_path).resolve()
+    with tempfile.TemporaryDirectory(prefix="glimmer-visual-chrome-") as profile:
+        argv = [
+            chrome,
+            "--headless=new",
+            "--disable-gpu",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-extensions",
+            f"--user-data-dir={profile}",
+            f"--window-size={width},{height}",
+            f"--screenshot={out_path}",
+            url,
+        ]
+        if run_fn is not None:
+            result = run_fn(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=max(1, timeout_ms / 1000),
+                check=False,
+            )
+        else:
+            result = _run_chrome_until_screenshot(argv, out_path, timeout_ms)
+    if result.returncode != 0 or not out_path.is_file():
+        detail = (result.stderr or result.stdout or "screenshot was not created")[-1000:]
+        raise RuntimeError(f"headless Chrome capture failed ({result.returncode}): {detail}")
+
+
+def _png_complete(path):
+    try:
+        with Path(path).open("rb") as handle:
+            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+                return False
+            handle.seek(-12, 2)
+            return handle.read(12) == b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    except (OSError, ValueError):
+        return False
+
+
+def _run_chrome_until_screenshot(argv, out_path, timeout_ms):
+    """Stop Chrome after it has flushed a complete PNG.
+
+    Some macOS Chrome builds keep their headless parent alive after writing
+    ``--screenshot`` (for example while a Vite websocket is open). Waiting for
+    process exit would misclassify the already-written capture as a timeout.
+    """
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + max(1, timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        if _png_complete(out_path):
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+            return subprocess.CompletedProcess(argv, 0, stdout, stderr)
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+        time.sleep(0.1)
+    process.kill()
+    stdout, stderr = process.communicate()
+    return subprocess.CompletedProcess(
+        argv, 124, stdout, (stderr or "") + "\nheadless Chrome screenshot timed out"
+    )
 
 
 def load_states_file(path):
@@ -220,6 +345,90 @@ def _unique(seq):
     return list(dict.fromkeys(seq))
 
 
+def load_local_reference_manifest(output_dir):
+    """Read local-only design references materialized by glimmer-v2.
+
+    These entries are evidence for the Control Center/human review. Their
+    bytes are never added to a model payload by this verifier.
+    """
+    path = Path(output_dir) / "references" / "manifest.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    references = raw.get("references") if isinstance(raw, dict) else None
+    if not isinstance(references, list):
+        return []
+    result = []
+    for item in references[:5]:
+        if not isinstance(item, dict):
+            continue
+        file_name = item.get("file")
+        label = item.get("label")
+        source_path = item.get("sourcePath")
+        if not isinstance(file_name, str) or not re.fullmatch(
+            r"reference-\d{2}\.(?:png|jpg|jpeg|webp)", file_name
+        ):
+            continue
+        if not (path.parent / file_name).is_file():
+            continue
+        result.append({
+            "file": file_name,
+            "label": label if isinstance(label, str) else file_name,
+            "sourcePath": source_path if isinstance(source_path, str) else None,
+            "modelReviewed": False,
+        })
+    return result
+
+
+def load_reference_image_policy(output_dir):
+    """Return the gateway-authored closed policy stored with local evidence."""
+    path = Path(output_dir) / "references" / "manifest.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "local-only"
+    policy = raw.get("referenceImagePolicy") if isinstance(raw, dict) else None
+    return policy if policy in ("local-only", "vision-model") else "local-only"
+
+
+def load_reference_images(output_dir, paths):
+    """Load explicitly consented references, constrained to visual/references.
+
+    ``--reference-image`` is the model-upload capability boundary. Even then,
+    symlink resolution, containment, extension, count and byte caps are checked
+    again here before any bytes can be added to a network payload.
+    """
+    paths = list(paths or [])
+    if len(paths) > MAX_REFERENCE_IMAGES:
+        raise ValueError(f"at most {MAX_REFERENCE_IMAGES} --reference-image values are allowed")
+    output_root = Path(output_dir).resolve()
+    reference_root = (output_root / "references").resolve()
+    labels = {item["file"]: item["label"] for item in load_local_reference_manifest(output_root)}
+    result = []
+    seen = set()
+    for raw_path in paths:
+        candidate = Path(raw_path).resolve(strict=True)
+        try:
+            candidate.relative_to(reference_root)
+        except ValueError as exc:
+            raise ValueError("--reference-image must resolve inside output-dir/references") from exc
+        if candidate in seen or not candidate.is_file():
+            raise ValueError("--reference-image values must name unique regular files")
+        seen.add(candidate)
+        mime_type = REFERENCE_IMAGE_MIME_TYPES.get(candidate.suffix.lower())
+        size = candidate.stat().st_size
+        if mime_type is None or size > MAX_REFERENCE_IMAGE_BYTES:
+            raise ValueError("reference images must be PNG/JPG/WEBP files up to 10 MiB")
+        result.append({
+            "file": candidate.name,
+            "label": labels.get(candidate.name, candidate.name),
+            "mimeType": mime_type,
+            "bytes": candidate.read_bytes(),
+        })
+    return result
+
+
 def _extract_json_object(text):
     """Best-effort extraction of a single JSON object from the model's
     reply text. Mirrors glimmer-engineer.py's _extract_json_object (not
@@ -247,7 +456,8 @@ def _extract_json_object(text):
     raise ValueError("no parseable JSON object found in vision model reply")
 
 
-def _build_vision_payload(image_b64, route, viewport_slug, checks, state="initial", model_id=DEFAULT_MODEL_ID):
+def _build_vision_payload(image_b64, route, viewport_slug, checks, state="initial",
+                          model_id=DEFAULT_MODEL_ID, reference_images=None):
     """Pure request-builder (mirrors glimmer-engineer.py's
     _build_delivery_review_payload split) so a self-check can assert the
     constructed payload has no "tools" key -- omission of that key IS the
@@ -268,19 +478,48 @@ def _build_vision_payload(image_b64, route, viewport_slug, checks, state="initia
         "Inspect the attached screenshot against the checks above. Report "
         "only what is actually visible in the image."
     )
+    content = [
+        {"type": "text", "text": contract_text},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+        },
+    ]
+    if reference_images:
+        content = [{"type": "text", "text": contract_text}]
+        for index, reference in enumerate(reference_images, start=1):
+            content.extend([
+                {
+                    "type": "text",
+                    "text": (
+                        f"REFERENCE IMAGE {index}: {reference['label']}. Use it only as a "
+                        "visual comparison input; do not assume its implementation details."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": (
+                            f"data:{reference['mimeType']};base64,"
+                            f"{reference['imageB64']}"
+                        )
+                    },
+                },
+            ])
+        content.extend([
+            {"type": "text", "text": "TARGET SCREENSHOT TO VERIFY:"},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+            },
+        ])
     return {
         "model": model_id,
         "messages": [
             {"role": "system", "content": VISION_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": contract_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                    },
-                ],
+                "content": content,
             },
         ],
         "max_tokens": 1024,
@@ -336,7 +575,7 @@ def _model_endpoint_url(model_url):
 # the vision endpoint per call, same effect as a "vision" role would have.
 def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
                        timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None,
-                       state="initial", model_id=DEFAULT_MODEL_ID):
+                       state="initial", model_id=DEFAULT_MODEL_ID, reference_images=None):
     """One chat-completions call for one screenshot. Returns the model's
     raw (untrusted) findings list. Raises on any failure -- network error,
     timeout, non-2xx (401 included -- a missing/wrong Authorization header
@@ -353,8 +592,17 @@ def call_vision_model(image_bytes, route, viewport_slug, checks, model_url,
     # Add an explicit size cap before base64-encoding if a real capture
     # ever produces multi-tens-of-MB screenshots in practice.
     image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    encoded_references = [
+        {
+            "label": item["label"],
+            "mimeType": item["mimeType"],
+            "imageB64": base64.b64encode(item["bytes"]).decode("ascii"),
+        }
+        for item in (reference_images or [])
+    ]
     payload = _build_vision_payload(
-        image_b64, route, viewport_slug, checks, state=state, model_id=model_id
+        image_b64, route, viewport_slug, checks, state=state, model_id=model_id,
+        reference_images=encoded_references,
     )
     endpoint = _model_endpoint_url(model_url)
     response = post_fn(endpoint, payload, timeout_s, _auth_headers(api_key_text))
@@ -410,7 +658,7 @@ def _coerce_finding(raw, viewport_slug, state="initial"):
 
 def run_vision_model(captures, output_dir, route, checks, model_url,
                       timeout_s=DEFAULT_VISION_TIMEOUT_S, post_fn=None, api_key_text=None,
-                      model_id=DEFAULT_MODEL_ID):
+                      model_id=DEFAULT_MODEL_ID, reference_images=None):
     """Real implementation of the extension point C4-plumbing left
     documented-but-stubbed. One chat-completions call per successfully
     captured (viewport, state) pair -- V7 §22.7: a capture entry with no
@@ -447,7 +695,7 @@ def run_vision_model(captures, output_dir, route, checks, model_url,
             raw_findings = call_vision_model(
                 image_bytes, route, viewport_slug, checks, model_url,
                 timeout_s=timeout_s, post_fn=post_fn, api_key_text=api_key_text,
-                state=state, model_id=model_id,
+                state=state, model_id=model_id, reference_images=reference_images,
             )
         except Exception as exc:  # noqa: BLE001 -- one call must never crash the run or fabricate findings
             reports.append({
@@ -507,7 +755,20 @@ def _default_capture_states(url, width, height, output_dir, viewport_slug, state
     state is reached (bad viewport spec, browser launch, navigation) has
     nothing partial to report and is allowed to propagate to the caller
     (capture_viewport_states), which has its own top-level catch."""
-    from playwright.sync_api import sync_playwright  # pip install playwright && playwright install
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        initial_filename = f"{viewport_slug}-initial.png"
+        _chrome_cli_capture(
+            url, width, height, output_dir / initial_filename, timeout_ms=timeout_ms
+        )
+        captured = [{"name": "initial", "screenshot": initial_filename}]
+        if len(states) == 1:
+            return captured, None
+        return captured, (
+            "RuntimeError: declared interaction-state capture requires Python Playwright; "
+            "the packaged Chrome fallback captured the initial state only"
+        )
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -563,7 +824,7 @@ def capture_viewport_states(url, viewport_spec, output_dir, states, capture_fn=_
     return entries
 
 
-def build_manifest(url, captures, states=("initial",)):
+def build_manifest(url, captures, states=("initial",), checks=None, references=None):
     """V7 §22.14 visual-manifest.json shape (route/viewports/states/status),
     extended with a `captures` array carrying per-viewport success/failure
     (required: "summarizing what was captured, including per-viewport
@@ -583,6 +844,8 @@ def build_manifest(url, captures, states=("initial",)):
         "states": list(states),
         "status": overall,
         "captures": captures,
+        "checks": list(checks or []),
+        "references": list(references or []),
         "findings": [],
     }
 
@@ -704,11 +967,30 @@ def main(argv=None):
                           f"{MAX_ACTIONS_PER_STATE} actions each; fails loud (nonzero exit) on "
                           "any malformed entry. Omitted -> exactly the pre-3.3 single-state "
                           "capture, byte-for-byte.")
+    ap.add_argument(
+        "--reference-image",
+        action="append",
+        default=None,
+        help=(
+            "Explicit per-task consent input: send this local reference image to the "
+            "configured Vision model for comparison. Repeatable (max 5). Every path "
+            "must resolve inside --output-dir/references. Omit to keep references local."
+        ),
+    )
     args = ap.parse_args(argv)
+
+    if args.reference_image and not args.vision:
+        ap.error("--reference-image requires --vision")
 
     viewports = args.viewport or list(DEFAULT_VIEWPORTS)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    reference_policy = load_reference_image_policy(output_dir)
+    if args.reference_image and reference_policy != "vision-model":
+        ap.error(
+            "--reference-image requires referenceImagePolicy=vision-model in the local manifest"
+        )
+    reference_images = load_reference_images(output_dir, args.reference_image)
 
     if args.states_file:
         state_specs = load_states_file(args.states_file)
@@ -720,21 +1002,41 @@ def main(argv=None):
         state_names = ["initial"]
         captures = [capture_viewport(args.url, vp, output_dir) for vp in viewports]
 
-    manifest = build_manifest(args.url, captures, states=state_names)
+    checks = args.check or list(DEFAULT_CHECKS)
+    references = load_local_reference_manifest(output_dir)
+    sent_reference_names = {item["file"] for item in reference_images}
+    manifest = build_manifest(
+        args.url, captures, states=state_names, checks=checks, references=references
+    )
     (output_dir / "visual-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     if args.vision:
-        checks = args.check or list(DEFAULT_CHECKS)
         findings, reports = run_vision_model(
             captures, output_dir, args.url, checks, args.model_url,
             timeout_s=args.vision_timeout,
             api_key_text=_read_api_key(args.api_key_file),
             model_id=args.model_id,
+            reference_images=reference_images,
         )
         findings_doc = build_findings(captures, findings, reports)
         findings_doc["modelId"] = args.model_id
     else:
+        reports = None
         findings_doc = build_findings(captures)
+    attempted_reference_names = sent_reference_names if reports else set()
+    reviewed_reference_names = (
+        sent_reference_names
+        if reports and any(report.get("status") == "reviewed" for report in reports)
+        else set()
+    )
+    for reference in references:
+        reference["modelReviewed"] = reference["file"] in reviewed_reference_names
+    manifest["references"] = references
+    (output_dir / "visual-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    findings_doc["references"] = references
+    findings_doc["referenceImagePolicy"] = reference_policy
+    findings_doc["referencesSentToModel"] = sorted(attempted_reference_names)
+    findings_doc["referencesReviewedByModel"] = sorted(reviewed_reference_names)
     (output_dir / "findings.json").write_text(json.dumps(findings_doc, indent=2), encoding="utf-8")
 
     ok_count = sum(1 for c in captures if c["status"] == "captured")
@@ -778,6 +1080,31 @@ def _selfcheck() -> None:
         assert c_fail["status"] == "failed" and "navigation timeout" in c_fail["error"]
         assert (out / "1440x900.png").exists()
         assert not (out / "390x844.png").exists(), "a failed viewport must not leave a screenshot file"
+
+        chrome_calls = []
+
+        def fake_chrome_run(argv, **kwargs):
+            chrome_calls.append((argv, kwargs))
+            screenshot_arg = next(item for item in argv if item.startswith("--screenshot="))
+            Path(screenshot_arg.split("=", 1)[1]).write_bytes(b"PNG-chrome-fallback")
+
+            class Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return Result()
+
+        chrome_out = out / "chrome-fallback.png"
+        _chrome_cli_capture(
+            "http://127.0.0.1:5183/settings", 800, 600, chrome_out,
+            run_fn=fake_chrome_run, chrome="/Applications/Fake Chrome",
+        )
+        assert chrome_out.read_bytes() == b"PNG-chrome-fallback"
+        assert chrome_calls[0][0][0] == "/Applications/Fake Chrome"
+        assert "--window-size=800,600" in chrome_calls[0][0]
+        assert chrome_calls[0][0][-1] == "http://127.0.0.1:5183/settings"
+        assert "shell" not in chrome_calls[0][1], "browser capture must never invoke a shell"
 
         # A malformed viewport spec must also be isolated, not crash the run.
         c_bad = capture_viewport("http://x", "not-a-viewport", out, capture_fn=fake_ok)
@@ -874,6 +1201,59 @@ def _selfcheck() -> None:
             "http://model/v1/chat/completions",
             "https://models.example/v1/chat/completions",
         ], "origin and /v1 base URLs must both produce exactly one /v1 segment"
+
+        # Reference bytes stay out of the payload unless a caller has loaded
+        # and explicitly supplied them after the manifest policy check.
+        plain_payload = _build_vision_payload(
+            "target", "http://x/route", "1440x900", DEFAULT_CHECKS
+        )
+        plain_content = plain_payload["messages"][1]["content"]
+        assert len(plain_content) == 2
+        assert sum(item["type"] == "image_url" for item in plain_content) == 1
+
+        reference_dir = out / "references"
+        reference_dir.mkdir()
+        reference_path = reference_dir / "reference-01.png"
+        reference_path.write_bytes(b"reference-png")
+        (reference_dir / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "referenceImagePolicy": "vision-model",
+            "visionUploadAllowed": True,
+            "references": [{
+                "file": "reference-01.png",
+                "sourcePath": "design/reference.png",
+                "label": "Approved settings reference",
+            }],
+        }), encoding="utf-8")
+        loaded_references = load_reference_images(out, [reference_path])
+        assert loaded_references[0]["label"] == "Approved settings reference"
+        assert load_reference_image_policy(out) == "vision-model"
+        try:
+            load_reference_images(out, [out / "1440x900.png"])
+            assert False, "reference paths outside output-dir/references must be rejected"
+        except ValueError:
+            pass
+
+        sent_payloads = []
+
+        def fake_post_reference_spy(url, payload, timeout_s, headers=None):
+            sent_payloads.append(payload)
+            return {"choices": [{"message": {"content": '{"findings": []}'}}]}
+
+        call_vision_model(
+            b"target-png", "http://x/route", "1440x900", DEFAULT_CHECKS,
+            "http://model", post_fn=fake_post_reference_spy,
+            reference_images=loaded_references,
+        )
+        reference_content = sent_payloads[0]["messages"][1]["content"]
+        assert [item["type"] for item in reference_content] == [
+            "text", "text", "image_url", "text", "image_url"
+        ]
+        assert "Approved settings reference" in reference_content[1]["text"]
+        assert reference_content[2]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert reference_content[-1]["image_url"]["url"].endswith(
+            base64.b64encode(b"target-png").decode("ascii")
+        )
 
         # --- finding coercion (mirrors validate_delivery_review's tolerant
         # conventions): unknown severity -> "low", missing/blank description

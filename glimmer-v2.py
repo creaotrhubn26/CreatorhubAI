@@ -91,6 +91,28 @@ VISUAL_DEFAULT_CHECKS = (
     "no horizontal overflow",
 )
 
+# DesignContract v1 is supplied by the Control Center as a private JSON
+# artifact. It extends the existing task contract without creating a second
+# pipeline: Architect and Engineer see it through the authoritative contract,
+# while the visual verifier consumes only its bounded checks/states/viewports.
+DESIGN_KINDS = {"build", "improve", "audit", "reference-match"}
+DESIGN_STRATEGIES = {"detect", "existing", "required", "none"}
+DESIGN_MAX_FILE_BYTES = 128 * 1024
+DESIGN_MAX_REFERENCES = 5
+DESIGN_REFERENCE_MAX_BYTES = 10 * 1024 * 1024
+DESIGN_REFERENCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+DESIGN_REFERENCE_IMAGE_POLICIES = {"local-only", "vision-model"}
+DESIGN_ASSET_IMAGE_EXTENSIONS = DESIGN_REFERENCE_EXTENSIONS
+DESIGN_ASSET_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov"}
+DESIGN_ASSET_VECTOR_EXTENSIONS = {".svg"}
+DESIGN_ASSET_ASPECT_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4"}
+DESIGN_REQUIREMENT_FIELDS = (
+    "requirements",
+    "cmsRequirements",
+    "designTokenRequirements",
+    "uxRequirements",
+)
+
 IGNORE_DIRS = {
     ".git", "node_modules", ".next", ".turbo", ".cache", "coverage",
     "dist", "build", "out", ".output", ".venv", "venv", "__pycache__",
@@ -941,7 +963,8 @@ def visual_requiredness(level, visual_url, contract, files, plan):
         return "absent"
     visual_requirements = sanitize_visual_requirements(plan)
     frontend_match = visual_scope_matches_frontend(contract, files)
-    if level in ("standard", "full") and (frontend_match or visual_requirements):
+    design_match = isinstance(contract, dict) and isinstance(contract.get("design"), dict)
+    if level in ("standard", "full") and (frontend_match or visual_requirements or design_match):
         return "required"
     return "recommended"
 
@@ -971,8 +994,12 @@ def verification_plan(m, files, level, verify_entries, session, visual_url,
     changes at all.
     """
     required = verifier_commands(m, files, level)
-    required = expand_verify_entries(required, verify_entries, session, visual_url, model_readiness_url,
-                                      visual_requirements=sanitize_visual_requirements(plan))
+    design = contract.get("design") if isinstance(contract, dict) else None
+    visual_requirements = _design_visual_requirements(design, plan)
+    required = expand_verify_entries(
+        required, verify_entries, session, visual_url, model_readiness_url,
+        visual_requirements=visual_requirements, design=design,
+    )
     next_level = NEXT_VERIFICATION_LEVEL.get(level)
     recommended = []
     if next_level:
@@ -987,7 +1014,8 @@ def verification_plan(m, files, level, verify_entries, session, visual_url,
     if outcome != "absent" and not already_visual:
         visual_cmd = build_visual_verify_command(
             session, visual_url, model_readiness_url,
-            visual_requirements=sanitize_visual_requirements(plan),
+            visual_requirements=visual_requirements,
+            design=design,
         )
         if outcome == "required":
             required.append(visual_cmd)
@@ -1005,6 +1033,621 @@ def _model_base_url(readiness_url):
     Not a new source of truth -- reuses the one v2 already has."""
     parts = urllib.parse.urlsplit(readiness_url)
     return f"{parts.scheme}://{parts.netloc}"
+
+
+def _bounded_design_strings(value, field, max_items=20, max_chars=500):
+    if not isinstance(value, list) or len(value) > max_items:
+        raise V2Error(f"{field} must be an array with at most {max_items} entries")
+    result = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item) > max_chars:
+            raise V2Error(f"{field} entries must be non-empty strings up to {max_chars} characters")
+        result.append(item.strip())
+    return result
+
+
+def _design_relative_path(value, field):
+    if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+        raise V2Error(f"{field} must be a non-empty workspace-relative path")
+    candidate = Path(value.strip())
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise V2Error(f"{field} must be a workspace-relative path without '..'")
+    return candidate.as_posix()
+
+
+def _normalize_loopback_url(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+        raise V2Error("design.targetUrl must be a non-empty URL up to 2048 characters")
+    parsed = urllib.parse.urlsplit(value.strip())
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.username
+        or parsed.password
+        or parsed.hostname not in ("localhost", "127.0.0.1", "::1")
+    ):
+        raise V2Error("design.targetUrl must be an http(s) loopback URL without credentials")
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _normalize_mobbin_url(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+        raise V2Error("design.inspirations.mobbinUrl is invalid")
+    parsed = urllib.parse.urlsplit(value.strip())
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or (host != "mobbin.com" and not host.endswith(".mobbin.com"))
+    ):
+        raise V2Error("design inspiration URLs must use official Mobbin HTTPS hosts")
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _design_exact_keys(value, allowed, field):
+    if not isinstance(value, dict) or any(key not in allowed for key in value):
+        raise V2Error(f"{field} contains unsupported fields")
+
+
+def _design_text(value, field, max_chars, allow_empty=False):
+    if not isinstance(value, str) or "\0" in value or len(value) > max_chars:
+        raise V2Error(f"{field} is invalid or exceeds {max_chars} characters")
+    if not allow_empty and not value.strip():
+        raise V2Error(f"{field} must not be empty")
+    return value if allow_empty else value.strip()
+
+
+def _design_number(value, field, minimum, maximum):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not minimum <= value <= maximum
+    ):
+        raise V2Error(f"{field} must be between {minimum} and {maximum}")
+    return value
+
+
+def _design_timestamp(value, field):
+    normalized = _design_text(value, field, 64)
+    try:
+        dt.datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise V2Error(f"{field} must be an ISO timestamp") from exc
+    return normalized
+
+
+def _design_region(value, field):
+    _design_exact_keys(value, {"x", "y", "width", "height"}, field)
+    result = {
+        "x": _design_number(value.get("x"), f"{field}.x", 0, 1),
+        "y": _design_number(value.get("y"), f"{field}.y", 0, 1),
+    }
+    for key in ("width", "height"):
+        if key in value:
+            result[key] = _design_number(value[key], f"{field}.{key}", 0, 1)
+    if result.get("width") is not None and result["x"] + result["width"] > 1.000001:
+        raise V2Error(f"{field} extends outside the captured image")
+    if result.get("height") is not None and result["y"] + result["height"] > 1.000001:
+        raise V2Error(f"{field} extends outside the captured image")
+    return result
+
+
+def _design_style(value):
+    allowed = {
+        "textColor", "backgroundColor", "fontFamily", "fontSizePx", "fontWeight",
+        "lineHeight", "paddingPx", "marginPx", "gapPx", "borderColor",
+        "borderWidthPx", "borderRadiusPx", "opacity", "direction", "align",
+    }
+    _design_exact_keys(value, allowed, "design.elementEdits.style")
+    result = {}
+    for key in ("textColor", "backgroundColor", "borderColor"):
+        if key in value:
+            color = _design_text(value[key], f"design.elementEdits.style.{key}", 9)
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?", color):
+                raise V2Error(f"design.elementEdits.style.{key} must be a hex color")
+            result[key] = color.lower()
+    if "fontFamily" in value:
+        font = _design_text(value["fontFamily"], "design.elementEdits.style.fontFamily", 200)
+        if re.search(r"[{};]", font):
+            raise V2Error("design.elementEdits.style.fontFamily is invalid")
+        result["fontFamily"] = font
+    bounds = {
+        "fontSizePx": (8, 240), "fontWeight": (100, 900), "lineHeight": (0.5, 4),
+        "paddingPx": (0, 512), "marginPx": (-512, 512), "gapPx": (0, 512),
+        "borderWidthPx": (0, 64), "borderRadiusPx": (0, 2000), "opacity": (0, 1),
+    }
+    for key, (minimum, maximum) in bounds.items():
+        if key in value:
+            result[key] = _design_number(
+                value[key], f"design.elementEdits.style.{key}", minimum, maximum
+            )
+    if "direction" in value:
+        if value["direction"] not in ("row", "column"):
+            raise V2Error("design.elementEdits.style.direction is invalid")
+        result["direction"] = value["direction"]
+    if "align" in value:
+        if value["align"] not in ("start", "center", "end", "space-between"):
+            raise V2Error("design.elementEdits.style.align is invalid")
+        result["align"] = value["align"]
+    return result
+
+
+def _normalize_design_element_edits(value):
+    if not isinstance(value, list) or len(value) > 50:
+        raise V2Error("design.elementEdits must contain at most 50 entries")
+    result = []
+    ids = set()
+    allowed = {
+        "id", "target", "screenshot", "viewport", "state", "region", "selectorHint",
+        "sourcePathHint", "expectedText", "text", "imageSource", "style", "createdAt",
+    }
+    for item in value:
+        _design_exact_keys(item, allowed, "design.elementEdits")
+        edit_id = _design_text(item.get("id"), "design.elementEdits.id", 100)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", edit_id) or edit_id in ids:
+            raise V2Error("design element edit id is invalid or duplicated")
+        ids.add(edit_id)
+        screenshot = _design_text(item.get("screenshot"), "design.elementEdits.screenshot", 255)
+        if not re.fullmatch(r"[A-Za-z0-9x-]+\.png", screenshot):
+            raise V2Error("design element edit screenshot name is invalid")
+        edit = {
+            "id": edit_id,
+            "target": _design_text(item.get("target"), "design.elementEdits.target", 500),
+            "screenshot": screenshot,
+            "viewport": _design_text(item.get("viewport"), "design.elementEdits.viewport", 40),
+            "state": _design_text(item.get("state"), "design.elementEdits.state", 80),
+            "region": _design_region(item.get("region"), "design.elementEdits.region"),
+            "style": _design_style(item.get("style")),
+            "createdAt": _design_timestamp(item.get("createdAt"), "design.elementEdits.createdAt"),
+        }
+        for key, max_chars in (("selectorHint", 500), ("expectedText", 5000), ("text", 5000)):
+            if key in item:
+                edit[key] = _design_text(
+                    item[key], f"design.elementEdits.{key}", max_chars,
+                    allow_empty=key in ("expectedText", "text"),
+                )
+        for key in ("sourcePathHint", "imageSource"):
+            if key in item:
+                edit[key] = _design_relative_path(item[key], f"design.elementEdits.{key}")
+        if "text" not in edit and "imageSource" not in edit and not edit["style"]:
+            raise V2Error("design element edit must change text, an image, or a style property")
+        result.append(edit)
+    return result
+
+
+def _normalize_design_asset_references(value):
+    if not isinstance(value, list) or len(value) > 5:
+        raise V2Error("design.assetRequests.referenceImages must contain at most 5 entries")
+    result = []
+    for item in value:
+        _design_exact_keys(item, {"path", "label"}, "design.assetRequests.referenceImages")
+        source = _design_relative_path(item.get("path"), "design.assetRequests.referenceImages.path")
+        if Path(source).suffix.lower() not in DESIGN_REFERENCE_EXTENSIONS:
+            raise V2Error("design asset references must be PNG, JPG, or WEBP files")
+        reference = {"path": source}
+        if "label" in item:
+            reference["label"] = _design_text(
+                item["label"], "design.assetRequests.referenceImages.label", 200
+            )
+        result.append(reference)
+    return result
+
+
+def _normalize_design_asset_requests(value):
+    if not isinstance(value, list) or len(value) > 20:
+        raise V2Error("design.assetRequests must contain at most 20 entries")
+    result = []
+    ids = set()
+    allowed = {
+        "id", "kind", "prompt", "outputPath", "aspectRatio", "size", "resolution",
+        "durationSeconds", "audio", "animated", "referenceImages",
+        "referenceUploadPolicy", "screenshot", "createdAt",
+    }
+    for item in value:
+        _design_exact_keys(item, allowed, "design.assetRequests")
+        asset_id = _design_text(item.get("id"), "design.assetRequests.id", 100)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", asset_id) or asset_id in ids:
+            raise V2Error("design asset request id is invalid or duplicated")
+        ids.add(asset_id)
+        kind = item.get("kind")
+        if kind not in ("image", "video", "vector"):
+            raise V2Error("design asset request kind is invalid")
+        output = _design_relative_path(item.get("outputPath"), "design.assetRequests.outputPath")
+        extensions = {
+            "image": DESIGN_ASSET_IMAGE_EXTENSIONS,
+            "video": DESIGN_ASSET_VIDEO_EXTENSIONS,
+            "vector": DESIGN_ASSET_VECTOR_EXTENSIONS,
+        }[kind]
+        if Path(output).suffix.lower() not in extensions:
+            raise V2Error("design asset output extension does not match its kind")
+        aspect = item.get("aspectRatio")
+        if aspect not in DESIGN_ASSET_ASPECT_RATIOS:
+            raise V2Error("design asset aspect ratio is invalid")
+        policy = item.get("referenceUploadPolicy")
+        if policy not in ("local-only", "generation-model"):
+            raise V2Error("design asset reference upload policy is invalid")
+        asset = {
+            "id": asset_id,
+            "kind": kind,
+            "prompt": _design_text(item.get("prompt"), "design.assetRequests.prompt", 2000),
+            "outputPath": output,
+            "aspectRatio": aspect,
+            "referenceImages": _normalize_design_asset_references(item.get("referenceImages")),
+            "referenceUploadPolicy": policy,
+            "createdAt": _design_timestamp(item.get("createdAt"), "design.assetRequests.createdAt"),
+        }
+        screenshot = item.get("screenshot")
+        if screenshot is not None:
+            screenshot = _design_text(screenshot, "design.assetRequests.screenshot", 255)
+            if not re.fullmatch(r"[A-Za-z0-9x-]+\.png", screenshot):
+                raise V2Error("design asset screenshot name is invalid")
+            asset["screenshot"] = screenshot
+        kind_fields = set(item) & {"size", "resolution", "durationSeconds", "audio", "animated"}
+        expected_fields = {
+            "image": {"size"},
+            "video": {"resolution", "durationSeconds", "audio"},
+            "vector": {"animated"},
+        }[kind]
+        if kind_fields != expected_fields:
+            raise V2Error("design asset kind-specific fields are invalid")
+        if kind == "image":
+            if item["size"] not in ("1K", "2K", "4K"):
+                raise V2Error("design image size is invalid")
+            asset["size"] = item["size"]
+        elif kind == "video":
+            if (
+                item["resolution"] not in ("720p", "1080p")
+                or isinstance(item["durationSeconds"], bool)
+                or item["durationSeconds"] not in (2, 4, 6, 8)
+                or not isinstance(item["audio"], bool)
+            ):
+                raise V2Error("design video settings are invalid")
+            asset.update({
+                "resolution": item["resolution"],
+                "durationSeconds": item["durationSeconds"],
+                "audio": item["audio"],
+            })
+        else:
+            if not isinstance(item["animated"], bool):
+                raise V2Error("design vector animation setting is invalid")
+            asset["animated"] = item["animated"]
+        result.append(asset)
+    return result
+
+
+def load_design_contract(path_value):
+    """Load and fail-closed validate the gateway-authored DesignContract.
+
+    The path itself is trusted argv from the gateway, but direct CLI callers
+    get the same schema boundary. The normalized result is embedded into the
+    authoritative task contract and copied into the session for provenance.
+    """
+    if not path_value:
+        return None
+    path = Path(path_value).expanduser().resolve()
+    try:
+        if not path.is_file() or path.stat().st_size > DESIGN_MAX_FILE_BYTES:
+            raise V2Error("--design-contract must name a JSON file no larger than 128 KiB")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except V2Error:
+        raise
+    except (OSError, ValueError) as exc:
+        raise V2Error(f"Could not read --design-contract: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("kind") not in DESIGN_KINDS:
+        raise V2Error("design.kind is invalid")
+
+    normalized = {
+        "kind": raw["kind"],
+        "requirements": _bounded_design_strings(raw.get("requirements"), "design.requirements"),
+        "referenceImages": [],
+        "referenceImagePolicy": raw.get("referenceImagePolicy"),
+        "states": [],
+        "viewports": _bounded_design_strings(raw.get("viewports"), "design.viewports", 6, 20),
+        "inspirations": [],
+        "variants": [],
+        "elementEdits": [],
+        "assetRequests": [],
+    }
+    if normalized["referenceImagePolicy"] not in DESIGN_REFERENCE_IMAGE_POLICIES:
+        raise V2Error("design.referenceImagePolicy must be local-only or vision-model")
+    for key in ("audience", "primaryAction"):
+        value = raw.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value.strip() or len(value) > 500:
+                raise V2Error(f"design.{key} must be a non-empty string up to 500 characters")
+            normalized[key] = value.strip()
+    target_url = _normalize_loopback_url(raw.get("targetUrl"))
+    if target_url:
+        normalized["targetUrl"] = target_url
+
+    if not normalized["viewports"]:
+        raise V2Error("design.viewports must contain at least one viewport")
+    for viewport in normalized["viewports"]:
+        match = re.fullmatch(r"(\d{3,4})x(\d{3,4})", viewport)
+        if not match or any(not 240 <= int(value) <= 3840 for value in match.groups()):
+            raise V2Error("design.viewports entries must be WxH values between 240 and 3840")
+
+    references = raw.get("referenceImages")
+    if not isinstance(references, list) or len(references) > DESIGN_MAX_REFERENCES:
+        raise V2Error(f"design.referenceImages must contain at most {DESIGN_MAX_REFERENCES} entries")
+    for item in references:
+        if not isinstance(item, dict):
+            raise V2Error("design.referenceImages entries must be objects")
+        reference_path = _design_relative_path(item.get("path"), "design.referenceImages.path")
+        if Path(reference_path).suffix.lower() not in DESIGN_REFERENCE_EXTENSIONS:
+            raise V2Error("design reference images must be PNG, JPG, or WEBP files")
+        reference = {"path": reference_path}
+        label = item.get("label")
+        if label is not None:
+            if not isinstance(label, str) or not label.strip() or len(label) > 200:
+                raise V2Error("design reference image label is invalid")
+            reference["label"] = label.strip()
+        normalized["referenceImages"].append(reference)
+
+    states = raw.get("states")
+    if not isinstance(states, list) or len(states) > 10:
+        raise V2Error("design.states must contain at most 10 states")
+    seen_states = set()
+    for item in states:
+        if not isinstance(item, dict):
+            raise V2Error("design state must be an object")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 80:
+            raise V2Error("design state name is invalid")
+        state_key = name.strip().lower()
+        if state_key in seen_states:
+            raise V2Error("design state names must be unique")
+        seen_states.add(state_key)
+        actions = item.get("actions")
+        if not isinstance(actions, list) or len(actions) > 10:
+            raise V2Error("each design state may contain at most 10 actions")
+        normalized_actions = []
+        for action in actions:
+            if not isinstance(action, dict):
+                raise V2Error("design action must be an object")
+            if action.get("action") == "click":
+                selector = action.get("selector")
+                if not isinstance(selector, str) or not selector.strip() or len(selector) > 500:
+                    raise V2Error("design click selector is invalid")
+                normalized_actions.append({"action": "click", "selector": selector.strip()})
+            elif (
+                action.get("action") == "wait"
+                and isinstance(action.get("ms"), int)
+                and not isinstance(action.get("ms"), bool)
+                and 1 <= action["ms"] <= 30000
+            ):
+                normalized_actions.append({"action": "wait", "ms": action["ms"]})
+            else:
+                raise V2Error("design actions are limited to click and wait (1..30000 ms)")
+        normalized["states"].append({
+            "name": name.strip(),
+            "actions": normalized_actions,
+            "expectations": _bounded_design_strings(
+                item.get("expectations"), "design.states.expectations", 10, 500
+            ),
+        })
+
+    for section_name, path_key, allow_key in (
+        ("cms", "schemaPaths", "localizationRequired"),
+        ("designTokens", "sourcePaths", "allowNewTokens"),
+    ):
+        section = raw.get(section_name)
+        if not isinstance(section, dict) or section.get("strategy") not in DESIGN_STRATEGIES:
+            raise V2Error(f"design.{section_name}.strategy is invalid")
+        normalized_section = {
+            "strategy": section["strategy"],
+            path_key: [
+                _design_relative_path(item, f"design.{section_name}.{path_key}")
+                for item in _bounded_design_strings(
+                    section.get(path_key), f"design.{section_name}.{path_key}", 20, 4096
+                )
+            ],
+            "requirements": _bounded_design_strings(
+                section.get("requirements"), f"design.{section_name}.requirements"
+            ),
+        }
+        if not isinstance(section.get(allow_key), bool):
+            raise V2Error(f"design.{section_name}.{allow_key} must be a boolean")
+        normalized_section[allow_key] = section[allow_key]
+        if section_name == "cms" and section.get("providerHint") is not None:
+            provider = section["providerHint"]
+            if not isinstance(provider, str) or not provider.strip() or len(provider) > 500:
+                raise V2Error("design.cms.providerHint is invalid")
+            normalized_section["providerHint"] = provider.strip()
+        normalized[section_name] = normalized_section
+
+    inspirations = raw.get("inspirations")
+    if not isinstance(inspirations, list) or len(inspirations) > 20:
+        raise V2Error("design.inspirations must contain at most 20 entries")
+    for item in inspirations:
+        if not isinstance(item, dict) or item.get("source") != "mobbin":
+            raise V2Error("design inspirations must use the Mobbin source")
+        if item.get("platform") not in ("ios", "web"):
+            raise V2Error("design inspiration platform must be ios or web")
+        inspiration = {
+            "source": "mobbin",
+            "screenId": _bounded_design_strings(
+                [item.get("screenId")], "design.inspirations.screenId", 1, 200
+            )[0],
+            "appName": _bounded_design_strings(
+                [item.get("appName")], "design.inspirations.appName", 1, 200
+            )[0],
+            "platform": item["platform"],
+            "mobbinUrl": _normalize_mobbin_url(item.get("mobbinUrl")),
+            "query": _bounded_design_strings(
+                [item.get("query")], "design.inspirations.query", 1, 500
+            )[0],
+        }
+        if item.get("notes") is not None:
+            inspiration["notes"] = _bounded_design_strings(
+                [item.get("notes")], "design.inspirations.notes", 1, 1000
+            )[0]
+        normalized["inspirations"].append(inspiration)
+
+    variants = raw.get("variants")
+    if not isinstance(variants, list) or len(variants) > 10:
+        raise V2Error("design.variants must contain at most 10 entries")
+    seen_variant_ids = set()
+    for item in variants:
+        if not isinstance(item, dict):
+            raise V2Error("design variant must be an object")
+        variant_id = item.get("id")
+        if (
+            not isinstance(variant_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", variant_id)
+            or variant_id in seen_variant_ids
+        ):
+            raise V2Error("design variant id is invalid or duplicated")
+        seen_variant_ids.add(variant_id)
+        count = item.get("count")
+        if isinstance(count, bool) or count not in (2, 3, 4):
+            raise V2Error("design variant count must be 2, 3, or 4")
+        variant = {
+            "id": variant_id,
+            "target": _bounded_design_strings(
+                [item.get("target")], "design.variants.target", 1, 500
+            )[0],
+            "count": count,
+            "directions": _bounded_design_strings(
+                item.get("directions"), "design.variants.directions", 4, 500
+            ),
+        }
+        if not variant["directions"]:
+            raise V2Error("design variant directions must not be empty")
+        screenshot = item.get("screenshot")
+        if screenshot is not None:
+            if not isinstance(screenshot, str) or not re.fullmatch(r"[A-Za-z0-9x-]+\.png", screenshot):
+                raise V2Error("design variant screenshot name is invalid")
+            variant["screenshot"] = screenshot
+        region = item.get("region")
+        if region is not None:
+            if not isinstance(region, dict):
+                raise V2Error("design variant region must be an object")
+            normalized_region = {}
+            for key in ("x", "y", "width", "height"):
+                coordinate = region.get(key)
+                if key in ("x", "y") or coordinate is not None:
+                    if (
+                        isinstance(coordinate, bool)
+                        or not isinstance(coordinate, (int, float))
+                        or not 0 <= coordinate <= 1
+                    ):
+                        raise V2Error("design variant region coordinates must be normalized 0..1")
+                    normalized_region[key] = coordinate
+            variant["region"] = normalized_region
+        normalized["variants"].append(variant)
+    normalized["elementEdits"] = _normalize_design_element_edits(raw.get("elementEdits", []))
+    normalized["assetRequests"] = _normalize_design_asset_requests(raw.get("assetRequests", []))
+    return normalized
+
+
+def materialize_design_references(ws, session, design):
+    """Copy bounded workspace images into visual/references with provenance."""
+    if not design or not design.get("referenceImages"):
+        return []
+    ws_resolved = ws.resolve()
+    reference_dir = session / "visual" / "references"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    materialized = []
+    for index, reference in enumerate(design["referenceImages"], start=1):
+        source = (ws_resolved / reference["path"]).resolve()
+        try:
+            source.relative_to(ws_resolved)
+        except ValueError as exc:
+            raise V2Error(f"Design reference escapes workspace: {reference['path']}") from exc
+        try:
+            size = source.stat().st_size
+        except OSError as exc:
+            raise V2Error(f"Design reference is unreadable: {reference['path']}") from exc
+        if not source.is_file() or size > DESIGN_REFERENCE_MAX_BYTES:
+            raise V2Error(f"Design reference must be a file up to 10 MiB: {reference['path']}")
+        suffix = source.suffix.lower()
+        target_name = f"reference-{index:02d}{suffix}"
+        atomic_write_bytes(reference_dir / target_name, source.read_bytes())
+        materialized.append({
+            "file": target_name,
+            "sourcePath": reference["path"],
+            "label": reference.get("label") or source.name,
+        })
+    atomic_write_json(reference_dir / "manifest.json", {
+        "version": 1,
+        "referenceImagePolicy": design["referenceImagePolicy"],
+        "visionUploadAllowed": design["referenceImagePolicy"] == "vision-model",
+        "references": materialized,
+    })
+    return materialized
+
+
+def _design_visual_requirements(design, plan):
+    values = []
+    if isinstance(design, dict):
+        values.extend(design.get("requirements") or [])
+        for state in design.get("states") or []:
+            values.extend(state.get("expectations") or [])
+        cms = design.get("cms") or {}
+        values.extend(f"CMS/content: {item}" for item in cms.get("requirements") or [])
+        if cms.get("localizationRequired"):
+            values.append("content remains usable with localized and unusually long copy")
+        tokens = design.get("designTokens") or {}
+        values.extend(f"Design tokens: {item}" for item in tokens.get("requirements") or [])
+        if tokens.get("strategy") != "none":
+            values.append("visual styling remains consistent with the repository's semantic design tokens")
+        for inspiration in design.get("inspirations") or []:
+            values.append(
+                f"Mobbin inspiration ({inspiration.get('appName')}, {inspiration.get('platform')}): "
+                f"use the referenced interaction pattern without copying brand-specific assets"
+            )
+        for variant in design.get("variants") or []:
+            directions = "; ".join(variant.get("directions") or [])
+            values.append(
+                f"Produce {variant.get('count')} bounded design alternatives for "
+                f"{variant.get('target')}: {directions}"
+            )
+        for edit in design.get("elementEdits") or []:
+            values.append(
+                f"Visual element edit for {edit.get('target')}: confirm the owning source "
+                "component and implement the declared text, image, and token-compatible style changes"
+            )
+        for asset in design.get("assetRequests") or []:
+            values.append(
+                f"Generated {asset.get('kind')} asset must exist at {asset.get('outputPath')} "
+                "and match the declared prompt, aspect ratio, and project references"
+            )
+    if isinstance(plan, dict):
+        for field in ("visualRequirements", "uxRequirements", "designTokenRequirements"):
+            raw = plan.get(field)
+            if isinstance(raw, list):
+                values.extend(raw)
+    result = []
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip()[:MAX_VISUAL_REQUIREMENT_CHARS]
+            if normalized not in result:
+                result.append(normalized)
+            if len(result) >= 40:
+                break
+    return result
+
+
+def _design_states_file(session, design):
+    states = design.get("states") if isinstance(design, dict) else None
+    if not states:
+        return None
+    path = session / "visual-states.json"
+    atomic_write_json(path, [{"name": item["name"], "actions": item["actions"]} for item in states])
+    return path
+
+
+def _design_references(session):
+    path = session / "visual" / "references" / "manifest.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    references = raw.get("references") if isinstance(raw, dict) else None
+    return references if isinstance(references, list) else []
 
 
 def sanitize_visual_requirements(plan):
@@ -1051,7 +1694,7 @@ def visual_scope_matches_frontend(contract, files):
 
 
 def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_DEFAULT,
-                                 visual_requirements=None):
+                                 visual_requirements=None, design=None):
     """C4 (glimmer-v7): real subprocess argv for the visual capture check,
     targeting sessions/<id>/visual/ (V7 §22.14 evidence store layout).
     Creates the output directory up front so glimmer-visual.py -- which is
@@ -1085,8 +1728,12 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
         "vision",
     )
     cmd = [sys.executable, str(GLIMMER_VISUAL), "--url", url, "--output-dir", str(out_dir)]
-    for vp in VISUAL_DEFAULT_VIEWPORTS:
+    viewports = design.get("viewports") if isinstance(design, dict) else None
+    for vp in viewports or VISUAL_DEFAULT_VIEWPORTS:
         cmd += ["--viewport", vp]
+    states_file = _design_states_file(session, design)
+    if states_file:
+        cmd += ["--states-file", str(states_file)]
     cmd += [
         "--vision",
         "--model-url", vision_model["baseUrl"],
@@ -1104,6 +1751,13 @@ def build_visual_verify_command(session, url, model_readiness_url=READINESS_URL_
             cmd += ["--check", check]
         for req in visual_requirements:
             cmd += ["--check", req]
+    if isinstance(design, dict) and design.get("referenceImagePolicy") == "vision-model":
+        # This flag is only emitted for explicit per-task consent. The visual
+        # verifier independently constrains every path to its output-dir.
+        for reference in _design_references(session):
+            file_name = reference.get("file") if isinstance(reference, dict) else None
+            if isinstance(file_name, str):
+                cmd += ["--reference-image", str(out_dir / "references" / file_name)]
     return cmd
 
 
@@ -1127,7 +1781,8 @@ def validate_visual_url(raw_verify_entries, visual_url):
 
 
 def expand_verify_entries(commands, raw_entries, session, visual_url,
-                           model_readiness_url=READINESS_URL_DEFAULT, visual_requirements=None):
+                           model_readiness_url=READINESS_URL_DEFAULT, visual_requirements=None,
+                           design=None):
     """Expand contract.verification / --verify entries into real subprocess
     argv lists, appended onto `commands`. Mirrors the pre-C4
     shlex.split-and-append behavior exactly for every entry EXCEPT the
@@ -1153,7 +1808,7 @@ def expand_verify_entries(commands, raw_entries, session, visual_url,
     for raw in raw_entries:
         if raw.strip().lower() == VISUAL_VERIFY_TOKEN:
             cmd = build_visual_verify_command(session, visual_url, model_readiness_url,
-                                               visual_requirements=visual_requirements)
+                                               visual_requirements=visual_requirements, design=design)
         else:
             cmd = shlex.split(raw)
         if cmd and cmd not in commands:
@@ -1788,6 +2443,29 @@ def _intent_instruction(contract):
     )
 
 
+def _design_execution_instruction(contract):
+    """Fail-closed execution semantics for visual-editor design actions."""
+    design = contract.get("design") or {}
+    edits = design.get("elementEdits") or []
+    assets = design.get("assetRequests") or []
+    if not edits and not assets:
+        return ""
+    return (
+        "\n\nSTRUCTURED VISUAL EDITOR ACTIONS:\n"
+        "design.elementEdits are authoritative intent tied to captured regions, but selectorHint "
+        "and sourcePathHint are hints, not proof. Locate the real owning component, confirm "
+        "expectedText when present, make only the declared structured changes, and preserve CMS, "
+        "semantic tokens, responsive behavior, and accessibility. Do not use broad text replacement.\n"
+        "For every design.assetRequests entry, use a genuinely installed and configured image, "
+        "video, or vector generator and write the real result to its declared workspace-relative "
+        "outputPath. Never claim success by creating empty bytes, placeholder media, or renaming an "
+        "unrelated file. local-only references must not be sent to any external model; "
+        "generation-model references may be supplied only to the selected generator. If the "
+        "required generator, credentials, or capability is unavailable, leave the output untouched "
+        "and report BLOCKED with the exact missing prerequisite."
+    )
+
+
 def make_architect_prompt(contract, summary, ws=None):
     """C1 (glimmer-v7): the "task" text handed to `glimmer-engineer.py
     --mode architect` — NOT make_prompt's full engineering OPERATING
@@ -1816,7 +2494,7 @@ def make_architect_prompt(contract, summary, ws=None):
 
     TRUSTED REPOSITORY MAP:
     {summary}
-    """).strip() + _intent_instruction(contract) + build_adr_prompt_section(contract, ws)
+    """).strip() + _intent_instruction(contract) + _design_execution_instruction(contract) + build_adr_prompt_section(contract, ws)
 
 
 
@@ -2568,6 +3246,10 @@ a genuine fix may still require another file if the evidence supports it.
                 "constraints",
                 "candidateFiles",
                 "verificationPlan",
+                "visualRequirements",
+                "uxRequirements",
+                "cmsRequirements",
+                "designTokenRequirements",
             )
         }
         # Task 2.2 (V7 §5.12): "Engineer should always know which
@@ -2661,7 +3343,7 @@ a genuine fix may still require another file if the evidence supports it.
     - Narrow diagnostic commands are allowed when needed.
     - Inspect the exact diff before finishing.
     - If the task cannot safely be completed, do not make speculative changes.
-    """).strip() + _intent_instruction(contract) + plan_block + focus_block + build_skills_block(contract, plan)
+    """).strip() + _intent_instruction(contract) + _design_execution_instruction(contract) + plan_block + focus_block + build_skills_block(contract, plan)
 
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
@@ -6044,6 +6726,9 @@ def main():
     ap.add_argument("--visual-url", default=None,
                     help="URL Playwright navigates to for the visual verification check. "
                          "Required when \"visual\" is one of the --verify entries; ignored otherwise.")
+    ap.add_argument("--design-contract", default=None,
+                    help="Path to a validated DesignContract JSON artifact supplied by the gateway. "
+                         "Adds CMS, design-token, reference-image, state and viewport context.")
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--max-turns", type=int)
     # Task Contract fields (glimmer-v7 R2). Choices mirror @glimmer/shared's real
@@ -6108,6 +6793,11 @@ def main():
     ws = Path(args.workspace).expanduser().resolve()
     engineer = Path(args.engineer).expanduser().resolve()
     task = " ".join(args.task).strip()
+    design_contract = load_design_contract(args.design_contract)
+    if design_contract and design_contract.get("targetUrl"):
+        if args.visual_url and args.visual_url != design_contract["targetUrl"]:
+            raise V2Error("--visual-url must match design.targetUrl")
+        args.visual_url = design_contract["targetUrl"]
 
     if not ws.is_dir():
         raise V2Error(f"Workspace missing: {ws}")
@@ -6202,6 +6892,10 @@ def main():
         "verification": args.verify,
         "repairBudget": args.max_repairs,
     }
+    if design_contract is not None:
+        contract["design"] = design_contract
+        atomic_write_json(session / "design-contract.json", design_contract)
+        materialize_design_references(ws, session, design_contract)
     if args.max_turns is not None:
         contract["maxTurns"] = args.max_turns
     # Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles -- optional,
@@ -6635,8 +7329,11 @@ def main():
 
             if not files:
                 commands = [["git", "diff", "--check"]]
-                commands = expand_verify_entries(commands, args.verify, session, args.visual_url, args.model_readiness_url,
-                                                  visual_requirements=sanitize_visual_requirements(architecture_plan))
+                commands = expand_verify_entries(
+                    commands, args.verify, session, args.visual_url, args.model_readiness_url,
+                    visual_requirements=_design_visual_requirements(design_contract, architecture_plan),
+                    design=design_contract,
+                )
                 if args.verify:
                     ok, results = verify(ws, commands, args.timeout, session, iteration,
                                          repo, source_root, baseline, args.toolchain_mode,
@@ -10450,6 +11147,108 @@ def _visual_selfcheck() -> None:
     live browser or a live model call.
     Run with: python3 glimmer-v2.py --visual-selfcheck
     """
+    # Design reference upload is fail-closed at both schema and argv
+    # boundaries: local-only is valid but emits no model-upload flags;
+    # vision-model emits one flag per materialized, bounded reference.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        ws = root / "workspace"
+        session = root / "session"
+        (ws / "design").mkdir(parents=True)
+        session.mkdir()
+        (ws / "design" / "settings.png").write_bytes(b"reference-image")
+        design_doc = {
+            "kind": "reference-match",
+            "requirements": ["primary action remains visible"],
+            "referenceImages": [{"label": "Settings", "path": "design/settings.png"}],
+            "referenceImagePolicy": "local-only",
+            "states": [],
+            "viewports": ["1440x900", "390x844"],
+            "inspirations": [{
+                "source": "mobbin", "screenId": "screen-1", "appName": "Example",
+                "platform": "web", "mobbinUrl": "https://mobbin.com/screens/screen-1",
+                "query": "settings page with a persistent save action",
+            }],
+            "variants": [{
+                "id": "variant-1", "target": "settings header", "count": 3,
+                "directions": ["compact", "editorial"],
+            }],
+            "elementEdits": [{
+                "id": "edit-1", "target": "settings title",
+                "screenshot": "1440x900-initial.png", "viewport": "1440x900",
+                "state": "initial", "region": {"x": 0.1, "y": 0.1, "width": 0.4},
+                "expectedText": "Settings", "text": "Workspace settings",
+                "style": {"textColor": "#123456", "fontSizePx": 32},
+                "createdAt": "2026-08-27T10:00:00.000Z",
+            }],
+            "assetRequests": [{
+                "id": "asset-1", "kind": "vector",
+                "prompt": "A restrained geometric settings illustration",
+                "outputPath": "public/generated/settings.svg", "aspectRatio": "4:3",
+                "animated": False,
+                "referenceImages": [{"path": "design/settings.png"}],
+                "referenceUploadPolicy": "local-only",
+                "screenshot": "1440x900-initial.png",
+                "createdAt": "2026-08-27T10:00:00.000Z",
+            }],
+            "cms": {
+                "strategy": "detect", "schemaPaths": [], "requirements": [],
+                "localizationRequired": False,
+            },
+            "designTokens": {
+                "strategy": "detect", "sourcePaths": [], "requirements": [],
+                "allowNewTokens": False,
+            },
+        }
+        contract_path = root / "design-contract.json"
+        contract_path.write_text(json.dumps(design_doc), encoding="utf-8")
+        local_design = load_design_contract(contract_path)
+        assert local_design["inspirations"][0]["screenId"] == "screen-1"
+        assert local_design["variants"][0]["count"] == 3
+        assert local_design["elementEdits"][0]["style"]["textColor"] == "#123456"
+        assert local_design["assetRequests"][0]["outputPath"].endswith("settings.svg")
+        execution_contract = {"design": local_design}
+        execution_instruction = _design_execution_instruction(execution_contract)
+        assert "Never claim success" in execution_instruction
+        assert "local-only references must not be sent" in execution_instruction
+        materialize_design_references(ws, session, local_design)
+        local_cmd = build_visual_verify_command(
+            session, "http://localhost:5173/settings", design=local_design
+        )
+        assert "--reference-image" not in local_cmd
+        local_manifest = json.loads(
+            (session / "visual" / "references" / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert local_manifest["visionUploadAllowed"] is False
+
+        design_doc["referenceImagePolicy"] = "vision-model"
+        contract_path.write_text(json.dumps(design_doc), encoding="utf-8")
+        vision_design = load_design_contract(contract_path)
+        materialize_design_references(ws, session, vision_design)
+        vision_cmd = build_visual_verify_command(
+            session, "http://localhost:5173/settings", design=vision_design
+        )
+        assert vision_cmd.count("--reference-image") == 1
+        sent_path = Path(vision_cmd[vision_cmd.index("--reference-image") + 1])
+        assert sent_path == session / "visual" / "references" / "reference-01.png"
+
+        del design_doc["referenceImagePolicy"]
+        contract_path.write_text(json.dumps(design_doc), encoding="utf-8")
+        try:
+            load_design_contract(contract_path)
+            assert False, "missing referenceImagePolicy must fail closed"
+        except V2Error as exc:
+            assert "referenceImagePolicy" in str(exc)
+
+        design_doc["referenceImagePolicy"] = "local-only"
+        design_doc["assetRequests"][0]["outputPath"] = "../settings.svg"
+        contract_path.write_text(json.dumps(design_doc), encoding="utf-8")
+        try:
+            load_design_contract(contract_path)
+            assert False, "asset path traversal must fail closed"
+        except V2Error as exc:
+            assert "workspace-relative" in str(exc)
+
     # --- opt-in guarantee: a verification plan without "visual" is
     # byte-identical to the pre-C4 inline shlex.split-and-append loop. ---
     with tempfile.TemporaryDirectory() as td:
