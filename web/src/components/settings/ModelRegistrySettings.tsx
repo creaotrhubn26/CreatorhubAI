@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ModelRegistry, ModelRegistryUpdateEntry, ModelRole } from "@glimmer/shared";
+import type {
+  AdaptiveRoutingConfig,
+  ModelRegistry,
+  ModelRegistryUpdateEntry,
+  ModelRole,
+} from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 
 const ROLES: Array<{ id: ModelRole; label: string; note: string }> = [
@@ -17,7 +22,11 @@ type DraftModel = ModelRegistryUpdateEntry & {
   persisted: boolean;
   draftKey: string;
 };
-type Draft = { models: DraftModel[]; roles: ModelRegistry["roles"] };
+type Draft = {
+  models: DraftModel[];
+  roles: ModelRegistry["roles"];
+  routing: AdaptiveRoutingConfig;
+};
 
 function draftFromRegistry(registry: ModelRegistry): Draft {
   return {
@@ -29,6 +38,12 @@ function draftFromRegistry(registry: ModelRegistry): Draft {
       draftKey: `saved:${model.id}`,
     })),
     roles: { ...registry.roles },
+    routing: registry.routing ?? {
+      enabled: false,
+      highRisk: {},
+      criticProviderId: null,
+      requireIndependentCritic: false,
+    },
   };
 }
 
@@ -69,6 +84,7 @@ export function ModelRegistrySettings() {
           }),
         ),
         roles: draft.roles,
+        routing: draft.routing,
       });
     },
     onSuccess: (registry) => {
@@ -122,10 +138,25 @@ export function ModelRegistrySettings() {
       const models = current.models.filter((model) => model.draftKey !== draftKey);
       const fallback = models[0].id;
       const roles = { ...current.roles };
+      const highRisk = { ...current.routing.highRisk };
       if (!models.some((model) => model.id === removed.id)) {
-        for (const role of ROLES) if (roles[role.id] === removed.id) roles[role.id] = fallback;
+        for (const role of ROLES) {
+          if (roles[role.id] === removed.id) roles[role.id] = fallback;
+          if (highRisk[role.id] === removed.id) delete highRisk[role.id];
+        }
       }
-      return { models, roles };
+      return {
+        models,
+        roles,
+        routing: {
+          ...current.routing,
+          highRisk,
+          criticProviderId:
+            current.routing.criticProviderId === removed.id
+              ? null
+              : current.routing.criticProviderId,
+        },
+      };
     });
   }
 
@@ -260,6 +291,103 @@ export function ModelRegistrySettings() {
             </select>
           </label>
         ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>Adaptive routing</legend>
+        <label>
+          <input
+            type="checkbox"
+            checked={draft.routing.enabled}
+            onChange={(event) =>
+              setDraft((current) =>
+                current
+                  ? {
+                      ...current,
+                      routing: { ...current.routing, enabled: event.target.checked },
+                    }
+                  : current,
+              )
+            }
+          />{" "}
+          Use configured high-risk overrides
+        </label>
+        {ROLES.map((role) => (
+          <label key={`high-risk-${role.id}`}>
+            {role.label} for HIGH/CRITICAL tasks
+            <select
+              aria-label={`${role.label} high-risk model`}
+              value={draft.routing.highRisk[role.id] ?? ""}
+              onChange={(event) =>
+                setDraft((current) => {
+                  if (!current) return current;
+                  const highRisk = { ...current.routing.highRisk };
+                  if (event.target.value) highRisk[role.id] = event.target.value;
+                  else delete highRisk[role.id];
+                  return { ...current, routing: { ...current.routing, highRisk } };
+                })
+              }
+            >
+              <option value="">Use normal role assignment</option>
+              {draft.models.map((model) => (
+                <option key={model.draftKey} value={model.id}>
+                  {model.label || model.id}
+                </option>
+              ))}
+            </select>
+          </label>
+        ))}
+        <label>
+          Critic model
+          <select
+            aria-label="Critic model"
+            value={draft.routing.criticProviderId ?? ""}
+            onChange={(event) =>
+              setDraft((current) =>
+                current
+                  ? {
+                      ...current,
+                      routing: {
+                        ...current.routing,
+                        criticProviderId: event.target.value || null,
+                      },
+                    }
+                  : current,
+              )
+            }
+          >
+            <option value="">Use Consult role</option>
+            {draft.models.map((model) => (
+              <option key={model.draftKey} value={model.id}>
+                {model.label || model.id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={draft.routing.requireIndependentCritic}
+            onChange={(event) =>
+              setDraft((current) =>
+                current
+                  ? {
+                      ...current,
+                      routing: {
+                        ...current.routing,
+                        requireIndependentCritic: event.target.checked,
+                      },
+                    }
+                  : current,
+              )
+            }
+          />{" "}
+          Require a different provider/model identity for critic acceptance
+        </label>
+        <small>
+          Repository evidence is supplied only to a loopback critic endpoint. Remote critics are
+          reported as unavailable.
+        </small>
       </fieldset>
 
       <button type="button" onClick={() => save.mutate()} disabled={save.isPending}>

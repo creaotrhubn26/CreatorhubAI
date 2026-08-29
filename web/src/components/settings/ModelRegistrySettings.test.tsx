@@ -87,4 +87,40 @@ describe("ModelRegistrySettings", () => {
     expect(idInput).toHaveValue("cloud");
     expect((screen.getByLabelText("Engineer model") as HTMLSelectElement).value).toBe("local");
   });
+
+  it("saves adaptive routing and an explicitly independent critic policy", async () => {
+    vi.spyOn(glimmerApi, "getModelRegistry").mockResolvedValue(registry);
+    const saveRegistry = vi.spyOn(glimmerApi, "saveModelRegistry").mockImplementation(
+      async (update) =>
+        ({
+          ...registry,
+          ...update,
+          models: registry.models,
+          source: "saved",
+        }) as ModelRegistry,
+    );
+    renderSettings();
+
+    await screen.findByRole("group", { name: "Frontier" });
+    fireEvent.click(screen.getByLabelText(/use configured high-risk overrides/i));
+    fireEvent.change(screen.getByLabelText("Engineer high-risk model"), {
+      target: { value: "frontier" },
+    });
+    fireEvent.change(screen.getByLabelText("Critic model"), { target: { value: "frontier" } });
+    fireEvent.click(screen.getByLabelText(/require a different provider\/model identity/i));
+    fireEvent.click(screen.getByRole("button", { name: "Save model registry" }));
+
+    await waitFor(() => expect(saveRegistry).toHaveBeenCalledTimes(1));
+    expect(saveRegistry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        routing: {
+          enabled: true,
+          highRisk: { engineer: "frontier" },
+          criticProviderId: "frontier",
+          requireIndependentCritic: true,
+        },
+      }),
+    );
+    expect(screen.getByText(/remote critics are reported as unavailable/i)).toBeInTheDocument();
+  });
 });

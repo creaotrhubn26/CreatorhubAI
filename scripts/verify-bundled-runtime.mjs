@@ -7,7 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "2dc127dc657db34154ee95866a9ba068d7584752";
+const EXPECTED_ORCHESTRATOR_COMMIT = "9c183d4ee2eed102cf497fce5ae1da68afe2f14c";
 const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-accuracy-v2";
 const EXPECTED_PYTHON_FILES = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
@@ -20,8 +20,8 @@ const EXPECTED_PYTHON_FILES = {
     "8bfe061a1ca73426e415f9a3ad2ffbe587e8bc49bb81423af8892cc1ffaa9326",
 };
 const EXPECTED_ORCHESTRATOR_FILES = {
-  "glimmer-v2.py": "5e52137fd07ac0a538b519fdd50fb5e5bac8c258c9eeb28d4b0f58035b7cf88b",
-  "glimmer-engineer.py": "2742ef0ab9fe158576dba901a555f5448c312c02a84a4109495153232cc3c67f",
+  "glimmer-v2.py": "d937e86b031b449473df02d2137d948500fd5751dc55c9fcca5875e33bd4d44c",
+  "glimmer-engineer.py": "0c1e797076d62416840512bd844964c82ebb584f2c4280ec7e5f7ec93d47bb14",
   "glimmer_events.py": "d31179ab2f5cedf1c7b0cf9a32452bbaa03580ed056a9163ae8ace66ea63a53e",
   "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
   "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",

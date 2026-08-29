@@ -113,6 +113,31 @@ describe("model registry API", () => {
     expect((await fs.readFile(stored.models[1].apiKeyFile, "utf8")).trim()).toBe("first-key");
   });
 
+  it("stores adaptive high-risk and independent-critic routing additively", async () => {
+    const update = {
+      ...registryUpdate(),
+      routing: {
+        enabled: true,
+        highRisk: { engineer: "frontier" },
+        criticProviderId: "local",
+        requireIndependentCritic: true,
+      },
+    };
+    const saved = await request(app)
+      .put("/api/models/config")
+      .set("Origin", UI_ORIGIN)
+      .send(update);
+    expect(saved.status).toBe(200);
+    expect(saved.body.routing).toEqual(update.routing);
+    const stored = JSON.parse(await fs.readFile(path.join(stateRoot, "models.json"), "utf8"));
+    expect(stored.routing).toEqual(update.routing);
+
+    const invalid = { ...update, routing: { ...update.routing, criticProviderId: "missing" } };
+    expect(
+      (await request(app).put("/api/models/config").set("Origin", UI_ORIGIN).send(invalid)).status,
+    ).toBe(400);
+  });
+
   it("clears only the gateway-owned key file when requested", async () => {
     await request(app)
       .put("/api/models/config")

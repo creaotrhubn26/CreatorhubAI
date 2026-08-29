@@ -7,6 +7,7 @@ import type {
   ModelRegistryUpdate,
   ModelRegistryUpdateEntry,
   ModelRole,
+  AdaptiveRoutingConfig,
 } from "@glimmer/shared";
 import { CONFIG } from "../config.js";
 
@@ -33,6 +34,16 @@ interface StoredRegistry {
   version: 1;
   models: StoredModel[];
   roles: Record<ModelRole, string>;
+  routing?: AdaptiveRoutingConfig;
+}
+
+function defaultRouting(): AdaptiveRoutingConfig {
+  return {
+    enabled: false,
+    highRisk: {},
+    criticProviderId: null,
+    requireIndependentCritic: false,
+  };
 }
 
 function defaultStoredRegistry(): StoredRegistry {
@@ -48,6 +59,7 @@ function defaultStoredRegistry(): StoredRegistry {
       },
     ],
     roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
+    routing: defaultRouting(),
   };
 }
 
@@ -81,7 +93,24 @@ function isStoredRegistry(value: unknown): value is StoredRegistry {
       return false;
     if (model.apiKeyFile !== null && typeof model.apiKeyFile !== "string") return false;
   }
-  return ROLES.every((role) => typeof raw.roles![role] === "string" && ids.has(raw.roles![role]));
+  if (!ROLES.every((role) => typeof raw.roles![role] === "string" && ids.has(raw.roles![role])))
+    return false;
+  if (raw.routing !== undefined) {
+    if (
+      typeof raw.routing !== "object" ||
+      typeof raw.routing.enabled !== "boolean" ||
+      typeof raw.routing.requireIndependentCritic !== "boolean" ||
+      (raw.routing.criticProviderId !== null && !ids.has(raw.routing.criticProviderId)) ||
+      !raw.routing.highRisk ||
+      typeof raw.routing.highRisk !== "object" ||
+      Object.entries(raw.routing.highRisk).some(
+        ([role, provider]) =>
+          !ROLES.includes(role as ModelRole) || typeof provider !== "string" || !ids.has(provider),
+      )
+    )
+      return false;
+  }
+  return true;
 }
 
 async function readStoredRegistry(): Promise<{
@@ -119,7 +148,13 @@ async function toPublic(
       hasApiKey: await exists(model.apiKeyFile),
     })),
   );
-  return { version: 1, models, roles: registry.roles, source };
+  return {
+    version: 1,
+    models,
+    roles: registry.roles,
+    routing: registry.routing ?? defaultRouting(),
+    source,
+  };
 }
 
 export async function readModelRegistry(): Promise<ModelRegistry> {
@@ -181,7 +216,26 @@ function normalizeUpdate(input: unknown): ModelRegistryUpdate {
     }
     roles[role] = providerId;
   }
-  return { models, roles };
+  let routing: AdaptiveRoutingConfig | undefined;
+  if (raw.routing !== undefined) {
+    if (!raw.routing || typeof raw.routing !== "object") invalid("routing must be an object");
+    const highRisk: Partial<Record<ModelRole, string>> = {};
+    for (const [role, provider] of Object.entries(raw.routing.highRisk ?? {})) {
+      if (!ROLES.includes(role as ModelRole) || typeof provider !== "string" || !ids.has(provider))
+        invalid(`high-risk role ${role} must reference a configured model`);
+      highRisk[role as ModelRole] = provider;
+    }
+    const criticProviderId = raw.routing.criticProviderId ?? null;
+    if (criticProviderId !== null && !ids.has(criticProviderId))
+      invalid("criticProviderId must reference a configured model");
+    routing = {
+      enabled: raw.routing.enabled === true,
+      highRisk,
+      criticProviderId,
+      requireIndependentCritic: raw.routing.requireIndependentCritic === true,
+    };
+  }
+  return { models, roles, ...(routing ? { routing } : {}) };
 }
 
 async function writeAtomic(file: string, text: string, mode: number): Promise<void> {
@@ -230,7 +284,12 @@ export async function saveModelRegistry(input: unknown): Promise<ModelRegistry> 
     });
   }
 
-  const stored: StoredRegistry = { version: 1, models: storedModels, roles: update.roles };
+  const stored: StoredRegistry = {
+    version: 1,
+    models: storedModels,
+    roles: update.roles,
+    routing: update.routing ?? current.routing ?? defaultRouting(),
+  };
   await writeAtomic(CONFIG.modelConfigPath, `${JSON.stringify(stored, null, 2)}\n`, 0o600);
 
   // Delete only key files the gateway itself owns. A legacy/manual key path

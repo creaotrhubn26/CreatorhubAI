@@ -7,6 +7,7 @@ import { workspacesRouter } from "./routes/workspaces.js";
 import { modelRouter } from "./routes/model.js";
 import { repositoryRouter } from "./routes/repository.js";
 import { taskIntelligenceRouter } from "./routes/taskIntelligence.js";
+import { qualityRouter } from "./routes/quality.js";
 import { integrationsRouter } from "./routes/integrations.js";
 import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { designBridgeRouter } from "./routes/designBridge.js";
@@ -132,6 +133,7 @@ export function createApp(): Express {
   app.use("/api", modelRouter);
   app.use("/api", repositoryRouter);
   app.use("/api", taskIntelligenceRouter);
+  app.use("/api", qualityRouter);
   app.use("/api", integrationsRouter);
   app.use("/api", diagnosticsRouter);
   app.use("/api", designWorkflowRouter);
