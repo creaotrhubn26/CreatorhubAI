@@ -7,7 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "9c183d4ee2eed102cf497fce5ae1da68afe2f14c";
+const EXPECTED_ORCHESTRATOR_COMMIT = "df08dd240bc7a23e09a830473407e80d50f89f03";
 const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-accuracy-v2";
 const EXPECTED_PYTHON_FILES = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
@@ -31,6 +31,14 @@ const EXPECTED_ORCHESTRATOR_FILES = {
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
   "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
+  "eval-baselines/baseline-stub.json":
+    "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
+  "eval-baselines/latest-stub.json":
+    "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
+  "eval-baselines/baseline-live.json":
+    "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
+  "eval-baselines/latest-live.json":
+    "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
 };
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
 
@@ -135,7 +143,11 @@ if (!origin.files || typeof origin.files !== "object") {
   throw new Error("bundled orchestrator integrity manifest has no file checksums");
 }
 for (const [name, expected] of Object.entries(EXPECTED_ORCHESTRATOR_FILES)) {
-  if (path.basename(name) !== name || !/^[a-f0-9]{64}$/.test(String(expected))) {
+  if (
+    path.isAbsolute(name) ||
+    name.split(/[\\/]/).includes("..") ||
+    !/^[a-f0-9]{64}$/.test(String(expected))
+  ) {
     throw new Error(`invalid bundled orchestrator integrity entry: ${name}`);
   }
   if (origin.files[name] !== expected) {

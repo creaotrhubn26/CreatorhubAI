@@ -7,7 +7,7 @@
 # network; each final file must match its release SHA-256 before output.
 set -euo pipefail
 
-ORCHESTRATOR_REF="9c183d4ee2eed102cf497fce5ae1da68afe2f14c"
+ORCHESTRATOR_REF="df08dd240bc7a23e09a830473407e80d50f89f03"
 SNAPSHOT_ID="glimmer-accuracy-v2"
 
 cd "$(dirname "$0")/.."
@@ -28,6 +28,10 @@ FILES=(
   "glimmer_verification.py"
   "glimmer-visual.py"
   "run-github-mcp.sh"
+  "eval-baselines/baseline-stub.json"
+  "eval-baselines/latest-stub.json"
+  "eval-baselines/baseline-live.json"
+  "eval-baselines/latest-live.json"
 )
 SHAS=(
   "d937e86b031b449473df02d2137d948500fd5751dc55c9fcca5875e33bd4d44c"
@@ -41,6 +45,10 @@ SHAS=(
   "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711"
   "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5"
   "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33"
+  "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18"
+  "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45"
+  "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41"
+  "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91"
 )
 
 SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)"
@@ -51,6 +59,7 @@ fi
 for index in "${!FILES[@]}"; do
   file="${FILES[$index]}"
   printf '%s  %s\n' "${SHAS[$index]}" "$SOURCE/$file" | shasum -a 256 -c -
+  mkdir -p "$STAGING/$(dirname "$file")"
   cp "$SOURCE/$file" "$STAGING/$file"
 done
 
@@ -61,7 +70,7 @@ done
 test "$OUT" = "binaries/runtime/orchestrator"
 rm -rf "$OUT"
 mkdir -p "$OUT"
-cp "$STAGING"/* "$OUT/"
+cp -R "$STAGING"/. "$OUT/"
 chmod +x "$OUT/glimmer-v2.py" "$OUT/glimmer-engineer.py" \
   "$OUT/glimmer-visual.py" "$OUT/run-github-mcp.sh"
 
