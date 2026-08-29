@@ -12,6 +12,7 @@ import type {
   DesignFeedbackTool,
   DesignChangeSetFeedbackRefs,
   DesignInspiration,
+  DesignProfileReference,
   DesignReferenceImage,
   DesignRegion,
   DesignVariantRequest,
@@ -25,6 +26,7 @@ interface Props {
   route: string;
   capture: VisualCapture;
   initialInspirations: DesignInspiration[];
+  initialDesignProfiles: DesignProfileReference[];
   initialReferenceImages: DesignReferenceImage[];
 }
 
@@ -168,6 +170,7 @@ export function VisualFeedbackStudio({
   route,
   capture,
   initialInspirations,
+  initialDesignProfiles,
   initialReferenceImages,
 }: Props) {
   const navigate = useNavigate();
@@ -188,6 +191,8 @@ export function VisualFeedbackStudio({
   const [annotations, setAnnotations] = useState<DesignFeedbackAnnotation[]>([]);
   const [variants, setVariants] = useState<DesignVariantRequest[]>([]);
   const [inspirations, setInspirations] = useState<DesignInspiration[]>(initialInspirations);
+  const [designProfiles, setDesignProfiles] =
+    useState<DesignProfileReference[]>(initialDesignProfiles);
   const [elementEdits, setElementEdits] = useState<DesignElementEdit[]>([]);
   const [assetRequests, setAssetRequests] = useState<DesignAssetRequest[]>([]);
   const hydrated = useRef(false);
@@ -199,9 +204,12 @@ export function VisualFeedbackStudio({
     setInspirations(
       feedback.data?.inspirations?.length ? feedback.data.inspirations : initialInspirations,
     );
+    setDesignProfiles(
+      feedback.data?.designProfiles?.length ? feedback.data.designProfiles : initialDesignProfiles,
+    );
     setElementEdits(feedback.data?.elementEdits ?? []);
     setAssetRequests(feedback.data?.assetRequests ?? []);
-  }, [feedback.data, feedback.isLoading, initialInspirations]);
+  }, [feedback.data, feedback.isLoading, initialDesignProfiles, initialInspirations]);
 
   const mutation = useMutation({ mutationFn: glimmerApi.saveDesignFeedback.bind(null, sessionId) });
   const [workflowLinkError, setWorkflowLinkError] = useState("");
@@ -276,6 +284,7 @@ export function VisualFeedbackStudio({
       annotations: DesignFeedbackAnnotation[];
       variants: DesignVariantRequest[];
       inspirations: DesignInspiration[];
+      designProfiles: DesignProfileReference[];
       elementEdits: DesignElementEdit[];
       assetRequests: DesignAssetRequest[];
     },
@@ -289,6 +298,7 @@ export function VisualFeedbackStudio({
       setAnnotations(saved.annotations);
       setVariants(saved.variants);
       setInspirations(saved.inspirations);
+      setDesignProfiles(saved.designProfiles);
       setElementEdits(saved.elementEdits);
       setAssetRequests(saved.assetRequests);
       if (activeChangeSet && workflow.data && (options.link || options.unlink)) {
@@ -324,7 +334,15 @@ export function VisualFeedbackStudio({
   }
 
   function currentDocument(patch: Partial<Parameters<typeof persist>[0]> = {}) {
-    return { annotations, variants, inspirations, elementEdits, assetRequests, ...patch };
+    return {
+      annotations,
+      variants,
+      inspirations,
+      designProfiles,
+      elementEdits,
+      assetRequests,
+      ...patch,
+    };
   }
 
   function chooseMode(next: StudioMode) {

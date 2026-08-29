@@ -2,6 +2,7 @@ import { lazy, Suspense, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type {
   DesignInspiration,
+  DesignProfileReference,
   DesignReferenceImage,
   VisualCapture,
   VisualFinding,
@@ -64,11 +65,13 @@ export function VisualVerificationPanel({
   sessionId,
   workspace = "",
   initialInspirations = [],
+  initialDesignProfiles = [],
   initialReferenceImages = [],
 }: {
   sessionId: string;
   workspace?: string;
   initialInspirations?: DesignInspiration[];
+  initialDesignProfiles?: DesignProfileReference[];
   initialReferenceImages?: DesignReferenceImage[];
 }) {
   const [selectedCapture, setSelectedCapture] = useState<VisualCapture | null>(null);
@@ -126,6 +129,7 @@ export function VisualVerificationPanel({
             sessionId={sessionId}
             route={manifest.route}
             capture={fallbackCapture}
+            initialDesignProfiles={initialDesignProfiles}
           />
         </Suspense>
       )}
@@ -175,6 +179,7 @@ export function VisualVerificationPanel({
             route={manifest.route}
             capture={selectedCapture}
             initialInspirations={initialInspirations}
+            initialDesignProfiles={initialDesignProfiles}
             initialReferenceImages={initialReferenceImages}
           />
         </Suspense>

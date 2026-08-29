@@ -8,6 +8,7 @@ import type {
   DesignVariantRequest,
 } from "@glimmer/shared";
 import { normalizeAssetRequests, normalizeElementEdits } from "./designActions.js";
+import { normalizeDesignProfiles } from "./designProfiles.js";
 
 const DESIGN_KINDS = new Set(["build", "improve", "audit", "reference-match"]);
 const STRATEGIES = new Set<DesignContextStrategy>(["detect", "existing", "required", "none"]);
@@ -320,6 +321,8 @@ export function validateDesignContract(input: unknown): DesignContractValidation
   }
   const inspirations = normalizeInspirations(raw.inspirations);
   if (inspirations instanceof Error) return { error: inspirations.message };
+  const designProfiles = normalizeDesignProfiles(raw.designProfiles ?? []);
+  if (!designProfiles) return { error: "design.designProfiles are invalid" };
   const variants = normalizeVariants(raw.variants);
   if (variants instanceof Error) return { error: variants.message };
   const elementEdits = normalizeElementEdits(raw.elementEdits ?? []);
@@ -367,6 +370,7 @@ export function validateDesignContract(input: unknown): DesignContractValidation
       states,
       viewports: viewports.value!,
       inspirations,
+      designProfiles,
       variants,
       elementEdits,
       assetRequests,

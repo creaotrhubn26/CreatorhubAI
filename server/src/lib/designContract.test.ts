@@ -120,6 +120,42 @@ describe("validateDesignContract", () => {
     });
   });
 
+  it("keeps curated profile direction separate and drift-detectable", () => {
+    const result = validateDesignContract({
+      ...VALID,
+      designProfiles: [
+        {
+          source: "creatorhub-catalog",
+          profileId: "editorial",
+          profileVersion: "0.1.0",
+          designHash: "a".repeat(64),
+          title: "Editorial",
+          adoptedQualities: ["calm hierarchy"],
+          rejectedQualities: ["literal screen composition"],
+        },
+      ],
+    });
+    expect(result.value?.designProfiles).toEqual([
+      expect.objectContaining({ profileId: "editorial", designHash: "a".repeat(64) }),
+    ]);
+    expect(
+      validateDesignContract({
+        ...VALID,
+        designProfiles: [
+          {
+            source: "creatorhub-catalog",
+            profileId: "../editorial",
+            profileVersion: "0.1.0",
+            designHash: "not-a-hash",
+            title: "Editorial",
+            adoptedQualities: ["calm"],
+            rejectedQualities: [],
+          },
+        ],
+      }).error,
+    ).toMatch(/designProfiles/i);
+  });
+
   it("accepts structured visual edits and asset generation requests", () => {
     const result = validateDesignContract({
       ...VALID,

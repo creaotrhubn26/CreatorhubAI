@@ -4,6 +4,7 @@ import type {
   DesignAssetRequest,
   DesignElementEdit,
   DesignInspiration,
+  DesignProfileReference,
   DesignReferenceImage,
   DesignState,
   DesignTaskKind,
@@ -22,6 +23,7 @@ export interface DesignComposerFields {
   designStates: string;
   designViewports: string;
   designInspirations: DesignInspiration[];
+  designProfiles: DesignProfileReference[];
   designVariants: DesignVariantRequest[];
   designElementEdits: DesignElementEdit[];
   designAssetRequests: DesignAssetRequest[];
@@ -48,6 +50,7 @@ export const DEFAULT_DESIGN_FORM: DesignComposerFields = {
   designStates: "",
   designViewports: "1440x900, 390x844",
   designInspirations: [],
+  designProfiles: [],
   designVariants: [],
   designElementEdits: [],
   designAssetRequests: [],
@@ -132,6 +135,7 @@ export function buildDesignContract(form: DesignComposerFields): DesignContract 
     states,
     viewports: paths(form.designViewports),
     inspirations: form.designInspirations,
+    designProfiles: form.designProfiles,
     variants: form.designVariants,
     elementEdits: form.designElementEdits,
     assetRequests: form.designAssetRequests,
@@ -305,6 +309,18 @@ export function designComposerError(form: DesignComposerFields): string | null {
     )
   ) {
     return "Mobbin inspiration must come from an official HTTPS Mobbin screen URL.";
+  }
+  if (
+    form.designProfiles.length > 3 ||
+    form.designProfiles.some(
+      (item) =>
+        !item.profileId.trim() ||
+        !item.title.trim() ||
+        !/^[a-f0-9]{64}$/i.test(item.designHash) ||
+        !item.adoptedQualities.length,
+    )
+  ) {
+    return "Choose at most three valid design profiles with explicit qualities to adopt.";
   }
   if (
     form.designVariants.length > 10 ||

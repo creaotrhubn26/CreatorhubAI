@@ -6,6 +6,7 @@ import type {
   DesignVariantRequest,
 } from "@glimmer/shared";
 import { normalizeAssetRequests, normalizeElementEdits } from "./designActions.js";
+import { normalizeDesignProfiles } from "./designProfiles.js";
 
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/;
 const FEEDBACK_TOOLS = new Set([
@@ -270,7 +271,14 @@ export function validateDesignFeedbackUpdate(
   if (
     Object.keys(input).some(
       (key) =>
-        !["annotations", "variants", "inspirations", "elementEdits", "assetRequests"].includes(key),
+        ![
+          "annotations",
+          "variants",
+          "inspirations",
+          "designProfiles",
+          "elementEdits",
+          "assetRequests",
+        ].includes(key),
     )
   ) {
     return { error: "design feedback contains unsupported fields" };
@@ -280,11 +288,13 @@ export function validateDesignFeedbackUpdate(
   const normalizedAnnotations = annotations(raw.annotations, screenshots);
   const normalizedVariants = variants(raw.variants, screenshots);
   const normalizedInspirations = inspirations(raw.inspirations);
+  const normalizedDesignProfiles = normalizeDesignProfiles(raw.designProfiles ?? []);
   const normalizedElementEdits = normalizeElementEdits(raw.elementEdits, { screenshots });
   const normalizedAssetRequests = normalizeAssetRequests(raw.assetRequests, { screenshots });
   if (!normalizedAnnotations) return { error: "design feedback annotations are invalid" };
   if (!normalizedVariants) return { error: "design feedback variants are invalid" };
   if (!normalizedInspirations) return { error: "design feedback inspirations are invalid" };
+  if (!normalizedDesignProfiles) return { error: "design feedback design profiles are invalid" };
   if (!normalizedElementEdits) return { error: "design feedback element edits are invalid" };
   if (!normalizedAssetRequests) return { error: "design feedback asset requests are invalid" };
   return {
@@ -292,6 +302,7 @@ export function validateDesignFeedbackUpdate(
       annotations: normalizedAnnotations,
       variants: normalizedVariants,
       inspirations: normalizedInspirations,
+      designProfiles: normalizedDesignProfiles,
       elementEdits: normalizedElementEdits,
       assetRequests: normalizedAssetRequests,
     },

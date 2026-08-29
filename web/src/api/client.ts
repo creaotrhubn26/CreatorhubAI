@@ -51,6 +51,12 @@ import type {
   MobbinIntegrationStatus,
   MobbinSearchRequest,
   MobbinSearchResult,
+  DesignCatalogCustomProfileInput,
+  DesignCatalogFacets,
+  DesignCatalogLibrary,
+  DesignCatalogProfile,
+  DesignCatalogSearchRequest,
+  DesignCatalogSearchResult,
   LiveDesignResolveRequest,
   LiveDesignResolveResponse,
   LiveDesignProposalRequest,
@@ -272,6 +278,34 @@ export const glimmerApi = {
     }),
   mobbinImageUrl: (imageToken: string) =>
     `${API_BASE}/api/integrations/mobbin/image/${encodeURIComponent(imageToken)}`,
+  getDesignCatalogFacets: () => request<DesignCatalogFacets>("/api/design-catalog/facets"),
+  searchDesignCatalog: (input: DesignCatalogSearchRequest) =>
+    request<DesignCatalogSearchResult>("/api/design-catalog/search", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getDesignCatalogProfile: (id: string) =>
+    request<DesignCatalogProfile>(`/api/design-catalog/profiles/${encodeURIComponent(id)}`),
+  designCatalogPreviewUrl: (id: string) =>
+    `${API_BASE}/api/design-catalog/profiles/${encodeURIComponent(id)}/preview.svg`,
+  getDesignCatalogLibrary: () => request<DesignCatalogLibrary>("/api/design-catalog/library"),
+  saveDesignCatalogLibrary: (update: {
+    favorites?: string[];
+    collections?: DesignCatalogLibrary["collections"];
+  }) =>
+    request<DesignCatalogLibrary>("/api/design-catalog/library", {
+      method: "PUT",
+      body: JSON.stringify(update),
+    }),
+  createCustomDesignProfile: (input: DesignCatalogCustomProfileInput) =>
+    request<DesignCatalogLibrary>("/api/design-catalog/custom", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteCustomDesignProfile: (id: string) =>
+    request<DesignCatalogLibrary>(`/api/design-catalog/custom/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
   getModelStatus: () => request<ModelStatus>("/api/model/status"),
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>

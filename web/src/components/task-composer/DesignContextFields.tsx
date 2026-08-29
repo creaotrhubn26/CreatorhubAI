@@ -4,6 +4,7 @@ import { designComposerError } from "../../state/designContract";
 import { MobbinInspirationPicker } from "./MobbinInspirationPicker";
 import { DesignVariantFields } from "./DesignVariantFields";
 import { DesignAssetFields } from "./DesignAssetFields";
+import { DesignCatalogExplorer } from "../design/DesignCatalogExplorer";
 
 interface Props {
   form: TaskComposerFormState;
@@ -120,6 +121,23 @@ export function DesignContextFields({ form, setForm }: Props) {
               }
             />
           </label>
+          <DesignCatalogExplorer
+            compact
+            value={form.designProfiles}
+            onChange={(designProfiles) => setForm({ ...form, designProfiles })}
+            projectContext={{
+              platform: "web",
+              cms: form.cmsProviderHint,
+              requirements: form.designRequirements
+                .split(/\r?\n/)
+                .map((item) => item.trim())
+                .filter(Boolean),
+              tokenNames: form.designTokenRequirements
+                .split(/\r?\n/)
+                .map((item) => item.trim())
+                .filter(Boolean),
+            }}
+          />
           <MobbinInspirationPicker
             value={form.designInspirations}
             onChange={(designInspirations) => setForm({ ...form, designInspirations })}

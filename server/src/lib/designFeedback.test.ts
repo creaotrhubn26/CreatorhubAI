@@ -37,6 +37,17 @@ const VALID = {
       query: "checkout with Apple Pay",
     },
   ],
+  designProfiles: [
+    {
+      source: "creatorhub-catalog",
+      profileId: "editorial",
+      profileVersion: "0.1.0",
+      designHash: "a".repeat(64),
+      title: "Editorial",
+      adoptedQualities: ["calm hierarchy"],
+      rejectedQualities: ["literal copying"],
+    },
+  ],
   elementEdits: [
     {
       id: "edit-1",
@@ -81,6 +92,7 @@ describe("validateDesignFeedbackUpdate", () => {
       ],
       variants: [{ count: 3 }],
       inspirations: [{ source: "mobbin" }],
+      designProfiles: [{ profileId: "editorial" }],
       elementEdits: [{ text: "Creator plan" }],
       assetRequests: [{ kind: "image", size: "2K" }],
     });
@@ -113,6 +125,18 @@ describe("validateDesignFeedbackUpdate", () => {
         ["1440x900-initial.png"],
       ).error,
     ).toMatch(/inspirations/i);
+  });
+
+  it("rejects profile references that cannot be verified for drift", () => {
+    expect(
+      validateDesignFeedbackUpdate(
+        {
+          ...VALID,
+          designProfiles: [{ ...VALID.designProfiles[0], designHash: "mutable" }],
+        },
+        ["1440x900-initial.png"],
+      ).error,
+    ).toMatch(/design profiles/i);
   });
 
   it("rejects arbitrary annotation fields and unsafe generated output paths", () => {

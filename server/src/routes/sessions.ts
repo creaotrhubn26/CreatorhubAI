@@ -1026,6 +1026,7 @@ sessionsRouter.get("/sessions/:id/visual/feedback", async (req, res) => {
         annotations: feedback.annotations ?? [],
         variants: feedback.variants ?? [],
         inspirations: feedback.inspirations ?? [],
+        designProfiles: feedback.designProfiles ?? [],
         elementEdits: feedback.elementEdits ?? [],
         assetRequests: feedback.assetRequests ?? [],
       },

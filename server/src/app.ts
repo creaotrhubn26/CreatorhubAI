@@ -11,6 +11,7 @@ import { integrationsRouter } from "./routes/integrations.js";
 import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { designBridgeRouter } from "./routes/designBridge.js";
 import { designWorkflowRouter } from "./routes/designWorkflow.js";
+import { designCatalogRouter } from "./routes/designCatalog.js";
 import { CONFIG } from "./config.js";
 
 // The only origins allowed to reach this API: the local web dev server
@@ -134,6 +135,7 @@ export function createApp(): Express {
   app.use("/api", integrationsRouter);
   app.use("/api", diagnosticsRouter);
   app.use("/api", designWorkflowRouter);
+  app.use("/api", designCatalogRouter);
   app.use("/api", designBridgeRouter);
   // Terminal error handler: Express 4 does not catch async handler rejections,
   // and an unhandled rejection kills the gateway (orphaning running agents).

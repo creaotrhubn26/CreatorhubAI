@@ -401,6 +401,7 @@ export function ActiveSessionScreen() {
           sessionId={id}
           workspace={session.workspace}
           initialInspirations={session.taskContract?.design?.inspirations ?? []}
+          initialDesignProfiles={session.taskContract?.design?.designProfiles ?? []}
           initialReferenceImages={session.taskContract?.design?.referenceImages ?? []}
         />
       )}

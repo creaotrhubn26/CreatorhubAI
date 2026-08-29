@@ -9,6 +9,7 @@ import type {
   DesignFeedbackPoint,
   DesignFeedbackTool,
   DesignFeedbackUpdate,
+  DesignProfileReference,
   DesignChangeSetCreateRequest,
   DesignChangeSetFeedbackRefs,
   DesignWorkflowTransitionAction,
@@ -38,6 +39,7 @@ import type {
 import { glimmerApi } from "../../api/client";
 import { DesignWorkflowPanel } from "./DesignWorkflowPanel";
 import { LiveDesignStructurePanel } from "./LiveDesignStructurePanel";
+import { DesignCatalogExplorer } from "../design/DesignCatalogExplorer";
 
 const BRIDGE_NAMESPACE = "glimmer-live-design";
 
@@ -45,6 +47,7 @@ interface Props {
   sessionId: string;
   route: string;
   capture?: VisualCapture;
+  initialDesignProfiles?: DesignProfileReference[];
 }
 
 interface EditorDraft {
@@ -157,6 +160,7 @@ type InspectorTab =
   | "layout"
   | "component"
   | "responsive"
+  | "library"
   | "tokens"
   | "code"
   | "review"
@@ -170,6 +174,7 @@ const INSPECTOR_TABS: Array<{ id: InspectorTab; label: string }> = [
   { id: "layout", label: "Layout" },
   { id: "component", label: "Component" },
   { id: "responsive", label: "Responsive" },
+  { id: "library", label: "Library" },
   { id: "tokens", label: "Tokens" },
   { id: "code", label: "Code" },
   { id: "review", label: "Review" },
@@ -989,11 +994,17 @@ function numberOrUndefined(value: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function baseFeedback(current: DesignFeedbackDocument | null | undefined): DesignFeedbackUpdate {
+function baseFeedback(
+  current: DesignFeedbackDocument | null | undefined,
+  initialDesignProfiles: DesignProfileReference[] = [],
+): DesignFeedbackUpdate {
   return {
     annotations: current?.annotations ?? [],
     variants: current?.variants ?? [],
     inspirations: current?.inspirations ?? [],
+    designProfiles: current?.designProfiles?.length
+      ? current.designProfiles
+      : initialDesignProfiles,
     elementEdits: current?.elementEdits ?? [],
     assetRequests: current?.assetRequests ?? [],
   };
@@ -1273,7 +1284,7 @@ function revisionLabel(revision: LiveDesignRevision): string {
   return "Style change";
 }
 
-export function LiveDesignBridge({ sessionId, route, capture }: Props) {
+export function LiveDesignBridge({ sessionId, route, capture, initialDesignProfiles = [] }: Props) {
   const target = useMemo(() => localPreviewUrl(route), [route]);
   const designerRoot = useRef<HTMLDivElement>(null);
   const designerHovered = useRef(false);
@@ -4176,6 +4187,24 @@ export function LiveDesignBridge({ sessionId, route, capture }: Props) {
                   </button>
                 </div>
               </section>
+            )}
+            {activeTab === "library" && (
+              <DesignCatalogExplorer
+                value={
+                  feedback.data?.designProfiles?.length
+                    ? feedback.data.designProfiles
+                    : initialDesignProfiles
+                }
+                tokenGraph={resolution?.tokenGraph ?? []}
+                projectContext={{
+                  platform: "web",
+                  tokenNames: resolution?.tokenGraph?.map((token) => token.name) ?? [],
+                }}
+                onChange={(designProfiles) => {
+                  const update = baseFeedback(feedback.data, initialDesignProfiles);
+                  feedbackMutation.mutate({ update: { ...update, designProfiles } });
+                }}
+              />
             )}
             {activeTab === "tokens" && (
               <section className="live-design-bridge__source">

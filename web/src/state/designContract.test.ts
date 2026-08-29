@@ -109,6 +109,26 @@ describe("designContract", () => {
     });
   });
 
+  it("carries selected catalogue direction without mixing it into screen inspiration", () => {
+    const designProfiles = [
+      {
+        source: "creatorhub-catalog" as const,
+        profileId: "editorial",
+        profileVersion: "0.1.0",
+        designHash: "a".repeat(64),
+        title: "Editorial",
+        adoptedQualities: ["calm hierarchy"],
+        rejectedQualities: ["literal copying"],
+      },
+    ];
+    const contract = buildDesignContract({
+      ...DEFAULT_DESIGN_FORM,
+      designEnabled: true,
+      designProfiles,
+    });
+    expect(contract).toMatchObject({ inspirations: [], designProfiles });
+  });
+
   it("carries visual element edits and real asset jobs into the contract", () => {
     const contract = buildDesignContract({
       ...DEFAULT_DESIGN_FORM,

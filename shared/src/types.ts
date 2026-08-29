@@ -145,6 +145,140 @@ export interface DesignInspiration {
   notes?: string;
 }
 
+export type DesignProfileSource = "creatorhub-catalog" | "custom";
+
+/** Durable design direction. It records what to adopt and reject, never executable style/code. */
+export interface DesignProfileReference {
+  source: DesignProfileSource;
+  profileId: string;
+  profileVersion: string;
+  designHash: string;
+  title: string;
+  adoptedQualities: string[];
+  rejectedQualities: string[];
+}
+
+export type DesignCatalogProfileType =
+  "brand-derived" | "visual-archetype" | "product-domain" | "layout-pattern" | "starter" | "custom";
+
+export interface DesignCatalogProfile {
+  source: DesignProfileSource;
+  id: string;
+  title: string;
+  description: string;
+  version: string;
+  designHash: string;
+  license: string;
+  category: string;
+  profileType: DesignCatalogProfileType;
+  platforms: string[];
+  productKinds: string[];
+  tags: string[];
+  characteristics: {
+    tones: string[];
+    density: string;
+    contrast: string;
+    geometry: string;
+    elevation: string;
+    modes: string[];
+    motion: string;
+  };
+  typography: {
+    primary: string;
+    display: string;
+    mono: string;
+    proprietary: boolean;
+    substitutes: string[];
+  };
+  colors: Record<string, string>;
+  components: string[];
+  layouts: string[];
+  quality: {
+    completeness: number;
+    richness: number;
+    overall: number;
+    evidence: "researched" | "curated" | "generated" | "custom";
+    referenceRisk: "low" | "medium" | "high";
+  };
+  selection: {
+    adopt: string[];
+    verify: string[];
+    avoid: string[];
+  };
+  score?: number;
+  reasons?: string[];
+  conflicts?: string[];
+}
+
+export interface DesignCatalogFacets {
+  schemaVersion: 2;
+  catalogVersion: string;
+  count: number;
+  source: "creatorhub-engineering";
+  categories: Array<{ value: string; count: number }>;
+  profileTypes: Array<{ value: string; count: number }>;
+  platforms: Array<{ value: string; count: number }>;
+  productKinds: Array<{ value: string; count: number }>;
+  tones: Array<{ value: string; count: number }>;
+  densities: Array<{ value: string; count: number }>;
+  contrasts: Array<{ value: string; count: number }>;
+  modes: Array<{ value: string; count: number }>;
+}
+
+export interface DesignCatalogSearchRequest {
+  query: string;
+  limit?: number;
+  filters?: Partial<{
+    category: string;
+    profileType: string;
+    platform: string;
+    productKind: string;
+    tone: string;
+    density: string;
+    contrast: string;
+    mode: string;
+  }>;
+  exclude?: string[];
+  projectContext?: {
+    platform?: string;
+    cms?: string;
+    requirements?: string[];
+    tokenNames?: string[];
+  };
+}
+
+export interface DesignCatalogSearchResult {
+  query: string;
+  total: number;
+  catalogVersion: string;
+  results: DesignCatalogProfile[];
+}
+
+export interface DesignCatalogCustomProfileInput {
+  title: string;
+  description: string;
+  category: string;
+  tones: string[];
+  colors: Record<string, string>;
+  typography?: { primary?: string; display?: string; mono?: string };
+  adopt: string[];
+  avoid: string[];
+}
+
+export interface DesignCatalogCollection {
+  id: string;
+  title: string;
+  profileIds: string[];
+}
+
+export interface DesignCatalogLibrary {
+  version: 1;
+  updatedAt: string;
+  favorites: string[];
+  collections: DesignCatalogCollection[];
+  customProfiles: DesignCatalogProfile[];
+}
+
 export interface DesignRegion {
   /** Coordinates are normalized to the captured image, from 0 through 1. */
   x: number;
@@ -235,6 +369,8 @@ export interface DesignContract {
   states: DesignState[];
   viewports: string[];
   inspirations: DesignInspiration[];
+  /** Curated design directions remain distinct from imported screen inspiration. */
+  designProfiles?: DesignProfileReference[];
   variants: DesignVariantRequest[];
   elementEdits: DesignElementEdit[];
   assetRequests: DesignAssetRequest[];
@@ -928,6 +1064,7 @@ export interface DesignFeedbackDocument {
   annotations: DesignFeedbackAnnotation[];
   variants: DesignVariantRequest[];
   inspirations: DesignInspiration[];
+  designProfiles: DesignProfileReference[];
   elementEdits: DesignElementEdit[];
   assetRequests: DesignAssetRequest[];
 }
@@ -936,6 +1073,7 @@ export interface DesignFeedbackUpdate {
   annotations: DesignFeedbackAnnotation[];
   variants: DesignVariantRequest[];
   inspirations: DesignInspiration[];
+  designProfiles: DesignProfileReference[];
   elementEdits: DesignElementEdit[];
   assetRequests: DesignAssetRequest[];
 }
