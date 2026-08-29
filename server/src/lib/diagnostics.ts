@@ -31,8 +31,8 @@ const startTime = Date.now();
 const SUPPORT_LOG_BYTES = 16 * 1024;
 const SUPPORT_LOG_SESSIONS = 3;
 const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
-  "glimmer-v2.py": "d937e86b031b449473df02d2137d948500fd5751dc55c9fcca5875e33bd4d44c",
-  "glimmer-engineer.py": "0c1e797076d62416840512bd844964c82ebb584f2c4280ec7e5f7ec93d47bb14",
+  "glimmer-v2.py": "a4edb51f9dc01793b668bdbb58b8b542d9c9ce218cb4f06747ee45cd2b121ba5",
+  "glimmer-engineer.py": "16be8ca1c4ec368e3247a1f034a0db5b8418235129cf964962d12ee9bda3f7db",
   "glimmer_events.py": "d31179ab2f5cedf1c7b0cf9a32452bbaa03580ed056a9163ae8ace66ea63a53e",
   "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
   "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",
@@ -40,7 +40,7 @@ const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
   "glimmer_quality.py": "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188",
   "glimmer_semantic.py": "e1d3ce00c33f6db5d4183b1e8c237bbea50532ee051018b64b577163f864f167",
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
-  "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
+  "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
   "eval-baselines/baseline-stub.json":
     "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
