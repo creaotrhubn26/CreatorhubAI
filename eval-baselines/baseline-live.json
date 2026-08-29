@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "phase": "baseline",
+  "mode": "live",
+  "scope": "smoke",
+  "orchestratorCommit": "cd2010958f884e406e04142ed16573e16b9c1278",
+  "suiteVersion": "2.0.0",
+  "sourceResult": "eval-results/20260829T091316Z.json",
+  "taskIds": ["create-hello-module"],
+  "total": 1,
+  "taskSuccess": 0,
+  "falseVerified": 0,
+  "budgetViolations": 1,
+  "honestyFailures": 0,
+  "claimPrecision": null,
+  "candidateRecallAt5": null,
+  "wallSeconds": 600.103,
+  "outcome": "timed_out",
+  "timeoutSeconds": 600,
+  "qualityGateStatus": "incomplete_full_live_suite"
+}
