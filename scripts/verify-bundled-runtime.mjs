@@ -7,7 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "a7bb2c962e34f149ff2fa8b318ab0d2b745d3f09";
+const EXPECTED_ORCHESTRATOR_COMMIT = "84f17cb4d3916573778fc90d131cc93cca8fad57";
 const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-runpod-r2";
 const EXPECTED_PYTHON_FILES = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
