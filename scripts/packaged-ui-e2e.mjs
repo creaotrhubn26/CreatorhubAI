@@ -77,13 +77,21 @@ assert(
   "unsubmitted workspace draft was not restored after reload",
 );
 
-async function composeAndRun(objective) {
+async function composeAndRun(objective, mode = "inspect") {
   await page.goto(`${appUrl}/tasks/new`);
   await page.getByPlaceholder("What should Glimmer work on?").fill(objective);
   await page.getByLabel("Workspace path").fill(workspace);
-  await page.getByRole("group", { name: "Mode" }).getByRole("combobox").selectOption("inspect");
+  await page.getByRole("group", { name: "Mode" }).getByRole("combobox").selectOption(mode);
   await page.getByRole("button", { name: "RUN GLIMMER" }).click();
-  await page.waitForURL(/\/sessions\/[^/]+$/);
+  await Promise.race([
+    page.waitForURL(/\/sessions\/[^/]+$/),
+    page
+      .getByRole("alert")
+      .waitFor()
+      .then(async () => {
+        throw new Error(`task creation failed in UI: ${await page.getByRole("alert").innerText()}`);
+      }),
+  ]);
   const id = new URL(page.url()).pathname.split("/").pop();
   assert(id, "session navigation did not contain an id");
   await page.getByRole("heading", { name: objective }).waitFor();
@@ -98,6 +106,41 @@ try {
     .locator(".ide-session-row.is-active .ide-session-row__meta")
     .getByText(/completed/i)
     .waitFor();
+  await page
+    .getByText("Packaged-app E2E fixture completed without modifying the repository.")
+    .waitFor();
+
+  await page.getByRole("banner").getByRole("button", { name: "New Task" }).click();
+  const v2Id = await composeAndRun("[v2-report] verify evidence and code graph");
+  await waitForStatus(v2Id, "completed");
+  await page.getByText("Only supported claims are presented as facts.").waitFor();
+  await page.getByText(/presence · verified/i).waitFor();
+  await page.getByText(/graph coverage 75%/i).waitFor();
+  await page.getByText(/1 rejected claim/i).waitFor();
+
+  await page.getByRole("banner").getByRole("button", { name: "New Task" }).click();
+  const clarificationId = await composeAndRun(
+    "[clarification] choose storage before implementation",
+    "implement",
+  );
+  await waitForStatus(clarificationId, "waiting_for_clarification");
+  await page.getByRole("region", { name: "Clarification required" }).waitFor();
+  await page.getByLabel("SQLite").click();
+  await page.getByLabel("Additional context").fill("Reuse the existing schema");
+  await page.getByRole("button", { name: "Continue with this answer" }).click();
+  await waitForStatus(clarificationId, "verified");
+
+  await page.getByRole("banner").getByRole("button", { name: "New Task" }).click();
+  const timeoutId = await composeAndRun(
+    "[clarification-timeout] leave the decision unresolved",
+    "implement",
+  );
+  await waitForStatus(timeoutId, "waiting_for_clarification");
+  const timedOut = await waitForStatus(timeoutId, "needs_review");
+  assert(
+    timedOut.failure?.class === "AMBIGUOUS_TASK",
+    `clarification timeout did not preserve AMBIGUOUS_TASK (${timedOut.failure?.class})`,
+  );
 
   await page.getByRole("banner").getByRole("button", { name: "New Task" }).click();
   const cancelId = await composeAndRun("[cancel] cancel from the visible UI");
@@ -119,6 +162,15 @@ try {
     .waitFor();
 
   await page.getByRole("link", { name: "Settings", exact: true }).click();
+  await page.getByRole("heading", { name: "Local quality metrics" }).waitFor();
+  await page.getByText("Average code-graph coverage").waitFor();
+  await page.getByText("75%", { exact: true }).waitFor();
+  await page.getByLabel(/Use configured high-risk overrides/i).click();
+  await page.getByLabel("Engineer high-risk model").selectOption("local");
+  await page.getByLabel("Critic model").selectOption("local");
+  await page.getByLabel(/Require a different provider\/model identity/i).click();
+  await page.getByRole("button", { name: "Save model registry" }).click();
+  await page.getByText(/Model registry saved/i).waitFor();
   await page.getByRole("heading", { name: "System diagnostics" }).waitFor();
   await page.getByText(`Glimmer ${health.version}`).waitFor();
   await page.getByRole("button", { name: "Repair installation" }).click();
@@ -140,6 +192,9 @@ try {
         appVersion: health.version,
         workflow: {
           first: { id: firstId, status: "completed" },
+          v2: { id: v2Id, status: "completed" },
+          clarification: { id: clarificationId, status: "verified" },
+          clarificationTimeout: { id: timeoutId, status: "needs_review" },
           cancelled: { id: cancelId, status: "cancelled" },
           restarted: { id: restartedId, status: "completed" },
         },
