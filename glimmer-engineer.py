@@ -17,10 +17,38 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import error, request
+from urllib.parse import urlsplit
 
 from glimmer_events import emit as emit_event
 from glimmer_journal import DurableJournal, append_jsonl_durable, atomic_write_json
-from glimmer_models import load_model_registry, model_for_role
+from glimmer_memory import record_outcome
+from glimmer_models import (
+    critic_model,
+    load_model_registry,
+    model_for_role,
+    model_independence,
+    routing_decision,
+)
+from glimmer_quality import (
+    build_critic_request,
+    parse_critic_response,
+    validate_task_report_v2,
+)
+from glimmer_semantic import (
+    impact_paths as semantic_impact_paths,
+)
+from glimmer_semantic import (
+    query_references as semantic_query_references,
+)
+from glimmer_semantic import (
+    query_symbols as semantic_query_symbols,
+)
+from glimmer_semantic import (
+    related_tests as semantic_related_tests,
+)
+from glimmer_semantic import (
+    repository_cache_key as semantic_repository_cache_key,
+)
 
 GLIMMER_EVENTS_PATH = os.environ.get("GLIMMER_EVENTS_PATH")
 GLIMMER_SESSION_ID = os.environ.get("GLIMMER_SESSION_ID")
@@ -407,6 +435,7 @@ SEMANTIC_TOOL_NAMES = {
     "find_symbol",
     "find_references",
     "find_related_tests",
+    "impact_paths",
     # Task 5.1 (V7 §7 Tier2 "retrievable"): get_evidence(id) reads one
     # already-persisted evidence-*.jsonl entry back into the conversation
     # by id -- same client-side interception path as the other three (see
@@ -441,6 +470,7 @@ PATH_TOOLS = {
     # secure_tool_arguments/resolve_workspace_path here is the ONLY path-
     # containment scheme O4 uses; no second scheme was introduced.
     "find_related_tests",
+    "impact_paths",
 }
 
 REQUIRED_ENGINEERING_TOOLS = {
@@ -748,8 +778,9 @@ def _streaming_chat_at(provider, payload, timeout_s, on_progress):
 # endpoint as a CLI arg, which IS its routing; it stays standalone.
 
 MODEL_REGISTRY = load_model_registry(default_base_url=API_BASE)
+TASK_RISK = os.environ.get("GLIMMER_TASK_RISK", "UNKNOWN").upper()
 MODEL_ROLES = {
-    role: MODEL_REGISTRY["roles"][role]
+    role: model_for_role(MODEL_REGISTRY, role, TASK_RISK)["id"]
     for role in ("engineer", "architect", "consult")
 }
 
@@ -948,14 +979,26 @@ class ModelProvider:
 
 _MODEL_PROVIDERS = {}
 for _role, _provider_id in MODEL_ROLES.items():
-    _entry = model_for_role(MODEL_REGISTRY, _role)
+    _entry = model_for_role(MODEL_REGISTRY, _role, TASK_RISK)
     _MODEL_PROVIDERS[_role] = ModelProvider(
         base_url=_entry["baseUrl"],
         api_key_path=_entry["apiKeyFile"],
         role=_role,
         model_id=_entry["modelId"],
-        provider_id=_provider_id,
+        provider_id=_entry["id"],
     )
+
+_critic_entry = critic_model(MODEL_REGISTRY)
+_MODEL_PROVIDERS["critic"] = ModelProvider(
+    base_url=_critic_entry["baseUrl"],
+    api_key_path=_critic_entry["apiKeyFile"],
+    role="critic",
+    model_id=_critic_entry["modelId"],
+    provider_id=_critic_entry["id"],
+)
+
+for _routing_role in ("engineer", "architect", "consult"):
+    _emit("model_routing_decision", **routing_decision(MODEL_REGISTRY, _routing_role, TASK_RISK))
 
 
 def _provider_for_role(role):
@@ -3058,6 +3101,7 @@ _EVIDENCE_KIND_BY_TOOL = {
     "find_symbol": "symbol",
     "find_references": "symbol",
     "find_related_tests": "test-search",
+    "impact_paths": "impact",
     "get_evidence": "retrieval",
 }
 
@@ -3393,12 +3437,11 @@ def is_post_write_validation_command(command):
 # SEMANTIC CODE TOOLS (O4, glimmer-v7 reconciliation §3.11)
 # ============================================================
 #
-# find_symbol / find_references / find_related_tests, served client-side
-# (see the SEMANTIC_TOOL_NAMES comment above for the rationale). All three
-# are deterministic, lexical/regex-based scans over workspace files — NOT
-# a real language server, parser, or AST — and say so in their own
-# `description` field (SEMANTIC_TOOL_DEFINITIONS below) so the model
-# doesn't over-trust the results.
+# find_symbol / find_references / find_related_tests / impact_paths, served
+# client-side (see the SEMANTIC_TOOL_NAMES comment above). They prefer the
+# session's versioned Tree-sitter repository index and label its per-result
+# provenance. A missing/stale index falls back to the existing lexical/AST
+# scans rather than presenting incomplete semantic data as current.
 #
 # Ignore-directory discipline: glimmer-v2.py already has this exact
 # convention (IGNORE_DIRS / walk_files, glimmer-v2.py line ~43). The two
@@ -3467,6 +3510,39 @@ def _validate_semantic_name(name):
             f"name too long ({len(name)} chars, max {_SEMANTIC_MAX_NAME_LEN})"
         )
     return name
+
+
+def _load_current_repo_index(workspace):
+    """Return this session's index only when its cache key still matches.
+
+    The index is built before the engineer starts. A write during the session
+    changes the dirty-file hash, so semantic tools invoked afterwards must not
+    silently reuse the pre-write graph.
+    """
+    if not GLIMMER_EVENTS_PATH:
+        return None
+    path = Path(GLIMMER_EVENTS_PATH).parent / "repo-index.json"
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(index, dict) or index.get("schemaVersion") != 1:
+            return None
+        parser_versions = index.get("parserVersions")
+        if not isinstance(parser_versions, dict):
+            return None
+        current_key, _head, _dirty_hash = semantic_repository_cache_key(
+            Path(workspace),
+            {str(key): str(value) for key, value in parser_versions.items()},
+        )
+        return index if current_key == index.get("cacheKey") else None
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        return None
+
+
+def _relative_semantic_path(path, workspace):
+    try:
+        return Path(path).resolve(strict=False).relative_to(Path(workspace)).as_posix()
+    except (OSError, ValueError):
+        return None
 
 
 _JS_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
@@ -3641,6 +3717,26 @@ def find_symbol(name, kind, workspace):
     Python `def`, since callers rarely distinguish the two). Capped at
     _SEMANTIC_MAX_MATCHES; returns "file:line: <matched line>" per hit."""
     name = _validate_semantic_name(name)
+    index = _load_current_repo_index(workspace)
+    if index is not None:
+        indexed = semantic_query_symbols(index, name, _SEMANTIC_MAX_MATCHES)
+        if kind:
+            wanted_kind = str(kind).strip().lower()
+            indexed = [
+                item for item in indexed
+                if wanted_kind in str(item.get("kind") or "").lower()
+                or (wanted_kind == "function" and "method" in str(item.get("kind") or "").lower())
+            ]
+        if indexed:
+            rows = [
+                f"{item.get('path')}:{item.get('line')}: {item.get('name')} "
+                f"[{item.get('kind')}; provenance={item.get('provenance')}]"
+                for item in indexed
+            ]
+            return (
+                f"Found {len(rows)} indexed symbol match(es) for '{name}' "
+                "(current repo-index.json):\n" + "\n".join(rows)
+            )
     patterns = _symbol_patterns(re.escape(name))
 
     if kind:
@@ -3726,6 +3822,35 @@ def find_references(name, workspace):
     path — the opposite on both counts — actually handled). Capped at
     _SEMANTIC_MAX_MATCHES total matches."""
     name = _validate_semantic_name(name)
+    index = _load_current_repo_index(workspace)
+    if index is not None:
+        symbols = [
+            item for item in semantic_query_symbols(index, name, _SEMANTIC_MAX_MATCHES)
+            if str(item.get("name") or "") == name
+        ]
+        indexed = []
+        for symbol in symbols:
+            for edge in semantic_query_references(
+                index, str(symbol.get("id") or ""), _SEMANTIC_MAX_MATCHES
+            ):
+                row = dict(edge)
+                row["symbol"] = symbol.get("id")
+                indexed.append(row)
+                if len(indexed) >= _SEMANTIC_MAX_MATCHES:
+                    break
+            if len(indexed) >= _SEMANTIC_MAX_MATCHES:
+                break
+        if indexed:
+            rows = [
+                f"{str(item.get('from') or 'file:unknown').removeprefix('file:')}:"
+                f"{item.get('line')}: -> {item.get('symbol')} "
+                f"[provenance={item.get('provenance', 'tree-sitter')}]"
+                for item in indexed
+            ]
+            return (
+                f"Found {len(rows)} indexed reference(s) to '{name}' "
+                "(current repo-index.json):\n" + "\n".join(rows)
+            )
     pattern = re.compile(r"\b" + re.escape(name) + r"\b")
 
     by_file = {}
@@ -3819,6 +3944,16 @@ def find_related_tests(path, workspace):
     through the exact same resolve_workspace_path containment check as
     read_file/write_file/edit_file — no second scheme)."""
     source = Path(path)
+    index = _load_current_repo_index(workspace)
+    relative = _relative_semantic_path(source, workspace)
+    if index is not None and relative:
+        indexed = semantic_related_tests(index, relative)
+        if indexed:
+            return (
+                f"Found {len(indexed)} indexed related test file(s) for "
+                f"'{source.name}' [provenance=repo-index relation]:\n"
+                + "\n".join(indexed)
+            )
     base = source.stem
 
     # A test file that imports/requires this basename rather than being
@@ -3862,6 +3997,26 @@ def find_related_tests(path, workspace):
     return (
         f"Found {len(matches)} likely test file(s) for '{source.name}':\n"
         + "\n".join(matches)
+    )
+
+
+def find_impact_paths(path, workspace):
+    """Return import-neighbour and test paths from a current repo index."""
+    relative = _relative_semantic_path(path, workspace)
+    if not relative:
+        return "No impact paths: path is outside the workspace."
+    index = _load_current_repo_index(workspace)
+    if index is None:
+        return (
+            "No impact paths available: repo-index.json is missing or stale. "
+            "Use find_references/grep_search as the explicitly lexical fallback."
+        )
+    paths = semantic_impact_paths(index, relative, _SEMANTIC_MAX_MATCHES)
+    if not paths:
+        return f"No indexed impact paths found for '{relative}'."
+    return (
+        f"Found {len(paths)} impact path(s) for '{relative}' "
+        "[provenance=repo-index graph]:\n" + "\n".join(paths)
     )
 
 
@@ -3924,6 +4079,8 @@ def _execute_semantic_tool(tool_name, arguments, workspace):
         text = find_references(arguments.get("name", ""), workspace)
     elif tool_name == "find_related_tests":
         text = find_related_tests(arguments.get("path", ""), workspace)
+    elif tool_name == "impact_paths":
+        text = find_impact_paths(arguments.get("path", ""), workspace)
     elif tool_name == "get_evidence":
         text = _find_evidence_by_id(str(arguments.get("id", "")))
     else:
@@ -4049,6 +4206,35 @@ SEMANTIC_TOOL_DEFINITIONS = [
                         "path": {
                             "type": "string",
                             "description": "Workspace-relative or absolute path to the source file.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+    },
+    {
+        "display_name": "Find impact paths",
+        "tool": "impact_paths",
+        "type": "function",
+        "permissions": {"write": False},
+        "uses_cwd": True,
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": "impact_paths",
+                "description": (
+                    "Find files connected to a source path through the current "
+                    "repository import/test graph. Results are available only "
+                    "from a cache-valid repo-index.json and include explicit "
+                    "graph provenance; use grep_search as a labelled fallback."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative or absolute source path.",
                         },
                     },
                     "required": ["path"],
@@ -7461,7 +7647,9 @@ ARCHITECT_SYSTEM_PROMPT = (
     '  "designTokenRequirements": ["token reuse or justified token additions"],\n'
     '  "risk": "low|medium|high|critical (REQUIRED)",\n'
     '  "expectedScope": {"minFiles": 1, "maxFiles": 4},\n'
-    '  "uncertainties": ["anything you could not confirm"]\n'
+    '  "uncertainties": ["anything you could not confirm"],\n'
+    '  "decisionPoints": [{"id":"decision-1", "question":"...", "impact":"low|medium|high", '
+    '"options":["option A", "option B"]}]\n'
     "}\n\n"
     "objective, packages, and risk are REQUIRED. Every other field must "
     "still be present, but may be an empty array/object if you have "
@@ -7505,6 +7693,7 @@ def _fallback_architecture_plan(objective, reason):
         plan[field] = []
     for field in ARCHITECT_DESIGN_REQUIREMENT_FIELDS:
         plan[field] = []
+    plan["decisionPoints"] = []
 
     return plan
 
@@ -7624,6 +7813,36 @@ def validate_architecture_plan(data):
                     requirements.append(item.strip()[:MAX_VISUAL_REQUIREMENT_CHARS])
         normalized[field] = requirements
 
+    decision_points = []
+    raw_decision_points = data.get("decisionPoints", [])
+    if isinstance(raw_decision_points, list):
+        for index, point in enumerate(raw_decision_points[:10]):
+            if not isinstance(point, dict):
+                continue
+            question = point.get("question")
+            impact = point.get("impact")
+            options = point.get("options")
+            if (
+                not isinstance(question, str)
+                or not question.strip()
+                or impact not in {"low", "medium", "high"}
+                or not isinstance(options, list)
+            ):
+                continue
+            clean_options = [
+                option.strip()[:300] for option in options[:3]
+                if isinstance(option, str) and option.strip()
+            ]
+            if len(clean_options) < 2:
+                continue
+            decision_points.append({
+                "id": str(point.get("id") or f"decision-{index + 1}")[:80],
+                "question": question.strip()[:1000],
+                "impact": impact,
+                "options": clean_options,
+            })
+    normalized["decisionPoints"] = decision_points
+
     expected_scope = data.get("expectedScope")
     if isinstance(expected_scope, dict):
         normalized["expectedScope"] = expected_scope
@@ -7737,12 +7956,16 @@ TASK_REPORT_SYSTEM_PROMPT = (
     "{\n"
     '  "summary": "concise evidence-based result",\n'
     '  "findings": [{"severity":"critical|high|medium|low|info", "category":"...", '
-    '"title":"...", "description":"...", "evidence":[{"path":"src/x.ts", '
+    '"title":"...", "description":"...", "claimType":"presence|absence|behavior|risk", '
+    '"evidenceIds":["exact ids returned by repository tools"], '
+    '"evidence":[{"path":"src/x.ts", '
     '"line":12, "detail":"..."}], "recommendedFix":"..."}],\n'
     '  "implementationPlan": ["ordered step 1", "ordered step 2"],\n'
+    '  "decisionPoints": [{"id":"decision-1", "question":"...", "impact":"low|medium|high", '
+    '"options":["option A", "option B"]}],\n'
     '  "confidence": "high|medium|low"\n'
     "}\n"
-    "All four keys are required. Empty arrays are allowed when repository evidence "
+    "All five keys are required. Empty arrays are allowed when repository evidence "
     "supports no findings or no implementation steps."
 )
 
@@ -7774,8 +7997,15 @@ def validate_task_report(data, mode, objective):
         description = raw.get("description")
         category = raw.get("category")
         recommended = raw.get("recommendedFix")
+        claim_type = raw.get("claimType")
         if not all(isinstance(v, str) and v.strip() for v in (title, description, category, recommended)):
             continue
+        if claim_type not in {"presence", "absence", "behavior", "risk"}:
+            claim_type = "risk"
+        evidence_ids = [
+            value[:200] for value in raw.get("evidenceIds", [])[:50]
+            if isinstance(value, str) and value.strip()
+        ] if isinstance(raw.get("evidenceIds"), list) else []
         evidence = []
         raw_evidence = raw.get("evidence")
         if isinstance(raw_evidence, list):
@@ -7796,31 +8026,45 @@ def validate_task_report(data, mode, objective):
             "category": category.strip()[:200],
             "title": title.strip()[:500],
             "description": description.strip()[:4000],
+            "claimType": claim_type,
+            "evidenceIds": evidence_ids,
             "evidence": evidence,
             "recommendedFix": recommended.strip()[:4000],
         })
 
     plan = [step.strip()[:2000] for step in raw_plan[:100] if isinstance(step, str) and step.strip()]
+    decision_points = raw.get("decisionPoints") if isinstance(raw.get("decisionPoints"), list) else []
     return True, {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "mode": mode,
         "objective": objective,
         "summary": summary.strip()[:8000],
         "findings": findings,
         "implementationPlan": plan,
+        "decisionPoints": decision_points[:10],
         "confidence": confidence,
     }
 
 
 def _fallback_task_report(mode, objective, reason):
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "mode": mode,
         "objective": objective,
         "summary": "The read-only report could not be completed.",
         "findings": [],
+        "rejectedFindings": [],
         "implementationPlan": [],
+        "decisionPoints": [],
         "confidence": "low",
+        "coverage": {
+            "filesInspected": 0,
+            "searchesRun": 0,
+            "graphCoverage": None,
+            "unsupportedLanguages": [],
+            "evidenceRecords": 0,
+        },
+        "critic": {"status": "unavailable", "independence": "unavailable"},
         "reportFailed": True,
         "reportFailureReason": reason,
     }
@@ -7840,6 +8084,101 @@ def _write_task_report_file(output):
         return None
 
 
+def _run_task_report_critic(candidate):
+    """Run a second review only on a loopback provider.
+
+    Repository evidence is sensitive. A configured remote critic is recorded
+    as unavailable instead of receiving repository-derived payloads without a
+    separate, explicit egress contract.
+    """
+    if not GLIMMER_EVENTS_PATH:
+        return None
+    session_dir = Path(GLIMMER_EVENTS_PATH).parent
+    primary = _provider_for_role("architect")
+    critic = _provider_for_role("critic")
+    independence = model_independence(
+        {"id": primary.provider_id, "modelId": primary.model_id},
+        {"id": critic.provider_id, "modelId": critic.model_id},
+    )
+    require_independent = bool(
+        (MODEL_REGISTRY.get("routing") or {}).get("requireIndependentCritic")
+    )
+    critic_host = (urlsplit(critic.base_url).hostname or "").lower()
+    if critic_host not in {"127.0.0.1", "localhost", "::1"}:
+        print("[glimmer-engineer] remote task-report critic disabled: repository evidence stays local")
+        return {
+            "acceptedFindingIndexes": [],
+            "reasons": {},
+            "independence": "unavailable",
+            "requireIndependent": require_independent,
+        }
+    try:
+        request_payload = build_critic_request(
+            candidate,
+            session_dir,
+            {"providerId": critic.provider_id, "modelId": critic.model_id},
+        )
+        request_payload.pop("modelIdentity", None)
+        request_payload["model"] = critic.model_id
+        response = chat_with_retry(request_payload, attempts=2, role="critic")
+        content = response["choices"][0]["message"].get("content") or ""
+        data = _extract_json_object(content)
+        return parse_critic_response(
+            data,
+            len(candidate.get("findings") or []),
+            independence,
+            require_independent,
+        )
+    except Exception as exc:  # critic failure must not erase deterministic validation
+        print(f"[glimmer-engineer] task-report critic unavailable: {type(exc).__name__}: {exc}")
+        return {
+            "acceptedFindingIndexes": [],
+            "reasons": {},
+            "independence": "unavailable",
+            "requireIndependent": require_independent,
+        }
+
+
+def _finalize_task_report(candidate, mode, objective, workspace):
+    session_dir = Path(GLIMMER_EVENTS_PATH).parent if GLIMMER_EVENTS_PATH else Path(workspace)
+    repo_index = None
+    try:
+        loaded_index = json.loads((session_dir / "repo-index.json").read_text(encoding="utf-8"))
+        if isinstance(loaded_index, dict):
+            repo_index = loaded_index
+    except (OSError, ValueError):
+        pass
+    critic = _run_task_report_critic(candidate)
+    ok, output = validate_task_report_v2(
+        candidate, mode, objective, workspace, session_dir, critic, repo_index,
+    )
+    if not ok:
+        return _fallback_task_report(mode, objective, str(output))
+    verified = sum(
+        1 for finding in output["findings"]
+        if finding.get("verification", {}).get("status") == "verified"
+    )
+    _emit(
+        "claim_validation_completed",
+        verified=verified,
+        partial=len(output["findings"]) - verified,
+        rejected=len(output["rejectedFindings"]),
+        confidence=output["confidence"],
+    )
+    for finding in output["rejectedFindings"]:
+        reasons = finding.get("verification", {}).get("reasons") or ["unknown"]
+        record_outcome(
+            workspace,
+            "rejected-claim",
+            {
+                "claimType": finding.get("claimType"),
+                "category": finding.get("category"),
+                "reasonCode": reasons[0],
+            },
+        )
+    return output
+
+
 def _task_report_selfcheck():
     import inspect
     import tempfile
@@ -7849,15 +8188,17 @@ def _task_report_selfcheck():
         "findings": [{
             "severity": "high", "category": "correctness", "title": "Unsafe fallback",
             "description": "The fallback hides a real failure.",
+            "claimType": "behavior", "evidenceIds": ["task-report-selfcheck-ev-1"],
             "evidence": [{"path": "src/a.ts", "line": 12, "detail": "catch returns success"}],
             "recommendedFix": "Preserve the failure state.",
         }],
         "implementationPlan": ["Change the fallback", "Add a regression test"],
+        "decisionPoints": [],
         "confidence": "high",
     }
     ok, normalized = validate_task_report(valid, "inspect", "Hva kan bli bedre?")
     assert ok
-    assert normalized["schemaVersion"] == 1
+    assert normalized["schemaVersion"] == 2
     assert normalized["mode"] == "inspect"
     assert normalized["objective"] == "Hva kan bli bedre?"
     assert validate_task_report(valid, "implement", "x")[0] is False
@@ -8433,7 +8774,9 @@ def run_architect(task, workspace, max_turns, review_request_path=None, task_mod
 
     if report_mode:
         if final_result is not None:
-            output = final_result
+            output = _finalize_task_report(
+                final_result, task_mode, _extract_task_objective(task), workspace,
+            )
             print()
             print("════════════════════════════════════")
             print(f"{task_mode.upper()} TASK REPORT")
