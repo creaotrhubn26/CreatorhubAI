@@ -51,6 +51,12 @@ def _default_registry(default_base_url: str) -> dict:
         "version": 1,
         "models": {DEFAULT_PROVIDER_ID: model},
         "roles": {role: DEFAULT_PROVIDER_ID for role in ROLES},
+        "routing": {
+            "enabled": False,
+            "highRisk": {},
+            "criticProviderId": None,
+            "requireIndependentCritic": False,
+        },
         "source": "default",
     }
 
@@ -109,14 +115,99 @@ def load_model_registry(path: Path | None = None, default_base_url: str | None =
         if not isinstance(provider_id, str) or provider_id not in models:
             return fallback
         roles[role] = provider_id
-    return {"version": 1, "models": models, "roles": roles, "source": str(registry_path)}
+    raw_routing = raw.get("routing")
+    routing = {
+        "enabled": False,
+        "highRisk": {},
+        "criticProviderId": None,
+        "requireIndependentCritic": False,
+    }
+    if raw_routing is not None:
+        if not isinstance(raw_routing, dict):
+            return fallback
+        if "enabled" in raw_routing and not isinstance(raw_routing.get("enabled"), bool):
+            return fallback
+        if "requireIndependentCritic" in raw_routing and not isinstance(
+            raw_routing.get("requireIndependentCritic"), bool
+        ):
+            return fallback
+        high_risk = raw_routing.get("highRisk", {})
+        if not isinstance(high_risk, dict):
+            return fallback
+        normalized_high_risk = {}
+        for role, provider_id in high_risk.items():
+            if role not in ROLES or not isinstance(provider_id, str) or provider_id not in models:
+                return fallback
+            normalized_high_risk[role] = provider_id
+        critic_provider_id = raw_routing.get("criticProviderId")
+        if critic_provider_id is not None and (
+            not isinstance(critic_provider_id, str) or critic_provider_id not in models
+        ):
+            return fallback
+        routing = {
+            "enabled": raw_routing.get("enabled", False),
+            "highRisk": normalized_high_risk,
+            "criticProviderId": critic_provider_id,
+            "requireIndependentCritic": raw_routing.get("requireIndependentCritic", False),
+        }
+    return {
+        "version": 1,
+        "models": models,
+        "roles": roles,
+        "routing": routing,
+        "source": str(registry_path),
+    }
 
 
-def model_for_role(registry: dict, role: str) -> dict:
+def model_for_role(registry: dict, role: str, risk: str | None = None) -> dict:
     roles = registry["roles"]
     models = registry["models"]
     provider_id = roles.get(role) or roles["engineer"]
+    routing = registry.get("routing") or {}
+    if (
+        routing.get("enabled", False)
+        and str(risk or "").upper() in {"HIGH", "CRITICAL"}
+        and isinstance(routing.get("highRisk"), dict)
+    ):
+        provider_id = routing["highRisk"].get(role) or provider_id
     return models[provider_id]
+
+
+def critic_model(registry: dict) -> dict:
+    routing = registry.get("routing") or {}
+    provider_id = routing.get("criticProviderId") if routing.get("enabled", False) else None
+    if not provider_id:
+        provider_id = registry["roles"].get("consult") or registry["roles"]["engineer"]
+    return registry["models"][provider_id]
+
+
+def model_independence(primary: dict, critic: dict) -> str:
+    if not primary or not critic:
+        return "unavailable"
+    if primary.get("id") != critic.get("id") and primary.get("modelId") != critic.get("modelId"):
+        return "independent"
+    return "same-model"
+
+
+def routing_decision(registry: dict, role: str, risk: str | None = None) -> dict:
+    selected = model_for_role(registry, role, risk)
+    critic = critic_model(registry)
+    base = registry["roles"].get(role) or registry["roles"]["engineer"]
+    adaptive = selected.get("id") != base
+    critic_host = (parse.urlsplit(str(critic.get("baseUrl") or "")).hostname or "").lower()
+    critic_independence = (
+        model_independence(selected, critic)
+        if critic_host in {"localhost", "127.0.0.1", "::1"}
+        else "unavailable"
+    )
+    return {
+        "role": role,
+        "risk": str(risk or "UNKNOWN").upper(),
+        "providerId": selected.get("id"),
+        "modelId": selected.get("modelId"),
+        "reason": "high-risk-override" if adaptive else "configured-role",
+        "criticIndependence": critic_independence,
+    }
 
 
 def _selfcheck() -> None:
@@ -143,6 +234,20 @@ def _selfcheck() -> None:
         assert model_for_role(registry, "engineer")["modelId"] == "local-30b"
         assert model_for_role(registry, "architect")["baseUrl"] == "https://models.example/v1"
         assert "super-secret-token" not in json.dumps(registry), "registry must carry paths, never key contents"
+
+        adaptive = json.loads(path.read_text(encoding="utf-8"))
+        adaptive["routing"] = {
+            "enabled": True,
+            "highRisk": {"engineer": "frontier"},
+            "criticProviderId": "private",
+            "requireIndependentCritic": True,
+        }
+        path.write_text(json.dumps(adaptive), encoding="utf-8")
+        routed = load_model_registry(path)
+        assert model_for_role(routed, "engineer", "HIGH")["id"] == "frontier"
+        assert model_for_role(routed, "engineer", "LOW")["id"] == "private"
+        assert critic_model(routed)["id"] == "private"
+        assert model_independence(model_for_role(routed, "engineer", "HIGH"), critic_model(routed)) == "independent"
 
         invalid = json.loads(path.read_text(encoding="utf-8"))
         invalid["models"][1]["baseUrl"] = "https://models.example/v1?key=must-not-live-in-url"

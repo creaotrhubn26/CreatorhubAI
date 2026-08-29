@@ -68,6 +68,11 @@ EVENT_TYPES = {
     # (classify_yellow) needs a human decision -- one per approval
     # request, before the poll loop over approvals.json starts.
     "approval_requested",
+    # Accuracy v2 facts: deterministic validation/indexing, clarification,
+    # adaptive routing and repeated-repair prevention.
+    "claim_validation_completed", "repo_index_completed",
+    "clarification_requested", "clarification_resolved",
+    "model_routing_decision", "repair_strategy_rejected",
 }
 
 
@@ -142,6 +147,14 @@ def _selfcheck() -> None:
             ("model_retry", {"attempt": 2, "strategy": "same_turn"}),
             ("model_request_started", {"requestId": "req-1", "role": "engineer",
                                        "providerId": "private", "modelId": "local-30b"}),
+            ("model_routing_decision", {"role": "engineer", "risk": "HIGH",
+                                         "providerId": "frontier", "modelId": "frontier-1",
+                                         "reason": "high-risk-override"}),
+            ("claim_validation_completed", {"verified": 2, "partial": 0, "rejected": 1}),
+            ("repo_index_completed", {"supportedFiles": 12, "partial": False}),
+            ("clarification_requested", {"clarificationId": "clarify-1"}),
+            ("clarification_resolved", {"clarificationId": "clarify-1"}),
+            ("repair_strategy_rejected", {"strategyId": "repeat", "failureSignature": "sig"}),
             # Fix round 1 (MED): sample updated to the real Task 5.1 shape
             # glimmer-engineer.py actually emits (tier0Chars/tier1Chars/
             # tier2Refs/tier3Note) -- the old systemBytes/taskBytes sample

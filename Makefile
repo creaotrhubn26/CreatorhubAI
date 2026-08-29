@@ -12,7 +12,11 @@ PYTHON_FILES := \
 	glimmer-visual.py \
 	glimmer_events.py \
 	glimmer_journal.py \
-	glimmer_models.py
+	glimmer_models.py \
+	glimmer_memory.py \
+	glimmer_quality.py \
+	glimmer_semantic.py \
+	glimmer_verification.py
 
 .PHONY: quality lint typecheck compile selfcheck
 
@@ -22,7 +26,7 @@ lint:
 	$(RUFF) check $(PYTHON_FILES)
 
 typecheck:
-	$(MYPY) glimmer_events.py glimmer_journal.py glimmer_models.py
+	$(MYPY) glimmer_events.py glimmer_journal.py glimmer_models.py glimmer_memory.py
 
 compile:
 	$(PYTHON) -m compileall -q $(PYTHON_FILES)
@@ -31,6 +35,10 @@ selfcheck:
 	$(PYTHON) glimmer_events.py
 	$(PYTHON) glimmer_journal.py --selfcheck
 	$(PYTHON) glimmer_models.py
+	$(PYTHON) glimmer_memory.py
+	$(PYTHON) glimmer_quality.py
+	$(PYTHON) glimmer_semantic.py
+	$(PYTHON) glimmer_verification.py
 	$(PYTHON) glimmer-engineer.py --streaming-transport-selfcheck
 	$(PYTHON) glimmer-engineer.py --github-cli-selfcheck
 	$(PYTHON) glimmer-engineer.py --task-report-selfcheck

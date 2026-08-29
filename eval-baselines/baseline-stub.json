@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "phase": "baseline",
+  "mode": "stub",
+  "orchestratorCommit": "cd2010958f884e406e04142ed16573e16b9c1278",
+  "suiteVersion": "2.0.0",
+  "sourceResult": "eval-results/20260829T090739Z.json",
+  "total": 12,
+  "taskSuccess": 11,
+  "falseVerified": 1,
+  "budgetViolations": 0,
+  "honestyFailures": 0,
+  "claimPrecision": null,
+  "candidateRecallAt5": null
+}

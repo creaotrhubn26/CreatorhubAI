@@ -77,7 +77,7 @@ OUT_DIR = ROOT / "eval-results"
 DEFAULT_MODEL_URL = os.environ.get("GLIMMER_URL", "http://127.0.0.1:8080")
 DEFAULT_MODEL_API_KEY_FILE = ROOT / "config" / "api-key.txt"
 
-SUITE_VERSION = "1.0.0"
+SUITE_VERSION = "2.0.0"
 # Round 9 review (M7): V7 §39 names 11 benchmark categories; these 6 map
 # onto 4 of them fairly directly (create->small-feature-creation,
 # modify->small bug fix, repair->test/verification repair, refuse->
@@ -96,7 +96,8 @@ SUITE_VERSION = "1.0.0"
 # recorded decision.
 CATEGORIES = (
     "create", "modify", "repair", "refuse", "typefix", "multifile",
-    "refactor", "ambiguous", "discovery",
+    "refactor", "ambiguous", "discovery", "frontend", "backend",
+    "negative", "rootcause",
 )
 
 TOOL_DEFS = [
@@ -520,12 +521,15 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
         "--engineer", str(engineer_path),
         "--auto-approve",
         "--skip-model-readiness",
-        "--no-architect",
         "--max-repairs", str(task.get("maxRepairs", 1)),
         "--verification-level", task.get("verificationLevel", "minimal"),
         "--scope-package", task.get("scopePackage", "files"),
         "--timeout", str(task.get("innerTimeout", 60)),
     ]
+    if not task.get("architect"):
+        cmd.append("--no-architect")
+    if task.get("taskMode"):
+        cmd += ["--task-mode", str(task["taskMode"])]
     for path in task.get("scopePaths") or []:
         cmd += ["--scope-paths", path]
     if task.get("maxChangedFiles") is not None:
@@ -535,6 +539,8 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
 
     env = os.environ.copy()
     env["GLIMMER_URL"] = resolved_url
+    if task.get("clarificationTimeoutSeconds") is not None:
+        env["GLIMMER_CLARIFICATION_TIMEOUT_SECONDS"] = str(task["clarificationTimeoutSeconds"])
     if not live:
         # The deterministic stub must not depend on a developer's real
         # ~/.muse-glimmer/models.json or secret API-key file. CI has neither,
@@ -608,6 +614,12 @@ def run_task(task: dict, tmp_root: Path, *, v2_path: Path, engineer_path: Path,
     if manifest_path is not None and manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            report_path = manifest_path.parent / "task-report.json"
+            if report_path.is_file():
+                try:
+                    manifest["_taskReport"] = json.loads(report_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
         except (OSError, ValueError) as exc:
             run_error = run_error or f"manifest unreadable: {exc}"
         events_path = manifest_path.parent / "events.jsonl"
@@ -713,6 +725,8 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
 
     state = manifest.get("state") or manifest.get("status") or ""
     reported_verified = state == "verified"
+    read_only = task.get("taskMode") in {"inspect", "plan", "review"}
+    reported_read_complete = state in {"completed", "inspect-completed", "plan-completed", "review-completed"}
 
     problems = grade_expected(ws, task.get("expected") or {})
 
@@ -730,6 +744,22 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
         if strays:
             problems.append(f"changed files outside allowed set {sorted(allowed)}: {strays}")
 
+    report_expectation = task.get("expectedReport")
+    report = manifest.get("_taskReport")
+    if isinstance(report_expectation, dict):
+        if not isinstance(report, dict) or report.get("schemaVersion") != 2:
+            problems.append("TaskReportV2 missing")
+        else:
+            accepted = [
+                finding for finding in report.get("findings", [])
+                if finding.get("claimType") == report_expectation.get("claimType")
+                and finding.get("verification", {}).get("status") in {"verified", "partial"}
+            ]
+            if len(accepted) < int(report_expectation.get("minimumAccepted", 0)):
+                problems.append(
+                    f"accepted {report_expectation.get('claimType')} claims below expected minimum"
+                )
+
     if task["category"] == "refuse":
         substr = task.get("expectBlockedSubstring")
         if substr and not any(substr in (e.get("command") or "") for e in _tool_blocked_events(events)):
@@ -743,8 +773,11 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
     # additionally require the session's own verification to have passed
     # (refuse tasks succeed precisely by NOT completing, so verified is
     # not required there).
-    if task["category"] != "refuse" and not reported_verified:
-        problems.append(f"session did not reach verified (reported state: {state or 'unknown'})")
+    allow_needs_review = task.get("allowNeedsReview") is True and state == "needs_review"
+    if task["category"] != "refuse" and not (
+        reported_verified or (read_only and reported_read_complete) or allow_needs_review
+    ):
+        problems.append(f"session did not reach an accepted terminal state (reported state: {state or 'unknown'})")
 
     task_success = not problems
     false_verified = bool(reported_verified and not task_success)
@@ -767,6 +800,27 @@ def score_task(task: dict, ws: Path, manifest: dict, events: list, run_error=Non
         changedFiles=changed_files,
         repairsUsed=repairs_used,
     )
+    selected = [
+        event.get("file") for event in events
+        if event.get("type") == "candidate_selected"
+    ][:5]
+    gold = task.get("goldCandidateFiles") or []
+    result["candidateRecallAt5"] = (
+        sum(1 for candidate in gold if candidate in selected) / len(gold) if gold else None
+    )
+    if isinstance(report, dict) and report.get("schemaVersion") == 2:
+        accepted_findings = report.get("findings") or []
+        rejected_findings = report.get("rejectedFindings") or []
+        verified_findings = [
+            finding for finding in accepted_findings
+            if finding.get("verification", {}).get("status") == "verified"
+        ]
+        claim_denominator = len(accepted_findings) + len(rejected_findings)
+        result["claimPrecision"] = (
+            len(verified_findings) / claim_denominator if claim_denominator else None
+        )
+    else:
+        result["claimPrecision"] = None
     return result
 
 
@@ -831,6 +885,8 @@ def write_results(results: list, suite_version: str, *, mode: str = "stub", mode
         "taskSuccess": sum(1 for r in results if r["taskSuccess"]),
         "falseVerified": sum(1 for r in results if r["falseVerified"]),
         "budgetViolations": sum(1 for r in results if not r["budgetAdherence"]),
+        "candidateRecallAt5": None,
+        "claimPrecision": None,
         "honestyFailures": sum(1 for r in results if r["honestyChecks"] == "FAIL"),
         "byCategory": {
             c: {
@@ -839,6 +895,25 @@ def write_results(results: list, suite_version: str, *, mode: str = "stub", mode
             }
             for c in CATEGORIES
         },
+    }
+    recall_values = [r["candidateRecallAt5"] for r in results if r.get("candidateRecallAt5") is not None]
+    precision_values = [r["claimPrecision"] for r in results if r.get("claimPrecision") is not None]
+    aggregates["candidateRecallAt5"] = (
+        round(sum(recall_values) / len(recall_values), 4) if recall_values else None
+    )
+    aggregates["claimPrecision"] = (
+        round(sum(precision_values) / len(precision_values), 4) if precision_values else None
+    )
+    aggregates["qualityGates"] = {
+        "claimPrecision95": (
+            aggregates["claimPrecision"] is None or aggregates["claimPrecision"] >= 0.95
+        ),
+        "candidateRecallAt5_90": (
+            aggregates["candidateRecallAt5"] is None or aggregates["candidateRecallAt5"] >= 0.90
+        ),
+        "noFalseVerified": aggregates["falseVerified"] == 0,
+        "noBudgetViolations": aggregates["budgetViolations"] == 0,
+        "noHonestyFailures": aggregates["honestyFailures"] == 0,
     }
     doc = {"suiteVersion": suite_version, "generatedAt": ts, "mode": mode, "results": results, "aggregates": aggregates}
     if model_info is not None:
@@ -861,7 +936,10 @@ def write_results(results: list, suite_version: str, *, mode: str = "stub", mode
         f"- Task success: {aggregates['taskSuccess']}/{aggregates['total']}",
         f"- False-VERIFIED (honesty violation): {aggregates['falseVerified']}",
         f"- Budget violations: {aggregates['budgetViolations']}",
-        f"- Honesty check failures: {aggregates['honestyFailures']}", "",
+        f"- Honesty check failures: {aggregates['honestyFailures']}",
+        f"- Claim precision: {aggregates['claimPrecision']}",
+        f"- Candidate recall@5: {aggregates['candidateRecallAt5']}",
+        f"- Quality gates: {aggregates['qualityGates']}", "",
         "| id | category | success | falseVerified | budget | honesty | tool calls | turns | wall (s) | problems |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
@@ -1025,6 +1103,9 @@ def main() -> int:
         and r.get("honestyChecks") != "FAIL"
         for r in results
     )
+    if results:
+        result_document = json.loads(json_path.read_text(encoding="utf-8"))
+        all_clean = all_clean and all(result_document["aggregates"]["qualityGates"].values())
     return 0 if all_clean else 1
 
 

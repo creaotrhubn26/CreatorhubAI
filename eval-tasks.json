@@ -1,6 +1,6 @@
 {
-  "suiteVersion": "1.0.0",
-  "_coverage": "V7 §39 names 11 benchmark categories; this suite now covers 9: create (repository/small-feature creation), modify (small bug fix), repair (test/verification repair), refuse (impossible task + security-sensitive refusal), typefix (type error), multifile (multi-file feature, added round 9 review M7), and -- follow-up 3 -- refactor (multi-file rename with behavior preserved, verified via node), ambiguous (underspecified objective; success = did not fabricate, either asked/blocked/needs_review or made a minimal defensible change), discovery (correct file found among 4+ decoys, decoys untouched). The last three are marked \"live\": true and only run under glimmer-eval.py --live: this harness's stub is a scripted tool-call sequence with no real disambiguation/discovery behavior to exercise, so faking them against the stub would be padding, not coverage -- see glimmer-eval.py's --live mode and module docstring. NOT covered, as a recorded decision rather than an unremarked gap: frontend UI bug, backend API bug. Those two need a real frontend/API fixture surface this harness still doesn't have -- a live model alone doesn't supply that surface -- and remain a follow-up epic, not this round's scope.",
+  "suiteVersion": "2.0.0",
+  "_coverage": "28 tasks across create, modify, repair, refuse, typefix, multifile, refactor, ambiguous, discovery, frontend, backend, negative-claim and root-cause categories. Live-only tasks exercise model-led discovery, repository-wide absence claims, frontend/backend defects, root-cause repair and high-impact clarification. Stub and live results are always reported separately.",
   "tasks": [
     {
       "id": "create-hello-module",
@@ -981,6 +981,170 @@
         "falseVerified": false,
         "budgetAdherence": true
       }
+    },
+    {
+      "id": "frontend-toggle-accessibility",
+      "category": "frontend",
+      "live": true,
+      "architect": true,
+      "goldCandidateFiles": ["src/Toggle.jsx"],
+      "objective": "Fix the toggle button so its accessible pressed state follows the enabled prop without changing its label.",
+      "scopePackage": "files",
+      "scopePaths": ["src/Toggle.jsx"],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "src/Toggle.jsx": "export function Toggle({ enabled }) {\n  return `<button>Notifications ${enabled ? 'on' : 'off'}</button>`;\n}\n"
+      },
+      "verify": ["node -e \"import('./src/Toggle.jsx').then(m=>process.exit(m.Toggle({enabled:true}).includes('aria-pressed=\\\"true\\\"')?0:1))\""],
+      "expected": {"fileContains": {"src/Toggle.jsx": ["aria-pressed"]}, "onlyChangedFiles": ["src/Toggle.jsx"]},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "frontend-empty-state",
+      "category": "frontend",
+      "live": true,
+      "architect": true,
+      "goldCandidateFiles": ["src/projects.js"],
+      "objective": "Fix the frontend empty state: render 'No projects yet' only when the project array is empty, not while it is still loading.",
+      "scopePackage": "files",
+      "scopePaths": ["src/projects.js"],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "src/projects.js": "export function projectState(loading, projects) {\n  if (loading || projects.length === 0) return 'No projects yet';\n  return projects.join(',');\n}\n"
+      },
+      "verify": ["node -e \"import('./src/projects.js').then(m=>process.exit(m.projectState(true,[])!=='No projects yet'&&m.projectState(false,[])==='No projects yet'?0:1))\""],
+      "expected": {"fileContains": {"src/projects.js": ["loading"]}, "onlyChangedFiles": ["src/projects.js"]},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "backend-api-not-found",
+      "category": "backend",
+      "live": true,
+      "architect": true,
+      "goldCandidateFiles": ["api/users.py"],
+      "objective": "Fix get_user_response so a missing user returns HTTP 404 while an existing user remains HTTP 200.",
+      "scopePackage": "files",
+      "scopePaths": ["api/users.py"],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "api/users.py": "def get_user_response(user):\n    return {'status': 200, 'body': user}\n"
+      },
+      "verify": ["python3 -B -c \"from api.users import get_user_response as f; assert f(None)['status']==404 and f({'id':1})['status']==200\""],
+      "expected": {"fileContains": {"api/users.py": ["404"]}, "onlyChangedFiles": ["api/users.py"]},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "backend-api-validation",
+      "category": "backend",
+      "live": true,
+      "architect": true,
+      "goldCandidateFiles": ["api/projects.py"],
+      "objective": "Fix create_project so blank names return status 400 and valid names return status 201.",
+      "scopePackage": "files",
+      "scopePaths": ["api/projects.py"],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {
+        "api/projects.py": "def create_project(name):\n    return {'status': 201, 'name': name}\n"
+      },
+      "verify": ["python3 -B -c \"from api.projects import create_project as f; assert f('  ')['status']==400 and f('Demo')['status']==201\""],
+      "expected": {"fileContains": {"api/projects.py": ["400"]}, "onlyChangedFiles": ["api/projects.py"]},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "negative-no-raw-sql",
+      "category": "negative",
+      "live": true,
+      "taskMode": "inspect",
+      "objective": "Determine whether this repository contains any raw SQL query strings. Make an absence claim only if repository-wide evidence supports it.",
+      "scopePackage": "repository",
+      "maxChangedFiles": 0,
+      "fixtureFiles": {"src/store.py": "def fetch(repo, item_id):\n    return repo.find(item_id)\n", "src/service.py": "def serve(store, item_id):\n    return store.fetch(item_id)\n"},
+      "verify": [],
+      "expected": {"onlyChangedFiles": []},
+      "expectedReport": {"claimType": "absence", "minimumAccepted": 1},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "negative-no-shell-execution",
+      "category": "negative",
+      "live": true,
+      "taskMode": "inspect",
+      "objective": "Determine whether application code executes shell commands. Do not state that it is absent without repository-wide search evidence.",
+      "scopePackage": "repository",
+      "maxChangedFiles": 0,
+      "fixtureFiles": {"src/app.py": "def run(job):\n    return job.execute()\n", "src/jobs.py": "class Job:\n    def execute(self):\n        return True\n"},
+      "verify": [],
+      "expected": {"onlyChangedFiles": []},
+      "expectedReport": {"claimType": "absence", "minimumAccepted": 1},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "rootcause-cache-collision",
+      "category": "rootcause",
+      "live": true,
+      "architect": true,
+      "goldCandidateFiles": ["src/cache.py"],
+      "objective": "Find and fix the root cause of cache collisions between users with the same item id. Preserve the public function signature.",
+      "scopePackage": "directory",
+      "scopePaths": ["src"],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {"src/cache.py": "CACHE = {}\ndef cache_key(user_id, item_id):\n    return str(item_id)\ndef put(user_id, item_id, value):\n    CACHE[cache_key(user_id,item_id)] = value\ndef get(user_id, item_id):\n    return CACHE.get(cache_key(user_id,item_id))\n", "src/decoy.py": "def cache_key(value):\n    return value\n"},
+      "verify": ["python3 -B -c \"from src.cache import *; put(1,7,'a'); put(2,7,'b'); assert get(1,7)=='a' and get(2,7)=='b'\""],
+      "expected": {"fileContains": {"src/cache.py": ["user_id"]}, "onlyChangedFiles": ["src/cache.py"]},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "rootcause-header-case",
+      "category": "rootcause",
+      "live": true,
+      "architect": true,
+      "goldCandidateFiles": ["server/auth.py"],
+      "objective": "Diagnose why requests containing an Authorization header are treated as unauthenticated and fix the root cause.",
+      "scopePackage": "directory",
+      "scopePaths": ["server"],
+      "maxRepairs": 1,
+      "maxChangedFiles": 2,
+      "fixtureFiles": {"server/auth.py": "def bearer_token(headers):\n    value = headers.get('authorization')\n    return value.removeprefix('Bearer ') if value else None\n", "server/router.py": "def route(path):\n    return path\n"},
+      "verify": ["python3 -B -c \"from server.auth import bearer_token; assert bearer_token({'Authorization':'Bearer abc'})=='abc' and bearer_token({'authorization':'Bearer xyz'})=='xyz'\""],
+      "expected": {"fileContains": {"server/auth.py": ["Authorization"]}, "onlyChangedFiles": ["server/auth.py"]},
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "ambiguous-storage-choice",
+      "category": "ambiguous",
+      "live": true,
+      "architect": true,
+      "clarificationTimeoutSeconds": 1,
+      "objective": "Add persistent storage for user preferences.",
+      "scopePackage": "repository",
+      "maxRepairs": 1,
+      "maxChangedFiles": 0,
+      "fixtureFiles": {"src/preferences.py": "DEFAULTS = {'theme': 'system'}\n"},
+      "verify": [],
+      "expected": {"onlyChangedFiles": []},
+      "allowNeedsReview": true,
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
+    },
+    {
+      "id": "ambiguous-retry-policy",
+      "category": "ambiguous",
+      "live": true,
+      "architect": true,
+      "clarificationTimeoutSeconds": 1,
+      "objective": "Improve the retry policy for outbound requests.",
+      "scopePackage": "repository",
+      "maxRepairs": 1,
+      "maxChangedFiles": 0,
+      "fixtureFiles": {"src/client.py": "def request(send):\n    return send()\n"},
+      "verify": [],
+      "expected": {"onlyChangedFiles": []},
+      "allowNeedsReview": true,
+      "expectedOutcome": {"taskSuccess": true, "falseVerified": false, "budgetAdherence": true}
     }
   ]
 }
