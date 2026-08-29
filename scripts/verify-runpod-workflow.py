@@ -56,6 +56,16 @@ def main() -> None:
     require(text.count("runs-on: ubuntu-24.04") == 2, "runner must be explicit")
     require(text.count("timeout-minutes: 90") == 2, "both jobs need a time limit")
     require(text.count("platforms: linux/amd64") == 2, "only linux/amd64 is supported")
+    require(
+        text.count("ref: glimmer-orchestrator-main") == 2,
+        "both jobs must build the fixed orchestrator release branch",
+    )
+    require(text.count("id: checkout") == 2, "both jobs must expose the checked-out commit")
+    require(
+        text.count("steps.checkout.outputs.commit") == 7,
+        "image identity must come from the checked-out orchestrator commit",
+    )
+    require("github.sha" not in text, "default-branch workflow SHA is not image provenance")
     require(text.count("persist-credentials: false") == 2, "checkout credentials must not persist")
     require(text.count("packages: write") == 1, "only the publish job may write packages")
     require(text.count("push: false") == 1, "validation build must never push")
