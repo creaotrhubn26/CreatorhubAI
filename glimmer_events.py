@@ -73,6 +73,9 @@ EVENT_TYPES = {
     "claim_validation_completed", "repo_index_completed",
     "clarification_requested", "clarification_resolved",
     "model_routing_decision", "repair_strategy_rejected",
+    # Remote compute v1. These carry stable ids/states only; capabilities,
+    # model credentials, source, and checkpoint bytes are never events.
+    "remote_job_started", "remote_checkpoint_created", "remote_job_completed",
 }
 
 
@@ -155,6 +158,9 @@ def _selfcheck() -> None:
             ("clarification_requested", {"clarificationId": "clarify-1"}),
             ("clarification_resolved", {"clarificationId": "clarify-1"}),
             ("repair_strategy_rejected", {"strategyId": "repeat", "failureSignature": "sig"}),
+            ("remote_job_started", {"jobId": "job-1", "backend": "runpod_pod"}),
+            ("remote_checkpoint_created", {"jobId": "job-1", "sequence": 1}),
+            ("remote_job_completed", {"jobId": "job-1", "status": "verified"}),
             # Fix round 1 (MED): sample updated to the real Task 5.1 shape
             # glimmer-engineer.py actually emits (tier0Chars/tier1Chars/
             # tier2Refs/tier3Note) -- the old systemBytes/taskBytes sample

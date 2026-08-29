@@ -1,0 +1,12 @@
+**
+!Dockerfile.runpod
+!requirements-runpod.txt
+!*.py
+!patches/
+!patches/*.patch
+!docker/
+!docker/runpod/
+!docker/runpod/*.py
+!docker/runpod/*.sh
+!docker/runpod/*.list
+!docker/runpod/image-lock.json

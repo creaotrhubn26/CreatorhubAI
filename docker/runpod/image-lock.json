@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "platform": "linux/amd64",
+  "cuda": "12.4.1",
+  "ubuntuSnapshot": "20260828T000000Z",
+  "buildBase": "nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749",
+  "runtimeBase": "nvidia/cuda:12.4.1-runtime-ubuntu22.04@sha256:cff3a0d82d2c2b47bab252d67fa9b34a20ef4c50781d98501b5c7367ea9afd10",
+  "llamaCppRepository": "https://github.com/ggml-org/llama.cpp.git",
+  "llamaCppCommit": "a94d563ed801d1da1b8c2432946de07d0231bb3d",
+  "pythonPackages": {
+    "cryptography": "49.0.0",
+    "cffi": "2.1.1",
+    "pycparser": "3.0",
+    "tree-sitter": "0.26.0",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "tree-sitter-rust": "0.24.2"
+  }
+}

@@ -154,6 +154,13 @@ class DurableJournal:
         self.process_name = process_name
         self.path = self.session_dir / JOURNAL_FILE
         self.recovery_path = self.session_dir / RECOVERY_FILE
+        remote_checkpoint_dir = os.environ.get("GLIMMER_REMOTE_CHECKPOINT_DIR")
+        self.remote_checkpoint_path = (
+            Path(remote_checkpoint_dir).resolve() / "checkpoint-latest.json"
+            if remote_checkpoint_dir
+            else None
+        )
+        self._remote_checkpoint_sequence = 0
         self._lock = threading.RLock()
         self._closed = False
         self._last_stream_flush: dict[str, float] = {}
@@ -264,6 +271,23 @@ class DurableJournal:
 
     def _write_recovery_state(self) -> None:
         atomic_write_json(self.recovery_path, self._state)
+        if self.remote_checkpoint_path is not None:
+            self._remote_checkpoint_sequence += 1
+            # Deliberately exclude conversation/model text, tool arguments,
+            # source, and secrets. The worker only needs a bounded progress
+            # projection to decide that a durable checkpoint advanced.
+            projection = {
+                "schemaVersion": 1,
+                "sessionId": self.session_id,
+                "sequence": self._remote_checkpoint_sequence,
+                "phase": self._state.get("phase", "unknown"),
+                "turn": self._state.get("turn"),
+                "lastDurableAt": self._state.get("lastDurableAt"),
+                "durableMessageCount": self._state.get("durableMessageCount", 0),
+                "partialModelCharacters": self._state.get("partialModelCharacters", 0),
+                "processState": self._state.get("processState", "running"),
+            }
+            atomic_write_json(self.remote_checkpoint_path, projection)
 
     def append(self, kind: str, payload=None, *, turn=None, request_id=None, call_id=None) -> None:
         if self._closed:

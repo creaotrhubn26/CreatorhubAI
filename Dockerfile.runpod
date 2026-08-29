@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+ARG BUILD_BASE=nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749
+ARG RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04@sha256:cff3a0d82d2c2b47bab252d67fa9b34a20ef4c50781d98501b5c7367ea9afd10
+
+FROM ${BUILD_BASE} AS llama-build
+ARG DEBIAN_FRONTEND=noninteractive
+ARG LLAMA_CPP_COMMIT=a94d563ed801d1da1b8c2432946de07d0231bb3d
+COPY docker/runpod/jammy-snapshot.sources.list /etc/apt/sources.list
+RUN find /etc/apt/sources.list.d -maxdepth 1 -type f -delete \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates cmake git ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git init llama.cpp \
+    && cd llama.cpp \
+    && git remote add origin https://github.com/ggml-org/llama.cpp.git \
+    && git fetch --depth=1 origin "${LLAMA_CPP_COMMIT}" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${LLAMA_CPP_COMMIT}"
+COPY patches/llama-exec-shell-timeout-1200.patch /tmp/timeout.patch
+COPY patches/llama-mcp-tool-permissions.patch /tmp/mcp-permissions.patch
+RUN cd /src/llama.cpp \
+    && git apply --check /tmp/timeout.patch \
+    && git apply /tmp/timeout.patch \
+    && git apply --check /tmp/mcp-permissions.patch \
+    && git apply /tmp/mcp-permissions.patch \
+    && cmake -S . -B build -G Ninja \
+        -DGGML_CUDA=ON \
+        -DLLAMA_CURL=OFF \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target llama-server --parallel "$(nproc)" \
+    && install -Dm755 build/bin/llama-server /out/llama-server
+
+FROM ${RUNTIME_BASE} AS worker
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BUILD_ID=unverified
+ARG SOURCE_COMMIT=unverified
+ARG LLAMA_CPP_COMMIT=a94d563ed801d1da1b8c2432946de07d0231bb3d
+LABEL org.opencontainers.image.title="Muse Glimmer RunPod worker" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      no.creatorhub.glimmer.worker-build="${BUILD_ID}" \
+      no.creatorhub.glimmer.llama-commit="${LLAMA_CPP_COMMIT}" \
+      no.creatorhub.glimmer.protocol="1"
+COPY docker/runpod/jammy-snapshot.sources.list /etc/apt/sources.list
+RUN find /etc/apt/sources.list.d -maxdepth 1 -type f -delete \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git gosu python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-runpod.txt /tmp/requirements-runpod.txt
+RUN python3 -m pip install --no-cache-dir --only-binary=:all: --require-hashes \
+      -r /tmp/requirements-runpod.txt \
+    && rm /tmp/requirements-runpod.txt
+COPY --from=llama-build /out/llama-server /opt/glimmer/bin/llama-server
+WORKDIR /opt/glimmer
+COPY glimmer-v2.py glimmer-engineer.py glimmer-visual.py /opt/glimmer/
+COPY glimmer_events.py glimmer_journal.py glimmer_models.py /opt/glimmer/
+COPY glimmer_memory.py glimmer_quality.py glimmer_semantic.py glimmer_verification.py /opt/glimmer/
+COPY glimmer_remote.py runpod_worker.py /opt/glimmer/
+COPY docker/runpod/fetch_artifact.py docker/runpod/healthcheck.py /opt/glimmer/docker/runpod/
+COPY docker/runpod/entrypoint.sh /opt/glimmer/docker/runpod/entrypoint.sh
+RUN chmod 0555 /opt/glimmer/docker/runpod/entrypoint.sh \
+    && python3 -m py_compile /opt/glimmer/*.py \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin glimmer \
+    && install -d -o glimmer -g glimmer -m 0700 /run/glimmer-worker /workspace
+EXPOSE 4318
+ENV PYTHONUNBUFFERED=1 \
+    GLIMMER_WORKER_BUILD_ID=${BUILD_ID} \
+    GLIMMER_LLAMA_CPP_COMMIT=${LLAMA_CPP_COMMIT}
+ENTRYPOINT ["/opt/glimmer/docker/runpod/entrypoint.sh"]

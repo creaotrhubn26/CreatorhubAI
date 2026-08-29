@@ -6949,6 +6949,9 @@ def main():
     ap.add_argument("--skip-model-readiness", action="store_true")
     ap.add_argument("--model-readiness-url", default=READINESS_URL_DEFAULT)
     ap.add_argument("--readiness-timeout", type=int, default=180)
+    ap.add_argument("--remote-manifest", default=None,
+                    help="Trusted worker-only RemoteJobManifestV1 path. The manifest is revalidated "
+                         "against this invocation before repository work begins.")
     ap.add_argument("--toolchain-mode", choices=("path", "linked", "none"), default="path",
                     help="path=reuse source tool binaries via env (safe default); linked=temporary ignored node_modules symlinks during trusted verification only; none=no source toolchain reuse")
     # C1 (glimmer-v7): manual force-on, default False. Independent of the
@@ -6986,6 +6989,7 @@ def main():
     ws = Path(args.workspace).expanduser().resolve()
     engineer = Path(args.engineer).expanduser().resolve()
     task = " ".join(args.task).strip()
+    remote_manifest = None
     design_contract = load_design_contract(args.design_contract)
     if design_contract and design_contract.get("targetUrl"):
         if args.visual_url and args.visual_url != design_contract["targetUrl"]:
@@ -7023,6 +7027,32 @@ def main():
         raise V2Error("Recovery completed safely. Review/reset the preserved diff, then rerun v2.1")
 
     b, baseline, up = branch(ws), head(ws), upstream(ws)
+    if args.remote_manifest:
+        remote_path = Path(args.remote_manifest).expanduser()
+        try:
+            stat = remote_path.lstat()
+            if remote_path.is_symlink() or not remote_path.is_file() or stat.st_size > 128 * 1024:
+                raise V2Error("Remote job manifest must be a bounded regular file")
+            from glimmer_remote import parse_remote_job_manifest
+
+            remote_manifest = parse_remote_job_manifest(
+                json.loads(remote_path.read_text(encoding="utf-8"))
+            )
+        except V2Error:
+            raise
+        except Exception as exc:
+            raise V2Error("Remote job manifest is invalid") from exc
+        expected_context = int(os.environ.get("GLIMMER_CTX", "0") or 0)
+        if (
+            args.session_id != remote_manifest.session_id
+            or task != remote_manifest.objective
+            or args.max_repairs != remote_manifest.max_repairs
+            or args.timeout != remote_manifest.timeout_seconds
+            or expected_context != remote_manifest.context_tokens
+            or b != remote_manifest.branch
+            or baseline != remote_manifest.baseline_sha
+        ):
+            raise V2Error("Remote job manifest does not match the worker invocation")
     dirty = clean_start_dirty(ws)
     if dirty:
         raise V2Error("V2.1 requires clean start:\n" + "\n".join(dirty[:100]))
@@ -7043,6 +7073,9 @@ def main():
     events_path = session / "events.jsonl"
     emit_event(events_path, "session_created", sid,
                taskSummary=_truncate_bytes(task, 500, "..."), workspace=str(ws))
+    if remote_manifest is not None:
+        emit_event(events_path, "remote_job_started", sid,
+                   jobId=remote_manifest.job_id, backend="runpod_pod")
 
     repo = build_repo_map(ws)
     atomic_write_json(session / "repo-map.json", repo)
@@ -8389,6 +8422,9 @@ def main():
         # SessionCompletedEvent.status is typed GlimmerSessionStatus (R3): use
         # the canonical manifest["state"], not the raw manifest["status"].
         emit_event(events_path, "session_completed", sid, status=manifest["state"])
+        if remote_manifest is not None:
+            emit_event(events_path, "remote_job_completed", sid,
+                       jobId=remote_manifest.job_id, status=manifest["state"])
 
     print("\n" + "=" * 72)
     print(f" GLIMMER V2.1: {final_label}")

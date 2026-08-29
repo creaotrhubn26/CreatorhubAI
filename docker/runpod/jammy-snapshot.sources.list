@@ -1,0 +1,3 @@
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20260828T000000Z jammy main universe restricted multiverse
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20260828T000000Z jammy-updates main universe restricted multiverse
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20260828T000000Z jammy-security main universe restricted multiverse

@@ -15,18 +15,20 @@ PYTHON_FILES := \
 	glimmer_models.py \
 	glimmer_memory.py \
 	glimmer_quality.py \
+	glimmer_remote.py \
 	glimmer_semantic.py \
-	glimmer_verification.py
+	glimmer_verification.py \
+	runpod_worker.py
 
-.PHONY: quality lint typecheck compile selfcheck
+.PHONY: quality lint typecheck compile selfcheck remote-test image-contract
 
-quality: lint typecheck compile selfcheck
+quality: lint typecheck compile selfcheck remote-test image-contract
 
 lint:
 	$(RUFF) check $(PYTHON_FILES)
 
 typecheck:
-	$(MYPY) glimmer_events.py glimmer_journal.py glimmer_models.py glimmer_memory.py
+	$(MYPY) glimmer_events.py glimmer_journal.py glimmer_models.py glimmer_memory.py glimmer_remote.py
 
 compile:
 	$(PYTHON) -m compileall -q $(PYTHON_FILES)
@@ -51,3 +53,9 @@ selfcheck:
 	$(PYTHON) glimmer-visual.py --selfcheck
 	$(PYTHON) glimmer-metrics.py --selfcheck
 	$(PYTHON) glimmer-eval.py --selfcheck
+
+remote-test:
+	$(PYTHON) -m unittest tests.test_glimmer_remote tests.test_runpod_worker
+
+image-contract:
+	scripts/verify-runpod-image.sh
