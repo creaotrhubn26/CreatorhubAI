@@ -10,6 +10,7 @@ export const STATES: GlimmerSessionStatus[] = [
   "created",
   "preflight",
   "understanding",
+  "waiting_for_clarification",
   "discovery",
   "candidate_selection",
   "implementing",

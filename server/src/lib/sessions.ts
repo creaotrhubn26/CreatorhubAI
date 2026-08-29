@@ -31,6 +31,8 @@ import type {
   ApprovalRequest,
   HunkAcceptance,
   TaskReport,
+  ClarificationRequest,
+  RepoIndexV1,
 } from "@glimmer/shared";
 
 // V7 §18: tier defaults to "required" for any manifest written before this
@@ -68,6 +70,7 @@ export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   // for a YELLOW-classified action, and reverts it as soon as the wait
   // resolves -- see glimmer-v2.py's canonical_session_state, kept in sync.
   if (raw === "waiting-for-approval") return "waiting_for_approval";
+  if (raw === "waiting-for-clarification") return "waiting_for_clarification";
   // C2 (glimmer-v7): terminal status when the architect review gate rejects
   // the implementation or the review budget is exhausted — must never be
   // promoted to "verified". Prefix match: Task 1.3 splits the legacy
@@ -75,7 +78,7 @@ export function mapManifestStatus(raw: string): GlimmerSessionStatus {
   // variants (see glimmer-v2.py's classify_failure); both must hit this
   // explicit branch rather than fall through to the generic unknown-status
   // fallback below (same resulting value today, but only by coincidence).
-  if (raw.startsWith("needs-architect-review")) return "needs_review";
+  if (raw.startsWith("needs-")) return "needs_review";
   if (raw.startsWith("blocked-")) return "blocked";
   if (raw.startsWith("failed-")) return "failed";
   // repo-map-only is TERMINAL (glimmer-v2.py writes it and exits immediately,
@@ -329,6 +332,44 @@ async function readSessionJsonFile<T>(id: string, filename: string): Promise<T |
 
 export function readTaskReport(id: string): Promise<TaskReport | null> {
   return readSessionJsonFile<TaskReport>(id, "task-report.json");
+}
+
+export function readRepoIndex(id: string): Promise<RepoIndexV1 | null> {
+  return readSessionJsonFile<RepoIndexV1>(id, "repo-index.json");
+}
+
+export function readClarification(id: string): Promise<ClarificationRequest | null> {
+  return readSessionJsonFile<ClarificationRequest>(id, "clarification.json");
+}
+
+export async function answerClarification(
+  id: string,
+  clarificationId: string,
+  answer: { optionId?: string | null; text?: string | null },
+): Promise<ClarificationRequest | null> {
+  const real = resolveSessionId(id);
+  if (!isValidSessionId(real)) throw new Error(`invalid session id: ${id}`);
+  const request = await readClarification(real);
+  if (!request || request.id !== clarificationId || request.sessionId !== real) return null;
+  if (request.status !== "pending") return request;
+  const optionId = typeof answer.optionId === "string" ? answer.optionId : null;
+  const text = typeof answer.text === "string" ? answer.text.trim().slice(0, 2_000) : null;
+  const validOption = optionId && request.options.some((option) => option.id === optionId);
+  if (!validOption && !text) throw new Error("answer must select a listed option or include text");
+  const answered: ClarificationRequest = {
+    ...request,
+    status: "answered",
+    answer: {
+      optionId: validOption ? optionId : null,
+      text: text || null,
+      answeredAt: new Date().toISOString(),
+    },
+  };
+  const finalPath = path.join(sessionsDir(), real, "clarification.json");
+  const temporaryPath = `${finalPath}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporaryPath, JSON.stringify(answered), { encoding: "utf8", mode: 0o600 });
+  await fs.rename(temporaryPath, finalPath);
+  return answered;
 }
 
 export function readArchitecturePlan(id: string): Promise<ArchitecturePlan | null> {

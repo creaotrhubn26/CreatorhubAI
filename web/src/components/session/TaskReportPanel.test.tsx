@@ -47,6 +47,59 @@ describe("TaskReportPanel", () => {
     expect(screen.getByText("Persist run state")).toBeInTheDocument();
   });
 
+  it("labels V2 claim validation, coverage, critic independence, and rejected claims", async () => {
+    vi.spyOn(client.glimmerApi, "getTaskReport").mockResolvedValue({
+      schemaVersion: 2,
+      mode: "inspect",
+      objective: "Validate evidence",
+      summary: "Only supported claims are shown as findings.",
+      findings: [
+        {
+          severity: "info",
+          category: "structure",
+          title: "Route exists",
+          description: "The route is present.",
+          claimType: "presence",
+          evidenceIds: ["ev-1"],
+          evidence: [{ path: "server.ts", line: 4, detail: "route declaration" }],
+          recommendedFix: "No change.",
+          verification: { status: "verified", reasons: [] },
+        },
+      ],
+      rejectedFindings: [
+        {
+          severity: "high",
+          category: "correctness",
+          title: "No tests exist",
+          description: "Unsupported absence claim.",
+          claimType: "absence",
+          evidenceIds: [],
+          evidence: [],
+          recommendedFix: "Search first.",
+          verification: { status: "rejected", reasons: ["repository search missing"] },
+        },
+      ],
+      implementationPlan: [],
+      confidence: "medium",
+      coverage: {
+        filesInspected: 4,
+        searchesRun: 2,
+        graphCoverage: 0.75,
+        unsupportedLanguages: ["haskell"],
+        evidenceRecords: 1,
+      },
+      decisionPoints: [],
+      critic: { status: "completed", independence: "independent" },
+    });
+    renderPanel();
+
+    expect(await screen.findByText(/presence · verified/i)).toBeInTheDocument();
+    expect(screen.getByText(/graph coverage 75%/i)).toBeInTheDocument();
+    expect(screen.getByText(/independence: independent/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 rejected claim/i)).toBeInTheDocument();
+    expect(screen.getByText(/repository search missing/i)).toBeInTheDocument();
+  });
+
   it("renders nothing when the session has no report", async () => {
     vi.spyOn(client.glimmerApi, "getTaskReport").mockRejectedValue(new Error("404"));
     const { container } = renderPanel();

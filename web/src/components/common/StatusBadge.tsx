@@ -6,6 +6,7 @@ const COLOR: Record<string, string> = {
   completed: "var(--green)",
   REACHABLE_AUTH: "var(--amber)",
   waiting_for_approval: "var(--amber)",
+  waiting_for_clarification: "var(--amber)",
   needs_review: "var(--amber)",
   repairing: "var(--amber)",
   OFFLINE: "var(--red)",

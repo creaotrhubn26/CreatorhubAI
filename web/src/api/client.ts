@@ -30,6 +30,9 @@ import type {
   SessionDiff,
   HunkReviewResult,
   TaskReport,
+  RepoIndexV1,
+  ClarificationRequest,
+  LocalQualityMetrics,
   CliIntegrationsStatus,
   DeveloperClientsStatus,
   WorkspaceHandoffClientId,
@@ -310,6 +313,7 @@ export const glimmerApi = {
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>
     request<ModelRegistry>("/api/models/config", { method: "PUT", body: JSON.stringify(registry) }),
+  getQualityMetrics: () => request<LocalQualityMetrics>("/api/quality/metrics"),
   listSessionPage: (cursor?: string, limit = 100) => {
     const query = new URLSearchParams({ limit: String(limit) });
     if (cursor) query.set("cursor", cursor);
@@ -322,6 +326,18 @@ export const glimmerApi = {
   getSessionAnalysis: (id: string) => request<SessionAnalysis>(`/api/sessions/${id}/analysis`),
   getArchitecturePlan: (id: string) => request<ArchitecturePlan>(`/api/sessions/${id}/plan`),
   getTaskReport: (id: string) => request<TaskReport>(`/api/sessions/${id}/task-report`),
+  getRepoIndex: (id: string) => request<RepoIndexV1>(`/api/sessions/${id}/repo-index`),
+  getClarification: (id: string) =>
+    request<ClarificationRequest>(`/api/sessions/${id}/clarification`),
+  answerClarification: (
+    id: string,
+    requestId: string,
+    answer: { optionId?: string | null; text?: string | null },
+  ) =>
+    request<ClarificationRequest>(
+      `/api/sessions/${id}/clarifications/${encodeURIComponent(requestId)}/answer`,
+      { method: "POST", body: JSON.stringify(answer) },
+    ),
   getArchitectReviews: (id: string) =>
     request<ArchitectReview[]>(`/api/sessions/${id}/architect-reviews`),
   getDeliveryReview: (id: string) => request<DeliveryReview>(`/api/sessions/${id}/delivery-review`),

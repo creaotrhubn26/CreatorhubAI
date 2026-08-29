@@ -16,6 +16,7 @@ export type GlimmerSessionStatus =
   | "verifying"
   | "repairing"
   | "waiting_for_approval"
+  | "waiting_for_clarification"
   | "blocked"
   | "failed"
   | "verified"
@@ -454,7 +455,7 @@ export interface TaskReportFinding {
   recommendedFix: string;
 }
 
-export interface TaskReport {
+export interface TaskReportV1 {
   schemaVersion: 1;
   mode: ReadOnlyTaskMode;
   objective: string;
@@ -464,6 +465,72 @@ export interface TaskReport {
   confidence: "high" | "medium" | "low";
   reportFailed?: boolean;
   reportFailureReason?: string;
+}
+
+export type ClaimType = "presence" | "absence" | "behavior" | "risk";
+export type ClaimVerificationStatus = "verified" | "partial" | "rejected";
+
+export interface ClaimVerification {
+  status: ClaimVerificationStatus;
+  reasons: string[];
+  criticReason?: string;
+}
+
+export interface ReportCoverage {
+  filesInspected: number;
+  searchesRun: number;
+  graphCoverage: number | null;
+  unsupportedLanguages: string[];
+  evidenceRecords: number;
+}
+
+export interface TaskReportFindingV2 extends TaskReportFinding {
+  claimType: ClaimType;
+  evidenceIds: string[];
+  verification: ClaimVerification;
+}
+
+export interface ClarificationDecisionPoint {
+  id: string;
+  question: string;
+  impact: "low" | "medium" | "high";
+  options: Array<{ id: string; label: string }>;
+}
+
+export interface TaskReportV2 {
+  schemaVersion: 2;
+  mode: ReadOnlyTaskMode;
+  objective: string;
+  summary: string;
+  findings: TaskReportFindingV2[];
+  rejectedFindings: TaskReportFindingV2[];
+  implementationPlan: string[];
+  confidence: "high" | "medium" | "low";
+  coverage: ReportCoverage;
+  decisionPoints: ClarificationDecisionPoint[];
+  critic: {
+    status: "completed" | "unavailable";
+    independence: "independent" | "same-model" | "unavailable";
+  };
+  reportFailed?: boolean;
+  reportFailureReason?: string;
+}
+
+export type TaskReport = TaskReportV1 | TaskReportV2;
+
+export interface ClarificationRequest {
+  schemaVersion: 1;
+  id: string;
+  sessionId: string;
+  status: "pending" | "answered" | "expired";
+  createdAt: string;
+  expiresAt: string;
+  question: string;
+  impact: "high";
+  options: Array<{ id: string; label: string }>;
+  allowFreeform: true;
+  answer?: { optionId?: string | null; text?: string | null; answeredAt?: string };
+  expiredAt?: string;
 }
 
 // V7 §18: manifest.verificationPlan, command strings (not results) for the
@@ -2094,6 +2161,50 @@ export interface DeliveryPacketCreatedEvent extends GlimmerEventBase {
   type: "delivery_packet_created";
 }
 
+export interface ClaimValidationCompletedEvent extends GlimmerEventBase {
+  type: "claim_validation_completed";
+  verified: number;
+  partial: number;
+  rejected: number;
+  confidence: "high" | "medium" | "low";
+}
+
+export interface RepoIndexCompletedEvent extends GlimmerEventBase {
+  type: "repo_index_completed";
+  supportedFiles: number;
+  treeSitterFiles: number;
+  partial: boolean;
+  unsupportedLanguages: string[];
+}
+
+export interface ClarificationRequestedEvent extends GlimmerEventBase {
+  type: "clarification_requested";
+  clarificationId: string;
+  question: string;
+}
+
+export interface ClarificationResolvedEvent extends GlimmerEventBase {
+  type: "clarification_resolved";
+  clarificationId: string;
+  optionId?: string | null;
+}
+
+export interface ModelRoutingDecisionEvent extends GlimmerEventBase {
+  type: "model_routing_decision";
+  role: "engineer" | "architect" | "consult";
+  risk: string;
+  providerId: string;
+  modelId: string;
+  reason: "high-risk-override" | "configured-role";
+  criticIndependence?: "independent" | "same-model" | "unavailable";
+}
+
+export interface RepairStrategyRejectedEvent extends GlimmerEventBase {
+  type: "repair_strategy_rejected";
+  strategyId: string;
+  failureSignature: string;
+}
+
 export type GlimmerEvent =
   | ToolStartedEvent
   | ToolCompletedEvent
@@ -2133,7 +2244,13 @@ export type GlimmerEvent =
   | DocumentationStaleDetectedEvent
   | DocumentationVerifiedEvent
   | ApprovalRequestedEvent
-  | DeliveryPacketCreatedEvent;
+  | DeliveryPacketCreatedEvent
+  | ClaimValidationCompletedEvent
+  | RepoIndexCompletedEvent
+  | ClarificationRequestedEvent
+  | ClarificationResolvedEvent
+  | ModelRoutingDecisionEvent
+  | RepairStrategyRejectedEvent;
 
 const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "tool_started",
@@ -2175,6 +2292,12 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "documentation_impact_detected",
   "documentation_stale_detected",
   "documentation_verified",
+  "claim_validation_completed",
+  "repo_index_completed",
+  "clarification_requested",
+  "clarification_resolved",
+  "model_routing_decision",
+  "repair_strategy_rejected",
 ]);
 
 export function isGlimmerEvent(x: unknown): x is GlimmerEvent {
@@ -2598,7 +2721,15 @@ export interface ModelRegistry {
   version: 1;
   models: ModelRegistryEntry[];
   roles: Record<ModelRole, string>;
+  routing?: AdaptiveRoutingConfig;
   source: "default" | "saved";
+}
+
+export interface AdaptiveRoutingConfig {
+  enabled: boolean;
+  highRisk: Partial<Record<ModelRole, string>>;
+  criticProviderId: string | null;
+  requireIndependentCritic: boolean;
 }
 
 export interface ModelRegistryUpdateEntry {
@@ -2615,6 +2746,68 @@ export interface ModelRegistryUpdateEntry {
 export interface ModelRegistryUpdate {
   models: ModelRegistryUpdateEntry[];
   roles: Record<ModelRole, string>;
+  routing?: AdaptiveRoutingConfig;
+}
+
+export interface RepoIndexFile {
+  path: string;
+  language: string;
+  bytes: number;
+  sha256: string;
+  parser: "tree-sitter" | "lexical";
+  parseStatus: string;
+  package: string | null;
+  owners: string[];
+  isTest: boolean;
+}
+
+export interface RepoIndexSymbol {
+  id: string;
+  name: string;
+  kind: string;
+  path: string;
+  line: number;
+  provenance: "tree-sitter" | "lexical";
+}
+
+export interface RepoIndexV1 {
+  schemaVersion: 1;
+  generatedAt: string;
+  workspace: string;
+  head: string;
+  dirtyHash: string;
+  cacheKey: string;
+  parserVersions: Record<string, string>;
+  coverage: {
+    supportedFiles: number;
+    candidateFiles: number;
+    treeSitterFiles: number;
+    lexicalFallbackFiles: number;
+    skippedLargeFiles: number;
+    unsupportedLanguages?: string[];
+    unsupportedOrLexicalLanguages?: string[];
+    partial: boolean;
+    ratio: number;
+    limits: { maxFiles: number; maxFileBytes: number; maxSeconds: number };
+  };
+  files: RepoIndexFile[];
+  symbols: RepoIndexSymbol[];
+  edges: Array<Record<string, unknown>>;
+  routes: Array<Record<string, unknown>>;
+  tests: Array<{ source: string; tests: string[]; provenance: string }>;
+  diagnostics: string[];
+}
+
+export interface VerificationCandidate {
+  command: string;
+  package: string;
+  type: "typecheck" | "unit" | "lint" | "build" | "cargo" | "python" | "make" | "visual";
+  level: "required" | "recommended";
+  reason: string;
+  provenance: "package-script" | "cargo" | "python" | "makefile" | "semantic-index" | "fallback";
+  /** Temporary compatibility aliases written by pre-V2 orchestrators. */
+  kind?: string;
+  tier?: string;
 }
 
 // Task 4c(2/3): one page of the gateway's read-only directory browser
@@ -2675,6 +2868,7 @@ export interface TaskIntelligence {
   likelyArea: string | null;
   likelyPackage: string | null;
   suggestedVerification: string[];
+  verificationCandidates?: VerificationCandidate[];
   estimatedRisk: RiskLevel | null;
   provenance: DataProvenance;
   // Task 4c(b): which repo map the fields above were (or were not) derived
@@ -2693,6 +2887,24 @@ export interface TaskIntelligence {
   //                       different repo, so it is labeled, never implied
   //   none                no workspace named and no repo map exists anywhere
   repoMapStatus: "workspace-matched" | "unmatched-workspace" | "first-found" | "none";
+}
+
+export interface LocalQualityMetrics {
+  schemaVersion: 1;
+  sessionsScanned: number;
+  reports: number;
+  verifiedClaims: number;
+  partialClaims: number;
+  rejectedClaims: number;
+  claimPrecision: number | null;
+  averageGraphCoverage: number | null;
+  candidateRecallAt5: number | null;
+  evaluation: { live: unknown | null; stub: unknown | null };
+  routing: {
+    decisions: number;
+    highRiskOverrides: number;
+    criticIndependence: Record<"independent" | "same-model" | "unavailable", number>;
+  };
 }
 
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";

@@ -639,6 +639,89 @@ describe("GET /api/sessions/:id/task-report", () => {
       404,
     );
   });
+
+  it("reads a deterministically validated V2 report without breaking V1", async () => {
+    const id = "20260825-000003-task-report-v2";
+    const dir = path.join(stateRoot, "sessions", id);
+    const report = {
+      schemaVersion: 2,
+      mode: "inspect",
+      objective: "Inspect evidence",
+      summary: "One claim was verified.",
+      findings: [
+        {
+          severity: "info",
+          category: "structure",
+          title: "Route exists",
+          description: "The route is present.",
+          claimType: "presence",
+          evidenceIds: ["ev-1"],
+          evidence: [{ path: "server.ts", line: 1, detail: "route declaration" }],
+          recommendedFix: "No change.",
+          verification: { status: "verified", reasons: [] },
+        },
+      ],
+      rejectedFindings: [],
+      implementationPlan: [],
+      confidence: "medium",
+      coverage: {
+        filesInspected: 1,
+        searchesRun: 0,
+        graphCoverage: 1,
+        unsupportedLanguages: [],
+        evidenceRecords: 1,
+      },
+      decisionPoints: [],
+      critic: { status: "completed", independence: "same-model" },
+    };
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "task-report.json"), JSON.stringify(report));
+    expect((await request(app).get(`/api/sessions/${id}/task-report`)).body).toEqual(report);
+  });
+});
+
+describe("clarification API", () => {
+  it("requires the exact session/request ids and atomically records a listed answer", async () => {
+    const id = "clarification-session";
+    const requestId = `${id}-clarification-1`;
+    const dir = path.join(stateRoot, "sessions", id);
+    const clarification = {
+      schemaVersion: 1,
+      id: requestId,
+      sessionId: id,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      question: "Which storage should be used?",
+      impact: "high",
+      options: [
+        { id: "option-1", label: "SQLite" },
+        { id: "option-2", label: "JSON" },
+      ],
+      allowFreeform: true,
+    };
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "clarification.json"), JSON.stringify(clarification));
+
+    expect((await request(app).get(`/api/sessions/${id}/clarification`)).body).toEqual(
+      clarification,
+    );
+    expect(
+      (
+        await request(app)
+          .post(`/api/sessions/${id}/clarifications/wrong-id/answer`)
+          .set("Origin", UI_ORIGIN)
+          .send({ optionId: "option-1" })
+      ).status,
+    ).toBe(404);
+    const answered = await request(app)
+      .post(`/api/sessions/${id}/clarifications/${requestId}/answer`)
+      .set("Origin", UI_ORIGIN)
+      .send({ optionId: "option-2", text: "Use the existing local store" });
+    expect(answered.status).toBe(200);
+    expect(answered.body.status).toBe("answered");
+    expect(answered.body.answer.optionId).toBe("option-2");
+  });
 });
 
 describe("POST /api/sessions — §7 advanced controls validation", () => {

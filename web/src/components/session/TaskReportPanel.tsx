@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
+import type { TaskReportV2 } from "@glimmer/shared";
 
 export function TaskReportPanel({
   sessionId,
@@ -20,6 +21,7 @@ export function TaskReportPanel({
   });
   if (!report) return null;
 
+  const v2: TaskReportV2 | null = report.schemaVersion === 2 ? (report as TaskReportV2) : null;
   const summary = `${report.mode} · ${report.findings.length} finding${report.findings.length === 1 ? "" : "s"} · ${report.confidence} confidence`;
   return (
     <CollapsibleSection title="Task Report" summary={summary} defaultOpen>
@@ -39,6 +41,14 @@ export function TaskReportPanel({
                 <strong>
                   {finding.severity}: {finding.title}
                 </strong>
+                {"verification" in finding && (
+                  <p className="mono" style={{ fontSize: 12 }}>
+                    {finding.claimType} · {finding.verification.status}
+                    {finding.verification.reasons.length
+                      ? ` · ${finding.verification.reasons.join(", ")}`
+                      : ""}
+                  </p>
+                )}
                 <p>{finding.description}</p>
                 {finding.evidence.length > 0 && (
                   <ul>
@@ -59,6 +69,35 @@ export function TaskReportPanel({
               </li>
             ))}
           </ol>
+        </>
+      )}
+      {v2 && (
+        <>
+          <h3>Coverage</h3>
+          <p className="mono" style={{ fontSize: 12 }}>
+            {v2.coverage.filesInspected} files inspected · {v2.coverage.searchesRun} repository
+            searches · {v2.coverage.evidenceRecords} evidence records · graph coverage{" "}
+            {v2.coverage.graphCoverage == null
+              ? "unavailable"
+              : `${Math.round(v2.coverage.graphCoverage * 100)}%`}
+          </p>
+          <p className="mono" style={{ fontSize: 12 }}>
+            critic: {v2.critic.status} · independence: {v2.critic.independence}
+          </p>
+          {v2.rejectedFindings.length > 0 && (
+            <details>
+              <summary>
+                {v2.rejectedFindings.length} rejected claim(s), not presented as facts
+              </summary>
+              <ul>
+                {v2.rejectedFindings.map((finding, index) => (
+                  <li key={`${finding.title}-${index}`}>
+                    {finding.title}: {finding.verification.reasons.join(", ")}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
         </>
       )}
       {report.implementationPlan.length > 0 && (

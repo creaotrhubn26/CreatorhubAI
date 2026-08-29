@@ -8,6 +8,74 @@ import * as sseHook from "../../api/useSessionEvents";
 import { SessionEventsContext } from "../../api/useSessionEvents";
 
 describe("ActiveSessionScreen", () => {
+  it("shows and submits one structured high-impact clarification", async () => {
+    vi.spyOn(client.glimmerApi, "getSession").mockResolvedValue({
+      id: "s1",
+      task: "Choose storage",
+      status: "waiting_for_clarification",
+      workspace: "/ws",
+      branch: "glimmer/x",
+      baselineSha: "abc",
+      changedFiles: [],
+      verification: { overall: "NOT_RUN", checks: [] },
+      repairsUsed: 0,
+      repairBudget: 2,
+    } as any);
+    vi.spyOn(client.glimmerApi, "getClarification").mockResolvedValue({
+      schemaVersion: 1,
+      id: "clarification-1",
+      sessionId: "s1",
+      status: "pending",
+      createdAt: "2026-08-29T09:00:00Z",
+      expiresAt: "2026-08-29T09:05:00Z",
+      question: "Which storage should be used?",
+      impact: "high",
+      options: [
+        { id: "sqlite", label: "SQLite" },
+        { id: "json", label: "JSON" },
+      ],
+      allowFreeform: true,
+    });
+    const answer = vi.spyOn(client.glimmerApi, "answerClarification").mockResolvedValue({
+      schemaVersion: 1,
+      id: "clarification-1",
+      sessionId: "s1",
+      status: "answered",
+      createdAt: "2026-08-29T09:00:00Z",
+      expiresAt: "2026-08-29T09:05:00Z",
+      question: "Which storage should be used?",
+      impact: "high",
+      options: [],
+      allowFreeform: true,
+      answer: { optionId: "sqlite", text: "Use the existing schema" },
+    });
+    vi.spyOn(sseHook, "useSessionEvents").mockReturnValue([]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/sessions/s1"]}>
+          <Routes>
+            <Route path="/sessions/:id" element={<ActiveSessionScreen />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Which storage should be used?")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("SQLite"));
+    fireEvent.change(screen.getByLabelText("Additional context"), {
+      target: { value: "Use the existing schema" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /continue with this answer/i }));
+    await waitFor(() =>
+      expect(answer).toHaveBeenCalledWith("s1", "clarification-1", {
+        optionId: "sqlite",
+        text: "Use the existing schema",
+      }),
+    );
+  });
+
   it("shows an actionable error instead of loading forever when the session id is unavailable", async () => {
     vi.spyOn(client.glimmerApi, "getSession").mockRejectedValue(new Error("not found"));
     vi.spyOn(client.glimmerApi, "getSessionAnalysis").mockRejectedValue(new Error("not found"));

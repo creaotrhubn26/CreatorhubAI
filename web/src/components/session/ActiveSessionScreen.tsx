@@ -187,6 +187,87 @@ function ApprovalCard({
   );
 }
 
+function ClarificationCard({ sessionId }: { sessionId: string }) {
+  const queryClient = useQueryClient();
+  const [optionId, setOptionId] = useState<string | null>(null);
+  const [text, setText] = useState("");
+  const clarificationQuery = useQuery({
+    queryKey: ["clarification", sessionId],
+    queryFn: () => glimmerApi.getClarification(sessionId),
+    retry: false,
+    refetchInterval: 1_000,
+  });
+  const clarification = clarificationQuery.data;
+  const answerMutation = useMutation({
+    mutationFn: () =>
+      glimmerApi.answerClarification(sessionId, clarification!.id, { optionId, text }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["clarification", sessionId] });
+      queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+    },
+  });
+  if (!clarification || clarification.status !== "pending") return null;
+  const expiresAt = new Date(clarification.expiresAt);
+
+  return (
+    <section
+      aria-label="Clarification required"
+      style={{
+        border: "1px solid var(--amber)",
+        borderRadius: 8,
+        padding: 12,
+        margin: "12px 0",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <StatusBadge status="waiting_for_clarification" />
+        <strong>High-impact decision</strong>
+      </div>
+      <p>{clarification.question}</p>
+      <fieldset disabled={answerMutation.isPending} style={{ border: 0, padding: 0 }}>
+        {clarification.options.map((option) => (
+          <label key={option.id} style={{ display: "block", marginBottom: 6 }}>
+            <input
+              type="radio"
+              name={`clarification-${clarification.id}`}
+              value={option.id}
+              checked={optionId === option.id}
+              onChange={() => setOptionId(option.id)}
+            />{" "}
+            {option.label}
+          </label>
+        ))}
+        {clarification.allowFreeform && (
+          <label style={{ display: "block", marginTop: 8 }}>
+            Additional context
+            <textarea
+              aria-label="Additional context"
+              value={text}
+              maxLength={2_000}
+              onChange={(event) => setText(event.target.value)}
+              style={{ display: "block", width: "100%", marginTop: 4 }}
+            />
+          </label>
+        )}
+      </fieldset>
+      <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        Expires{" "}
+        {Number.isNaN(expiresAt.valueOf())
+          ? clarification.expiresAt
+          : expiresAt.toLocaleTimeString()}
+      </p>
+      <button
+        type="button"
+        disabled={answerMutation.isPending || (!optionId && !text.trim())}
+        onClick={() => answerMutation.mutate()}
+      >
+        {answerMutation.isPending ? "Submitting…" : "Continue with this answer"}
+      </button>
+      {answerMutation.isError && <p role="alert">Could not submit the clarification.</p>}
+    </section>
+  );
+}
+
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
@@ -331,6 +412,7 @@ export function ActiveSessionScreen() {
           stalled={isStalled(lastEventAt, Date.now())}
         />
       )}
+      {session.status === "waiting_for_clarification" && id && <ClarificationCard sessionId={id} />}
       <div className="toolbar">
         {!readOnlyMode && <Link to={`/sessions/${id}/diff`}>View diff</Link>}
         {!readOnlyMode && <Link to={`/sessions/${id}/verification`}>Verification Center</Link>}

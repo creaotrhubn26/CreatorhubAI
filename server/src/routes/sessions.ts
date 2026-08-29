@@ -25,6 +25,9 @@ import {
   readEvidenceEntry,
   resolveApproval,
   readTaskReport,
+  readRepoIndex,
+  readClarification,
+  answerClarification,
   readHunkAcceptances,
   writeHunkAcceptance,
   clearHunkAcceptance,
@@ -827,6 +830,44 @@ sessionsRouter.get("/sessions/:id/task-report", async (req, res) => {
     if (!report) return res.status(404).json({ error: "not found" });
     res.json(report);
   } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.get("/sessions/:id/repo-index", async (req, res) => {
+  try {
+    const index = await readRepoIndex(req.params.id);
+    if (!index) return res.status(404).json({ error: "not found" });
+    res.json(index);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.get("/sessions/:id/clarification", async (req, res) => {
+  try {
+    const clarification = await readClarification(req.params.id);
+    if (!clarification) return res.status(404).json({ error: "not found" });
+    res.json(clarification);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+sessionsRouter.post("/sessions/:id/clarifications/:requestId/answer", async (req, res) => {
+  try {
+    const optionId = typeof req.body?.optionId === "string" ? req.body.optionId : null;
+    const text = typeof req.body?.text === "string" ? req.body.text : null;
+    const clarification = await answerClarification(req.params.id, req.params.requestId, {
+      optionId,
+      text,
+    });
+    if (!clarification) return res.status(404).json({ error: "not found" });
+    res.json(clarification);
+  } catch (err: any) {
+    if (String(err.message).startsWith("answer must")) {
+      return res.status(400).json({ error: err.message });
+    }
     res.status(500).json({ error: err.message });
   }
 });
