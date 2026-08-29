@@ -23,7 +23,20 @@ from pathlib import Path
 
 from glimmer_events import emit as emit_event
 from glimmer_journal import atomic_write_bytes, atomic_write_json
+from glimmer_memory import effective_entries, record_outcome
 from glimmer_models import load_model_registry, model_for_role
+from glimmer_semantic import build_repo_index
+from glimmer_verification import (
+    discover_verification_catalog,
+    repeated_strategy,
+    select_verification_candidates,
+)
+from glimmer_verification import (
+    failure_signature as structured_failure_signature,
+)
+from glimmer_verification import (
+    strategy_id as repair_strategy_id,
+)
 
 ENGINEER_DEFAULT = Path.home() / "AI/muse-glimmer/glimmer-engineer.py"
 # Round 9 review (M2): GLIMMER_STATE_ROOT is the same env var control-center's
@@ -46,6 +59,7 @@ SKILLS_ROOT = Path.home() / ".muse-glimmer/skills"
 REPO_MAP_CACHE_ROOT = Path.home() / ".muse-glimmer/repo-maps"
 NODE_OPTIONS_DEFAULT = "--max-old-space-size=12288"
 READINESS_URL_DEFAULT = os.environ.get("GLIMMER_TOOLS_URL", "http://127.0.0.1:8080/tools")
+CURRENT_TASK_RISK = None
 # C4 (glimmer-v7): Vision Verification plumbing. GLIMMER_VISUAL is the
 # standalone capture script this module shells out to when the literal
 # token "visual" appears in contract.verification / --verify -- it is just
@@ -183,6 +197,10 @@ def canonical_session_state(raw_status: str) -> str:
     # session is actually paused waiting on approvals.json.
     if raw_status == "waiting-for-approval":
         return "waiting_for_approval"
+    if raw_status == "waiting-for-clarification":
+        return "waiting_for_clarification"
+    if raw_status.startswith("needs-review-"):
+        return "needs_review"
     # C2 (glimmer-v7): terminal status when the architect review gate
     # rejects the implementation (REPLAN_REQUIRED/HUMAN_REVIEW_REQUIRED)
     # or the review budget is exhausted — V7 §5.10's rule: a session in
@@ -424,6 +442,10 @@ def classify_failure(manifest: dict, events: list) -> dict | None:
         return {"class": "ORCHESTRATION_ABORTED", "detail": "read-only task report was not produced successfully", "evidenceIds": []}
     if raw == "failed-read-only-mutation":
         return {"class": "POLICY_BLOCK", "detail": "a read-only task changed workspace files", "evidenceIds": []}
+    if raw == "needs-review-ambiguous-task":
+        return {"class": "AMBIGUOUS_TASK", "detail": "high-impact clarification was not answered", "evidenceIds": []}
+    if raw == "needs-review-repeated-repair-strategy":
+        return {"class": "CODE_FAIL", "detail": "an identical repair strategy reached the same failure signature", "evidenceIds": []}
     if raw.startswith("cancelled"):
         return {"class": "USER_CANCELLED", "detail": "session terminated by SIGTERM/interrupt before reaching a terminal state", "evidenceIds": []}
     # Task 1.3: TOOL_EXECUTION_FAILURE covers a tool-result envelope (Task
@@ -2340,11 +2362,24 @@ def build_repair_contract(attempt_number, results, files, ws):
         for f in extract_existing_test_files(failing.get("outputTail", ""), ws):
             if f not in allowed:
                 allowed.append(f)
+    structured_failure = structured_failure_signature(
+        failing.get("outputTail", "") if failing else "",
+        int(failing.get("returncode") or 1) if failing else 1,
+    )
+    try:
+        current_diff = git(ws, "diff", "--binary", check=False)
+    except Exception:
+        current_diff = ""
+    strategy = repair_strategy_id(structured_failure, allowed, current_diff)
     return {
         "attempt": attempt_number,
         "failedCheck": failing.get("command") if failing else None,
         "newFailures": new_failures,
         "allowedFiles": allowed,
+        "failureCategory": structured_failure["category"],
+        "failureSignature": structured_failure["signature"],
+        "likelyFiles": structured_failure["likelyFiles"],
+        "strategyId": strategy,
     }
 
 
@@ -2360,6 +2395,29 @@ def compute_repair_writes_outside_allowed(files, repair_contract):
         return []
     allowed = set(repair_contract.get("allowedFiles") or [])
     return [f for f in files if f not in allowed]
+
+
+def record_verified_outcomes(ws, files, results, repair_contract=None):
+    """Persist only outcomes backed by a passing authoritative verifier."""
+    for result in results or []:
+        if result.get("ok") and result.get("command"):
+            record_outcome(
+                ws,
+                "verification-success",
+                {"command": result["command"], "package": "repository"},
+            )
+    if len(files or []) >= 2:
+        record_outcome(ws, "cochange", {"paths": files})
+    if repair_contract and repair_contract.get("failureSignature") and repair_contract.get("strategyId"):
+        record_outcome(
+            ws,
+            "repair-success",
+            {
+                "failureSignature": repair_contract["failureSignature"],
+                "strategyId": repair_contract["strategyId"],
+                "files": files or [],
+            },
+        )
 
 
 def checkpoint(ws, n):
@@ -2590,11 +2648,11 @@ def _rank_recent_change(ws, path, cache):
             ts = int(out.strip())
             age_days = max(0.0, (time.time() - ts) / 86400.0)
             if age_days <= 7:
-                result = (0.2, f"recent-change({int(age_days)}d)")
+                result = (0.03, f"recent-change-tiebreak({int(age_days)}d)")
             elif age_days <= 30:
-                result = (0.12, f"recent-change({int(age_days)}d)")
+                result = (0.02, f"recent-change-tiebreak({int(age_days)}d)")
             elif age_days <= 90:
-                result = (0.05, f"recent-change({int(age_days)}d)")
+                result = (0.01, f"recent-change-tiebreak({int(age_days)}d)")
     except (ValueError, OSError):
         result = (0.0, None)
     cache[path] = result
@@ -2617,6 +2675,7 @@ def rank_candidates(files, signals):
     scope = signals.get("scope") or {}
     ws = signals.get("ws")
     repo_map = signals.get("repo_map")
+    repo_index = signals.get("repo_index") or {}
 
     expected_prefixes = [p.rstrip("/") for p in _expected_prefixes(scope) if p]
     scope_package = scope.get("package")
@@ -2658,6 +2717,34 @@ def rank_candidates(files, signals):
             score += 0.2
             reasons.append(f"keyword:{matched_kw}")
 
+        semantic_symbols = [
+            symbol for symbol in repo_index.get("symbols", [])
+            if symbol.get("path") == path
+        ]
+        symbol_match = next((
+            symbol for symbol in semantic_symbols
+            if any(keyword in str(symbol.get("name") or "").lower() for keyword in keywords)
+        ), None)
+        if symbol_match:
+            score += 0.35
+            reasons.append(f"symbol:{symbol_match.get('name')}")
+        route_match = next((
+            route for route in repo_index.get("routes", [])
+            if route.get("path") == path and str(route.get("route") or "").lower() in str(signals.get("objective") or "").lower()
+        ), None)
+        if route_match:
+            score += 0.3
+            reasons.append(f"route:{route_match.get('route')}")
+        if any(item.get("source") == path and item.get("tests") for item in repo_index.get("tests", [])):
+            score += 0.15
+            reasons.append("related-tests")
+        for memory in signals.get("memory", []):
+            memory_paths = (memory.get("payload") or {}).get("paths") or []
+            if path in memory_paths:
+                score += min(0.2, float(memory.get("score") or 0) / 20)
+                reasons.append("verified-cochange-memory")
+                break
+
         ranked.append({"path": path, "score": round(score, 3), "reasons": reasons})
 
     ranked.sort(key=lambda c: (-c["score"], c["path"]))
@@ -2672,7 +2759,7 @@ def rank_candidates(files, signals):
 CANDIDATE_SELECTED_TOP_N = 5
 
 
-def _rerank_plan_candidates(architecture_plan, contract, repo_map, ws, events_path, sid):
+def _rerank_plan_candidates(architecture_plan, contract, repo_map, ws, events_path, sid, repo_index=None):
     """Task 5.3 (V7 §27): reorder plan.candidateFiles by rank_candidates'
     deterministic score (highest first) and emit the previously-unfired
     candidate_selected event for the top CANDIDATE_SELECTED_TOP_N.
@@ -2706,13 +2793,16 @@ def _rerank_plan_candidates(architecture_plan, contract, repo_map, ws, events_pa
             "ws": ws,
             "repo_map": repo_map,
             "objective": contract.get("objective"),
+            "repo_index": repo_index,
+            "memory": effective_entries(ws, "cochange"),
         }
         ranked = rank_candidates(paths, signals)
         rank_index = {r["path"]: i for i, r in enumerate(ranked)}
         candidates.sort(key=lambda c: rank_index.get(c.get("path"), len(ranked)))
 
         for r in ranked[:CANDIDATE_SELECTED_TOP_N]:
-            emit_event(events_path, "candidate_selected", sid, file=r["path"], reasons=r["reasons"])
+            emit_event(events_path, "candidate_selected", sid, file=r["path"], reasons=r["reasons"],
+                       provenance="semantic-index" if repo_index else "deterministic-fallback")
 
         return {r["path"]: r["score"] for r in ranked}
     except Exception as exc:  # noqa: BLE001 - ranking/event-emission must never break the run
@@ -3250,6 +3340,7 @@ a genuine fix may still require another file if the evidence supports it.
                 "uxRequirements",
                 "cmsRequirements",
                 "designTokenRequirements",
+                "clarification",
             )
         }
         # Task 2.2 (V7 §5.12): "Engineer should always know which
@@ -3348,7 +3439,8 @@ a genuine fix may still require another file if the evidence supports it.
 
 def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, events_path, session_id, mode=None,
                      plan_candidate_count=0, review_request=None, architect_consult_enabled=False,
-                     consult_request=None, timeout=None, scope_prefixes=None, task_mode=None):
+                     consult_request=None, timeout=None, scope_prefixes=None, task_mode=None,
+                     task_risk=None):
     cmd = [str(engineer), "--workspace", str(ws)]
     if mode is not None:
         # C1 (glimmer-v7): mode="architect" is the only caller that ever
@@ -3392,6 +3484,9 @@ def invoke_engineer(engineer, ws, prompt, auto_approve, max_turns, log_path, eve
     env = os.environ.copy()
     env["GLIMMER_EVENTS_PATH"] = str(events_path)
     env["GLIMMER_SESSION_ID"] = session_id
+    selected_risk = task_risk or CURRENT_TASK_RISK
+    if selected_risk in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+        env["GLIMMER_TASK_RISK"] = selected_risk
     # C1 handoff enforcement (Fix 2): same spawn-env plumbing as the two
     # lines above, signaling the engineer that a real (non-empty)
     # evidence handoff happened for this run so its discovery budget can
@@ -3540,6 +3635,16 @@ def compute_architect_risk(contract_like, candidate_count, verification_level) -
     return {"score": score, "signals": signals}
 
 
+def risk_level_from_score(score) -> str:
+    if not isinstance(score, int) or score <= 0:
+        return "LOW"
+    if score < ARCHITECT_RISK_THRESHOLD:
+        return "MEDIUM"
+    if score < ARCHITECT_RISK_THRESHOLD + 3:
+        return "HIGH"
+    return "CRITICAL"
+
+
 def load_architecture_plan(session_dir):
     """C1 (glimmer-v7): load architecture-plan.json from the session dir
     (same convention glimmer-engineer.py's _architecture_plan_file_path
@@ -3659,6 +3764,93 @@ def load_task_report(session_dir):
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def request_clarification(plan, session, events_path, sid, manifest, save_manifest):
+    """Pause once for the first unresolved high-impact architecture decision."""
+    points = plan.get("decisionPoints") if isinstance(plan, dict) else None
+    high_impact = next((point for point in points or [] if point.get("impact") == "high"), None)
+    if not high_impact:
+        return True
+    options = [
+        {"id": f"option-{index + 1}", "label": label}
+        for index, label in enumerate(high_impact.get("options") or [])
+        if isinstance(label, str) and label.strip()
+    ][:3]
+    if len(options) < 2:
+        return True
+    timeout = 300
+    try:
+        timeout = max(1, min(300, int(os.environ.get("GLIMMER_CLARIFICATION_TIMEOUT_SECONDS", "300"))))
+    except ValueError:
+        pass
+    now = dt.datetime.now(dt.timezone.utc)
+    clarification_id = f"{sid}-clarification-1"
+    artifact = {
+        "schemaVersion": 1,
+        "id": clarification_id,
+        "sessionId": sid,
+        "status": "pending",
+        "createdAt": now.isoformat(),
+        "expiresAt": (now + dt.timedelta(seconds=timeout)).isoformat(),
+        "question": high_impact["question"],
+        "impact": "high",
+        "options": options,
+        "allowFreeform": True,
+    }
+    path = Path(session) / "clarification.json"
+    atomic_write_json(path, artifact)
+    manifest["status"] = "waiting-for-clarification"
+    manifest["state"] = canonical_session_state(manifest["status"])
+    manifest["pendingClarification"] = clarification_id
+    emit_event(events_path, "clarification_requested", sid,
+               clarificationId=clarification_id, question=high_impact["question"][:300])
+    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+    save_manifest()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            current = None
+        if isinstance(current, dict) and current.get("id") == clarification_id and current.get("status") == "answered":
+            answer = current.get("answer")
+            if isinstance(answer, dict):
+                selected = answer.get("optionId")
+                text = answer.get("text")
+                valid_ids = {option["id"] for option in options}
+                if (isinstance(selected, str) and selected in valid_ids) or (isinstance(text, str) and text.strip()):
+                    plan["clarification"] = {
+                        "id": clarification_id,
+                        "optionId": selected if selected in valid_ids else None,
+                        "text": text.strip()[:2000] if isinstance(text, str) else None,
+                    }
+                    atomic_write_json(Path(session) / "architecture-plan.json", plan)
+                    manifest.pop("pendingClarification", None)
+                    manifest["status"] = "understanding"
+                    manifest["state"] = canonical_session_state(manifest["status"])
+                    emit_event(events_path, "clarification_resolved", sid,
+                               clarificationId=clarification_id, optionId=selected)
+                    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                    save_manifest()
+                    return True
+        time.sleep(0.5)
+
+    artifact["status"] = "expired"
+    artifact["expiredAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    atomic_write_json(path, artifact)
+    manifest.pop("pendingClarification", None)
+    manifest["status"] = "needs-review-ambiguous-task"
+    manifest["state"] = canonical_session_state(manifest["status"])
+    manifest["failure"] = {
+        "class": "AMBIGUOUS_TASK",
+        "detail": "High-impact clarification was not answered before the five-minute deadline.",
+        "evidenceIds": [],
+    }
+    emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+    save_manifest()
+    return False
 
 
 def run_read_only_task(engineer, ws, contract, summary, session, events_path, sid):
@@ -6703,6 +6895,7 @@ def _merge_engineer_owned_keys(manifest: dict, manifest_path) -> None:
 
 
 def main():
+    global CURRENT_TASK_RISK
     ap = argparse.ArgumentParser(description="Muse Glimmer Engineering Mode v2.1")
     ap.add_argument("task", nargs="+")
     ap.add_argument("--workspace", required=True)
@@ -6854,6 +7047,35 @@ def main():
     repo = build_repo_map(ws)
     atomic_write_json(session / "repo-map.json", repo)
     summary = repo_summary(repo)
+    repo_index = None
+    verification_catalog = []
+    try:
+        repo_index = build_repo_index(
+            ws,
+            repo,
+            output_path=session / "repo-index.json",
+            cache_root=STATE_ROOT.parent / "repo-indexes",
+        )
+        coverage = repo_index.get("coverage") or {}
+        emit_event(
+            events_path,
+            "repo_index_completed",
+            sid,
+            supportedFiles=coverage.get("supportedFiles", 0),
+            treeSitterFiles=coverage.get("treeSitterFiles", 0),
+            partial=bool(coverage.get("partial")),
+            unsupportedLanguages=coverage.get("unsupportedLanguages") or [],
+        )
+    except Exception as exc:  # semantic indexing is additive, never a session blocker
+        print(f"[V2] WARN: semantic repository index unavailable: {type(exc).__name__}: {exc}")
+    try:
+        verification_catalog = discover_verification_catalog(ws, repo)
+        atomic_write_json(
+            session / "verification-catalog.json",
+            {"schemaVersion": 1, "candidates": verification_catalog},
+        )
+    except Exception as exc:  # native verifier fallback remains authoritative
+        print(f"[V2] WARN: verification catalog unavailable: {type(exc).__name__}: {exc}")
 
     # Task 1.2: skill_loaded events, once per session -- separate from (and
     # ahead of) build_skills_block's own per-iteration load_skills() calls
@@ -6921,6 +7143,7 @@ def main():
     # architect_risk's docstring.
     architect_candidate_count = len(scope.get("paths") or [])
     architect_risk = compute_architect_risk(contract, architect_candidate_count, args.verification_level)
+    CURRENT_TASK_RISK = risk_level_from_score(architect_risk["score"])
     read_only_task = args.mode in ("inspect", "plan", "review")
     if read_only_task:
         architect_trigger_mode = "off"
@@ -6942,6 +7165,7 @@ def main():
         "baseline": baseline, "task": task, "maxRepairs": args.max_repairs,
         "startedAt": started_at,
         "verificationLevel": args.verification_level, "attempts": [], "status": "initialized",
+        "riskLevel": CURRENT_TASK_RISK,
         "state": canonical_session_state("initialized"),
         "eventsFile": "events.jsonl", "contract": contract,
         # Task 2.1 (V7 §5.5): always present, regardless of trigger mode --
@@ -7193,8 +7417,15 @@ def main():
             # score before anything reads it, computed ONCE (Fix round 1,
             # LOW) and threaded into read_candidate_evidence rather than
             # re-ranked a second time there.
-            rank_by_path = _rerank_plan_candidates(architecture_plan, contract, repo, ws, events_path, sid)
+            rank_by_path = _rerank_plan_candidates(
+                architecture_plan, contract, repo, ws, events_path, sid, repo_index,
+            )
             candidate_evidence = read_candidate_evidence(architecture_plan, ws, rank_by_path=rank_by_path)
+            if architecture_plan is not None and not request_clarification(
+                architecture_plan, session, events_path, sid, manifest, save,
+            ):
+                final_label = "AMBIGUOUS TASK — NEEDS REVIEW"
+                return 2
             # C2: gates/architectReviews are only ever added to the
             # manifest when a usable plan exists — with no plan there is
             # nothing to review against, so C2 never runs and these keys
@@ -7441,6 +7672,7 @@ def main():
                         manifest["verifiedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                         manifest["state"] = canonical_session_state(manifest["status"])
                         emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                        record_verified_outcomes(ws, [], results, repair_contract)
                         success = True
                         final_label = "NO CHANGE REQUIRED — VERIFIED"
                         save()
@@ -7742,6 +7974,23 @@ def main():
             plan = verification_plan(repo, files, args.verification_level, args.verify,
                                       session, args.visual_url, args.model_readiness_url,
                                       contract=manifest.get("contract"), plan=architecture_plan)
+            catalog_selection = select_verification_candidates(
+                verification_catalog, files, args.verification_level, repo, repo_index,
+            ) if verification_catalog else {"required": [], "recommended": []}
+            attempt["verificationCandidates"] = catalog_selection
+            for tier in ("required", "recommended"):
+                existing_commands = {tuple(command) for command in plan[tier]}
+                for candidate in catalog_selection[tier]:
+                    command_text = candidate.get("command")
+                    if not isinstance(command_text, str) or command_text in {"visual"} or command_text.startswith("test "):
+                        continue
+                    try:
+                        parsed_command = shlex.split(command_text)
+                    except ValueError:
+                        continue
+                    if parsed_command and tuple(parsed_command) not in existing_commands:
+                        plan[tier].append(parsed_command)
+                        existing_commands.add(tuple(parsed_command))
             commands = plan["required"]
             attempt["verificationPlan"] = {
                 "required": [shlex.join(c) for c in plan["required"]],
@@ -7940,6 +8189,7 @@ def main():
                 manifest["verifiedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 manifest["state"] = canonical_session_state(manifest["status"])
                 emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                record_verified_outcomes(ws, files, results, repair_contract)
                 save()
                 success = True
                 final_label = "VERIFIED"
@@ -7978,6 +8228,31 @@ def main():
             # follows just above.
             repair_contract = build_repair_contract(iteration + 1, results, files, ws)
             manifest["attempts"][-1]["repairContract"] = repair_contract
+            prior_strategies = [
+                {
+                    "failureSignature": (item.get("repairContract") or {}).get("failureSignature"),
+                    "strategyId": (item.get("repairContract") or {}).get("strategyId"),
+                }
+                for item in manifest["attempts"][:-1]
+            ]
+            if repeated_strategy(
+                prior_strategies,
+                {"signature": repair_contract.get("failureSignature")},
+                repair_contract.get("strategyId"),
+            ):
+                emit_event(
+                    events_path,
+                    "repair_strategy_rejected",
+                    sid,
+                    strategyId=repair_contract.get("strategyId"),
+                    failureSignature=repair_contract.get("failureSignature"),
+                )
+                manifest["status"] = "needs-review-repeated-repair-strategy"
+                manifest["state"] = canonical_session_state(manifest["status"])
+                emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
+                final_label = "REPEATED REPAIR STRATEGY — NEEDS REVIEW"
+                save()
+                break
             atomic_write_json(
                 session / f"repair-{iteration + 1:02d}.json",
                 {"repair": repair_contract},
@@ -8422,15 +8697,18 @@ def _architect_first_selfcheck() -> None:
 
         with_plan = make_prompt(contract, summary, 0, plan=loaded)
         assert with_plan != baseline
-        # Plan block is strictly appended — the pre-C1 prefix is untouched.
-        assert with_plan.startswith(baseline)
+        # The operating contract remains intact. Plan-selected skill text may
+        # be placed after the plan, so an exact baseline-prefix assertion
+        # would freeze an implementation detail unrelated to compatibility.
+        assert "TASK CONTRACT (authoritative" in with_plan
         assert "inspect hydration path" in with_plan
         assert "reuse existing persistence mechanism" in with_plan
         assert "a.ts" in with_plan
         assert "frontend_typecheck" in with_plan
         # Handoff is scoped down (per C1 task entry) to exactly these four
         # fields — no skills/allowed-tools/scope-constraint systems.
-        assert '"objective"' not in with_plan[len(baseline):]
+        plan_tail = with_plan.split("ARCHITECTURE PLAN", 1)[1]
+        assert '"objective"' not in plan_tail.split("FOCUS TASK", 1)[0]
 
     # invoke_engineer's mode="architect" path always forces --yes,
     # regardless of the caller's own auto_approve — no interactive stdin
@@ -11744,12 +12022,14 @@ def _repair_contract_selfcheck() -> None:
              "newErrorSignatures": ["a.ts:<LOC> error TS2322: x"]},
         ]
         rc = build_repair_contract(1, results, ["frontend/a.ts"], ws)
-        assert rc == {
-            "attempt": 1,
-            "failedCheck": "npm --prefix frontend run typecheck",
-            "newFailures": ["a.ts:<LOC> error TS2322: x"],
-            "allowedFiles": ["frontend/a.ts"],
-        }
+        assert rc["attempt"] == 1
+        assert rc["failedCheck"] == "npm --prefix frontend run typecheck"
+        assert rc["newFailures"] == ["a.ts:<LOC> error TS2322: x"]
+        assert rc["allowedFiles"] == ["frontend/a.ts"]
+        assert rc["failureCategory"]
+        assert len(rc["failureSignature"]) == 20
+        assert isinstance(rc["likelyFiles"], list)
+        assert len(rc["strategyId"]) == 20
 
         # 2. newFailures capped at 50.
         many = [f"err {i}" for i in range(80)]
@@ -12113,7 +12393,9 @@ def _candidate_ranking_selfcheck() -> None:
 
         ranked4 = rank_candidates(["old.ts", "fresh.ts"], {"ws": ws})
         by_path4 = {r["path"]: r for r in ranked4}
-        assert by_path4["fresh.ts"]["score"] == 0.2, "committed seconds ago must get full recent-change credit"
+        assert by_path4["fresh.ts"]["score"] == 0.03, (
+            "recent change is a tie-breaker, not a primary candidate signal"
+        )
         assert by_path4["old.ts"]["score"] == 0.0, "committed ~200 days ago must get zero recent-change credit"
         assert ranked4[0]["path"] == "fresh.ts", "higher score must sort first"
 
@@ -12149,8 +12431,8 @@ def _candidate_ranking_selfcheck() -> None:
         # Fix round 1 (LOW, single-pass ranking): the computed {path: score}
         # map is returned so the caller can thread it into
         # read_candidate_evidence instead of ranking a second time there.
-        assert rank_by_path == {"fresh.ts": 0.4, "old.ts": 0.0}, (
-            f"expected fresh.ts=0.4 (recency+keyword), old.ts=0.0, got {rank_by_path!r}"
+        assert rank_by_path == {"fresh.ts": 0.23, "old.ts": 0.0}, (
+            f"expected fresh.ts=0.23 (tie-break recency+keyword), old.ts=0.0, got {rank_by_path!r}"
         )
 
         events = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]

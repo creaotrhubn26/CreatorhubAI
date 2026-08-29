@@ -260,7 +260,7 @@ TIER3_COLD_NOTE = (
 # across commits and branches, so it needs a key that survives them,
 # hence a separate identity function below rather than reusing
 # REPO_MAP_CACHE_ROOT's SHA keying.
-MUSE_GLIMMER_HOME = Path.home() / ".muse-glimmer"
+MUSE_GLIMMER_HOME = Path(os.environ.get("GLIMMER_STATE_ROOT") or (Path.home() / ".muse-glimmer"))
 
 
 def _repo_identity(workspace) -> str:
