@@ -14,6 +14,9 @@ import { CONFIG } from "../../config.js";
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VOLUME_ID_PATTERN = /^[A-Za-z0-9_-]{1,191}$/;
 const IMAGE_DIGEST_PATTERN = /^[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const HOST_PATTERN =
+  /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MAX_API_KEY_CHARS = 16_384;
 const MAX_PROFILES = 8;
 
@@ -178,6 +181,68 @@ function optionalBudget(value: unknown, label: string): number | undefined {
   return boundedNumber(value, label, 1, 100_000);
 }
 
+function normalizeModelArtifacts(
+  value: ComputeProfileUpdateV1["modelArtifacts"],
+  profileId: string,
+): ComputeProfileUpdateV1["modelArtifacts"] {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object") {
+    invalid(`profile ${profileId}: modelArtifacts must be an object`);
+  }
+  if (
+    !Array.isArray(value.allowedHosts) ||
+    value.allowedHosts.length < 1 ||
+    value.allowedHosts.length > 12
+  ) {
+    invalid(`profile ${profileId}: model artifact allowedHosts must contain 1..12 hosts`);
+  }
+  const allowedHosts = value.allowedHosts.map((host) =>
+    typeof host === "string" ? host.trim().toLowerCase() : "",
+  );
+  if (
+    allowedHosts.some((host) => !HOST_PATTERN.test(host)) ||
+    new Set(allowedHosts).size !== allowedHosts.length
+  ) {
+    invalid(`profile ${profileId}: model artifact allowedHosts contains an invalid host`);
+  }
+  const normalizeArtifact = (
+    artifact: { url: string; sha256: string } | undefined,
+    label: string,
+  ) => {
+    if (!artifact || typeof artifact !== "object") {
+      invalid(`profile ${profileId}: ${label} artifact is required`);
+    }
+    const url = typeof artifact.url === "string" ? artifact.url.trim() : "";
+    const sha256 = typeof artifact.sha256 === "string" ? artifact.sha256.trim() : "";
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      invalid(`profile ${profileId}: ${label} artifact URL is invalid`);
+    }
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash ||
+      !allowedHosts.includes(parsed.hostname.toLowerCase())
+    ) {
+      invalid(`profile ${profileId}: ${label} artifact must use an allowlisted HTTPS host`);
+    }
+    if (!SHA256_PATTERN.test(sha256)) {
+      invalid(`profile ${profileId}: ${label} artifact SHA-256 is invalid`);
+    }
+    return { url, sha256 };
+  };
+  return {
+    model: normalizeArtifact(value.model, "model"),
+    mmproj: normalizeArtifact(value.mmproj, "mmproj"),
+    draftModel: normalizeArtifact(value.draftModel, "draft model"),
+    allowedHosts,
+  };
+}
+
 function normalizeProfile(value: unknown): StoredComputeProfile {
   if (!value || typeof value !== "object") invalid("each compute profile must be an object");
   const raw = value as Partial<ComputeProfileUpdateV1>;
@@ -226,6 +291,7 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
     raw.monthlyBudgetUsd,
     `profile ${raw.id}: monthlyBudgetUsd`,
   );
+  const modelArtifacts = normalizeModelArtifacts(raw.modelArtifacts, raw.id!);
   if (
     dailyBudgetUsd !== undefined &&
     monthlyBudgetUsd !== undefined &&
@@ -244,6 +310,7 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
     contextTokens: raw.contextTokens,
     imageDigest,
     ...(networkVolumeId ? { networkVolumeId } : {}),
+    ...(modelArtifacts ? { modelArtifacts } : {}),
     maxGpuHourlyUsd: boundedNumber(
       raw.maxGpuHourlyUsd,
       `profile ${raw.id}: maxGpuHourlyUsd`,
@@ -302,6 +369,9 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
     const active = profiles.find((profile) => profile.id === raw.activeProfileId)!;
     if (!active.imageDigest) invalid("the active RunPod profile requires an immutable imageDigest");
     if (!active.networkVolumeId) invalid("the active RunPod profile requires networkVolumeId");
+    if (!active.modelArtifacts) {
+      invalid("the active RunPod profile requires checksum-bound modelArtifacts");
+    }
     if (!willHaveKey) invalid("the active RunPod backend requires an API key");
   }
   return {

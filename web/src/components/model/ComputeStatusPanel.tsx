@@ -72,6 +72,22 @@ export function ComputeStatusPanel() {
         <dd className="mono">{data.pod?.id ?? "None"}</dd>
         <dt>GPU</dt>
         <dd>{data.pod?.gpuTypeId ?? "Unavailable"}</dd>
+        <dt>Worker</dt>
+        <dd>
+          {data.worker
+            ? data.worker.ready
+              ? "Authenticated and ready"
+              : data.worker.workerState
+            : "Unavailable"}
+        </dd>
+        <dt>Worker build</dt>
+        <dd className="mono">{data.worker?.buildId ?? "Unavailable"}</dd>
+        <dt>Model context</dt>
+        <dd>
+          {data.worker
+            ? `${data.worker.model.contextTokens.toLocaleString()} tokens`
+            : "Unavailable"}
+        </dd>
         <dt>Current rate</dt>
         <dd>{money(data.budget?.currentHourlyUsd)}</dd>
         <dt>Hourly ceiling</dt>
@@ -83,6 +99,11 @@ export function ComputeStatusPanel() {
       </dl>
       {data.idleDeadlineAt && <p>Idle cleanup deadline: {data.idleDeadlineAt}</p>}
       {data.hardDeadlineAt && <p>Hard deadline: {data.hardDeadlineAt}</p>}
+      {data.pod?.desiredStatus === "RUNNING" && !data.worker?.ready && (
+        <p role="alert">
+          Provider capacity is allocated, but authenticated worker readiness is not proven.
+        </p>
+      )}
       {!data.policy.watchdogConfigured && (
         <p role="note">
           Independent watchdog unavailable. Keep the Control Center running and do not leave paid

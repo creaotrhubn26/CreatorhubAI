@@ -7,8 +7,8 @@
 # network; each final file must match its release SHA-256 before output.
 set -euo pipefail
 
-ORCHESTRATOR_REF="3d5fcba94a504492de5d6d187257642900f2c59b"
-SNAPSHOT_ID="glimmer-accuracy-v2"
+ORCHESTRATOR_REF="a7bb2c962e34f149ff2fa8b318ab0d2b745d3f09"
+SNAPSHOT_ID="glimmer-runpod-r2"
 
 cd "$(dirname "$0")/.."
 OUT="binaries/runtime/orchestrator"
@@ -27,6 +27,8 @@ FILES=(
   "glimmer_semantic.py"
   "glimmer_verification.py"
   "glimmer-visual.py"
+  "glimmer_remote.py"
+  "runpod_worker.py"
   "run-github-mcp.sh"
   "eval-baselines/baseline-stub.json"
   "eval-baselines/latest-stub.json"
@@ -34,16 +36,18 @@ FILES=(
   "eval-baselines/latest-live.json"
 )
 SHAS=(
-  "a4edb51f9dc01793b668bdbb58b8b542d9c9ce218cb4f06747ee45cd2b121ba5"
+  "ecd0952e83bc9fd658230e4aa2707d92e90151e994529e78aacbd011b067ee4a"
   "16be8ca1c4ec368e3247a1f034a0db5b8418235129cf964962d12ee9bda3f7db"
-  "d31179ab2f5cedf1c7b0cf9a32452bbaa03580ed056a9163ae8ace66ea63a53e"
-  "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6"
+  "2fd4aa0afbe32b58150be442c0e2b4cbb70f1c5ab65f2a9d2e857b239cd34454"
+  "67a28a2c480ca65ff49133968bda89a0c4f9e670aa02e28cd5fcb3e269464cf5"
   "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c"
   "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920"
   "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188"
   "e1d3ce00c33f6db5d4183b1e8c237bbea50532ee051018b64b577163f864f167"
   "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711"
   "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3"
+  "5771ff5870bfc74b35cdad90c7011da5f23ca88bf2d54eb2f9a8a59188926bfd"
+  "08c0533b22745829e4e288a784ebafa4d2764f683de4f7cf8e15f8187cdef61e"
   "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33"
   "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18"
   "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45"
@@ -72,7 +76,8 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 cp -R "$STAGING"/. "$OUT/"
 chmod +x "$OUT/glimmer-v2.py" "$OUT/glimmer-engineer.py" \
-  "$OUT/glimmer-visual.py" "$OUT/run-github-mcp.sh"
+  "$OUT/glimmer-visual.py" "$OUT/glimmer_remote.py" \
+  "$OUT/runpod_worker.py" "$OUT/run-github-mcp.sh"
 
 {
   printf '{\n  "repository": "creaotrhubn26/CreatorhubAI",\n  "commit": "%s",\n  "snapshot": {"id": "%s"},\n  "files": {\n' \

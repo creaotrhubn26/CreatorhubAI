@@ -34,6 +34,7 @@ export const CONFIG = {
   modelKeysDir: path.join(stateRoot, "model-keys"),
   computeConfigPath: process.env.GLIMMER_COMPUTE_CONFIG ?? path.join(stateRoot, "compute.json"),
   computeKeysDir: path.join(stateRoot, "compute-keys"),
+  computeWorkerKeysDir: path.join(stateRoot, "compute-worker-keys"),
   computeStatePath: path.join(stateRoot, "compute-state.json"),
   computeUsagePath: path.join(stateRoot, "compute-usage.json"),
   // Fixed vendor origin: account credentials must never be redirected to a

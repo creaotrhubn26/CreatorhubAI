@@ -23,6 +23,12 @@ const config: ComputeConfigV1 = {
       contextTokens: 65_536,
       imageDigest: `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`,
       networkVolumeId: "volume_1",
+      modelArtifacts: {
+        model: { url: "https://models.example.com/model.gguf", sha256: "b".repeat(64) },
+        mmproj: { url: "https://models.example.com/mmproj.gguf", sha256: "c".repeat(64) },
+        draftModel: { url: "https://models.example.com/draft.gguf", sha256: "d".repeat(64) },
+        allowedHosts: ["models.example.com"],
+      },
       maxGpuHourlyUsd: 1.75,
       idleTimeoutSeconds: 300,
       clarificationTimeoutSeconds: 120,
@@ -62,11 +68,13 @@ function lease(overrides: Partial<ComputeLeaseV1> = {}): ComputeLeaseV1 {
 }
 
 function harness(options: {
-  currentLease?: ComputeLeaseV1;
+  currentLease?: ComputeLeaseV1 | null;
   currentConfig?: ComputeConfigV1;
   pod?: any;
+  workerFailure?: Error;
 }) {
-  let currentLease = options.currentLease ?? lease();
+  let currentLease: ComputeLeaseV1 | null =
+    "currentLease" in options ? (options.currentLease ?? null) : lease();
   const deletePod = vi.fn().mockResolvedValue(undefined);
   const finishUsage = vi.fn().mockResolvedValue(undefined);
   const clearLease = vi.fn().mockImplementation(async (id: string) => {
@@ -90,8 +98,45 @@ function harness(options: {
   const fakeClient = {
     getPod: vi.fn().mockImplementation(async () => (deleted ? null : providerPod)),
     listPods: vi.fn().mockResolvedValue([]),
+    createPod: vi.fn().mockResolvedValue(providerPod),
     deletePod,
+    getPodBilling: vi.fn().mockResolvedValue([]),
   };
+  const initialWorker = {
+    protocolVersion: 1 as const,
+    buildId: "r2-aaaaaaaaaaaa",
+    ready: false,
+    workerState: "bootstrapping" as const,
+    model: { ready: true, contextTokens: 65_536 as const },
+  };
+  const readyWorker = {
+    ...initialWorker,
+    ready: true,
+    workerState: "ready" as const,
+  };
+  const workerClient = {
+    health: options.workerFailure
+      ? vi.fn().mockRejectedValue(options.workerFailure)
+      : vi.fn().mockResolvedValueOnce(initialWorker).mockResolvedValue(readyWorker),
+    handshake: vi.fn().mockResolvedValue({
+      schemaVersion: 1,
+      buildId: "r2-aaaaaaaaaaaa",
+      capability: "C".repeat(43),
+      checkpointKey: "K".repeat(43),
+      contextTokens: 65_536,
+    }),
+  };
+  const deleteWorkerSecret = vi.fn().mockResolvedValue(undefined);
+  const storeWorkerHandshake = vi.fn().mockImplementation(async (id: string) => ({
+    version: 1,
+    leaseId: id,
+    capability: "C".repeat(43),
+    checkpointKey: "K".repeat(43),
+    handshakeIdempotencyKey: "I".repeat(43),
+    controllerNonce: "N".repeat(43),
+    createdAt: NOW.toISOString(),
+    rotatedAt: NOW.toISOString(),
+  }));
   const controller = new ComputeController({
     now: () => NOW,
     readConfig: vi.fn().mockResolvedValue(options.currentConfig ?? config),
@@ -114,8 +159,31 @@ function harness(options: {
     readTrackedPodIds: vi.fn().mockResolvedValue(["pod_123"]),
     storeReconciledUsage: vi.fn(),
     clientFactory: () => fakeClient as any,
+    workerFactory: vi.fn().mockReturnValue(workerClient),
+    createWorkerSecret: vi.fn().mockImplementation(async (id: string) => ({
+      version: 1,
+      leaseId: id,
+      bootstrapToken: "B".repeat(43),
+      handshakeIdempotencyKey: "I".repeat(43),
+      controllerNonce: "N".repeat(43),
+      createdAt: NOW.toISOString(),
+    })),
+    readWorkerSecret: vi.fn(),
+    storeWorkerHandshake,
+    deleteWorkerSecret,
+    sleep: vi.fn().mockResolvedValue(undefined),
+    workerReadyAttempts: 1,
   } as any);
-  return { controller, deletePod, finishUsage, clearLease };
+  return {
+    controller,
+    deletePod,
+    finishUsage,
+    clearLease,
+    deleteWorkerSecret,
+    fakeClient,
+    workerClient,
+    currentLease: () => currentLease,
+  };
 }
 
 describe("ComputeController startup recovery", () => {
@@ -160,5 +228,70 @@ describe("ComputeController startup recovery", () => {
     expect(result.cleaned).toBe(true);
     expect(result.detail).toContain("exceeds the configured");
     expect(deletePod).toHaveBeenCalledWith("pod_123");
+  });
+});
+
+describe("ComputeController authenticated worker startup", () => {
+  it("never promotes public health JSON to authenticated readiness", async () => {
+    const { controller, workerClient } = harness({
+      currentLease: lease({
+        state: "bootstrapping",
+        idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+        hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+      }),
+    });
+    workerClient.health.mockReset().mockResolvedValue({
+      protocolVersion: 1,
+      buildId: "r2-aaaaaaaaaaaa",
+      ready: true,
+      workerState: "ready",
+      model: { ready: true, contextTokens: 65_536 },
+    });
+    await expect(controller.getStatus()).resolves.toMatchObject({
+      state: "bootstrapping",
+      worker: { ready: false, workerState: "bootstrapping" },
+      detail: "Worker is reachable, but authenticated readiness is not established.",
+    });
+  });
+
+  it("does not report ready until the worker identity, context, and rotated capability validate", async () => {
+    const { controller, fakeClient, workerClient, currentLease } = harness({ currentLease: null });
+    const result = await controller.start();
+    expect(result).toMatchObject({
+      started: true,
+      status: {
+        state: "ready",
+        worker: {
+          buildId: "r2-aaaaaaaaaaaa",
+          ready: true,
+          model: { contextTokens: 65_536 },
+        },
+      },
+    });
+    expect(workerClient.handshake).toHaveBeenCalledTimes(1);
+    expect(currentLease()).toMatchObject({
+      state: "ready",
+      workerProtocolVersion: 1,
+      workerBuildId: "r2-aaaaaaaaaaaa",
+    });
+    const input = fakeClient.createPod.mock.calls[0][0];
+    expect(input.ports).toEqual(["4318/http"]);
+    expect(input.env).toMatchObject({
+      GLIMMER_CONTEXT_TOKENS: "65536",
+      GLIMMER_WORKER_BOOTSTRAP_TOKEN: "B".repeat(43),
+      GLIMMER_MODEL_SHA256: "b".repeat(64),
+    });
+    expect(JSON.stringify(input.env)).not.toContain("RunPod");
+  });
+
+  it("terminates immediately and clears worker secrets when authenticated readiness fails", async () => {
+    const { controller, deletePod, deleteWorkerSecret, currentLease } = harness({
+      currentLease: null,
+      workerFailure: new Error("worker proxy unavailable"),
+    });
+    await expect(controller.start()).rejects.toThrow(/Worker bootstrap failed/);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(deleteWorkerSecret).toHaveBeenCalledTimes(1);
+    expect(currentLease()).toBeNull();
   });
 });

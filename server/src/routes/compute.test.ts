@@ -9,6 +9,12 @@ import type { ComputeConfigV1, ComputeConfigUpdateV1 } from "@glimmer/shared";
 const UI_ORIGIN = "http://127.0.0.1:5183";
 const API_KEY = "runpod-route-secret";
 const IMAGE = `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`;
+const MODEL_ARTIFACTS = {
+  model: { url: "https://models.example.com/model.gguf", sha256: "b".repeat(64) },
+  mmproj: { url: "https://models.example.com/mmproj.gguf", sha256: "c".repeat(64) },
+  draftModel: { url: "https://models.example.com/draft.gguf", sha256: "d".repeat(64) },
+  allowedHosts: ["models.example.com"],
+};
 
 let app: Express;
 let stateRoot: string;
@@ -54,6 +60,7 @@ async function configuredUpdate(patch: Partial<ComputeConfigUpdateV1> = {}) {
         ...profile,
         imageDigest: IMAGE,
         networkVolumeId: "network_volume_1",
+        modelArtifacts: MODEL_ARTIFACTS,
       }),
     ),
     ...patch,
@@ -151,7 +158,43 @@ describe("compute configuration API", () => {
       .set("Origin", UI_ORIGIN)
       .send(updateFrom(defaults, { enabled: true, defaultBackend: "runpod_pod" }));
     expect(response.status).toBe(400);
-    expect(response.body.error).toMatch(/imageDigest|networkVolumeId|API key/);
+    expect(response.body.error).toMatch(/imageDigest|networkVolumeId|modelArtifacts|API key/);
+  });
+
+  it("rejects unallowlisted, credentialed, or non-checksummed model artifacts", async () => {
+    const defaults = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
+    const valid = updateFrom(defaults, {
+      enabled: true,
+      defaultBackend: "runpod_pod",
+      apiKey: API_KEY,
+      profiles: defaults.profiles.map(
+        ({ hasApiKey: _hasApiKey, watchdogConfigured: _watchdog, ...profile }) => ({
+          ...profile,
+          imageDigest: IMAGE,
+          networkVolumeId: "network_volume_1",
+          modelArtifacts: MODEL_ARTIFACTS,
+        }),
+      ),
+    });
+    for (const mutate of [
+      (input: any) =>
+        (input.profiles[0].modelArtifacts.model.url = "http://models.example.com/model.gguf"),
+      (input: any) =>
+        (input.profiles[0].modelArtifacts.model.url = "https://other.example.com/model.gguf"),
+      (input: any) =>
+        (input.profiles[0].modelArtifacts.model.url =
+          "https://user:secret@models.example.com/model.gguf"),
+      (input: any) => (input.profiles[0].modelArtifacts.model.sha256 = "not-a-sha256"),
+      (input: any) => (input.profiles[0].modelArtifacts.allowedHosts = ["127.0.0.1"]),
+    ]) {
+      const input = structuredClone(valid);
+      mutate(input);
+      const response = await request(app)
+        .put("/api/compute/config")
+        .set("Origin", UI_ORIGIN)
+        .send(input);
+      expect(response.status).toBe(400);
+    }
   });
 
   it("protects writes with the existing origin guard", async () => {
@@ -195,6 +238,7 @@ describe("RunPod compute lifecycle", () => {
   it("creates one Secure A100 Pod and terminates it on stop because it has a network volume", async () => {
     await configuredUpdate();
     let exists = false;
+    let workerRotated = false;
     const calls: Array<{ url: string; method: string; body?: unknown }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
@@ -204,6 +248,31 @@ describe("RunPod compute lifecycle", () => {
         method,
         ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
       });
+      if (url === "https://pod_123-4318.proxy.runpod.net/v1/health") {
+        return new Response(
+          JSON.stringify({
+            schemaVersion: 1,
+            buildId: "r2-aaaaaaaaaaaa",
+            ready: workerRotated,
+            model: { ready: true, contextTokens: 65_536 },
+            workerState: workerRotated ? "ready" : "bootstrapping",
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === "https://pod_123-4318.proxy.runpod.net/v1/handshake" && method === "POST") {
+        workerRotated = true;
+        return new Response(
+          JSON.stringify({
+            schemaVersion: 1,
+            buildId: "r2-aaaaaaaaaaaa",
+            capability: "C".repeat(43),
+            checkpointKey: "K".repeat(43),
+            contextTokens: 65_536,
+          }),
+          { status: 200 },
+        );
+      }
       if (url.includes("/billing/pods") && method === "GET") {
         return new Response(JSON.stringify([]), { status: 200 });
       }
@@ -247,8 +316,9 @@ describe("RunPod compute lifecycle", () => {
     expect(started.body.started).toBe(true);
     expect(started.body.status).toMatchObject({
       backend: "runpod_pod",
-      state: "bootstrapping",
+      state: "ready",
       pod: { id: "pod_123", adjustedCostPerHr: 1.39 },
+      worker: { buildId: "r2-aaaaaaaaaaaa", ready: true },
     });
     const create = calls.find((call) => call.method === "POST" && call.url.endsWith("/pods"));
     expect(create?.body).toMatchObject({
@@ -259,6 +329,11 @@ describe("RunPod compute lifecycle", () => {
       imageName: IMAGE,
       networkVolumeId: "network_volume_1",
       interruptible: false,
+      ports: ["4318/http"],
+      env: {
+        GLIMMER_CONTEXT_TOKENS: "65536",
+        GLIMMER_MODEL_SHA256: "b".repeat(64),
+      },
     });
     expect(JSON.stringify(create?.body)).not.toContain(API_KEY);
 

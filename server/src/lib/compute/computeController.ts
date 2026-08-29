@@ -7,6 +7,7 @@ import type {
   ComputeProfileV1,
   ComputeStatus,
   ComputeUsageSummary,
+  ComputeWorkerStatus,
 } from "@glimmer/shared";
 import { CONFIG } from "../../config.js";
 import { readComputeConfig, readRunPodApiKey, saveComputeConfig } from "./configStore.js";
@@ -19,6 +20,14 @@ import {
 } from "./computeLeaseStore.js";
 import { RunPodClient } from "./runpodClient.js";
 import type { RunPodCreatePodInput, RunPodPod } from "./runpodSchemas.js";
+import { WorkerClient, WorkerProtocolError, workerBaseUrlForPod } from "./workerClient.js";
+import {
+  createWorkerSecret,
+  deleteWorkerSecret,
+  readWorkerSecret,
+  storeWorkerHandshake,
+  type WorkerSecretV1,
+} from "./workerSecretStore.js";
 import {
   beginUsageInterval,
   finishUsageInterval,
@@ -37,6 +46,8 @@ export class ComputeControlError extends Error {
   }
 }
 
+class PermanentWorkerValidationError extends Error {}
+
 interface ControllerDependencies {
   now: () => Date;
   readConfig: typeof readComputeConfig;
@@ -52,6 +63,13 @@ interface ControllerDependencies {
   readTrackedPodIds: typeof readTrackedPodIds;
   storeReconciledUsage: typeof storeReconciledUsage;
   clientFactory: (apiKey: string) => RunPodClient;
+  workerFactory: (podId: string) => WorkerClient;
+  createWorkerSecret: typeof createWorkerSecret;
+  readWorkerSecret: typeof readWorkerSecret;
+  storeWorkerHandshake: typeof storeWorkerHandshake;
+  deleteWorkerSecret: typeof deleteWorkerSecret;
+  sleep: (milliseconds: number) => Promise<void>;
+  workerReadyAttempts: number;
 }
 
 const DEFAULT_DEPENDENCIES: ControllerDependencies = {
@@ -69,6 +87,13 @@ const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   readTrackedPodIds,
   storeReconciledUsage,
   clientFactory: (apiKey) => new RunPodClient({ baseUrl: CONFIG.runpodApiBaseUrl, apiKey }),
+  workerFactory: (podId) => new WorkerClient({ baseUrl: workerBaseUrlForPod(podId) }),
+  createWorkerSecret,
+  readWorkerSecret,
+  storeWorkerHandshake,
+  deleteWorkerSecret,
+  sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  workerReadyAttempts: 40,
 };
 
 function activeProfile(config: ComputeConfigV1): ComputeProfileV1 | null {
@@ -162,6 +187,7 @@ export class ComputeController {
     lease: ComputeLeaseV1 | null,
     pod: RunPodPod | null,
     detail?: string,
+    worker?: ComputeWorkerStatus,
   ): Promise<ComputeStatus> {
     const profile = lease
       ? config.profiles.find((candidate) => candidate.id === lease.profileId)
@@ -187,6 +213,8 @@ export class ComputeController {
     if (pod?.desiredStatus === "EXITED") state = "stopped";
     if (pod?.desiredStatus === "TERMINATED") state = "offline";
     if (pod?.desiredStatus === "RUNNING" && state === "provisioning") state = "bootstrapping";
+    if (pod?.desiredStatus === "RUNNING" && worker?.ready) state = "ready";
+    if (pod?.desiredStatus === "RUNNING" && worker && !worker.ready) state = "bootstrapping";
     if (budget && !budget.allowed && state !== "terminating") state = "budget_blocked";
     return {
       backend: "runpod_pod",
@@ -196,14 +224,17 @@ export class ComputeController {
       ...(pod ? { pod: podSummary(pod) } : {}),
       idleDeadlineAt: lease.idleDeadlineAt,
       hardDeadlineAt: lease.hardDeadlineAt,
+      ...(worker ? { worker } : {}),
       detail:
         detail ??
         lease.error ??
-        (pod?.desiredStatus === "RUNNING"
-          ? "The provider reports RUNNING; worker readiness is introduced in R2."
-          : pod
-            ? `The provider reports ${pod.desiredStatus}.`
-            : "The gateway has a provisional compute lease but no confirmed Pod yet."),
+        (worker?.ready
+          ? `Authenticated worker ${worker.buildId} is ready with ${worker.model.contextTokens} context tokens.`
+          : pod?.desiredStatus === "RUNNING"
+            ? "The provider is RUNNING while the authenticated worker is still bootstrapping."
+            : pod
+              ? `The provider reports ${pod.desiredStatus}.`
+              : "The gateway has a provisional compute lease but no confirmed Pod yet."),
       ...(budget ? { budget } : {}),
       policy: this.policy(profile ?? undefined),
     };
@@ -229,10 +260,14 @@ export class ComputeController {
     return matches[0];
   }
 
-  private createInput(profile: ComputeProfileV1, podName: string): RunPodCreatePodInput {
-    if (!profile.imageDigest || !profile.networkVolumeId) {
+  private createInput(
+    profile: ComputeProfileV1,
+    podName: string,
+    bootstrapToken: string,
+  ): RunPodCreatePodInput {
+    if (!profile.imageDigest || !profile.networkVolumeId || !profile.modelArtifacts) {
       throw new ComputeControlError(
-        "The active RunPod profile requires an immutable image digest and network volume",
+        "The active RunPod profile requires an immutable image digest, network volume, and checksum-bound model artifacts",
         412,
       );
     }
@@ -250,8 +285,118 @@ export class ComputeController {
       ports: ["4318/http"],
       interruptible: false,
       locked: false,
-      env: { GLIMMER_CONTEXT_TOKENS: String(profile.contextTokens) },
+      env: {
+        GLIMMER_CONTEXT_TOKENS: String(profile.contextTokens),
+        GLIMMER_WORKER_BOOTSTRAP_TOKEN: bootstrapToken,
+        GLIMMER_MODEL_URL: profile.modelArtifacts.model.url,
+        GLIMMER_MODEL_SHA256: profile.modelArtifacts.model.sha256,
+        GLIMMER_MMPROJ_URL: profile.modelArtifacts.mmproj.url,
+        GLIMMER_MMPROJ_SHA256: profile.modelArtifacts.mmproj.sha256,
+        GLIMMER_DFLASH_URL: profile.modelArtifacts.draftModel.url,
+        GLIMMER_DFLASH_SHA256: profile.modelArtifacts.draftModel.sha256,
+        GLIMMER_ARTIFACT_HOSTS: profile.modelArtifacts.allowedHosts.join(","),
+      },
     };
+  }
+
+  private validateWorker(
+    profile: ComputeProfileV1,
+    worker: ComputeWorkerStatus,
+    requireReady: boolean,
+  ): string | null {
+    if (!/^r2-[a-f0-9]{12}$/.test(worker.buildId)) {
+      return "worker image did not report an immutable R2 build id";
+    }
+    if (worker.model.contextTokens !== profile.contextTokens) {
+      return `worker context ${worker.model.contextTokens} does not match profile context ${profile.contextTokens}`;
+    }
+    if (requireReady && (!worker.ready || !worker.model.ready || worker.workerState !== "ready")) {
+      return "worker or model did not become ready";
+    }
+    return null;
+  }
+
+  private async bootstrapWorker(
+    podId: string,
+    profile: ComputeProfileV1,
+    secret: WorkerSecretV1,
+  ): Promise<ComputeWorkerStatus> {
+    const client = this.dependencies.workerFactory(podId);
+    let lastError = "worker proxy is unavailable";
+    const attempts = Math.max(
+      1,
+      Math.min(this.dependencies.workerReadyAttempts, Math.floor(profile.idleTimeoutSeconds / 12)),
+    );
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const initial = await client.health(secret.capability);
+        const initialError = this.validateWorker(profile, initial, false);
+        if (initialError) throw new PermanentWorkerValidationError(initialError);
+        let capability = secret.capability;
+        if (!capability) {
+          if (!secret.bootstrapToken) {
+            throw new WorkerProtocolError("worker bootstrap state is unavailable");
+          }
+          const handshake = await client.handshake({
+            bootstrapToken: secret.bootstrapToken,
+            controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+            nonce: secret.controllerNonce,
+            idempotencyKey: secret.handshakeIdempotencyKey,
+          });
+          if (
+            handshake.buildId !== initial.buildId ||
+            handshake.contextTokens !== profile.contextTokens
+          ) {
+            throw new PermanentWorkerValidationError(
+              "worker handshake identity does not match health",
+            );
+          }
+          const rotated = await this.dependencies.storeWorkerHandshake(
+            secret.leaseId,
+            handshake.capability,
+            handshake.checkpointKey,
+          );
+          capability = rotated.capability;
+        }
+        const ready = await client.health(capability);
+        const readyError = this.validateWorker(profile, ready, true);
+        if (!readyError) return ready;
+        lastError = readyError;
+      } catch (error) {
+        if (error instanceof PermanentWorkerValidationError) throw error;
+        lastError = error instanceof Error ? error.message : "worker bootstrap failed";
+      }
+      if (attempt + 1 < attempts) {
+        await this.dependencies.sleep(2_000);
+      }
+    }
+    throw new WorkerProtocolError(lastError);
+  }
+
+  private async terminateFailedBootstrap(
+    client: RunPodClient,
+    lease: ComputeLeaseV1,
+    reason: string,
+  ): Promise<boolean> {
+    const podId = lease.podId;
+    if (!podId) {
+      await this.dependencies.deleteWorkerSecret(lease.id);
+      return true;
+    }
+    await this.dependencies.saveLease({
+      ...lease,
+      state: "terminating",
+      error: `${reason}; termination requested immediately`,
+    });
+    await client.deletePod(podId);
+    if (await this.waitForTermination(client, podId)) {
+      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+      await this.dependencies.clearLease(lease.id);
+      await this.dependencies.deleteWorkerSecret(lease.id);
+      return true;
+    }
+    this.scheduleCleanupRetry("retry failed worker bootstrap termination");
+    return false;
   }
 
   private validateAllocatedPod(profile: ComputeProfileV1, pod: RunPodPod): string | null {
@@ -362,7 +507,36 @@ export class ComputeController {
     if (!lease) return this.statusFrom(config, null, null);
     try {
       const pod = await this.findLeasePod(await this.client(), lease);
-      return this.statusFrom(config, lease, pod);
+      if (!pod || pod.desiredStatus !== "RUNNING") return this.statusFrom(config, lease, pod);
+      try {
+        const secret = await this.dependencies.readWorkerSecret(lease.id);
+        const worker = await this.dependencies.workerFactory(pod.id).health(secret?.capability);
+        if (!secret?.capability) {
+          return this.statusFrom(
+            config,
+            lease,
+            pod,
+            "Worker is reachable, but authenticated readiness is not established.",
+            { ...worker, ready: false, workerState: "bootstrapping" },
+          );
+        }
+        const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+        const workerError = profile ? this.validateWorker(profile, worker, false) : null;
+        return this.statusFrom(
+          config,
+          lease,
+          pod,
+          workerError ?? undefined,
+          workerError ? { ...worker, ready: false, workerState: "bootstrapping" } : worker,
+        );
+      } catch (error) {
+        return this.statusFrom(
+          config,
+          lease,
+          pod,
+          `Worker status unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+        );
+      }
     } catch (error) {
       return this.statusFrom(
         config,
@@ -406,7 +580,6 @@ export class ComputeController {
       const now = this.dependencies.now();
       const leaseId = randomUUID();
       const podName = `glimmer-${safeInstanceId(CONFIG.instanceId)}-${leaseId.slice(0, 12)}`;
-      const createRequest = this.createInput(profile, podName);
       const client = await this.client();
       let lease: ComputeLeaseV1 = {
         version: 1,
@@ -423,6 +596,12 @@ export class ComputeController {
         ).toISOString(),
       };
       lease = await this.dependencies.saveLease(lease);
+      const workerSecret = await this.dependencies.createWorkerSecret(leaseId);
+      if (!workerSecret.bootstrapToken) {
+        await this.dependencies.clearLease(leaseId);
+        throw new ComputeControlError("worker bootstrap secret was not created", 500);
+      }
+      const createRequest = this.createInput(profile, podName, workerSecret.bootstrapToken);
       let pod: RunPodPod;
       try {
         pod = await client.createPod(createRequest);
@@ -442,6 +621,7 @@ export class ComputeController {
                 ? "RunPod create outcome is ambiguous; multiple Pods have the lease name"
                 : `RunPod create failed: ${error instanceof Error ? error.message : "unknown error"}`,
           });
+          if (matches.length === 0) await this.dependencies.deleteWorkerSecret(leaseId);
           throw error;
         }
         pod = matches[0];
@@ -470,6 +650,7 @@ export class ComputeController {
             await this.dependencies.finishUsage(leaseId, this.dependencies.now().toISOString());
           }
           await this.dependencies.clearLease(leaseId);
+          await this.dependencies.deleteWorkerSecret(leaseId);
         } else {
           this.scheduleCleanupRetry("retry rejected allocation termination");
         }
@@ -489,9 +670,25 @@ export class ComputeController {
         observedHourlyUsd,
       });
       await this.scheduleSafety(lease, profile);
+      let worker: ComputeWorkerStatus;
+      try {
+        worker = await this.bootstrapWorker(pod.id, profile, workerSecret);
+      } catch (error) {
+        const reason = `Worker bootstrap failed: ${error instanceof Error ? error.message : "unknown error"}`;
+        await this.terminateFailedBootstrap(client, lease, reason);
+        throw new ComputeControlError(reason, 502);
+      }
+      lease = await this.dependencies.saveLease({
+        ...lease,
+        state: "ready",
+        workerProtocolVersion: 1,
+        workerBuildId: worker.buildId,
+        workerReadyAt: this.dependencies.now().toISOString(),
+        error: undefined,
+      });
       return {
         started: true,
-        status: await this.statusFrom(config, lease, pod),
+        status: await this.statusFrom(config, lease, pod, undefined, worker),
       };
     });
   }
@@ -507,6 +704,7 @@ export class ComputeController {
       if (!pod) {
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
+        await this.dependencies.deleteWorkerSecret(lease.id);
         return {
           stopped: false,
           status: await this.statusFrom(config, null, null, "The recorded Pod no longer exists."),
@@ -535,6 +733,7 @@ export class ComputeController {
       }
       await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
       await this.dependencies.clearLease(lease.id);
+      await this.dependencies.deleteWorkerSecret(lease.id);
       return {
         stopped: true,
         terminated: true,
@@ -588,6 +787,7 @@ export class ComputeController {
       if (!pod) {
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
+        await this.dependencies.deleteWorkerSecret(lease.id);
         return { recovered: false, cleaned: true, detail: "missing Pod lease cleared" };
       }
       if (!profile) {
@@ -607,6 +807,7 @@ export class ComputeController {
         }
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
+        await this.dependencies.deleteWorkerSecret(lease.id);
         return {
           recovered: false,
           cleaned: true,
@@ -634,18 +835,60 @@ export class ComputeController {
         }
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
+        await this.dependencies.deleteWorkerSecret(lease.id);
         return {
           recovered: false,
           cleaned: true,
           detail: allocationError ?? "expired compute lease terminated",
         };
       }
+      let worker: ComputeWorkerStatus | undefined;
+      if (pod.desiredStatus === "RUNNING") {
+        const secret = await this.dependencies.readWorkerSecret(lease.id);
+        if (!secret) {
+          const cleaned = await this.terminateFailedBootstrap(
+            client,
+            { ...lease, podId: pod.id },
+            "worker secret is missing after gateway restart",
+          );
+          return {
+            recovered: false,
+            cleaned,
+            detail: cleaned
+              ? "Pod terminated because worker authentication state is missing"
+              : "Pod termination is pending because worker authentication state is missing",
+          };
+        }
+        try {
+          worker = await this.bootstrapWorker(pod.id, profile, secret);
+        } catch (error) {
+          const reason = `worker recovery failed: ${error instanceof Error ? error.message : "unknown error"}`;
+          const cleaned = await this.terminateFailedBootstrap(
+            client,
+            { ...lease, podId: pod.id },
+            reason,
+          );
+          return { recovered: false, cleaned, detail: reason };
+        }
+      }
       const updated =
         (await this.dependencies.updateLease((current) => ({
           ...current,
           podId: pod.id,
           observedHourlyUsd: price(pod),
-          state: pod.desiredStatus === "RUNNING" ? "bootstrapping" : "stopped",
+          state: worker?.ready
+            ? "ready"
+            : pod.desiredStatus === "RUNNING"
+              ? "bootstrapping"
+              : "stopped",
+          ...(worker
+            ? {
+                workerProtocolVersion: 1 as const,
+                workerBuildId: worker.buildId,
+                workerReadyAt: this.dependencies.now().toISOString(),
+                error: undefined,
+              }
+            : {}),
         }))) ?? lease;
       await this.scheduleSafety(updated, profile);
       return { recovered: true, cleaned: false, detail: "compute lease reattached" };

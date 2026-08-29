@@ -2768,6 +2768,20 @@ export type ComputeRunState =
 export type RunPodGpuTypeId =
   "NVIDIA A100 80GB PCIe" | "NVIDIA A100-SXM4-80GB" | "NVIDIA H100 PCIe" | "NVIDIA H100 80GB HBM3";
 
+export interface ComputeArtifactV1 {
+  /** Stable public HTTPS URL. Redirect destinations remain host-allowlisted by the worker. */
+  url: string;
+  sha256: string;
+}
+
+export interface ComputeModelArtifactsV1 {
+  model: ComputeArtifactV1;
+  mmproj: ComputeArtifactV1;
+  draftModel: ComputeArtifactV1;
+  /** Exact DNS names accepted for the initial request and every redirect. */
+  allowedHosts: string[];
+}
+
 export interface ComputeProfileV1 {
   id: string;
   label: string;
@@ -2781,6 +2795,8 @@ export interface ComputeProfileV1 {
   imageDigest: string;
   /** Existing RunPod network volume. The gateway never creates one implicitly. */
   networkVolumeId?: string;
+  /** Public, checksum-bound model artifacts. No model credential is accepted here. */
+  modelArtifacts?: ComputeModelArtifactsV1;
   maxGpuHourlyUsd: number;
   idleTimeoutSeconds: number;
   clarificationTimeoutSeconds: number;
@@ -2845,12 +2861,91 @@ export interface ComputeStatus {
   hardDeadlineAt?: string;
   detail: string;
   budget?: ComputeBudgetStatus;
+  worker?: ComputeWorkerStatus;
   policy: {
     secureCloudOnly: true;
     maximumGpuCount: 1;
     watchdogConfigured: boolean;
     unattendedUseAllowed: boolean;
   };
+}
+
+export interface ComputeWorkerStatus {
+  protocolVersion: 1;
+  buildId: string;
+  ready: boolean;
+  workerState: "bootstrapping" | "ready" | "busy";
+  model: {
+    ready: boolean;
+    contextTokens: 65_536 | 131_072;
+  };
+}
+
+export interface RemoteInputV1 {
+  format: "git_bundle";
+  parts: number;
+  bytes: number;
+  sha256: string;
+}
+
+export interface RemoteJobManifestV1 {
+  schemaVersion: 1;
+  instanceId: string;
+  sessionId: string;
+  jobId: string;
+  repositoryFingerprint: string;
+  baselineSha: string;
+  branch: `glimmer/${string}`;
+  objective: string;
+  contextTokens: 65_536 | 131_072;
+  maxRepairs: number;
+  timeoutSeconds: number;
+  createdAt: string;
+  input: RemoteInputV1;
+}
+
+export type RemoteJobState =
+  | "created"
+  | "uploading"
+  | "running"
+  | "cancelling"
+  | "cancelled"
+  | "succeeded"
+  | "failed"
+  | "interrupted";
+
+export interface RemoteCheckpointV1 {
+  sequence: number;
+  bytes: number;
+  sha256: string;
+  plaintextSha256: string;
+  kind: "progress" | "result";
+  final: boolean;
+  acknowledged: boolean;
+}
+
+export interface RemoteJobStatusV1 {
+  schemaVersion: 1;
+  jobId: string;
+  sessionId: string;
+  state: RemoteJobState;
+  receivedParts: number;
+  expectedParts: number;
+  receivedBytes: number;
+  expectedBytes: number;
+  createdAt: string;
+  updatedAt: string;
+  checkpoints: RemoteCheckpointV1[];
+  exitCode?: number;
+  detail?: string;
+}
+
+export interface RemoteJobResultV1 {
+  schemaVersion: 1;
+  jobId: string;
+  exitCode: number;
+  completedAt: string;
+  resultCommit?: string;
 }
 
 export interface ComputeUsageSummary {

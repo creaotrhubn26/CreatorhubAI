@@ -83,6 +83,13 @@ describe("ComputeStatusPanel", () => {
         adjustedCostPerHr: 1.39,
       },
       budget: { ...offline.budget!, currentHourlyUsd: 1.39 },
+      worker: {
+        protocolVersion: 1,
+        buildId: "r2-aaaaaaaaaaaa",
+        ready: true,
+        workerState: "ready",
+        model: { ready: true, contextTokens: 65_536 },
+      },
     });
     mockUsage();
     vi.spyOn(glimmerApi, "stopCompute").mockResolvedValue({
@@ -94,6 +101,9 @@ describe("ComputeStatusPanel", () => {
     expect(await screen.findByText("pod_123")).toBeInTheDocument();
     expect(screen.getByText("NVIDIA A100 80GB PCIe")).toBeInTheDocument();
     expect(screen.getByText("$1.3900")).toBeInTheDocument();
+    expect(screen.getByText("Authenticated and ready")).toBeInTheDocument();
+    expect(screen.getByText("r2-aaaaaaaaaaaa")).toBeInTheDocument();
+    expect(screen.getByText("65,536 tokens")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Terminate external compute" })).toBeEnabled();
   });
 });

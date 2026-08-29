@@ -90,6 +90,24 @@ export function ComputeSettings() {
   const active = draft.profiles.find((profile) => profile.id === draft.activeProfileId);
   if (!active) return <p role="alert">The active compute profile is missing.</p>;
   const hasApiKey = active.hasApiKey && !draft.clearApiKey;
+  const artifacts = active.modelArtifacts ?? {
+    model: { url: "", sha256: "" },
+    mmproj: { url: "", sha256: "" },
+    draftModel: { url: "", sha256: "" },
+    allowedHosts: [],
+  };
+  function updateArtifact(
+    kind: "model" | "mmproj" | "draftModel",
+    field: "url" | "sha256",
+    value: string,
+  ) {
+    updateProfile({
+      modelArtifacts: {
+        ...artifacts,
+        [kind]: { ...artifacts[kind], [field]: value },
+      },
+    });
+  }
 
   return (
     <section aria-labelledby="compute-settings-heading">
@@ -204,6 +222,59 @@ export function ComputeSettings() {
             spellCheck={false}
           />
         </label>
+        <fieldset>
+          <legend>Checksum-bound model artifacts</legend>
+          <p>
+            Model files remain on the network volume. The worker accepts only HTTPS hosts listed
+            here and verifies every SHA-256 before becoming ready.
+          </p>
+          <label>
+            Allowed download hosts
+            <input
+              value={artifacts.allowedHosts.join(", ")}
+              onChange={(event) =>
+                updateProfile({
+                  modelArtifacts: {
+                    ...artifacts,
+                    allowedHosts: event.target.value
+                      .split(",")
+                      .map((host) => host.trim().toLowerCase())
+                      .filter(Boolean),
+                  },
+                })
+              }
+              placeholder="huggingface.co, cdn-lfs.huggingface.co"
+              spellCheck={false}
+            />
+          </label>
+          {(
+            [
+              ["model", "Main model"],
+              ["mmproj", "Vision projector"],
+              ["draftModel", "Draft model"],
+            ] as const
+          ).map(([kind, label]) => (
+            <div key={kind}>
+              <label>
+                {label} HTTPS URL
+                <input
+                  value={artifacts[kind].url}
+                  onChange={(event) => updateArtifact(kind, "url", event.target.value)}
+                  spellCheck={false}
+                />
+              </label>
+              <label>
+                {label} SHA-256
+                <input
+                  value={artifacts[kind].sha256}
+                  onChange={(event) => updateArtifact(kind, "sha256", event.target.value)}
+                  placeholder="64 lowercase hexadecimal characters"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+          ))}
+        </fieldset>
         <label>
           Maximum GPU rate (USD/hour)
           <input
