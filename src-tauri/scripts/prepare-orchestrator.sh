@@ -17,6 +17,19 @@ SOURCE="${GLIMMER_ORCHESTRATOR_SOURCE:-$HOME/AI/muse-glimmer}"
 STAGING="$(mktemp -d "${TMPDIR:-/tmp}/glimmer-orchestrator.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 
+if [[ -d "$SOURCE" ]]; then
+  SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)"
+else
+  SOURCE="$STAGING/source"
+  SOURCE_COMMIT="$(git -C .. rev-parse "${ORCHESTRATOR_REF}^{commit}" 2>/dev/null || true)"
+  if [[ "$SOURCE_COMMIT" != "$ORCHESTRATOR_REF" ]]; then
+    echo "orchestrator commit $ORCHESTRATOR_REF is unavailable; CI checkouts require fetch-depth: 0" >&2
+    exit 1
+  fi
+  mkdir -p "$SOURCE"
+  git -C .. archive "$ORCHESTRATOR_REF" | tar -x -C "$SOURCE"
+fi
+
 FILES=(
   "glimmer-v2.py"
   "glimmer-engineer.py"
@@ -56,7 +69,6 @@ SHAS=(
   "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91"
 )
 
-SOURCE_COMMIT="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)"
 if [[ "$SOURCE_COMMIT" != "$ORCHESTRATOR_REF" ]]; then
   echo "orchestrator source must be exact commit $ORCHESTRATOR_REF (got ${SOURCE_COMMIT:-unavailable})" >&2
   exit 1
