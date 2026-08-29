@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ModelRunState } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
+import { ComputeStatusPanel } from "./ComputeStatusPanel";
 
 // What each intermediate state actually means, so the screen never implies
 // more than the gateway can prove. ONLINE comes from a 200 on /health and
@@ -55,7 +56,7 @@ export function ModelStatusScreen() {
       <h1>Muse Glimmer</h1>
       <StatusBadge status={data.status} />
       <section>
-        <h2>Server</h2>
+        <h2>Local model server</h2>
         <StatusBadge status={runState} />
         <p>{RUN_STATE_NOTE[runState as ModelRunState]}</p>
         <button
@@ -108,6 +109,7 @@ export function ModelStatusScreen() {
         <dt>Tokens/sec</dt>
         <dd>Unavailable</dd>
       </dl>
+      <ComputeStatusPanel />
     </div>
   );
 }

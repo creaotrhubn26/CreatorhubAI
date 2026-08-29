@@ -421,6 +421,7 @@ export async function repairInstallation(
     workspaceLeasesDir(),
     recoveryBackupsDir(),
     CONFIG.modelKeysDir,
+    CONFIG.computeKeysDir,
   ];
   for (const directory of writableDirectories) {
     let existed = true;

@@ -1,8 +1,34 @@
 import { createApp } from "./app.js";
 import { CONFIG } from "./config.js";
 import { reconcileActiveRunsOnStartup } from "./routes/sessions.js";
+import { getComputeController } from "./lib/compute/computeController.js";
 
 const app = createApp();
+
+let shutdownStarted = false;
+async function shutdownWithComputeCleanup(reason: string, exitCode = 0) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  const forceExit = setTimeout(() => {
+    console.error("[gateway] compute cleanup timed out during shutdown");
+    process.exit(1);
+  }, 12_000);
+  try {
+    const result = await getComputeController().stop(reason);
+    if (result.terminated)
+      console.log("[gateway] active RunPod compute terminated during shutdown");
+  } catch (error) {
+    console.error(
+      `[gateway] compute cleanup failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    clearTimeout(forceExit);
+    process.exit(exitCode);
+  }
+}
+
+process.once("SIGTERM", () => void shutdownWithComputeCleanup("gateway received SIGTERM"));
+process.once("SIGINT", () => void shutdownWithComputeCleanup("gateway received SIGINT", 130));
 
 if (CONFIG.parentPid) {
   const parentPid = CONFIG.parentPid;
@@ -11,8 +37,8 @@ if (CONFIG.parentPid) {
       process.kill(parentPid, 0);
     } catch (error: any) {
       if (error?.code === "EPERM") return;
-      console.error(`[gateway] parent process ${parentPid} is gone; exiting for safe restart.`);
-      process.exit(0);
+      console.error(`[gateway] parent process ${parentPid} is gone; cleaning up for safe restart.`);
+      void shutdownWithComputeCleanup("desktop parent process exited");
     }
   }, 1_000);
   parentWatchdog.unref();
@@ -21,6 +47,20 @@ if (CONFIG.parentPid) {
 const recovery = await reconcileActiveRunsOnStartup();
 if (recovery.reattached || recovery.interrupted || recovery.completed) {
   console.log(`[gateway] startup recovery=${JSON.stringify(recovery)}`);
+}
+const computeRecovery = await getComputeController()
+  .reconcileOnStartup()
+  .catch((error) => ({
+    recovered: false,
+    cleaned: false,
+    detail: `unavailable: ${error instanceof Error ? error.message : String(error)}`,
+  }));
+if (
+  computeRecovery.recovered ||
+  computeRecovery.cleaned ||
+  computeRecovery.detail !== "no compute lease"
+) {
+  console.log(`[gateway] compute recovery=${JSON.stringify(computeRecovery)}`);
 }
 // Loopback only: this API can spawn processes, so it must never be reachable
 // from other hosts on the network.

@@ -2749,6 +2749,139 @@ export interface ModelRegistryUpdate {
   routing?: AdaptiveRoutingConfig;
 }
 
+export type ComputeBackend = "local_process" | "runpod_pod";
+
+export type ComputeRunState =
+  | "offline"
+  | "provisioning"
+  | "bootstrapping"
+  | "ready"
+  | "busy"
+  | "idle"
+  | "stopping"
+  | "stopped"
+  | "terminating"
+  | "failed"
+  | "budget_blocked"
+  | "unavailable";
+
+export type RunPodGpuTypeId =
+  "NVIDIA A100 80GB PCIe" | "NVIDIA A100-SXM4-80GB" | "NVIDIA H100 PCIe" | "NVIDIA H100 80GB HBM3";
+
+export interface ComputeProfileV1 {
+  id: string;
+  label: string;
+  provider: "runpod";
+  cloudType: "SECURE";
+  performance: "economy" | "latency";
+  gpuTypeIds: RunPodGpuTypeId[];
+  gpuCount: 1;
+  contextTokens: 65_536 | 131_072;
+  /** Immutable OCI reference: registry/repository@sha256:<64 hex>. */
+  imageDigest: string;
+  /** Existing RunPod network volume. The gateway never creates one implicitly. */
+  networkVolumeId?: string;
+  maxGpuHourlyUsd: number;
+  idleTimeoutSeconds: number;
+  clarificationTimeoutSeconds: number;
+  hardSessionLimitSeconds: number;
+  dailyBudgetUsd?: number;
+  monthlyBudgetUsd?: number;
+  hasApiKey: boolean;
+  watchdogConfigured: boolean;
+}
+
+export interface ComputeConfigV1 {
+  version: 1;
+  enabled: boolean;
+  defaultBackend: ComputeBackend;
+  profiles: ComputeProfileV1[];
+  activeProfileId?: string;
+  source: "default" | "saved";
+}
+
+export type ComputeProfileUpdateV1 = Omit<ComputeProfileV1, "hasApiKey" | "watchdogConfigured">;
+
+export interface ComputeConfigUpdateV1 {
+  version: 1;
+  enabled: boolean;
+  defaultBackend: ComputeBackend;
+  profiles: ComputeProfileUpdateV1[];
+  activeProfileId?: string;
+  /** Omit/blank to preserve the gateway-owned RunPod account key. */
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface ComputePodSummary {
+  id: string;
+  name: string;
+  desiredStatus: "RUNNING" | "EXITED" | "TERMINATED";
+  gpuTypeId?: string;
+  gpuCount?: number;
+  adjustedCostPerHr?: number;
+  publicIp?: string;
+  lastStartedAt?: string;
+}
+
+export interface ComputeBudgetStatus {
+  allowed: boolean;
+  hourlyCeilingUsd: number;
+  currentHourlyUsd?: number;
+  dailyBudgetUsd?: number;
+  monthlyBudgetUsd?: number;
+  estimatedTodayUsd: number;
+  estimatedMonthUsd: number;
+  reason?: string;
+}
+
+export interface ComputeStatus {
+  backend: ComputeBackend;
+  state: ComputeRunState;
+  checkedAt: string;
+  profileId?: string;
+  pod?: ComputePodSummary;
+  idleDeadlineAt?: string;
+  hardDeadlineAt?: string;
+  detail: string;
+  budget?: ComputeBudgetStatus;
+  policy: {
+    secureCloudOnly: true;
+    maximumGpuCount: 1;
+    watchdogConfigured: boolean;
+    unattendedUseAllowed: boolean;
+  };
+}
+
+export interface ComputeUsageSummary {
+  checkedAt: string;
+  estimatedTodayUsd: number;
+  estimatedMonthUsd: number;
+  estimatedTotalUsd: number;
+  reconciledTodayUsd?: number;
+  reconciledMonthUsd?: number;
+  activeHourlyUsd?: number;
+  provenance: {
+    estimate: "local-interval-ledger";
+    reconciled: "runpod-billing-api" | "unavailable";
+  };
+}
+
+export interface ComputeCredentialTestResult {
+  provider: "runpod";
+  authenticated: boolean;
+  checkedAt: string;
+  visiblePodCount: number;
+  detail: string;
+}
+
+export interface ComputeControlResult {
+  started?: boolean;
+  stopped?: boolean;
+  terminated?: boolean;
+  status: ComputeStatus;
+}
+
 export interface RepoIndexFile {
   path: string;
   language: string;

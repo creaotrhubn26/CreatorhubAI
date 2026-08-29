@@ -88,6 +88,12 @@ import type {
   DesignWorkflowMutationRequest,
   DesignWorkflowRollbackResponse,
   VisualRegressionEvidence,
+  ComputeConfigV1,
+  ComputeConfigUpdateV1,
+  ComputeStatus,
+  ComputeUsageSummary,
+  ComputeCredentialTestResult,
+  ComputeControlResult,
 } from "@glimmer/shared";
 import { tauriGlobal } from "../state/desktopNotify";
 
@@ -152,6 +158,18 @@ async function modelControl(action: "start" | "stop"): Promise<ModelControlResul
     throw new Error(body.error || `POST /api/model/${action} failed: ${res.status}`);
   }
   return body as ModelControlResult;
+}
+
+async function computeControl(action: "start" | "stop"): Promise<ComputeControlResult> {
+  const res = await gatewayFetch(`${API_BASE}/api/compute/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok && !(res.status === 409 && body?.status)) {
+    throw new Error(body.error || `POST /api/compute/${action} failed: ${res.status}`);
+  }
+  return body as ComputeControlResult;
 }
 
 // Shared POST+SSE reader for session and repository-selection asks. The two
@@ -313,6 +331,25 @@ export const glimmerApi = {
   getModelRegistry: () => request<ModelRegistry>("/api/models/config"),
   saveModelRegistry: (registry: ModelRegistryUpdate) =>
     request<ModelRegistry>("/api/models/config", { method: "PUT", body: JSON.stringify(registry) }),
+  getComputeConfig: () => request<ComputeConfigV1>("/api/compute/config"),
+  saveComputeConfig: (config: ComputeConfigUpdateV1) =>
+    request<ComputeConfigV1>("/api/compute/config", {
+      method: "PUT",
+      body: JSON.stringify(config),
+    }),
+  getComputeStatus: () => request<ComputeStatus>("/api/compute/status"),
+  getComputeUsage: () => request<ComputeUsageSummary>("/api/compute/usage"),
+  reconcileComputeUsage: () =>
+    request<ComputeUsageSummary>("/api/compute/usage/reconcile", { method: "POST" }),
+  testComputeCredential: () =>
+    request<ComputeCredentialTestResult>("/api/compute/test", { method: "POST" }),
+  startCompute: () => computeControl("start"),
+  stopCompute: () => computeControl("stop"),
+  terminateComputePod: (podId: string) =>
+    request<ComputeControlResult>("/api/compute/pod", {
+      method: "DELETE",
+      body: JSON.stringify({ podId }),
+    }),
   getQualityMetrics: () => request<LocalQualityMetrics>("/api/quality/metrics"),
   listSessionPage: (cursor?: string, limit = 100) => {
     const query = new URLSearchParams({ limit: String(limit) });

@@ -13,6 +13,7 @@ import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { designBridgeRouter } from "./routes/designBridge.js";
 import { designWorkflowRouter } from "./routes/designWorkflow.js";
 import { designCatalogRouter } from "./routes/designCatalog.js";
+import { computeRouter } from "./routes/compute.js";
 import { CONFIG } from "./config.js";
 
 // The only origins allowed to reach this API: the local web dev server
@@ -131,6 +132,7 @@ export function createApp(): Express {
   app.use("/api", sessionsRouter);
   app.use("/api", workspacesRouter);
   app.use("/api", modelRouter);
+  app.use("/api", computeRouter);
   app.use("/api", repositoryRouter);
   app.use("/api", taskIntelligenceRouter);
   app.use("/api", qualityRouter);

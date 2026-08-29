@@ -105,7 +105,7 @@ Default policy:
 | Price behavior | fail closed above `maxGpuHourlyUsd`; no silent expensive fallback |
 | Storage | network volume, model/cache plus encrypted checkpoints only |
 
-The controller reads `adjustedCostPerHr` from the created/current Pod and refuses readiness if it exceeds the configured ceiling. A monotonic local estimate provides immediate burn-rate visibility. `GET /v1/billing/pods`, grouped by Pod ID, later reconciles provider-billed time and USD. Estimated and reconciled values are displayed separately.
+The controller reads `adjustedCostPerHr` from the created/current Pod and refuses readiness if it exceeds the configured ceiling. A durable local interval ledger provides immediate burn-rate visibility, while in-process cleanup deadlines use monotonic timers. `GET /v1/billing/pods`, grouped by Pod ID, later reconciles provider-billed time and USD. Estimated and reconciled values are displayed separately.
 
 Browser activity does not extend a compute lease. Only an active job, a worker checkpoint, or a bounded user clarification lease does.
 

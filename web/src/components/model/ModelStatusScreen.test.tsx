@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ModelStatusScreen } from "./ModelStatusScreen";
@@ -8,6 +8,28 @@ function withQuery(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return <QueryClientProvider client={qc}>{ui}</QueryClientProvider>;
 }
+
+beforeEach(() => {
+  vi.spyOn(client.glimmerApi, "getComputeStatus").mockResolvedValue({
+    backend: "local_process",
+    state: "offline",
+    checkedAt: "2026-08-29T12:00:00Z",
+    detail: "Local process execution remains selected.",
+    policy: {
+      secureCloudOnly: true,
+      maximumGpuCount: 1,
+      watchdogConfigured: false,
+      unattendedUseAllowed: false,
+    },
+  });
+  vi.spyOn(client.glimmerApi, "getComputeUsage").mockResolvedValue({
+    checkedAt: "2026-08-29T12:00:00Z",
+    estimatedTodayUsd: 0,
+    estimatedMonthUsd: 0,
+    estimatedTotalUsd: 0,
+    provenance: { estimate: "local-interval-ledger", reconciled: "unavailable" },
+  });
+});
 
 describe("ModelStatusScreen", () => {
   it("renders real /props-derived metrics when the backend provides them", async () => {

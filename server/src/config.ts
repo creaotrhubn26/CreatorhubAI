@@ -32,6 +32,13 @@ export const CONFIG = {
   uiOrigin: process.env.GLIMMER_UI_ORIGIN,
   modelConfigPath: process.env.GLIMMER_MODEL_CONFIG ?? path.join(stateRoot, "models.json"),
   modelKeysDir: path.join(stateRoot, "model-keys"),
+  computeConfigPath: process.env.GLIMMER_COMPUTE_CONFIG ?? path.join(stateRoot, "compute.json"),
+  computeKeysDir: path.join(stateRoot, "compute-keys"),
+  computeStatePath: path.join(stateRoot, "compute-state.json"),
+  computeUsagePath: path.join(stateRoot, "compute-usage.json"),
+  // Fixed vendor origin: account credentials must never be redirected to a
+  // caller-configurable host. Tests inject their own client instead.
+  runpodApiBaseUrl: "https://rest.runpod.io/v1",
   glimmerV2Path,
   engineerPath:
     process.env.GLIMMER_ENGINEER_PATH ?? path.join(legacyOrchestratorRoot, "glimmer-engineer.py"),

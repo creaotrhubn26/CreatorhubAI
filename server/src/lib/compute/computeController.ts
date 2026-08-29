@@ -1,0 +1,665 @@
+import { randomUUID } from "node:crypto";
+import type {
+  ComputeBudgetStatus,
+  ComputeConfigV1,
+  ComputeControlResult,
+  ComputeCredentialTestResult,
+  ComputeProfileV1,
+  ComputeStatus,
+  ComputeUsageSummary,
+} from "@glimmer/shared";
+import { CONFIG } from "../../config.js";
+import { readComputeConfig, readRunPodApiKey, saveComputeConfig } from "./configStore.js";
+import {
+  clearComputeLease,
+  readComputeLease,
+  saveComputeLease,
+  updateComputeLease,
+  type ComputeLeaseV1,
+} from "./computeLeaseStore.js";
+import { RunPodClient } from "./runpodClient.js";
+import type { RunPodCreatePodInput, RunPodPod } from "./runpodSchemas.js";
+import {
+  beginUsageInterval,
+  finishUsageInterval,
+  readUsageSummary,
+  readTrackedPodIds,
+  storeReconciledUsage,
+  usageWindowStarts,
+} from "./usageLedger.js";
+
+export class ComputeControlError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode = 400,
+  ) {
+    super(message);
+  }
+}
+
+interface ControllerDependencies {
+  now: () => Date;
+  readConfig: typeof readComputeConfig;
+  saveConfig: typeof saveComputeConfig;
+  readApiKey: typeof readRunPodApiKey;
+  readLease: typeof readComputeLease;
+  saveLease: typeof saveComputeLease;
+  updateLease: typeof updateComputeLease;
+  clearLease: typeof clearComputeLease;
+  beginUsage: typeof beginUsageInterval;
+  finishUsage: typeof finishUsageInterval;
+  readUsage: typeof readUsageSummary;
+  readTrackedPodIds: typeof readTrackedPodIds;
+  storeReconciledUsage: typeof storeReconciledUsage;
+  clientFactory: (apiKey: string) => RunPodClient;
+}
+
+const DEFAULT_DEPENDENCIES: ControllerDependencies = {
+  now: () => new Date(),
+  readConfig: readComputeConfig,
+  saveConfig: saveComputeConfig,
+  readApiKey: readRunPodApiKey,
+  readLease: readComputeLease,
+  saveLease: saveComputeLease,
+  updateLease: updateComputeLease,
+  clearLease: clearComputeLease,
+  beginUsage: beginUsageInterval,
+  finishUsage: finishUsageInterval,
+  readUsage: readUsageSummary,
+  readTrackedPodIds,
+  storeReconciledUsage,
+  clientFactory: (apiKey) => new RunPodClient({ baseUrl: CONFIG.runpodApiBaseUrl, apiKey }),
+};
+
+function activeProfile(config: ComputeConfigV1): ComputeProfileV1 | null {
+  return config.profiles.find((profile) => profile.id === config.activeProfileId) ?? null;
+}
+
+function price(pod: RunPodPod): number | undefined {
+  return pod.adjustedCostPerHr ?? pod.costPerHr;
+}
+
+function podSummary(pod: RunPodPod) {
+  return {
+    id: pod.id,
+    name: pod.name,
+    desiredStatus: pod.desiredStatus,
+    ...(pod.gpu?.id ? { gpuTypeId: pod.gpu.id } : {}),
+    ...(pod.gpu?.count !== undefined ? { gpuCount: pod.gpu.count } : {}),
+    ...(price(pod) !== undefined ? { adjustedCostPerHr: price(pod) } : {}),
+    ...(pod.publicIp ? { publicIp: pod.publicIp } : {}),
+    ...(pod.lastStartedAt ? { lastStartedAt: pod.lastStartedAt } : {}),
+  };
+}
+
+function budgetStatus(
+  profile: ComputeProfileV1,
+  usage: ComputeUsageSummary,
+  currentHourlyUsd?: number,
+): ComputeBudgetStatus {
+  const daySpent = Math.max(usage.estimatedTodayUsd, usage.reconciledTodayUsd ?? 0);
+  const monthSpent = Math.max(usage.estimatedMonthUsd, usage.reconciledMonthUsd ?? 0);
+  let reason: string | undefined;
+  if (currentHourlyUsd !== undefined && currentHourlyUsd > profile.maxGpuHourlyUsd) {
+    reason = `provider rate $${currentHourlyUsd.toFixed(4)}/h exceeds the configured $${profile.maxGpuHourlyUsd.toFixed(4)}/h ceiling`;
+  } else if (profile.dailyBudgetUsd !== undefined && daySpent >= profile.dailyBudgetUsd) {
+    reason = "daily compute budget is exhausted";
+  } else if (profile.monthlyBudgetUsd !== undefined && monthSpent >= profile.monthlyBudgetUsd) {
+    reason = "monthly compute budget is exhausted";
+  }
+  return {
+    allowed: !reason,
+    hourlyCeilingUsd: profile.maxGpuHourlyUsd,
+    ...(currentHourlyUsd !== undefined ? { currentHourlyUsd } : {}),
+    ...(profile.dailyBudgetUsd !== undefined ? { dailyBudgetUsd: profile.dailyBudgetUsd } : {}),
+    ...(profile.monthlyBudgetUsd !== undefined
+      ? { monthlyBudgetUsd: profile.monthlyBudgetUsd }
+      : {}),
+    estimatedTodayUsd: usage.estimatedTodayUsd,
+    estimatedMonthUsd: usage.estimatedMonthUsd,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+function safeInstanceId(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized.slice(0, 32) || "local";
+}
+
+export class ComputeController {
+  private operation: Promise<unknown> = Promise.resolve();
+  private safetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(private readonly dependencies: ControllerDependencies = DEFAULT_DEPENDENCIES) {}
+
+  private exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.operation.catch(() => undefined).then(operation);
+    this.operation = next;
+    return next;
+  }
+
+  private async client(): Promise<RunPodClient> {
+    const key = await this.dependencies.readApiKey();
+    if (!key) throw new ComputeControlError("RunPod API key is not configured", 412);
+    return this.dependencies.clientFactory(key);
+  }
+
+  private policy(profile?: ComputeProfileV1) {
+    const watchdogConfigured = profile?.watchdogConfigured ?? false;
+    return {
+      secureCloudOnly: true as const,
+      maximumGpuCount: 1 as const,
+      watchdogConfigured,
+      unattendedUseAllowed: watchdogConfigured,
+    };
+  }
+
+  private async statusFrom(
+    config: ComputeConfigV1,
+    lease: ComputeLeaseV1 | null,
+    pod: RunPodPod | null,
+    detail?: string,
+  ): Promise<ComputeStatus> {
+    const profile = lease
+      ? config.profiles.find((candidate) => candidate.id === lease.profileId)
+      : activeProfile(config);
+    const usage = await this.dependencies.readUsage(this.dependencies.now());
+    const observedPrice = pod ? price(pod) : lease?.observedHourlyUsd;
+    const budget = profile ? budgetStatus(profile, usage, observedPrice) : undefined;
+    if (!lease) {
+      return {
+        backend: config.defaultBackend,
+        state: "offline",
+        checkedAt: this.dependencies.now().toISOString(),
+        ...(profile ? { profileId: profile.id, budget } : {}),
+        detail:
+          detail ??
+          (config.defaultBackend === "local_process"
+            ? "Local process execution remains selected."
+            : "No RunPod Pod is active."),
+        policy: this.policy(profile ?? undefined),
+      };
+    }
+    let state = lease.state;
+    if (pod?.desiredStatus === "EXITED") state = "stopped";
+    if (pod?.desiredStatus === "TERMINATED") state = "offline";
+    if (pod?.desiredStatus === "RUNNING" && state === "provisioning") state = "bootstrapping";
+    if (budget && !budget.allowed && state !== "terminating") state = "budget_blocked";
+    return {
+      backend: "runpod_pod",
+      state,
+      checkedAt: this.dependencies.now().toISOString(),
+      profileId: lease.profileId,
+      ...(pod ? { pod: podSummary(pod) } : {}),
+      idleDeadlineAt: lease.idleDeadlineAt,
+      hardDeadlineAt: lease.hardDeadlineAt,
+      detail:
+        detail ??
+        lease.error ??
+        (pod?.desiredStatus === "RUNNING"
+          ? "The provider reports RUNNING; worker readiness is introduced in R2."
+          : pod
+            ? `The provider reports ${pod.desiredStatus}.`
+            : "The gateway has a provisional compute lease but no confirmed Pod yet."),
+      ...(budget ? { budget } : {}),
+      policy: this.policy(profile ?? undefined),
+    };
+  }
+
+  private async findLeasePod(
+    client: RunPodClient,
+    lease: ComputeLeaseV1,
+    persistRecoveredId = false,
+  ): Promise<RunPodPod | null> {
+    if (lease.podId) return client.getPod(lease.podId);
+    const matches = (await client.listPods()).filter((pod) => pod.name === lease.podName);
+    if (matches.length > 1) {
+      throw new ComputeControlError(
+        "Multiple RunPod Pods match the provisional lease; refusing automatic selection",
+        409,
+      );
+    }
+    if (!matches.length) return null;
+    if (persistRecoveredId) {
+      await this.dependencies.updateLease((current) => ({ ...current, podId: matches[0].id }));
+    }
+    return matches[0];
+  }
+
+  private createInput(profile: ComputeProfileV1, podName: string): RunPodCreatePodInput {
+    if (!profile.imageDigest || !profile.networkVolumeId) {
+      throw new ComputeControlError(
+        "The active RunPod profile requires an immutable image digest and network volume",
+        412,
+      );
+    }
+    return {
+      name: podName,
+      imageName: profile.imageDigest,
+      cloudType: "SECURE",
+      computeType: "GPU",
+      gpuTypeIds: profile.gpuTypeIds,
+      gpuTypePriority: "availability",
+      gpuCount: 1,
+      containerDiskInGb: 50,
+      networkVolumeId: profile.networkVolumeId,
+      volumeMountPath: "/workspace",
+      ports: ["4318/http"],
+      interruptible: false,
+      locked: false,
+      env: { GLIMMER_CONTEXT_TOKENS: String(profile.contextTokens) },
+    };
+  }
+
+  private validateAllocatedPod(profile: ComputeProfileV1, pod: RunPodPod): string | null {
+    if (pod.desiredStatus !== "RUNNING") {
+      return `RunPod returned desiredStatus ${pod.desiredStatus}; RUNNING was required`;
+    }
+    const observedPrice = price(pod);
+    if (observedPrice === undefined) return "RunPod did not report a verifiable hourly rate";
+    if (observedPrice > profile.maxGpuHourlyUsd) {
+      return `provider rate $${observedPrice.toFixed(4)}/h exceeds the configured $${profile.maxGpuHourlyUsd.toFixed(4)}/h ceiling`;
+    }
+    if (pod.gpu?.count !== 1) {
+      return pod.gpu?.count === undefined
+        ? "RunPod did not prove that exactly one GPU was allocated"
+        : `RunPod allocated ${pod.gpu.count} GPUs; policy requires exactly one`;
+    }
+    if (!pod.gpu.id) return "RunPod did not report the allocated GPU type";
+    if (!profile.gpuTypeIds.some((gpuTypeId) => gpuTypeId === pod.gpu?.id)) {
+      return `RunPod allocated GPU type ${pod.gpu.id}, which is outside the active profile`;
+    }
+    return null;
+  }
+
+  private clearSafetyTimer() {
+    if (this.safetyTimer) clearTimeout(this.safetyTimer);
+    this.safetyTimer = null;
+  }
+
+  private scheduleCleanupRetry(reason: string) {
+    this.clearSafetyTimer();
+    this.safetyTimer = setTimeout(() => {
+      void this.stop(reason).catch((error) => {
+        console.error(
+          `[compute] cleanup retry failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }, 5_000);
+    this.safetyTimer.unref?.();
+  }
+
+  private async waitForTermination(client: RunPodClient, podId: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const pod = await client.getPod(podId);
+      if (!pod || pod.desiredStatus === "TERMINATED") return true;
+      if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return false;
+  }
+
+  private async scheduleSafety(lease: ComputeLeaseV1, profile: ComputeProfileV1) {
+    this.clearSafetyTimer();
+    const nowMs = this.dependencies.now().getTime();
+    const deadlines = [Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt)];
+    if (lease.observedHourlyUsd && lease.observedHourlyUsd > 0) {
+      const usage = await this.dependencies.readUsage(this.dependencies.now());
+      const daySpent = Math.max(usage.estimatedTodayUsd, usage.reconciledTodayUsd ?? 0);
+      const monthSpent = Math.max(usage.estimatedMonthUsd, usage.reconciledMonthUsd ?? 0);
+      if (profile.dailyBudgetUsd !== undefined) {
+        deadlines.push(
+          nowMs +
+            Math.max(
+              0,
+              ((profile.dailyBudgetUsd - daySpent) / lease.observedHourlyUsd) * 3_600_000,
+            ),
+        );
+      }
+      if (profile.monthlyBudgetUsd !== undefined) {
+        deadlines.push(
+          nowMs +
+            Math.max(
+              0,
+              ((profile.monthlyBudgetUsd - monthSpent) / lease.observedHourlyUsd) * 3_600_000,
+            ),
+        );
+      }
+    }
+    const delay = Math.max(0, Math.min(...deadlines) - nowMs);
+    this.safetyTimer = setTimeout(() => {
+      void this.stop("automatic safety deadline").catch((error) => {
+        console.error(
+          `[compute] automatic cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }, delay);
+    this.safetyTimer.unref?.();
+  }
+
+  async readConfig(): Promise<ComputeConfigV1> {
+    return this.dependencies.readConfig();
+  }
+
+  async saveConfig(input: unknown): Promise<ComputeConfigV1> {
+    return this.exclusive(async () => {
+      const lease = await this.dependencies.readLease();
+      if (lease) {
+        throw new ComputeControlError(
+          "Stop active RunPod compute before changing its configuration",
+          409,
+        );
+      }
+      return this.dependencies.saveConfig(input);
+    });
+  }
+
+  async getStatus(): Promise<ComputeStatus> {
+    const config = await this.dependencies.readConfig();
+    const lease = await this.dependencies.readLease();
+    if (!lease) return this.statusFrom(config, null, null);
+    try {
+      const pod = await this.findLeasePod(await this.client(), lease);
+      return this.statusFrom(config, lease, pod);
+    } catch (error) {
+      return this.statusFrom(
+        config,
+        lease,
+        null,
+        `RunPod status unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+  }
+
+  async testCredentials(): Promise<ComputeCredentialTestResult> {
+    const pods = await (await this.client()).listPods();
+    return {
+      provider: "runpod",
+      authenticated: true,
+      checkedAt: this.dependencies.now().toISOString(),
+      visiblePodCount: pods.length,
+      detail: "RunPod accepted the stored credential. No resource was created.",
+    };
+  }
+
+  async start(): Promise<ComputeControlResult> {
+    return this.exclusive(async () => {
+      const config = await this.dependencies.readConfig();
+      const profile = activeProfile(config);
+      if (!config.enabled || config.defaultBackend !== "runpod_pod" || !profile) {
+        throw new ComputeControlError("RunPod compute is not enabled as the active backend", 412);
+      }
+      const existing = await this.dependencies.readLease();
+      if (existing) {
+        const status = await this.getStatus();
+        return { started: false, status };
+      }
+      // Refresh provider billing inside this guarded mutation before deciding
+      // whether another paid allocation fits the configured budgets.
+      const usage = await this.getUsage(true);
+      const budget = budgetStatus(profile, usage);
+      if (!budget.allowed) {
+        throw new ComputeControlError(budget.reason ?? "compute budget blocks this start", 409);
+      }
+      const now = this.dependencies.now();
+      const leaseId = randomUUID();
+      const podName = `glimmer-${safeInstanceId(CONFIG.instanceId)}-${leaseId.slice(0, 12)}`;
+      const createRequest = this.createInput(profile, podName);
+      const client = await this.client();
+      let lease: ComputeLeaseV1 = {
+        version: 1,
+        id: leaseId,
+        profileId: profile.id,
+        podName,
+        state: "provisioning",
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        lastActivityAt: now.toISOString(),
+        idleDeadlineAt: new Date(now.getTime() + profile.idleTimeoutSeconds * 1_000).toISOString(),
+        hardDeadlineAt: new Date(
+          now.getTime() + profile.hardSessionLimitSeconds * 1_000,
+        ).toISOString(),
+      };
+      lease = await this.dependencies.saveLease(lease);
+      let pod: RunPodPod;
+      try {
+        pod = await client.createPod(createRequest);
+      } catch (error) {
+        // Creation has no documented idempotency key. Recover an exact-name
+        // Pod before declaring failure so a lost response cannot orphan spend.
+        const matches = await client
+          .listPods()
+          .then((pods) => pods.filter((candidate) => candidate.name === podName))
+          .catch(() => []);
+        if (matches.length !== 1) {
+          await this.dependencies.saveLease({
+            ...lease,
+            state: "failed",
+            error:
+              matches.length > 1
+                ? "RunPod create outcome is ambiguous; multiple Pods have the lease name"
+                : `RunPod create failed: ${error instanceof Error ? error.message : "unknown error"}`,
+          });
+          throw error;
+        }
+        pod = matches[0];
+      }
+      lease = await this.dependencies.saveLease({ ...lease, podId: pod.id });
+      const allocationError = this.validateAllocatedPod(profile, pod);
+      if (allocationError) {
+        const rejectedRate = price(pod);
+        if (rejectedRate !== undefined) {
+          await this.dependencies.beginUsage({
+            leaseId,
+            podId: pod.id,
+            startedAt: this.dependencies.now().toISOString(),
+            hourlyUsd: rejectedRate,
+          });
+        }
+        await this.dependencies.saveLease({
+          ...lease,
+          state: "budget_blocked",
+          observedHourlyUsd: rejectedRate,
+          error: `${allocationError}; termination requested immediately`,
+        });
+        await client.deletePod(pod.id);
+        if (await this.waitForTermination(client, pod.id)) {
+          if (rejectedRate !== undefined) {
+            await this.dependencies.finishUsage(leaseId, this.dependencies.now().toISOString());
+          }
+          await this.dependencies.clearLease(leaseId);
+        } else {
+          this.scheduleCleanupRetry("retry rejected allocation termination");
+        }
+        throw new ComputeControlError(allocationError, 409);
+      }
+      const observedHourlyUsd = price(pod)!;
+      const startedAt = this.dependencies.now().toISOString();
+      await this.dependencies.beginUsage({
+        leaseId,
+        podId: pod.id,
+        startedAt,
+        hourlyUsd: observedHourlyUsd,
+      });
+      lease = await this.dependencies.saveLease({
+        ...lease,
+        state: "bootstrapping",
+        observedHourlyUsd,
+      });
+      await this.scheduleSafety(lease, profile);
+      return {
+        started: true,
+        status: await this.statusFrom(config, lease, pod),
+      };
+    });
+  }
+
+  async stop(reason = "manual stop"): Promise<ComputeControlResult> {
+    return this.exclusive(async () => {
+      this.clearSafetyTimer();
+      const config = await this.dependencies.readConfig();
+      let lease = await this.dependencies.readLease();
+      if (!lease) return { stopped: false, status: await this.statusFrom(config, null, null) };
+      const client = await this.client();
+      const pod = await this.findLeasePod(client, lease, true);
+      if (!pod) {
+        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+        await this.dependencies.clearLease(lease.id);
+        return {
+          stopped: false,
+          status: await this.statusFrom(config, null, null, "The recorded Pod no longer exists."),
+        };
+      }
+      lease =
+        (await this.dependencies.updateLease((current) => ({
+          ...current,
+          state: "terminating",
+          error: reason,
+        }))) ?? lease;
+      // R1 profiles require a network volume. RunPod documents that such
+      // Pods cannot be stopped, so idle cleanup must terminate the Pod.
+      await client.deletePod(pod.id);
+      if (!(await this.waitForTermination(client, pod.id))) {
+        await this.dependencies.saveLease({
+          ...lease,
+          state: "terminating",
+          error: "RunPod still reports the Pod while termination is pending",
+        });
+        this.scheduleCleanupRetry("retry provider termination");
+        throw new ComputeControlError(
+          "RunPod still reports the Pod while termination is pending",
+          502,
+        );
+      }
+      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+      await this.dependencies.clearLease(lease.id);
+      return {
+        stopped: true,
+        terminated: true,
+        status: await this.statusFrom(config, null, null, "RunPod Pod terminated."),
+      };
+    });
+  }
+
+  async terminateExact(podId: string): Promise<ComputeControlResult> {
+    const lease = await this.dependencies.readLease();
+    if (!lease?.podId || lease.podId !== podId) {
+      throw new ComputeControlError("podId must exactly match the active compute lease", 409);
+    }
+    return this.stop("explicit exact-id termination");
+  }
+
+  async getUsage(reconcile = true): Promise<ComputeUsageSummary> {
+    if (reconcile) {
+      const key = await this.dependencies.readApiKey();
+      if (key) {
+        const now = this.dependencies.now();
+        const starts = usageWindowStarts(now);
+        const records = await this.dependencies.clientFactory(key).getPodBilling({
+          startTime: starts.month,
+        });
+        const trackedPodIds = new Set(await this.dependencies.readTrackedPodIds());
+        const trackedRecords = records.filter(
+          (record) => !!record.podId && trackedPodIds.has(record.podId),
+        );
+        const todayStart = Date.parse(starts.today);
+        await this.dependencies.storeReconciledUsage({
+          checkedAt: now.toISOString(),
+          todayUsd: trackedRecords
+            .filter((record) => Date.parse(record.time) >= todayStart)
+            .reduce((sum, record) => sum + record.amount, 0),
+          monthUsd: trackedRecords.reduce((sum, record) => sum + record.amount, 0),
+        });
+      }
+    }
+    return this.dependencies.readUsage(this.dependencies.now());
+  }
+
+  async reconcileOnStartup(): Promise<{ recovered: boolean; cleaned: boolean; detail: string }> {
+    return this.exclusive(async () => {
+      const lease = await this.dependencies.readLease();
+      if (!lease) return { recovered: false, cleaned: false, detail: "no compute lease" };
+      const config = await this.dependencies.readConfig();
+      const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+      const client = await this.client();
+      const pod = await this.findLeasePod(client, lease, true);
+      if (!pod) {
+        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+        await this.dependencies.clearLease(lease.id);
+        return { recovered: false, cleaned: true, detail: "missing Pod lease cleared" };
+      }
+      if (!profile) {
+        await client.deletePod(pod.id);
+        if (!(await this.waitForTermination(client, pod.id))) {
+          await this.dependencies.updateLease((current) => ({
+            ...current,
+            state: "terminating",
+            error: "Pod termination is pending after its compute profile was removed",
+          }));
+          this.scheduleCleanupRetry("retry missing-profile termination");
+          return {
+            recovered: false,
+            cleaned: false,
+            detail: "Pod termination is still pending",
+          };
+        }
+        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+        await this.dependencies.clearLease(lease.id);
+        return {
+          recovered: false,
+          cleaned: true,
+          detail: "Pod terminated because its compute profile is missing",
+        };
+      }
+      const allocationError = this.validateAllocatedPod(profile, pod);
+      const deadlinePassed =
+        this.dependencies.now().getTime() >=
+        Math.min(Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt));
+      if (allocationError || deadlinePassed) {
+        await client.deletePod(pod.id);
+        if (!(await this.waitForTermination(client, pod.id))) {
+          await this.dependencies.updateLease((current) => ({
+            ...current,
+            state: "terminating",
+            error: allocationError ?? "expired compute lease termination is pending",
+          }));
+          this.scheduleCleanupRetry("retry startup safety termination");
+          return {
+            recovered: false,
+            cleaned: false,
+            detail: "Pod termination is still pending",
+          };
+        }
+        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+        await this.dependencies.clearLease(lease.id);
+        return {
+          recovered: false,
+          cleaned: true,
+          detail: allocationError ?? "expired compute lease terminated",
+        };
+      }
+      const updated =
+        (await this.dependencies.updateLease((current) => ({
+          ...current,
+          podId: pod.id,
+          observedHourlyUsd: price(pod),
+          state: pod.desiredStatus === "RUNNING" ? "bootstrapping" : "stopped",
+        }))) ?? lease;
+      await this.scheduleSafety(updated, profile);
+      return { recovered: true, cleaned: false, detail: "compute lease reattached" };
+    });
+  }
+}
+
+let singleton: ComputeController | null = null;
+
+export function getComputeController(): ComputeController {
+  singleton ??= new ComputeController();
+  return singleton;
+}
+
+export function resetComputeControllerForTests() {
+  singleton = null;
+}

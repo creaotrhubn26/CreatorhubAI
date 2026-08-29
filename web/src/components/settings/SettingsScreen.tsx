@@ -10,6 +10,7 @@ import { DiagnosticsSettings } from "./DiagnosticsSettings";
 import { IntegrationProfileSettings } from "./IntegrationProfileSettings";
 import { MobbinIntegrationSettings } from "./MobbinIntegrationSettings";
 import { QualityMetricsSettings } from "./QualityMetricsSettings";
+import { ComputeSettings } from "./ComputeSettings";
 
 type PermissionState = "granted" | "denied" | "not asked";
 
@@ -83,6 +84,8 @@ export function SettingsScreen() {
       </div>
 
       <ModelRegistrySettings />
+
+      <ComputeSettings />
 
       <QualityMetricsSettings />
 

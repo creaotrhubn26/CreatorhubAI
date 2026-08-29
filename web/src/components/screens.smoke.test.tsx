@@ -36,6 +36,33 @@ vi.spyOn(client.glimmerApi, "getModelRegistry").mockResolvedValue({
   roles: { engineer: "local", architect: "local", consult: "local", vision: "local" },
   source: "default",
 });
+vi.spyOn(client.glimmerApi, "getComputeConfig").mockResolvedValue({
+  version: 1,
+  enabled: false,
+  defaultBackend: "local_process",
+  activeProfileId: "runpod-a100",
+  profiles: [],
+  source: "default",
+});
+vi.spyOn(client.glimmerApi, "getComputeStatus").mockResolvedValue({
+  backend: "local_process",
+  state: "offline",
+  checkedAt: "now",
+  detail: "Local process execution remains selected.",
+  policy: {
+    secureCloudOnly: true,
+    maximumGpuCount: 1,
+    watchdogConfigured: false,
+    unattendedUseAllowed: false,
+  },
+});
+vi.spyOn(client.glimmerApi, "getComputeUsage").mockResolvedValue({
+  checkedAt: "now",
+  estimatedTodayUsd: 0,
+  estimatedMonthUsd: 0,
+  estimatedTotalUsd: 0,
+  provenance: { estimate: "local-interval-ledger", reconciled: "unavailable" },
+});
 
 function withProviders(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });

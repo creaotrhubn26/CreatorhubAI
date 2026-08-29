@@ -76,6 +76,52 @@ describe("glimmerApi", () => {
     expect(JSON.parse(init?.body as string)).toEqual(update);
   });
 
+  it("reads and writes the secret-free compute contract through guarded routes", async () => {
+    const config = {
+      version: 1 as const,
+      enabled: false,
+      defaultBackend: "local_process" as const,
+      profiles: [],
+      source: "default" as const,
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => new Response(JSON.stringify(config), { status: 200 }));
+    await expect(glimmerApi.getComputeConfig()).resolves.toEqual(config);
+    expect(fetchMock).toHaveBeenLastCalledWith(`${API_BASE}/api/compute/config`, expect.anything());
+
+    await glimmerApi.saveComputeConfig({
+      version: 1,
+      enabled: false,
+      defaultBackend: "local_process",
+      profiles: [],
+    });
+    const [, init] = fetchMock.mock.calls.at(-1)!;
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(String(init?.body))).not.toHaveProperty("apiKey");
+  });
+
+  it("starts and stops compute through the dedicated control API", async () => {
+    const status = {
+      backend: "runpod_pod",
+      state: "bootstrapping",
+      checkedAt: "now",
+      detail: "starting",
+      policy: {
+        secureCloudOnly: true,
+        maximumGpuCount: 1,
+        watchdogConfigured: false,
+        unattendedUseAllowed: false,
+      },
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ started: true, status }), { status: 202 }));
+    await expect(glimmerApi.startCompute()).resolves.toMatchObject({ started: true });
+    expect(fetchMock.mock.calls[0][0]).toBe(`${API_BASE}/api/compute/start`);
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
+  });
+
   it("gets the secret-free CLI integration status", async () => {
     const response = {
       checkedAt: "now",

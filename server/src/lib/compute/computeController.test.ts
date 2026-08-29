@@ -1,0 +1,164 @@
+import { describe, expect, it, vi } from "vitest";
+import type { ComputeConfigV1, ComputeUsageSummary } from "@glimmer/shared";
+import { ComputeController } from "./computeController.js";
+import type { ComputeLeaseV1 } from "./computeLeaseStore.js";
+
+const NOW = new Date("2026-08-29T12:00:00.000Z");
+
+const config: ComputeConfigV1 = {
+  version: 1,
+  enabled: true,
+  defaultBackend: "runpod_pod",
+  activeProfileId: "runpod-a100",
+  source: "saved",
+  profiles: [
+    {
+      id: "runpod-a100",
+      label: "RunPod A100",
+      provider: "runpod",
+      cloudType: "SECURE",
+      performance: "economy",
+      gpuTypeIds: ["NVIDIA A100 80GB PCIe"],
+      gpuCount: 1,
+      contextTokens: 65_536,
+      imageDigest: `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`,
+      networkVolumeId: "volume_1",
+      maxGpuHourlyUsd: 1.75,
+      idleTimeoutSeconds: 300,
+      clarificationTimeoutSeconds: 120,
+      hardSessionLimitSeconds: 7_200,
+      dailyBudgetUsd: 10,
+      monthlyBudgetUsd: 50,
+      hasApiKey: true,
+      watchdogConfigured: false,
+    },
+  ],
+};
+
+const usage: ComputeUsageSummary = {
+  checkedAt: NOW.toISOString(),
+  estimatedTodayUsd: 0,
+  estimatedMonthUsd: 0,
+  estimatedTotalUsd: 0,
+  provenance: { estimate: "local-interval-ledger", reconciled: "unavailable" },
+};
+
+function lease(overrides: Partial<ComputeLeaseV1> = {}): ComputeLeaseV1 {
+  return {
+    version: 1,
+    id: "lease-1",
+    profileId: "runpod-a100",
+    podName: "glimmer-test-lease",
+    podId: "pod_123",
+    state: "bootstrapping",
+    createdAt: "2026-08-29T11:00:00.000Z",
+    updatedAt: "2026-08-29T11:00:00.000Z",
+    lastActivityAt: "2026-08-29T11:00:00.000Z",
+    idleDeadlineAt: "2026-08-29T11:05:00.000Z",
+    hardDeadlineAt: "2026-08-29T13:00:00.000Z",
+    observedHourlyUsd: 1.39,
+    ...overrides,
+  };
+}
+
+function harness(options: {
+  currentLease?: ComputeLeaseV1;
+  currentConfig?: ComputeConfigV1;
+  pod?: any;
+}) {
+  let currentLease = options.currentLease ?? lease();
+  const deletePod = vi.fn().mockResolvedValue(undefined);
+  const finishUsage = vi.fn().mockResolvedValue(undefined);
+  const clearLease = vi.fn().mockImplementation(async (id: string) => {
+    if (currentLease?.id !== id) return false;
+    currentLease = null as any;
+    return true;
+  });
+  let deleted = false;
+  deletePod.mockImplementation(async () => {
+    deleted = true;
+  });
+  const providerPod =
+    options.pod ??
+    ({
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING",
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+    } as const);
+  const fakeClient = {
+    getPod: vi.fn().mockImplementation(async () => (deleted ? null : providerPod)),
+    listPods: vi.fn().mockResolvedValue([]),
+    deletePod,
+  };
+  const controller = new ComputeController({
+    now: () => NOW,
+    readConfig: vi.fn().mockResolvedValue(options.currentConfig ?? config),
+    saveConfig: vi.fn(),
+    readApiKey: vi.fn().mockResolvedValue("key"),
+    readLease: vi.fn().mockImplementation(async () => currentLease),
+    saveLease: vi.fn().mockImplementation(async (next: ComputeLeaseV1) => {
+      currentLease = next;
+      return next;
+    }),
+    updateLease: vi.fn().mockImplementation(async (mutate: any) => {
+      if (!currentLease) return null;
+      currentLease = mutate(currentLease);
+      return currentLease;
+    }),
+    clearLease,
+    beginUsage: vi.fn(),
+    finishUsage,
+    readUsage: vi.fn().mockResolvedValue(usage),
+    readTrackedPodIds: vi.fn().mockResolvedValue(["pod_123"]),
+    storeReconciledUsage: vi.fn(),
+    clientFactory: () => fakeClient as any,
+  } as any);
+  return { controller, deletePod, finishUsage, clearLease };
+}
+
+describe("ComputeController startup recovery", () => {
+  it("terminates a Pod whose durable idle deadline passed while the gateway was down", async () => {
+    const { controller, deletePod, finishUsage, clearLease } = harness({});
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      recovered: false,
+      cleaned: true,
+      detail: "expired compute lease terminated",
+    });
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(finishUsage).toHaveBeenCalledWith("lease-1", NOW.toISOString());
+    expect(clearLease).toHaveBeenCalledWith("lease-1");
+  });
+
+  it("terminates instead of guessing when the persisted profile no longer exists", async () => {
+    const { controller, deletePod } = harness({
+      currentLease: lease({ profileId: "removed-profile" }),
+    });
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      cleaned: true,
+      detail: "Pod terminated because its compute profile is missing",
+    });
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+  });
+
+  it("terminates a recovered allocation that violates the price ceiling", async () => {
+    const { controller, deletePod } = harness({
+      currentLease: lease({
+        idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+        hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+      }),
+      pod: {
+        id: "pod_123",
+        name: "glimmer-test-lease",
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 9.99,
+        gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+      },
+    });
+    const result = await controller.reconcileOnStartup();
+    expect(result.cleaned).toBe(true);
+    expect(result.detail).toContain("exceeds the configured");
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+  });
+});

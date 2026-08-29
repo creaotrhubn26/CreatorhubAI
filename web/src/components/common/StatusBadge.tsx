@@ -28,6 +28,16 @@ const COLOR: Record<string, string> = {
   // process comes up, amber while the model loads (minutes, not seconds).
   STARTING: "var(--blue)",
   LOADING: "var(--amber)",
+  provisioning: "var(--blue)",
+  bootstrapping: "var(--blue)",
+  ready: "var(--green)",
+  busy: "var(--blue)",
+  idle: "var(--amber)",
+  stopping: "var(--amber)",
+  stopped: "var(--gray)",
+  terminating: "var(--amber)",
+  budget_blocked: "var(--red)",
+  unavailable: "var(--red)",
   // V7 §20: non-success terminal (workspace changed after VERIFIED) -- same
   // amber as needs_review/repairing, not red: no failure occurred, a re-run
   // just needs to happen.
