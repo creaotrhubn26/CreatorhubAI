@@ -7,7 +7,7 @@
 # network; each final file must match its release SHA-256 before output.
 set -euo pipefail
 
-ORCHESTRATOR_REF="f66229eaad0acaf90be40075288fa0efbb31f247"
+ORCHESTRATOR_REF="b654f6591e0ce97ea4e994b01d3b4a18e1d3f5c3"
 SNAPSHOT_ID="glimmer-runpod-r2"
 RUNPOD_WORKFLOW_SHA="c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952"
 

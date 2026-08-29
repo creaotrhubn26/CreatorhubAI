@@ -7,7 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "f66229eaad0acaf90be40075288fa0efbb31f247";
+const EXPECTED_ORCHESTRATOR_COMMIT = "b654f6591e0ce97ea4e994b01d3b4a18e1d3f5c3";
 const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-runpod-r2";
 const EXPECTED_RUNPOD_WORKFLOW_SHA =
   "c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952";
