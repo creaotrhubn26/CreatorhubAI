@@ -31,12 +31,16 @@ const startTime = Date.now();
 const SUPPORT_LOG_BYTES = 16 * 1024;
 const SUPPORT_LOG_SESSIONS = 3;
 const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
-  "glimmer-v2.py": "c2ff0da34fedf7b8ee2c1548a94045575d122392a68d30694d42fd12d628c2ed",
-  "glimmer-engineer.py": "cfb015ff39e7866f5a02d36919a6a62636ddc30ecdad348cf841dbcd07afccf6",
-  "glimmer_events.py": "5756d4280378ba351a75605109fcb4f84231e03b8cf9dcb63722173fc865b71e",
+  "glimmer-v2.py": "5e52137fd07ac0a538b519fdd50fb5e5bac8c258c9eeb28d4b0f58035b7cf88b",
+  "glimmer-engineer.py": "2742ef0ab9fe158576dba901a555f5448c312c02a84a4109495153232cc3c67f",
+  "glimmer_events.py": "d31179ab2f5cedf1c7b0cf9a32452bbaa03580ed056a9163ae8ace66ea63a53e",
   "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
-  "glimmer_models.py": "bf84fe821df6ce7e21babdeecc3dab3f053519ecf1edc467b4df83434b9ff6ee",
-  "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
+  "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",
+  "glimmer_memory.py": "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920",
+  "glimmer_quality.py": "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188",
+  "glimmer_semantic.py": "e1d3ce00c33f6db5d4183b1e8c237bbea50532ee051018b64b577163f864f167",
+  "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
+  "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
 };
 const BUNDLED_PYTHON_SHA256: Record<string, string> = {
@@ -46,6 +50,8 @@ const BUNDLED_PYTHON_SHA256: Record<string, string> = {
     "43e38afede6d52ae0d602a42209b9959fc66d6020a25bcf15921446f5d1c262f",
   "lib/python3.13/sqlite3/__init__.py":
     "6e956d2166e24ccf36fef21ad63d06a5dd8f7b674aca6c81ea91eacca6b85b01",
+  "requirements-tree-sitter.lock":
+    "8bfe061a1ca73426e415f9a3ad2ffbe587e8bc49bb81423af8892cc1ffaa9326",
 };
 
 type CommandResult = { code: number | null; stdout: string; stderr: string };
@@ -98,7 +104,7 @@ async function probePython(options: RuntimeProbeOptions): Promise<RuntimeCompone
   const bundled = options.pythonBundled ?? CONFIG.pythonBundled;
   const result = await (options.runner ?? runCommand)(pythonPath, [
     "-c",
-    "import json, pathlib, sqlite3, ssl, sys; print(sys.version.split()[0])",
+    "import json, pathlib, sqlite3, ssl, sys, tree_sitter, tree_sitter_python, tree_sitter_javascript, tree_sitter_typescript, tree_sitter_rust; print(sys.version.split()[0])",
   ]);
   const version = result.stdout.trim().split(/\s+/)[0];
   if (result.code !== 0 || !version) {
@@ -119,7 +125,7 @@ async function probePython(options: RuntimeProbeOptions): Promise<RuntimeCompone
       if (!pythonHome) throw new Error("PYTHONHOME is unavailable");
       const origin = JSON.parse(
         await fs.readFile(path.join(pythonHome, "ORIGIN.json"), "utf8"),
-      ) as { files?: unknown };
+      ) as { files?: unknown; treeSitterNativeFiles?: unknown };
       if (!origin.files || typeof origin.files !== "object") {
         throw new Error("integrity manifest is invalid");
       }
@@ -128,6 +134,28 @@ async function probePython(options: RuntimeProbeOptions): Promise<RuntimeCompone
         const manifested = (origin.files as Record<string, unknown>)[name];
         if (manifested !== expected || (await sha256(path.join(pythonHome, name))) !== expected) {
           throw new Error(`${name} checksum mismatch`);
+        }
+      }
+      if (
+        !origin.treeSitterNativeFiles ||
+        typeof origin.treeSitterNativeFiles !== "object" ||
+        Object.keys(origin.treeSitterNativeFiles).length < 5
+      ) {
+        throw new Error("Tree-sitter native integrity entries are missing");
+      }
+      const home = path.resolve(pythonHome);
+      for (const [name, expected] of Object.entries(
+        origin.treeSitterNativeFiles as Record<string, unknown>,
+      )) {
+        const target = path.resolve(home, name);
+        if (
+          typeof expected !== "string" ||
+          !/^[a-f0-9]{64}$/.test(expected) ||
+          !target.startsWith(home + path.sep) ||
+          !/\.(so|dylib)$/.test(name) ||
+          (await sha256(target)) !== expected
+        ) {
+          throw new Error(`${name} native checksum mismatch`);
         }
       }
     } catch (error) {
@@ -158,13 +186,20 @@ async function probePython(options: RuntimeProbeOptions): Promise<RuntimeCompone
 interface OrchestratorOrigin {
   commit?: unknown;
   overlay?: { id?: unknown };
+  snapshot?: { id?: unknown };
   files?: unknown;
 }
 
 function orchestratorVersion(origin: OrchestratorOrigin | null): string | undefined {
   if (typeof origin?.commit !== "string") return undefined;
   const base = origin.commit.slice(0, 12);
-  return typeof origin.overlay?.id === "string" ? `${base}+${origin.overlay.id}` : base;
+  const qualifier =
+    typeof origin.snapshot?.id === "string"
+      ? origin.snapshot.id
+      : typeof origin.overlay?.id === "string"
+        ? origin.overlay.id
+        : null;
+  return qualifier ? `${base}+${qualifier}` : base;
 }
 
 async function probeOrchestrator(options: RuntimeProbeOptions): Promise<RuntimeComponentCheck> {

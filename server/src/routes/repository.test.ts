@@ -39,6 +39,45 @@ describe("GET /api/repository/map", () => {
   });
 });
 
+describe("GET /api/repository/index", () => {
+  it("returns only an index matching the requested workspace or session", async () => {
+    const id = "repo-index-found";
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-repo-index-ws-"));
+    const dir = path.join(stateRoot, "sessions", id);
+    const index = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      workspace,
+      head: "abc",
+      dirtyHash: "def",
+      cacheKey: "key",
+      parserVersions: { "tree-sitter": "0.26.0" },
+      coverage: { ratio: 1 },
+      files: [],
+      symbols: [],
+      edges: [],
+      routes: [],
+      tests: [],
+      diagnostics: [],
+    };
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "repo-index.json"), JSON.stringify(index));
+    const found = await request(app).get("/api/repository/index").query({ workspace });
+    expect(found.status).toBe(200);
+    expect(found.body.sourceSessionId).toBe(id);
+    expect(found.body.cacheKey).toBe("key");
+    expect(
+      (
+        await request(app)
+          .get("/api/repository/index")
+          .query({ workspace: `${workspace}-other` })
+      ).status,
+    ).toBe(404);
+    await fs.rm(workspace, { recursive: true, force: true });
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+});
+
 // Task 7.5 (V7 "System Explorer"): docs/graph.json lives in a session's
 // WORKSPACE (the target repo), not in the session dir — a real fixture
 // needs both a manifest.json (so findDocGraph can learn the workspace path)

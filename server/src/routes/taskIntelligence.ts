@@ -1,12 +1,20 @@
 import { Router } from "express";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { findRepoMap, findRepoMapForWorkspace } from "./repository.js";
+import { sessionsDir } from "../config.js";
 import {
   inferArea,
   suggestVerification,
   computeArchitectRiskScore,
   riskScoreToLevel,
 } from "../lib/repoAnalysis.js";
-import type { TaskIntelligence, TaskContract, RepoMap } from "@glimmer/shared";
+import type {
+  TaskIntelligence,
+  TaskContract,
+  RepoMap,
+  VerificationCandidate,
+} from "@glimmer/shared";
 
 export const taskIntelligenceRouter = Router();
 
@@ -31,9 +39,11 @@ taskIntelligenceRouter.get("/task-intelligence", async (req, res) => {
         : undefined;
     let repoMap: RepoMap | null;
     let repoMapStatus: TaskIntelligence["repoMapStatus"];
+    let sourceSessionId: string | undefined;
     if (workspace) {
       const found = await findRepoMapForWorkspace(workspace);
       repoMap = found?.map ?? null;
+      sourceSessionId = found?.sessionId;
       repoMapStatus = found ? "workspace-matched" : "unmatched-workspace";
     } else {
       repoMap = await findRepoMap();
@@ -67,10 +77,44 @@ taskIntelligenceRouter.get("/task-intelligence", async (req, res) => {
       verificationLevel !== undefined ||
       candidateCount !== undefined;
 
+    let verificationCandidates: VerificationCandidate[] | undefined;
+    if (sourceSessionId) {
+      try {
+        const artifact = JSON.parse(
+          await fs.readFile(
+            path.join(sessionsDir(), sourceSessionId, "verification-catalog.json"),
+            "utf-8",
+          ),
+        ) as { candidates?: Array<Record<string, unknown>> };
+        verificationCandidates = (artifact.candidates ?? [])
+          .filter(
+            (candidate) => candidate.package === "." || !pkg || candidate.package === pkg.name,
+          )
+          .map((candidate) => ({
+            command: String(candidate.command ?? ""),
+            package: String(candidate.package ?? "."),
+            type: String(
+              candidate.type ?? candidate.kind ?? "unit",
+            ) as VerificationCandidate["type"],
+            level: String(
+              candidate.level ?? candidate.tier ?? "recommended",
+            ) as VerificationCandidate["level"],
+            reason: String(candidate.reason ?? "Discovered from workspace configuration"),
+            provenance: String(
+              candidate.provenance ?? "fallback",
+            ) as VerificationCandidate["provenance"],
+          }))
+          .filter((candidate) => candidate.command.length > 0);
+      } catch (err: any) {
+        if (err.code !== "ENOENT" && !(err instanceof SyntaxError)) throw err;
+      }
+    }
+
     const result: TaskIntelligence = {
       likelyArea: area,
       likelyPackage: pkg?.name ?? null,
       suggestedVerification: suggestVerification(pkg),
+      verificationCandidates,
       estimatedRisk: hasRiskHint
         ? riskScoreToLevel(
             computeArchitectRiskScore(scopePackage, {

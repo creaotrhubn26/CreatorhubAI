@@ -1,0 +1,17 @@
+# Hashes are for the published CPython 3.13 macOS arm64 and x86_64 wheels.
+# Runtime preparation uses --only-binary=:all: --no-deps --require-hashes.
+tree-sitter==0.26.0 \
+    --hash=sha256:6189c6c340c7384357711e3d92645e96bfb79f7a502f86de1ebdb23eb43f7dab \
+    --hash=sha256:ed0889dbed843ce45ede9f5169c0b2dea2222f12685844a03fadb81f12705867
+tree-sitter-python==0.25.0 \
+    --hash=sha256:480c21dbd995b7fe44813e741d71fed10ba695e7caab627fb034e3828469d762 \
+    --hash=sha256:14a79a47ddef72f987d5a2c122d148a812169d7484ff5c75a3db9609d419f361
+tree-sitter-javascript==0.25.0 \
+    --hash=sha256:8264a996b8845cfce06965152a013b5d9cbb7d199bc3503e12b5682e62bb1de1 \
+    --hash=sha256:b70f887fb269d6e58c349d683f59fa647140c410cfe2bee44a883b20ec92e3dc
+tree-sitter-typescript==0.23.2 \
+    --hash=sha256:c7cc1b0ff5d91bac863b0e38b1578d5505e718156c9db577c8baea2557f66de8 \
+    --hash=sha256:3cd752d70d8e5371fdac6a9a4df9d8924b63b6998d268586f7d374c9fba2a478
+tree-sitter-rust==0.24.2 \
+    --hash=sha256:01a46622735498493f29f3e628a90de95c96a07bfbeb88996243eb986b1cee36 \
+    --hash=sha256:3620cfd12340efa43082d45df76349ff511893a9c361da2f8d6d51e307020a59

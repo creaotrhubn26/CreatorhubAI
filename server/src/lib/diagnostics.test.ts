@@ -57,11 +57,27 @@ async function writeBundledPython() {
     await fs.writeFile(target, content);
     files[name] = createHash("sha256").update(content).digest("hex");
   }
+  const treeSitterNativeFiles: Record<string, string> = {};
+  for (const name of [
+    "tree_sitter/_binding.so",
+    "tree_sitter_python/_binding.so",
+    "tree_sitter_javascript/_binding.so",
+    "tree_sitter_typescript/_binding.so",
+    "tree_sitter_rust/_binding.so",
+  ]) {
+    const relative = path.join("lib/python3.13/site-packages", name);
+    const target = path.join(pythonHome, relative);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const content = `native fixture: ${name}\n`;
+    await fs.writeFile(target, content);
+    treeSitterNativeFiles[relative] = createHash("sha256").update(content).digest("hex");
+  }
   await fs.writeFile(
     path.join(pythonHome, "ORIGIN.json"),
     JSON.stringify({
       executableSha256: createHash("sha256").update("fake interpreter\n").digest("hex"),
       files,
+      treeSitterNativeFiles,
     }),
   );
   return { pythonHome, pythonPath, files };

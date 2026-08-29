@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { sessionsDir } from "../config.js";
 import { listSessionIds, isValidSessionId } from "../lib/sessions.js";
-import type { DocGraph, DocGraphSource, RepoMap } from "@glimmer/shared";
+import type { DocGraph, DocGraphSource, RepoIndexV1, RepoMap } from "@glimmer/shared";
 
 export const repositoryRouter = Router();
 
@@ -63,11 +63,45 @@ export async function findRepoMapForWorkspace(
   return null;
 }
 
+export async function findRepoIndexForWorkspace(
+  workspace?: string,
+  sessionId?: string,
+): Promise<{ index: RepoIndexV1; sessionId: string } | null> {
+  const target = workspace ? path.resolve(workspace) : null;
+  const ids = sessionId ? [sessionId] : await listSessionIds();
+  for (const id of ids) {
+    if (!isValidSessionId(id)) continue;
+    try {
+      const parsed = JSON.parse(
+        await fs.readFile(path.join(sessionsDir(), id, "repo-index.json"), "utf-8"),
+      ) as Partial<RepoIndexV1>;
+      if (parsed.schemaVersion !== 1 || typeof parsed.workspace !== "string") continue;
+      if (target && path.resolve(parsed.workspace) !== target) continue;
+      return { index: parsed as RepoIndexV1, sessionId: id };
+    } catch (err: any) {
+      if (err.code !== "ENOENT" && !(err instanceof SyntaxError)) throw err;
+    }
+  }
+  return null;
+}
+
 repositoryRouter.get("/repository/map", async (_req, res) => {
   try {
     const map = await findRepoMap();
     if (!map) return res.status(404).json({ error: "no repo-map.json found in any session" });
     res.json(map);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+repositoryRouter.get("/repository/index", async (req, res) => {
+  try {
+    const workspace = typeof req.query.workspace === "string" ? req.query.workspace : undefined;
+    const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : undefined;
+    const found = await findRepoIndexForWorkspace(workspace, sessionId);
+    if (!found) return res.status(404).json({ error: "no matching repo-index.json found" });
+    res.json({ ...found.index, sourceSessionId: found.sessionId });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

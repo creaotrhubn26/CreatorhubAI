@@ -152,6 +152,19 @@ export function TaskIntelligencePanel({
             honest "Unavailable" when the caller sent no hints at all. */}
         <dd>{data.estimatedRisk ?? "Unavailable"}</dd>
       </dl>
+      {data.verificationCandidates && data.verificationCandidates.length > 0 && (
+        <div>
+          <strong>Workspace verification candidates</strong>
+          <ul>
+            {data.verificationCandidates.map((candidate) => (
+              <li key={`${candidate.package}:${candidate.command}`}>
+                <span className="mono">{candidate.command}</span>
+                {` · ${candidate.level} · ${candidate.reason} (${candidate.provenance})`}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </fieldset>
   );
 }

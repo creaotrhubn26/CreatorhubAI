@@ -6,8 +6,9 @@
 # - binaries/runtime/python contains PYTHONHOME (the standard library and
 #   native extension modules) and is shipped as a bundle resource.
 #
-# The archive is pinned and checksum-verified. No pip packages are needed:
-# the Muse Glimmer orchestrator uses only Python's standard library.
+# The archive and Tree-sitter wheels are pinned and checksum-verified. Wheels
+# are downloaded only in this controlled preparation step; packaged runtime
+# execution never accesses a package index.
 set -euo pipefail
 
 PYTHON_VERSION="3.13.15"
@@ -16,7 +17,8 @@ BUILD_DATE="20260807"
 cd "$(dirname "$0")/.."
 mkdir -p binaries/runtime
 
-TRIPLE="$(rustc --print host-tuple 2>/dev/null || rustc -vV | sed -n 's/^host: //p')"
+HOST_TRIPLE="$(rustc --print host-tuple 2>/dev/null || rustc -vV | sed -n 's/^host: //p')"
+TRIPLE="${GLIMMER_RUNTIME_TARGET:-$HOST_TRIPLE}"
 case "$TRIPLE" in
   aarch64-apple-darwin)
     SHA256="dbadb0ffe46f8bace50daaf8a0c5fc6903c003690776da9eb5269e33c856bb53"
@@ -37,6 +39,7 @@ CACHE_ROOT="${GLIMMER_RUNTIME_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/glimmer-pyt
 CACHED_ARCHIVE="$CACHE_ROOT/$TARBALL"
 DEST="binaries/python3-$TRIPLE"
 PYTHON_HOME="binaries/runtime/python"
+TREE_SITTER_LOCK="runtime/requirements-tree-sitter.lock"
 
 mkdir -p "$CACHE_ROOT"
 if [[ ! -f "$CACHED_ARCHIVE" ]]; then
@@ -68,6 +71,44 @@ mv "$DEST.tmp" "$DEST"
 PYTHONHOME="$PWD/$PYTHON_HOME" "$PWD/$DEST" -c \
   'import json, ssl, subprocess, urllib.request; print("bundled Python runtime ready")'
 
+test -f "$TREE_SITTER_LOCK"
+PYTHONHOME="$PWD/$PYTHON_HOME" "$PWD/$DEST" -m ensurepip --upgrade
+PYTHONHOME="$PWD/$PYTHON_HOME" "$PWD/$DEST" -m pip install \
+  --disable-pip-version-check \
+  --only-binary=:all: \
+  --no-deps \
+  --no-compile \
+  --require-hashes \
+  --target "$PWD/$PYTHON_HOME/lib/python3.13/site-packages" \
+  --requirement "$TREE_SITTER_LOCK"
+cp "$TREE_SITTER_LOCK" "$PYTHON_HOME/requirements-tree-sitter.lock"
+
+PYTHONHOME="$PWD/$PYTHON_HOME" "$PWD/$DEST" -c '
+from importlib.metadata import version
+from tree_sitter import LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION, Language, Parser
+import tree_sitter_javascript, tree_sitter_python, tree_sitter_rust, tree_sitter_typescript
+assert (MIN_COMPATIBLE_LANGUAGE_VERSION, LANGUAGE_VERSION) == (13, 15)
+grammars = [
+    (tree_sitter_python.language, b"x = 1\n"),
+    (tree_sitter_javascript.language, b"const x = 1;"),
+    (tree_sitter_typescript.language_typescript, b"const x: number = 1;"),
+    (tree_sitter_typescript.language_tsx, b"const x = <div />;"),
+    (tree_sitter_rust.language, b"fn main() {}"),
+]
+for grammar, source in grammars:
+    tree = Parser(Language(grammar())).parse(source)
+    assert tree.root_node is not None and not tree.root_node.has_error
+expected = {
+    "tree-sitter": "0.26.0",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-javascript": "0.25.0",
+    "tree-sitter-typescript": "0.23.2",
+    "tree-sitter-rust": "0.24.2",
+}
+assert {name: version(name) for name in expected} == expected
+print("Tree-sitter runtime ready (grammar ABI 13-15)")
+'
+
 # Runtime repair/diagnostics cannot safely modify a signed app bundle, but it
 # can prove whether its critical interpreter files still match this prepared
 # snapshot. Keep the manifest inside PYTHONHOME so the gateway can find it via
@@ -84,10 +125,24 @@ node -e '
     "lib/python3.13/sqlite3/__init__.py",
   ];
   const hash = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  names.push("requirements-tree-sitter.lock");
   const files = Object.fromEntries(names.map((name) => [name, hash(path.join(home, name))]));
+  const sitePackages = path.join(home, "lib/python3.13/site-packages");
+  const nativeFiles = {};
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(target);
+      else if (entry.isFile() && /\.(so|dylib)$/.test(entry.name)) {
+        const relative = path.relative(home, target);
+        nativeFiles[relative] = hash(target);
+      }
+    }
+  };
+  visit(sitePackages);
   fs.writeFileSync(
     path.join(home, "ORIGIN.json"),
-    JSON.stringify({ version, archive, archiveSha256, files }, null, 2) + "\n",
+    JSON.stringify({ version, archive, archiveSha256, files, treeSitterNativeFiles: nativeFiles }, null, 2) + "\n",
   );
 ' "$PYTHON_HOME" "$PYTHON_VERSION" "$TARBALL" "$SHA256"
 

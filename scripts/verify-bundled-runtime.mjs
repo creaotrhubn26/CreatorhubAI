@@ -7,12 +7,8 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "0ec371d9dc5f76ec68b6463585183f19ddb6180d";
-const EXPECTED_ORCHESTRATOR_OVERLAY = {
-  id: "durable-journal-v1",
-  patchSha256: "107319c6b58b0161686eb12f010af9c66f893737c51fb219c162a5d421d13073",
-  moduleSha256: "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
-};
+const EXPECTED_ORCHESTRATOR_COMMIT = "2dc127dc657db34154ee95866a9ba068d7584752";
+const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-accuracy-v2";
 const EXPECTED_PYTHON_FILES = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",
   "lib/python3.13/ssl.py": "538bb1cb334bebb9cd45b58503473ba7fd99cc9a5b769b2ff5caea81876227c3",
@@ -20,14 +16,20 @@ const EXPECTED_PYTHON_FILES = {
     "43e38afede6d52ae0d602a42209b9959fc66d6020a25bcf15921446f5d1c262f",
   "lib/python3.13/sqlite3/__init__.py":
     "6e956d2166e24ccf36fef21ad63d06a5dd8f7b674aca6c81ea91eacca6b85b01",
+  "requirements-tree-sitter.lock":
+    "8bfe061a1ca73426e415f9a3ad2ffbe587e8bc49bb81423af8892cc1ffaa9326",
 };
 const EXPECTED_ORCHESTRATOR_FILES = {
-  "glimmer-v2.py": "1a7e1d8b16237bcc9af4cd4a8d7d85b5b5c01ced35b3c2bd5be69156ddfd5a2d",
-  "glimmer-engineer.py": "fe11fa79dae76877761de1ee2b1318099de48a94c46473919046b8b69b4ebcc8",
-  "glimmer_events.py": "5756d4280378ba351a75605109fcb4f84231e03b8cf9dcb63722173fc865b71e",
+  "glimmer-v2.py": "5e52137fd07ac0a538b519fdd50fb5e5bac8c258c9eeb28d4b0f58035b7cf88b",
+  "glimmer-engineer.py": "2742ef0ab9fe158576dba901a555f5448c312c02a84a4109495153232cc3c67f",
+  "glimmer_events.py": "d31179ab2f5cedf1c7b0cf9a32452bbaa03580ed056a9163ae8ace66ea63a53e",
   "glimmer_journal.py": "1832b24b2aa301b3f022e4f12a199aa22f36a6eb0c166dd413b95836996ce5e6",
-  "glimmer_models.py": "bf84fe821df6ce7e21babdeecc3dab3f053519ecf1edc467b4df83434b9ff6ee",
-  "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
+  "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",
+  "glimmer_memory.py": "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920",
+  "glimmer_quality.py": "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188",
+  "glimmer_semantic.py": "e1d3ce00c33f6db5d4183b1e8c237bbea50532ee051018b64b577163f864f167",
+  "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
+  "glimmer-visual.py": "0ba69bdfc9a8e50a8a2626293d3f734f2afd794a3e2f9ae7ad03d45358a967b5",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
 };
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
@@ -35,6 +37,11 @@ const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
 function preparedTriple() {
   if (process.platform !== "darwin") {
     throw new Error(`unsupported runtime verification platform: ${process.platform}`);
+  }
+  const requested = process.env.GLIMMER_RUNTIME_TARGET;
+  if (requested) {
+    if (["aarch64-apple-darwin", "x86_64-apple-darwin"].includes(requested)) return requested;
+    throw new Error(`unsupported requested runtime architecture: ${requested}`);
   }
   if (process.arch === "arm64") return "aarch64-apple-darwin";
   if (process.arch === "x64") return "x86_64-apple-darwin";
@@ -61,6 +68,10 @@ const requiredFiles = [
   path.join(orchestratorRoot, "glimmer_events.py"),
   path.join(orchestratorRoot, "glimmer_journal.py"),
   path.join(orchestratorRoot, "glimmer_models.py"),
+  path.join(orchestratorRoot, "glimmer_memory.py"),
+  path.join(orchestratorRoot, "glimmer_quality.py"),
+  path.join(orchestratorRoot, "glimmer_semantic.py"),
+  path.join(orchestratorRoot, "glimmer_verification.py"),
   path.join(orchestratorRoot, "run-github-mcp.sh"),
   path.join(orchestratorRoot, "ORIGIN.json"),
 ];
@@ -89,18 +100,36 @@ for (const [name, expected] of Object.entries(EXPECTED_PYTHON_FILES)) {
     .digest("hex");
   if (actual !== expected) throw new Error(`bundled Python checksum mismatch: ${name}`);
 }
+if (
+  !pythonOrigin.treeSitterNativeFiles ||
+  typeof pythonOrigin.treeSitterNativeFiles !== "object" ||
+  Object.keys(pythonOrigin.treeSitterNativeFiles).length < 5
+) {
+  throw new Error("bundled Python manifest has no Tree-sitter native-module checksums");
+}
+for (const [name, expected] of Object.entries(pythonOrigin.treeSitterNativeFiles)) {
+  if (
+    path.isAbsolute(name) ||
+    name.split(/[\\/]/).includes("..") ||
+    !name.startsWith("lib/python3.13/site-packages/") ||
+    !/\.(so|dylib)$/.test(name) ||
+    !/^[a-f0-9]{64}$/.test(String(expected))
+  ) {
+    throw new Error(`invalid Tree-sitter native integrity entry: ${name}`);
+  }
+  const actual = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(path.join(pythonHome, name)))
+    .digest("hex");
+  if (actual !== expected) throw new Error(`Tree-sitter native checksum mismatch: ${name}`);
+}
 
 const origin = JSON.parse(fs.readFileSync(path.join(orchestratorRoot, "ORIGIN.json"), "utf8"));
 if (origin.commit !== EXPECTED_ORCHESTRATOR_COMMIT) {
   throw new Error(`unexpected bundled orchestrator commit: ${origin.commit}`);
 }
-if (
-  !origin.overlay ||
-  origin.overlay.id !== EXPECTED_ORCHESTRATOR_OVERLAY.id ||
-  origin.overlay.patchSha256 !== EXPECTED_ORCHESTRATOR_OVERLAY.patchSha256 ||
-  origin.overlay.moduleSha256 !== EXPECTED_ORCHESTRATOR_OVERLAY.moduleSha256
-) {
-  throw new Error("unexpected bundled orchestrator durability overlay provenance");
+if (!origin.snapshot || origin.snapshot.id !== EXPECTED_ORCHESTRATOR_SNAPSHOT) {
+  throw new Error("unexpected bundled orchestrator snapshot provenance");
 }
 if (!origin.files || typeof origin.files !== "object") {
   throw new Error("bundled orchestrator integrity manifest has no file checksums");
@@ -152,7 +181,18 @@ try {
     preparedPython,
     [
       "-c",
-      "import json, ssl, sqlite3, subprocess, urllib.request; import glimmer_events, glimmer_journal, glimmer_models; print(__import__('sys').version)",
+      `from importlib.metadata import version
+from tree_sitter import LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION, Language, Parser
+import json, ssl, sqlite3, subprocess, urllib.request
+import glimmer_events, glimmer_journal, glimmer_models, glimmer_quality, glimmer_semantic, glimmer_verification, glimmer_memory
+import tree_sitter_javascript, tree_sitter_python, tree_sitter_rust, tree_sitter_typescript
+assert (MIN_COMPATIBLE_LANGUAGE_VERSION, LANGUAGE_VERSION) == (13, 15)
+expected = {'tree-sitter':'0.26.0','tree-sitter-python':'0.25.0','tree-sitter-javascript':'0.25.0','tree-sitter-typescript':'0.23.2','tree-sitter-rust':'0.24.2'}
+assert {name: version(name) for name in expected} == expected
+samples = [(tree_sitter_python.language,b'x = 1\\n'),(tree_sitter_javascript.language,b'const x = 1;'),(tree_sitter_typescript.language_typescript,b'const x: number = 1;'),(tree_sitter_typescript.language_tsx,b'const x = <div />;'),(tree_sitter_rust.language,b'fn main() {}')]
+for grammar, source in samples:
+    assert not Parser(Language(grammar())).parse(source).root_node.has_error
+print(__import__('sys').version)`,
     ],
     "bundled Python import self-test",
   );
@@ -175,5 +215,5 @@ try {
 }
 
 console.log(
-  `bundled runtime valid: Python 3.13.15 + orchestrator ${EXPECTED_ORCHESTRATOR_COMMIT} + ${EXPECTED_ORCHESTRATOR_OVERLAY.id}${appPath ? ` in ${appPath}` : ""}`,
+  `bundled runtime valid: Python 3.13.15 + orchestrator ${EXPECTED_ORCHESTRATOR_COMMIT} + ${EXPECTED_ORCHESTRATOR_SNAPSHOT}${appPath ? ` in ${appPath}` : ""}`,
 );
