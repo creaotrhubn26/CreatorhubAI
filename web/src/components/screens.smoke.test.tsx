@@ -42,6 +42,7 @@ vi.spyOn(client.glimmerApi, "getComputeConfig").mockResolvedValue({
   defaultBackend: "local_process",
   activeProfileId: "runpod-a100",
   profiles: [],
+  watchdog: { hasIngestToken: false },
   source: "default",
 });
 vi.spyOn(client.glimmerApi, "getComputeStatus").mockResolvedValue({

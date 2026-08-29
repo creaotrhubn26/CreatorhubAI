@@ -93,6 +93,7 @@ import type {
   ComputeStatus,
   ComputeUsageSummary,
   ComputeCredentialTestResult,
+  ComputeWatchdogTestResult,
   ComputeControlResult,
 } from "@glimmer/shared";
 import { tauriGlobal } from "../state/desktopNotify";
@@ -343,6 +344,8 @@ export const glimmerApi = {
     request<ComputeUsageSummary>("/api/compute/usage/reconcile", { method: "POST" }),
   testComputeCredential: () =>
     request<ComputeCredentialTestResult>("/api/compute/test", { method: "POST" }),
+  testComputeWatchdog: () =>
+    request<ComputeWatchdogTestResult>("/api/compute/watchdog/test", { method: "POST" }),
   startCompute: () => computeControl("start"),
   stopCompute: () => computeControl("stop"),
   terminateComputePod: (podId: string) =>

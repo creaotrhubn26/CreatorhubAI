@@ -55,11 +55,14 @@ describe("ComputeStatusPanel", () => {
     expect(await screen.findByText("offline")).toBeInTheDocument();
     expect(screen.getByText("$1.7500")).toBeInTheDocument();
     expect(screen.getByText(/Independent watchdog unavailable/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start external compute" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Start external compute" })).toBeDisabled();
   });
 
   it("starts only the explicitly selected remote backend", async () => {
-    vi.spyOn(glimmerApi, "getComputeStatus").mockResolvedValue(offline);
+    vi.spyOn(glimmerApi, "getComputeStatus").mockResolvedValue({
+      ...offline,
+      policy: { ...offline.policy, watchdogConfigured: true, unattendedUseAllowed: true },
+    });
     mockUsage();
     const start = vi.spyOn(glimmerApi, "startCompute").mockResolvedValue({
       started: true,

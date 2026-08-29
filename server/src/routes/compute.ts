@@ -53,6 +53,14 @@ computeRouter.post("/compute/test", async (_req, res) => {
   }
 });
 
+computeRouter.post("/compute/watchdog/test", async (_req, res) => {
+  try {
+    res.json(await getComputeController().testWatchdog());
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 computeRouter.post("/compute/start", async (_req, res) => {
   try {
     const result = await getComputeController().start();

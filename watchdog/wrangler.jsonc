@@ -1,0 +1,23 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "glimmer-runpod-watchdog",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-30",
+  "workers_dev": true,
+  "triggers": {
+    "crons": ["*/2 * * * *"],
+  },
+  "kv_namespaces": [
+    {
+      "binding": "LEASES",
+      "id": "00000000000000000000000000000000",
+    },
+  ],
+  "vars": {
+    "RUNPOD_API_BASE_URL": "https://rest.runpod.io/v1",
+    "STALE_AFTER_SECONDS": "180",
+  },
+  "observability": {
+    "enabled": false,
+  },
+}

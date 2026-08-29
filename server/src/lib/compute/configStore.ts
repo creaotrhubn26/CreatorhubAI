@@ -7,6 +7,8 @@ import type {
   ComputeConfigV1,
   ComputeProfileUpdateV1,
   ComputeProfileV1,
+  ComputeWatchdogTestResult,
+  ComputeWatchdogUpdateV1,
   RunPodGpuTypeId,
 } from "@glimmer/shared";
 import { CONFIG } from "../../config.js";
@@ -19,6 +21,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const HOST_PATTERN =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MAX_API_KEY_CHARS = 16_384;
+const WATCHDOG_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,512}$/;
 const MAX_PROFILES = 8;
 export const DEFAULT_RUNPOD_IMAGE_DIGEST =
   "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f";
@@ -32,6 +35,13 @@ const RUNPOD_GPU_IDS = new Set<RunPodGpuTypeId>([...RUNPOD_A100_GPU_IDS, ...RUNP
 
 type StoredComputeProfile = ComputeProfileUpdateV1;
 
+interface StoredWatchdogConfig {
+  endpointUrl: string;
+  tokenFile: string | null;
+  verifiedAt?: string;
+  lastSweepAt?: string;
+}
+
 interface StoredComputeConfig {
   version: 1;
   enabled: boolean;
@@ -39,6 +49,7 @@ interface StoredComputeConfig {
   profiles: StoredComputeProfile[];
   activeProfileId?: string;
   apiKeyFile: string | null;
+  watchdog?: StoredWatchdogConfig | null;
 }
 
 export class ComputeConfigValidationError extends Error {}
@@ -90,6 +101,7 @@ function defaultStoredConfig(): StoredComputeConfig {
     ],
     activeProfileId: "runpod-a100",
     apiKeyFile: null,
+    watchdog: null,
   };
 }
 
@@ -100,6 +112,44 @@ async function exists(file: string | null): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function normalizedWatchdogEndpoint(value: unknown): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") invalid("watchdog endpointUrl must be a URL");
+  let parsed: URL;
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    invalid("watchdog endpointUrl is invalid");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    invalid("watchdog endpointUrl must be an origin-only HTTPS URL");
+  }
+  return parsed.origin;
+}
+
+function isStoredWatchdog(value: unknown): value is StoredWatchdogConfig {
+  if (!value || typeof value !== "object") return false;
+  const raw = value as Partial<StoredWatchdogConfig>;
+  try {
+    if (normalizedWatchdogEndpoint(raw.endpointUrl) !== raw.endpointUrl) return false;
+  } catch {
+    return false;
+  }
+  return (
+    (raw.tokenFile === null ||
+      (typeof raw.tokenFile === "string" && isGatewayOwnedWatchdogPath(raw.tokenFile))) &&
+    (raw.verifiedAt === undefined || Number.isFinite(Date.parse(raw.verifiedAt))) &&
+    (raw.lastSweepAt === undefined || Number.isFinite(Date.parse(raw.lastSweepAt)))
+  );
 }
 
 function isStoredProfile(value: unknown): value is StoredComputeProfile {
@@ -128,6 +178,9 @@ function isStoredConfig(value: unknown): value is StoredComputeConfig {
   ) {
     return false;
   }
+  if (raw.watchdog !== undefined && raw.watchdog !== null && !isStoredWatchdog(raw.watchdog)) {
+    return false;
+  }
   const ids = new Set(raw.profiles.map((profile) => profile.id));
   return !raw.activeProfileId || ids.has(raw.activeProfileId);
 }
@@ -140,7 +193,11 @@ async function readStoredConfig(): Promise<{
     const parsed = JSON.parse(await fs.readFile(CONFIG.computeConfigPath, "utf8"));
     if (isStoredConfig(parsed)) {
       return {
-        config: { ...parsed, profiles: parsed.profiles.map(normalizeProfile) },
+        config: {
+          ...parsed,
+          profiles: parsed.profiles.map(normalizeProfile),
+          watchdog: parsed.watchdog ?? null,
+        },
         source: "saved",
       };
     }
@@ -155,12 +212,14 @@ async function toPublic(
   source: "default" | "saved",
 ): Promise<ComputeConfigV1> {
   const hasApiKey = await exists(config.apiKeyFile);
+  const hasIngestToken = await exists(config.watchdog?.tokenFile ?? null);
+  const watchdogConfigured = Boolean(
+    config.watchdog?.endpointUrl && hasIngestToken && config.watchdog.verifiedAt,
+  );
   const profiles: ComputeProfileV1[] = config.profiles.map((profile) => ({
     ...profile,
     hasApiKey,
-    // R1 deliberately does not accept a boolean assertion from the UI. A
-    // later milestone sets this only after a real watchdog handshake.
-    watchdogConfigured: false,
+    watchdogConfigured,
   }));
   return {
     version: 1,
@@ -168,6 +227,12 @@ async function toPublic(
     defaultBackend: config.defaultBackend,
     profiles,
     ...(config.activeProfileId ? { activeProfileId: config.activeProfileId } : {}),
+    watchdog: {
+      ...(config.watchdog?.endpointUrl ? { endpointUrl: config.watchdog.endpointUrl } : {}),
+      hasIngestToken,
+      ...(config.watchdog?.verifiedAt ? { verifiedAt: config.watchdog.verifiedAt } : {}),
+      ...(config.watchdog?.lastSweepAt ? { lastSweepAt: config.watchdog.lastSweepAt } : {}),
+    },
     source,
   };
 }
@@ -375,6 +440,7 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
   const apiKey = typeof raw.apiKey === "string" ? raw.apiKey.trim() : undefined;
   if (apiKey && apiKey.length > MAX_API_KEY_CHARS) invalid("RunPod API key is too long");
   if (apiKey && raw.clearApiKey) invalid("cannot set and clear the RunPod API key together");
+  const watchdog = normalizeWatchdogUpdate(raw.watchdog);
   const willHaveKey = !!apiKey || (hasExistingKey && raw.clearApiKey !== true);
   if (raw.enabled && raw.defaultBackend === "runpod_pod") {
     const active = profiles.find((profile) => profile.id === raw.activeProfileId)!;
@@ -396,6 +462,30 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
     activeProfileId: raw.activeProfileId,
     ...(apiKey ? { apiKey } : {}),
     clearApiKey: raw.clearApiKey === true,
+    ...(watchdog ? { watchdog } : {}),
+  };
+}
+
+function normalizeWatchdogUpdate(
+  value: ComputeWatchdogUpdateV1 | undefined,
+): ComputeWatchdogUpdateV1 | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object") invalid("watchdog must be an object");
+  const endpointUrl = normalizedWatchdogEndpoint(value.endpointUrl);
+  const ingestToken = typeof value.ingestToken === "string" ? value.ingestToken.trim() : undefined;
+  if (ingestToken && !endpointUrl) {
+    invalid("watchdog endpointUrl is required when setting an ingest token");
+  }
+  if (ingestToken && !WATCHDOG_TOKEN_PATTERN.test(ingestToken)) {
+    invalid("watchdog ingestToken must be 32..512 base64url characters");
+  }
+  if (ingestToken && value.clearIngestToken) {
+    invalid("cannot set and clear the watchdog ingest token together");
+  }
+  return {
+    ...(endpointUrl ? { endpointUrl } : {}),
+    ...(ingestToken ? { ingestToken } : {}),
+    clearIngestToken: value.clearIngestToken === true,
   };
 }
 
@@ -416,6 +506,15 @@ function isGatewayOwnedKeyPath(file: string | null): boolean {
   return path.resolve(file) === path.resolve(gatewayOwnedKeyPath());
 }
 
+function gatewayOwnedWatchdogPath(): string {
+  return path.join(CONFIG.computeKeysDir, "watchdog-ingest.key");
+}
+
+function isGatewayOwnedWatchdogPath(file: string | null): boolean {
+  if (!file) return false;
+  return path.resolve(file) === path.resolve(gatewayOwnedWatchdogPath());
+}
+
 export async function readComputeConfig(): Promise<ComputeConfigV1> {
   const { config, source } = await readStoredConfig();
   return toPublic(config, source);
@@ -433,6 +532,47 @@ export async function readRunPodApiKey(): Promise<string | null> {
   }
 }
 
+export interface ComputeWatchdogAccess {
+  endpointUrl: string;
+  ingestToken: string;
+}
+
+export async function readComputeWatchdogAccess(): Promise<ComputeWatchdogAccess | null> {
+  const { config } = await readStoredConfig();
+  if (!config.watchdog?.endpointUrl || !config.watchdog.tokenFile) return null;
+  try {
+    const ingestToken = (await fs.readFile(config.watchdog.tokenFile, "utf8")).trim();
+    if (!WATCHDOG_TOKEN_PATTERN.test(ingestToken)) {
+      throw new Error("stored watchdog ingest token is invalid");
+    }
+    return { endpointUrl: config.watchdog.endpointUrl, ingestToken };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export async function markComputeWatchdogVerified(
+  result: ComputeWatchdogTestResult,
+): Promise<ComputeConfigV1> {
+  const { config } = await readStoredConfig();
+  if (!config.watchdog?.endpointUrl || !(await exists(config.watchdog.tokenFile))) {
+    throw new ComputeConfigValidationError(
+      "watchdog endpoint and ingest token must be saved before verification",
+    );
+  }
+  const stored: StoredComputeConfig = {
+    ...config,
+    watchdog: {
+      ...config.watchdog,
+      verifiedAt: result.checkedAt,
+      ...(result.lastSweepAt ? { lastSweepAt: result.lastSweepAt } : {}),
+    },
+  };
+  await writeAtomic(CONFIG.computeConfigPath, `${JSON.stringify(stored, null, 2)}\n`);
+  return toPublic(stored, "saved");
+}
+
 export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1> {
   const { config: current } = await readStoredConfig();
   const hasExistingKey = await exists(current.apiKeyFile);
@@ -445,6 +585,32 @@ export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1
   } else if (update.clearApiKey) {
     apiKeyFile = null;
   }
+  const safeWatchdogPath = gatewayOwnedWatchdogPath();
+  let watchdog = current.watchdog ?? null;
+  if (update.watchdog) {
+    const endpointUrl = update.watchdog.endpointUrl;
+    let tokenFile = watchdog?.tokenFile ?? null;
+    if (update.watchdog.ingestToken) {
+      await writeAtomic(safeWatchdogPath, `${update.watchdog.ingestToken}\n`);
+      tokenFile = safeWatchdogPath;
+    } else if (update.watchdog.clearIngestToken) {
+      tokenFile = null;
+    }
+    const endpointChanged = endpointUrl !== watchdog?.endpointUrl;
+    const tokenChanged = Boolean(update.watchdog.ingestToken || update.watchdog.clearIngestToken);
+    watchdog = endpointUrl
+      ? {
+          endpointUrl,
+          tokenFile,
+          ...(!endpointChanged && !tokenChanged && watchdog?.verifiedAt
+            ? { verifiedAt: watchdog.verifiedAt }
+            : {}),
+          ...(!endpointChanged && !tokenChanged && watchdog?.lastSweepAt
+            ? { lastSweepAt: watchdog.lastSweepAt }
+            : {}),
+        }
+      : null;
+  }
   const stored: StoredComputeConfig = {
     version: 1,
     enabled: update.enabled,
@@ -452,6 +618,7 @@ export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1
     profiles: update.profiles,
     activeProfileId: update.activeProfileId,
     apiKeyFile,
+    watchdog,
   };
   await writeAtomic(CONFIG.computeConfigPath, `${JSON.stringify(stored, null, 2)}\n`);
   if (
@@ -460,6 +627,15 @@ export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1
     current.apiKeyFile !== apiKeyFile
   ) {
     await fs.unlink(current.apiKeyFile!).catch((error: any) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
+  if (
+    (update.watchdog?.clearIngestToken || (update.watchdog !== undefined && watchdog === null)) &&
+    isGatewayOwnedWatchdogPath(current.watchdog?.tokenFile ?? null) &&
+    current.watchdog?.tokenFile !== watchdog?.tokenFile
+  ) {
+    await fs.unlink(current.watchdog!.tokenFile!).catch((error: any) => {
       if (error?.code !== "ENOENT") throw error;
     });
   }

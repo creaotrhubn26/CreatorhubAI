@@ -7,10 +7,17 @@ import type {
   ComputeProfileV1,
   ComputeStatus,
   ComputeUsageSummary,
+  ComputeWatchdogTestResult,
   ComputeWorkerStatus,
 } from "@glimmer/shared";
 import { CONFIG } from "../../config.js";
-import { readComputeConfig, readRunPodApiKey, saveComputeConfig } from "./configStore.js";
+import {
+  markComputeWatchdogVerified,
+  readComputeConfig,
+  readComputeWatchdogAccess,
+  readRunPodApiKey,
+  saveComputeConfig,
+} from "./configStore.js";
 import {
   clearComputeLease,
   readComputeLease,
@@ -21,6 +28,7 @@ import {
 import { RunPodClient } from "./runpodClient.js";
 import type { RunPodCreatePodInput, RunPodPod } from "./runpodSchemas.js";
 import { WorkerClient, WorkerProtocolError, workerBaseUrlForPod } from "./workerClient.js";
+import { WatchdogClient, WatchdogProtocolError, type WatchdogLeaseV1 } from "./watchdogClient.js";
 import {
   createWorkerSecret,
   deleteWorkerSecret,
@@ -53,6 +61,8 @@ interface ControllerDependencies {
   readConfig: typeof readComputeConfig;
   saveConfig: typeof saveComputeConfig;
   readApiKey: typeof readRunPodApiKey;
+  readWatchdogAccess: typeof readComputeWatchdogAccess;
+  markWatchdogVerified: typeof markComputeWatchdogVerified;
   readLease: typeof readComputeLease;
   saveLease: typeof saveComputeLease;
   updateLease: typeof updateComputeLease;
@@ -63,6 +73,7 @@ interface ControllerDependencies {
   readTrackedPodIds: typeof readTrackedPodIds;
   storeReconciledUsage: typeof storeReconciledUsage;
   clientFactory: (apiKey: string) => RunPodClient;
+  watchdogFactory: (endpointUrl: string, ingestToken: string) => WatchdogClient;
   workerFactory: (podId: string) => WorkerClient;
   createWorkerSecret: typeof createWorkerSecret;
   readWorkerSecret: typeof readWorkerSecret;
@@ -77,6 +88,8 @@ const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   readConfig: readComputeConfig,
   saveConfig: saveComputeConfig,
   readApiKey: readRunPodApiKey,
+  readWatchdogAccess: readComputeWatchdogAccess,
+  markWatchdogVerified: markComputeWatchdogVerified,
   readLease: readComputeLease,
   saveLease: saveComputeLease,
   updateLease: updateComputeLease,
@@ -87,6 +100,8 @@ const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   readTrackedPodIds,
   storeReconciledUsage,
   clientFactory: (apiKey) => new RunPodClient({ baseUrl: CONFIG.runpodApiBaseUrl, apiKey }),
+  watchdogFactory: (endpointUrl, ingestToken) =>
+    new WatchdogClient({ baseUrl: endpointUrl, ingestToken }),
   workerFactory: (podId) => new WorkerClient({ baseUrl: workerBaseUrlForPod(podId) }),
   createWorkerSecret,
   readWorkerSecret,
@@ -157,6 +172,8 @@ function safeInstanceId(value: string): string {
 export class ComputeController {
   private operation: Promise<unknown> = Promise.resolve();
   private safetyTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogHeartbeat: ReturnType<typeof setInterval> | null = null;
+  private watchdogHeartbeatRunning = false;
 
   constructor(private readonly dependencies: ControllerDependencies = DEFAULT_DEPENDENCIES) {}
 
@@ -170,6 +187,78 @@ export class ComputeController {
     const key = await this.dependencies.readApiKey();
     if (!key) throw new ComputeControlError("RunPod API key is not configured", 412);
     return this.dependencies.clientFactory(key);
+  }
+
+  private async watchdog(): Promise<WatchdogClient> {
+    const access = await this.dependencies.readWatchdogAccess();
+    if (!access) {
+      throw new ComputeControlError(
+        "Independent compute watchdog endpoint and ingest token are not configured",
+        412,
+      );
+    }
+    return this.dependencies.watchdogFactory(access.endpointUrl, access.ingestToken);
+  }
+
+  private watchdogLease(
+    lease: ComputeLeaseV1,
+    profile: ComputeProfileV1,
+    heartbeatAt = this.dependencies.now(),
+  ): WatchdogLeaseV1 {
+    return {
+      schemaVersion: 1,
+      leaseId: lease.id,
+      ownerInstanceId: safeInstanceId(CONFIG.instanceId),
+      podName: lease.podName,
+      ...(lease.podId ? { podId: lease.podId } : {}),
+      hardDeadlineAt: lease.hardDeadlineAt,
+      lastHeartbeatAt: heartbeatAt.toISOString(),
+      maxHourlyUsd: profile.maxGpuHourlyUsd,
+    };
+  }
+
+  private clearWatchdogHeartbeat() {
+    if (this.watchdogHeartbeat) clearInterval(this.watchdogHeartbeat);
+    this.watchdogHeartbeat = null;
+    this.watchdogHeartbeatRunning = false;
+  }
+
+  private scheduleWatchdogHeartbeat() {
+    this.clearWatchdogHeartbeat();
+    this.watchdogHeartbeat = setInterval(() => {
+      if (this.watchdogHeartbeatRunning) return;
+      this.watchdogHeartbeatRunning = true;
+      void (async () => {
+        try {
+          const lease = await this.dependencies.readLease();
+          if (!lease) {
+            this.clearWatchdogHeartbeat();
+            return;
+          }
+          const config = await this.dependencies.readConfig();
+          const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+          if (!profile) throw new Error("active compute profile is unavailable");
+          await (await this.watchdog()).upsertLease(this.watchdogLease(lease, profile));
+        } catch (error) {
+          console.error(
+            `[compute] watchdog heartbeat failed: ${error instanceof Error ? error.message : "unknown error"}`,
+          );
+        } finally {
+          this.watchdogHeartbeatRunning = false;
+        }
+      })();
+    }, 60_000);
+    this.watchdogHeartbeat.unref?.();
+  }
+
+  private async deleteWatchdogLeaseBestEffort(leaseId: string): Promise<void> {
+    try {
+      await (await this.watchdog()).deleteLease(leaseId);
+    } catch (error) {
+      console.error(
+        `[compute] watchdog lease cleanup failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
   }
 
   private policy(profile?: ComputeProfileV1) {
@@ -386,7 +475,9 @@ export class ComputeController {
   ): Promise<boolean> {
     const podId = lease.podId;
     if (!podId) {
+      this.clearWatchdogHeartbeat();
       await this.dependencies.deleteWorkerSecret(lease.id);
+      await this.deleteWatchdogLeaseBestEffort(lease.id);
       return true;
     }
     await this.dependencies.saveLease({
@@ -396,9 +487,11 @@ export class ComputeController {
     });
     await client.deletePod(podId);
     if (await this.waitForTermination(client, podId)) {
+      this.clearWatchdogHeartbeat();
       await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
       await this.dependencies.clearLease(lease.id);
       await this.dependencies.deleteWorkerSecret(lease.id);
+      await this.deleteWatchdogLeaseBestEffort(lease.id);
       return true;
     }
     this.scheduleCleanupRetry("retry failed worker bootstrap termination");
@@ -564,12 +657,40 @@ export class ComputeController {
     };
   }
 
+  async testWatchdog(): Promise<ComputeWatchdogTestResult> {
+    return this.exclusive(async () => {
+      let result: ComputeWatchdogTestResult;
+      try {
+        result = await (await this.watchdog()).status();
+      } catch (error) {
+        throw new ComputeControlError(
+          `Independent compute watchdog test failed: ${error instanceof Error ? error.message : "unknown error"}`,
+          error instanceof WatchdogProtocolError && error.status === 401 ? 502 : 503,
+        );
+      }
+      if (!result.ready || !result.lastSweepAt) {
+        throw new ComputeControlError(
+          "Independent compute watchdog is reachable but its scheduled sweep is not ready",
+          503,
+        );
+      }
+      await this.dependencies.markWatchdogVerified(result);
+      return result;
+    });
+  }
+
   async start(): Promise<ComputeControlResult> {
     return this.exclusive(async () => {
       const config = await this.dependencies.readConfig();
       const profile = activeProfile(config);
       if (!config.enabled || config.defaultBackend !== "runpod_pod" || !profile) {
         throw new ComputeControlError("RunPod compute is not enabled as the active backend", 412);
+      }
+      if (!profile.watchdogConfigured) {
+        throw new ComputeControlError(
+          "RunPod compute cannot start until the independent watchdog has passed its live test",
+          412,
+        );
       }
       const existing = await this.dependencies.readLease();
       if (existing) {
@@ -582,6 +703,19 @@ export class ComputeController {
       const budget = budgetStatus(profile, usage);
       if (!budget.allowed) {
         throw new ComputeControlError(budget.reason ?? "compute budget blocks this start", 409);
+      }
+      let watchdog: WatchdogClient;
+      try {
+        watchdog = await this.watchdog();
+        const watchdogStatus = await watchdog.status();
+        if (!watchdogStatus.ready || !watchdogStatus.lastSweepAt) {
+          throw new WatchdogProtocolError("scheduled sweep is not ready");
+        }
+      } catch (error) {
+        throw new ComputeControlError(
+          `RunPod compute cannot start because the independent watchdog is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+          503,
+        );
       }
       const now = this.dependencies.now();
       const leaseId = randomUUID();
@@ -607,6 +741,17 @@ export class ComputeController {
         await this.dependencies.clearLease(leaseId);
         throw new ComputeControlError("worker bootstrap secret was not created", 500);
       }
+      try {
+        await watchdog.upsertLease(this.watchdogLease(lease, profile, now));
+      } catch (error) {
+        await this.dependencies.clearLease(leaseId);
+        await this.dependencies.deleteWorkerSecret(leaseId);
+        throw new ComputeControlError(
+          `RunPod compute was not created because the watchdog rejected its lease: ${error instanceof Error ? error.message : "unknown error"}`,
+          503,
+        );
+      }
+      this.scheduleWatchdogHeartbeat();
       const createRequest = this.createInput(profile, podName, workerSecret.bootstrapToken);
       let pod: RunPodPod;
       try {
@@ -614,11 +759,16 @@ export class ComputeController {
       } catch (error) {
         // Creation has no documented idempotency key. Recover an exact-name
         // Pod before declaring failure so a lost response cannot orphan spend.
-        const matches = await client
-          .listPods()
-          .then((pods) => pods.filter((candidate) => candidate.name === podName))
-          .catch(() => []);
+        let providerListSucceeded = false;
+        const matches = await client.listPods().then(
+          (pods) => {
+            providerListSucceeded = true;
+            return pods.filter((candidate) => candidate.name === podName);
+          },
+          () => [],
+        );
         if (matches.length !== 1) {
+          this.clearWatchdogHeartbeat();
           await this.dependencies.saveLease({
             ...lease,
             state: "failed",
@@ -627,12 +777,39 @@ export class ComputeController {
                 ? "RunPod create outcome is ambiguous; multiple Pods have the lease name"
                 : `RunPod create failed: ${error instanceof Error ? error.message : "unknown error"}`,
           });
-          if (matches.length === 0) await this.dependencies.deleteWorkerSecret(leaseId);
+          if (matches.length === 0 && providerListSucceeded) {
+            await this.dependencies.clearLease(leaseId);
+            await this.dependencies.deleteWorkerSecret(leaseId);
+            await this.deleteWatchdogLeaseBestEffort(leaseId);
+          }
           throw error;
         }
         pod = matches[0];
       }
       lease = await this.dependencies.saveLease({ ...lease, podId: pod.id });
+      try {
+        await watchdog.upsertLease(this.watchdogLease(lease, profile));
+      } catch (error) {
+        await this.dependencies.saveLease({
+          ...lease,
+          state: "terminating",
+          error: "watchdog did not accept the allocated Pod identity; termination requested",
+        });
+        this.clearWatchdogHeartbeat();
+        await client.deletePod(pod.id);
+        if (await this.waitForTermination(client, pod.id)) {
+          this.clearWatchdogHeartbeat();
+          await this.dependencies.clearLease(lease.id);
+          await this.dependencies.deleteWorkerSecret(lease.id);
+          await this.deleteWatchdogLeaseBestEffort(lease.id);
+        } else {
+          this.scheduleCleanupRetry("retry watchdog publication failure termination");
+        }
+        throw new ComputeControlError(
+          `RunPod allocation was terminated because the watchdog did not accept its identity: ${error instanceof Error ? error.message : "unknown error"}`,
+          503,
+        );
+      }
       const allocationError = this.validateAllocatedPod(profile, pod);
       if (allocationError) {
         const rejectedRate = price(pod);
@@ -650,6 +827,7 @@ export class ComputeController {
           observedHourlyUsd: rejectedRate,
           error: `${allocationError}; termination requested immediately`,
         });
+        this.clearWatchdogHeartbeat();
         await client.deletePod(pod.id);
         if (await this.waitForTermination(client, pod.id)) {
           if (rejectedRate !== undefined) {
@@ -657,6 +835,8 @@ export class ComputeController {
           }
           await this.dependencies.clearLease(leaseId);
           await this.dependencies.deleteWorkerSecret(leaseId);
+          this.clearWatchdogHeartbeat();
+          await this.deleteWatchdogLeaseBestEffort(leaseId);
         } else {
           this.scheduleCleanupRetry("retry rejected allocation termination");
         }
@@ -702,6 +882,7 @@ export class ComputeController {
   async stop(reason = "manual stop"): Promise<ComputeControlResult> {
     return this.exclusive(async () => {
       this.clearSafetyTimer();
+      this.clearWatchdogHeartbeat();
       const config = await this.dependencies.readConfig();
       let lease = await this.dependencies.readLease();
       if (!lease) return { stopped: false, status: await this.statusFrom(config, null, null) };
@@ -711,6 +892,7 @@ export class ComputeController {
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
         await this.dependencies.deleteWorkerSecret(lease.id);
+        await this.deleteWatchdogLeaseBestEffort(lease.id);
         return {
           stopped: false,
           status: await this.statusFrom(config, null, null, "The recorded Pod no longer exists."),
@@ -740,6 +922,7 @@ export class ComputeController {
       await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
       await this.dependencies.clearLease(lease.id);
       await this.dependencies.deleteWorkerSecret(lease.id);
+      await this.deleteWatchdogLeaseBestEffort(lease.id);
       return {
         stopped: true,
         terminated: true,
@@ -784,6 +967,7 @@ export class ComputeController {
 
   async reconcileOnStartup(): Promise<{ recovered: boolean; cleaned: boolean; detail: string }> {
     return this.exclusive(async () => {
+      this.clearWatchdogHeartbeat();
       const lease = await this.dependencies.readLease();
       if (!lease) return { recovered: false, cleaned: false, detail: "no compute lease" };
       const config = await this.dependencies.readConfig();
@@ -794,6 +978,7 @@ export class ComputeController {
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
         await this.dependencies.deleteWorkerSecret(lease.id);
+        await this.deleteWatchdogLeaseBestEffort(lease.id);
         return { recovered: false, cleaned: true, detail: "missing Pod lease cleared" };
       }
       if (!profile) {
@@ -814,10 +999,48 @@ export class ComputeController {
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
         await this.dependencies.deleteWorkerSecret(lease.id);
+        await this.deleteWatchdogLeaseBestEffort(lease.id);
         return {
           recovered: false,
           cleaned: true,
           detail: "Pod terminated because its compute profile is missing",
+        };
+      }
+      try {
+        if (!profile.watchdogConfigured) {
+          throw new WatchdogProtocolError("watchdog has not passed its live test");
+        }
+        const watchdog = await this.watchdog();
+        const watchdogStatus = await watchdog.status();
+        if (!watchdogStatus.ready || !watchdogStatus.lastSweepAt) {
+          throw new WatchdogProtocolError("scheduled sweep is not ready");
+        }
+        await watchdog.upsertLease(this.watchdogLease({ ...lease, podId: pod.id }, profile));
+        this.scheduleWatchdogHeartbeat();
+      } catch (error) {
+        await client.deletePod(pod.id);
+        if (!(await this.waitForTermination(client, pod.id))) {
+          await this.dependencies.updateLease((current) => ({
+            ...current,
+            podId: pod.id,
+            state: "terminating",
+            error: "independent watchdog unavailable during startup recovery",
+          }));
+          this.scheduleCleanupRetry("retry missing-watchdog startup termination");
+          return {
+            recovered: false,
+            cleaned: false,
+            detail: "Pod termination is pending because the independent watchdog is unavailable",
+          };
+        }
+        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+        await this.dependencies.clearLease(lease.id);
+        await this.dependencies.deleteWorkerSecret(lease.id);
+        await this.deleteWatchdogLeaseBestEffort(lease.id);
+        return {
+          recovered: false,
+          cleaned: true,
+          detail: `Pod terminated because the independent watchdog is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
         };
       }
       const allocationError = this.validateAllocatedPod(profile, pod);
@@ -825,6 +1048,7 @@ export class ComputeController {
         this.dependencies.now().getTime() >=
         Math.min(Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt));
       if (allocationError || deadlinePassed) {
+        this.clearWatchdogHeartbeat();
         await client.deletePod(pod.id);
         if (!(await this.waitForTermination(client, pod.id))) {
           await this.dependencies.updateLease((current) => ({
@@ -842,6 +1066,8 @@ export class ComputeController {
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
         await this.dependencies.deleteWorkerSecret(lease.id);
+        this.clearWatchdogHeartbeat();
+        await this.deleteWatchdogLeaseBestEffort(lease.id);
         return {
           recovered: false,
           cleaned: true,

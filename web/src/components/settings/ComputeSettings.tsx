@@ -15,6 +15,9 @@ interface Draft {
   profiles: ComputeProfileV1[];
   apiKey: string;
   clearApiKey: boolean;
+  watchdogEndpointUrl: string;
+  watchdogIngestToken: string;
+  clearWatchdogIngestToken: boolean;
 }
 
 function draftFromConfig(config: ComputeConfigV1): Draft {
@@ -25,6 +28,9 @@ function draftFromConfig(config: ComputeConfigV1): Draft {
     profiles: config.profiles.map((profile) => ({ ...profile })),
     apiKey: "",
     clearApiKey: false,
+    watchdogEndpointUrl: config.watchdog.endpointUrl ?? "",
+    watchdogIngestToken: "",
+    clearWatchdogIngestToken: false,
   };
 }
 
@@ -54,6 +60,13 @@ export function ComputeSettings() {
         defaultBackend: draft.defaultBackend,
         activeProfileId: draft.activeProfileId,
         profiles: draft.profiles.map(profileUpdate),
+        watchdog: {
+          endpointUrl: draft.watchdogEndpointUrl.trim(),
+          ...(draft.watchdogIngestToken.trim()
+            ? { ingestToken: draft.watchdogIngestToken.trim() }
+            : {}),
+          ...(draft.clearWatchdogIngestToken ? { clearIngestToken: true } : {}),
+        },
         ...(draft.apiKey.trim() ? { apiKey: draft.apiKey.trim() } : {}),
         ...(draft.clearApiKey ? { clearApiKey: true } : {}),
       });
@@ -65,6 +78,13 @@ export function ComputeSettings() {
     },
   });
   const testCredential = useMutation({ mutationFn: glimmerApi.testComputeCredential });
+  const testWatchdog = useMutation({
+    mutationFn: glimmerApi.testComputeWatchdog,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["compute-config"] });
+      void queryClient.invalidateQueries({ queryKey: ["compute-status"] });
+    },
+  });
 
   function updateProfile(patch: Partial<ComputeProfileV1>) {
     setDraft((current) =>
@@ -128,8 +148,9 @@ export function ComputeSettings() {
         file and are never returned to this screen.
       </p>
       <p role="note">
-        R1 has local idle and hard-deadline cleanup, but no independently deployed watchdog yet. Do
-        not leave paid compute unattended.
+        {data?.watchdog.verifiedAt
+          ? `The independent watchdog passed its live test at ${data.watchdog.verifiedAt}.`
+          : "Paid compute remains blocked until an independent watchdog has passed its live test."}
       </p>
       <p className="mono" style={{ fontSize: 12 }}>
         Configuration: {data?.source === "saved" ? "saved" : "local default"}
@@ -395,6 +416,74 @@ export function ComputeSettings() {
         )}
       </fieldset>
 
+      <fieldset>
+        <legend>Independent safety watchdog</legend>
+        <p>
+          The watchdog runs outside this Mac, receives only a minimal signed lease, and terminates
+          stale, over-budget, or expired Pods even if Glimmer is offline.
+        </p>
+        <label>
+          Watchdog endpoint URL
+          <input
+            type="url"
+            value={draft.watchdogEndpointUrl}
+            onChange={(event) =>
+              setDraft((current) =>
+                current ? { ...current, watchdogEndpointUrl: event.target.value } : current,
+              )
+            }
+            placeholder="https://glimmer-runpod-watchdog.example.workers.dev"
+            spellCheck={false}
+          />
+        </label>
+        <label>
+          Watchdog ingest token {data?.watchdog.hasIngestToken ? "(stored; blank keeps it)" : ""}
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={draft.watchdogIngestToken}
+            onChange={(event) =>
+              setDraft((current) =>
+                current
+                  ? {
+                      ...current,
+                      watchdogIngestToken: event.target.value,
+                      clearWatchdogIngestToken: false,
+                    }
+                  : current,
+              )
+            }
+            placeholder={
+              data?.watchdog.hasIngestToken ? "Keep existing token" : "32+ base64url characters"
+            }
+          />
+        </label>
+        {data?.watchdog.hasIngestToken && (
+          <label>
+            <input
+              type="checkbox"
+              checked={draft.clearWatchdogIngestToken}
+              onChange={(event) =>
+                setDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        clearWatchdogIngestToken: event.target.checked,
+                        watchdogIngestToken: "",
+                      }
+                    : current,
+                )
+              }
+            />{" "}
+            Remove stored watchdog token on save
+          </label>
+        )}
+        <small>
+          Save the endpoint and token first. A successful test records readiness but never creates a
+          GPU resource.
+        </small>
+      </fieldset>
+
       <button type="button" onClick={() => save.mutate()} disabled={save.isPending}>
         {save.isPending ? "Saving…" : "Save compute settings"}
       </button>
@@ -404,6 +493,15 @@ export function ComputeSettings() {
         disabled={testCredential.isPending || !active.hasApiKey}
       >
         {testCredential.isPending ? "Testing…" : "Test stored credential"}
+      </button>
+      <button
+        type="button"
+        onClick={() => testWatchdog.mutate()}
+        disabled={
+          testWatchdog.isPending || !data?.watchdog.endpointUrl || !data.watchdog.hasIngestToken
+        }
+      >
+        {testWatchdog.isPending ? "Testing watchdog…" : "Test independent watchdog"}
       </button>
       {save.isSuccess && <p role="status">Compute settings saved.</p>}
       {save.error && <p role="alert">Could not save — {(save.error as Error).message}</p>}
@@ -415,6 +513,14 @@ export function ComputeSettings() {
       )}
       {testCredential.error && (
         <p role="alert">Credential test failed — {(testCredential.error as Error).message}</p>
+      )}
+      {testWatchdog.data && (
+        <p role="status">
+          Independent watchdog ready; last external sweep {testWatchdog.data.lastSweepAt}.
+        </p>
+      )}
+      {testWatchdog.error && (
+        <p role="alert">Watchdog test failed — {(testWatchdog.error as Error).message}</p>
       )}
     </section>
   );

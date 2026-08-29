@@ -114,7 +114,9 @@ export function ComputeStatusPanel() {
         type="button"
         className="btn-primary"
         onClick={() => start.mutate()}
-        disabled={pending || active || data.backend !== "runpod_pod"}
+        disabled={
+          pending || active || data.backend !== "runpod_pod" || !data.policy.watchdogConfigured
+        }
       >
         Start external compute
       </button>

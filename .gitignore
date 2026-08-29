@@ -14,3 +14,5 @@ src-tauri/resources/gateway/
 .opencode
 .DS_Store
 /artifacts/
+/watchdog/.dev.vars
+/watchdog/.wrangler/

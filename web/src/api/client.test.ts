@@ -122,6 +122,23 @@ describe("glimmerApi", () => {
     expect(fetchMock.mock.calls[0][1]?.method).toBe("POST");
   });
 
+  it("tests watchdog readiness through its dedicated guarded endpoint", async () => {
+    const result = {
+      service: "glimmer-compute-watchdog",
+      schemaVersion: 1,
+      ready: true,
+      checkedAt: "2026-08-30T12:00:00.000Z",
+      lastSweepAt: "2026-08-30T11:59:00.000Z",
+      staleAfterSeconds: 180,
+    } as const;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(result));
+    await expect(glimmerApi.testComputeWatchdog()).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/compute/watchdog/test`,
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("gets the secret-free CLI integration status", async () => {
     const response = {
       checkedAt: "now",

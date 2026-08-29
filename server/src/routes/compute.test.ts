@@ -8,6 +8,8 @@ import type { ComputeConfigV1, ComputeConfigUpdateV1 } from "@glimmer/shared";
 
 const UI_ORIGIN = "http://127.0.0.1:5183";
 const API_KEY = "runpod-route-secret";
+const WATCHDOG_TOKEN = "watchdog_route_ingest_token_with_32_chars";
+const WATCHDOG_ENDPOINT = "https://watchdog.example";
 const IMAGE = `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`;
 const REGISTRY_AUTH_ID = "registry_auth_1";
 const MODEL_ARTIFACTS = {
@@ -56,6 +58,10 @@ async function configuredUpdate(patch: Partial<ComputeConfigUpdateV1> = {}) {
     enabled: true,
     defaultBackend: "runpod_pod",
     apiKey: API_KEY,
+    watchdog: {
+      endpointUrl: WATCHDOG_ENDPOINT,
+      ingestToken: WATCHDOG_TOKEN,
+    },
     profiles: defaults.profiles.map(
       ({ hasApiKey: _hasApiKey, watchdogConfigured: _watchdog, ...profile }) => ({
         ...profile,
@@ -75,6 +81,40 @@ async function configuredUpdate(patch: Partial<ComputeConfigUpdateV1> = {}) {
   return response.body as ComputeConfigV1;
 }
 
+function watchdogResponse(input: RequestInfo | URL, init?: RequestInit): Response | null {
+  const url = new URL(String(input));
+  if (url.origin !== WATCHDOG_ENDPOINT) return null;
+  if (url.pathname === "/v1/status") {
+    return Response.json({
+      service: "glimmer-compute-watchdog",
+      schemaVersion: 1,
+      ready: true,
+      checkedAt: "2026-08-30T12:00:00.000Z",
+      lastSweepAt: "2026-08-30T12:00:00.000Z",
+      staleAfterSeconds: 180,
+    });
+  }
+  const leaseId = url.pathname.split("/").at(-1)!;
+  if (init?.method === "PUT") {
+    return Response.json(
+      { accepted: true, leaseId, storedAt: "2026-08-30T12:00:00.000Z" },
+      { status: 201 },
+    );
+  }
+  if (init?.method === "DELETE") return Response.json({ deleted: true, leaseId });
+  throw new Error(`unexpected watchdog request ${init?.method ?? "GET"} ${url}`);
+}
+
+async function verifyWatchdog() {
+  const fetchMock = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async (input, init) => watchdogResponse(input, init)!);
+  const response = await request(app).post("/api/compute/watchdog/test").set("Origin", UI_ORIGIN);
+  fetchMock.mockRestore();
+  expect(response.status).toBe(200);
+  expect(response.body).toMatchObject({ ready: true, staleAfterSeconds: 180 });
+}
+
 describe("compute configuration API", () => {
   it("returns a disabled, local, secret-free default", async () => {
     const response = await request(app).get("/api/compute/config");
@@ -87,6 +127,7 @@ describe("compute configuration API", () => {
       source: "default",
     });
     expect(response.body.profiles).toHaveLength(2);
+    expect(response.body.watchdog).toEqual({ hasIngestToken: false });
     expect(response.body.profiles[0]).toMatchObject({
       cloudType: "SECURE",
       gpuCount: 1,
@@ -111,6 +152,42 @@ describe("compute configuration API", () => {
     expect(stored.apiKeyFile).toBe(path.join(stateRoot, "compute-keys", "runpod.key"));
     expect((await fs.stat(stored.apiKeyFile)).mode & 0o777).toBe(0o600);
     expect((await fs.readFile(stored.apiKeyFile, "utf8")).trim()).toBe(API_KEY);
+    expect(stored.watchdog.tokenFile).toBe(
+      path.join(stateRoot, "compute-keys", "watchdog-ingest.key"),
+    );
+    expect((await fs.stat(stored.watchdog.tokenFile)).mode & 0o777).toBe(0o600);
+    expect(JSON.stringify(saved)).not.toContain(WATCHDOG_TOKEN);
+  });
+
+  it("verifies the external watchdog without creating a provider resource", async () => {
+    const saved = await configuredUpdate();
+    expect(saved.watchdog).toMatchObject({
+      endpointUrl: WATCHDOG_ENDPOINT,
+      hasIngestToken: true,
+    });
+    expect(saved.watchdog.verifiedAt).toBeUndefined();
+    await verifyWatchdog();
+    const verified = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
+    expect(verified.watchdog).toMatchObject({
+      hasIngestToken: true,
+      verifiedAt: "2026-08-30T12:00:00.000Z",
+      lastSweepAt: "2026-08-30T12:00:00.000Z",
+    });
+    expect(verified.profiles.every((profile) => profile.watchdogConfigured)).toBe(true);
+
+    const cleared = await request(app)
+      .put("/api/compute/config")
+      .set("Origin", UI_ORIGIN)
+      .send(
+        updateFrom(verified, {
+          watchdog: { endpointUrl: "", clearIngestToken: true },
+        }),
+      );
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.watchdog).toEqual({ hasIngestToken: false });
+    await expect(
+      fs.stat(path.join(stateRoot, "compute-keys", "watchdog-ingest.key")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("preserves a blank stored key update and clears only the gateway-owned key on request", async () => {
@@ -152,6 +229,25 @@ describe("compute configuration API", () => {
         .put("/api/compute/config")
         .set("Origin", UI_ORIGIN)
         .send(input);
+      expect(response.status).toBe(400);
+    }
+  });
+
+  it("rejects non-HTTPS, credentialed, and path-bearing watchdog endpoints", async () => {
+    const defaults = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
+    for (const endpointUrl of [
+      "http://127.0.0.1:8787",
+      "https://user:password@watchdog.example",
+      "https://watchdog.example/private",
+    ]) {
+      const response = await request(app)
+        .put("/api/compute/config")
+        .set("Origin", UI_ORIGIN)
+        .send(
+          updateFrom(defaults, {
+            watchdog: { endpointUrl, ingestToken: WATCHDOG_TOKEN },
+          }),
+        );
       expect(response.status).toBe(400);
     }
   });
@@ -245,10 +341,13 @@ describe("RunPod compute lifecycle", () => {
 
   it("creates one Secure A100 Pod and terminates it on stop because it has a network volume", async () => {
     await configuredUpdate();
+    await verifyWatchdog();
     let exists = false;
     let workerRotated = false;
     const calls: Array<{ url: string; method: string; body?: unknown }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const watchdog = watchdogResponse(input, init);
+      if (watchdog) return watchdog;
       const url = String(input);
       const method = init?.method ?? "GET";
       calls.push({
@@ -366,8 +465,11 @@ describe("RunPod compute lifecycle", () => {
 
   it("immediately terminates an allocation above the configured ceiling", async () => {
     await configuredUpdate();
+    await verifyWatchdog();
     let deleted = false;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const watchdog = watchdogResponse(input, init);
+      if (watchdog) return watchdog;
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.includes("/billing/pods") && method === "GET") {
@@ -406,6 +508,7 @@ describe("RunPod compute lifecycle", () => {
 
   it("fails closed before allocation when provider billing cannot be reconciled", async () => {
     await configuredUpdate();
+    await verifyWatchdog();
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ error: "unavailable" }), { status: 503 }));

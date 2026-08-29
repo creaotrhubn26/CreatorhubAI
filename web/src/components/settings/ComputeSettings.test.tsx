@@ -11,6 +11,7 @@ const config: ComputeConfigV1 = {
   defaultBackend: "local_process",
   activeProfileId: "runpod-a100",
   source: "saved",
+  watchdog: { hasIngestToken: false },
   profiles: [
     {
       id: "runpod-a100",
@@ -82,7 +83,8 @@ describe("ComputeSettings", () => {
     expect(key.type).toBe("password");
     expect(key.value).toBe("");
     expect(screen.getByLabelText(/Container registry auth id/i)).toHaveValue("registry_auth_1");
-    expect(screen.getByText(/no independently deployed watchdog/i)).toBeInTheDocument();
+    expect(screen.getByText(/remains blocked until an independent watchdog/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Watchdog ingest token/i)).toHaveAttribute("type", "password");
 
     fireEvent.click(screen.getByLabelText(/Enable external compute configuration/i));
     fireEvent.change(screen.getByLabelText("Default backend"), {
@@ -104,6 +106,7 @@ describe("ComputeSettings", () => {
     const payload = save.mock.calls[0][0];
     expect(JSON.stringify(payload.profiles)).not.toContain("hasApiKey");
     expect(JSON.stringify(payload.profiles)).not.toContain("watchdogConfigured");
+    expect(payload.watchdog).toEqual({ endpointUrl: "" });
     expect(await screen.findByText("Compute settings saved.")).toBeInTheDocument();
   });
 
@@ -133,5 +136,28 @@ describe("ComputeSettings", () => {
     expect(
       await screen.findByText(/2 Pod\(s\) visible.*No resource was created/i),
     ).toBeInTheDocument();
+  });
+
+  it("tests a saved watchdog and reports the external sweep without creating compute", async () => {
+    const configured = {
+      ...config,
+      watchdog: {
+        endpointUrl: "https://watchdog.example",
+        hasIngestToken: true,
+      },
+    };
+    vi.spyOn(glimmerApi, "getComputeConfig").mockResolvedValue(configured);
+    const testWatchdog = vi.spyOn(glimmerApi, "testComputeWatchdog").mockResolvedValue({
+      service: "glimmer-compute-watchdog",
+      schemaVersion: 1,
+      ready: true,
+      checkedAt: "2026-08-30T12:00:00.000Z",
+      lastSweepAt: "2026-08-30T11:59:00.000Z",
+      staleAfterSeconds: 180,
+    });
+    renderSettings();
+    fireEvent.click(await screen.findByRole("button", { name: "Test independent watchdog" }));
+    await waitFor(() => expect(testWatchdog).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/last external sweep 2026-08-30T11:59/i)).toBeInTheDocument();
   });
 });

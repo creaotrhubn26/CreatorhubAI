@@ -2809,12 +2809,36 @@ export interface ComputeProfileV1 {
   watchdogConfigured: boolean;
 }
 
+export interface ComputeWatchdogConfigV1 {
+  endpointUrl?: string;
+  hasIngestToken: boolean;
+  verifiedAt?: string;
+  lastSweepAt?: string;
+}
+
+export interface ComputeWatchdogUpdateV1 {
+  endpointUrl?: string;
+  /** Omit/blank to preserve the gateway-owned HMAC credential. */
+  ingestToken?: string;
+  clearIngestToken?: boolean;
+}
+
+export interface ComputeWatchdogTestResult {
+  service: "glimmer-compute-watchdog";
+  schemaVersion: 1;
+  ready: boolean;
+  checkedAt: string;
+  lastSweepAt?: string;
+  staleAfterSeconds: number;
+}
+
 export interface ComputeConfigV1 {
   version: 1;
   enabled: boolean;
   defaultBackend: ComputeBackend;
   profiles: ComputeProfileV1[];
   activeProfileId?: string;
+  watchdog: ComputeWatchdogConfigV1;
   source: "default" | "saved";
 }
 
@@ -2826,6 +2850,7 @@ export interface ComputeConfigUpdateV1 {
   defaultBackend: ComputeBackend;
   profiles: ComputeProfileUpdateV1[];
   activeProfileId?: string;
+  watchdog?: ComputeWatchdogUpdateV1;
   /** Omit/blank to preserve the gateway-owned RunPod account key. */
   apiKey?: string;
   clearApiKey?: boolean;

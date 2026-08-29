@@ -33,7 +33,9 @@
     "packaged:force-quit-e2e": "node scripts/native-force-quit-e2e.mjs",
     "design-workflow:e2e": "node scripts/design-workflow-e2e.mjs",
     "live-design:framework-dogfood": "node scripts/live-design-framework-dogfood.mjs",
-    "structure-mode:e2e": "node scripts/design-workflow-e2e.mjs"
+    "structure-mode:e2e": "node scripts/design-workflow-e2e.mjs",
+    "watchdog:test": "vitest run watchdog/src/worker.test.js",
+    "watchdog:deploy": "wrangler deploy --config watchdog/wrangler.jsonc"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -44,6 +46,7 @@
     "playwright": "^1.58.2",
     "prettier": "^3.9.6",
     "typescript": "^5.5.4",
-    "typescript-eslint": "^8.68.0"
+    "typescript-eslint": "^8.68.0",
+    "wrangler": "4.127.1"
   }
 }
