@@ -214,6 +214,19 @@ export function ComputeSettings() {
           <small>Mutable image tags are rejected.</small>
         </label>
         <label>
+          Container registry auth id
+          <input
+            value={active.containerRegistryAuthId ?? ""}
+            onChange={(event) => updateProfile({ containerRegistryAuthId: event.target.value })}
+            placeholder="RunPod registry credential id"
+            spellCheck={false}
+          />
+          <small>
+            Create this credential in RunPod for the private GHCR worker image. Registry secrets are
+            never stored in Glimmer.
+          </small>
+        </label>
+        <label>
           Existing network volume id
           <input
             value={active.networkVolumeId ?? ""}

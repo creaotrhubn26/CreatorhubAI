@@ -265,15 +265,21 @@ export class ComputeController {
     podName: string,
     bootstrapToken: string,
   ): RunPodCreatePodInput {
-    if (!profile.imageDigest || !profile.networkVolumeId || !profile.modelArtifacts) {
+    if (
+      !profile.imageDigest ||
+      !profile.containerRegistryAuthId ||
+      !profile.networkVolumeId ||
+      !profile.modelArtifacts
+    ) {
       throw new ComputeControlError(
-        "The active RunPod profile requires an immutable image digest, network volume, and checksum-bound model artifacts",
+        "The active RunPod profile requires an immutable image digest, registry auth, network volume, and checksum-bound model artifacts",
         412,
       );
     }
     return {
       name: podName,
       imageName: profile.imageDigest,
+      containerRegistryAuthId: profile.containerRegistryAuthId,
       cloudType: "SECURE",
       computeType: "GPU",
       gpuTypeIds: profile.gpuTypeIds,

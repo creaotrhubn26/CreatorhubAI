@@ -154,6 +154,7 @@ interface ComputeProfileV1 {
   gpuCount: 1;
   contextTokens: 65_536 | 131_072;
   imageDigest: string;
+  containerRegistryAuthId?: string;
   networkVolumeId?: string;
   maxGpuHourlyUsd: number;
   idleTimeoutSeconds: number;
@@ -381,16 +382,18 @@ Both are based on the completed seven-measure accuracy work and leave the origin
 Before the first paid live smoke:
 
 1. Create a RunPod API key for the controller and store it through the Compute settings UI; never commit it.
-2. Choose or create a container registry and record an immutable image digest.
-3. Create a network volume sized for the verified model/runtime cache; do not store raw repository source there.
-4. Set explicit hourly, daily, and monthly budgets.
-5. Deploy and test the independent watchdog.
-6. Authorize one controlled A100 smoke; H100 remains a separate explicit benchmark.
+2. Create a RunPod container registry auth for the private GHCR package and enter only its ID in the active compute profile. Registry credentials remain in RunPod and are never stored by Glimmer.
+3. Use the published worker image `ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f`. It was built from orchestrator commit `b654f6591e0ce97ea4e994b01d3b4a18e1d3f5c3`, with OCI provenance and SBOM, then pulled and runtime-verified by GitHub Actions run `33277906183`.
+4. Create a network volume sized for the verified model/runtime cache; do not store raw repository source there.
+5. Set explicit hourly, daily, and monthly budgets.
+6. Deploy and test the independent watchdog.
+7. Authorize one controlled A100 smoke; H100 remains a separate explicit benchmark.
 
 ## Authoritative RunPod references
 
 - REST API overview and OpenAPI: <https://docs.runpod.io/api-reference/overview>
 - Create/list/get/start Pods: <https://docs.runpod.io/api-reference/pods/POST/pods>
+- Create a private container registry auth: <https://docs.runpod.io/api-reference/container-registry-auths/POST/containerregistryauth>
 - Pod lifecycle and stop/terminate behavior: <https://docs.runpod.io/pods/manage-pods>
 - Storage persistence and pricing: <https://docs.runpod.io/pods/storage/types>
 - HTTP proxy behavior and 100-second ceiling: <https://docs.runpod.io/pods/configuration/expose-ports>

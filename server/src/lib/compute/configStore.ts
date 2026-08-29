@@ -13,12 +13,15 @@ import { CONFIG } from "../../config.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const VOLUME_ID_PATTERN = /^[A-Za-z0-9_-]{1,191}$/;
+const REGISTRY_AUTH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,190}$/;
 const IMAGE_DIGEST_PATTERN = /^[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const HOST_PATTERN =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MAX_API_KEY_CHARS = 16_384;
 const MAX_PROFILES = 8;
+export const DEFAULT_RUNPOD_IMAGE_DIGEST =
+  "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f";
 
 export const RUNPOD_A100_GPU_IDS: RunPodGpuTypeId[] = [
   "NVIDIA A100 80GB PCIe",
@@ -60,7 +63,7 @@ function defaultProfile(
     gpuTypeIds,
     gpuCount: 1,
     contextTokens: 65_536,
-    imageDigest: "",
+    imageDigest: DEFAULT_RUNPOD_IMAGE_DIGEST,
     maxGpuHourlyUsd,
     idleTimeoutSeconds: 300,
     clarificationTimeoutSeconds: 120,
@@ -281,6 +284,13 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
   if (imageDigest && !IMAGE_DIGEST_PATTERN.test(imageDigest)) {
     invalid(`profile ${raw.id}: imageDigest must be an immutable sha256 OCI reference`);
   }
+  const containerRegistryAuthId =
+    typeof raw.containerRegistryAuthId === "string"
+      ? raw.containerRegistryAuthId.trim()
+      : undefined;
+  if (containerRegistryAuthId && !REGISTRY_AUTH_ID_PATTERN.test(containerRegistryAuthId)) {
+    invalid(`profile ${raw.id}: containerRegistryAuthId is invalid`);
+  }
   const networkVolumeId =
     typeof raw.networkVolumeId === "string" ? raw.networkVolumeId.trim() : undefined;
   if (networkVolumeId && !VOLUME_ID_PATTERN.test(networkVolumeId)) {
@@ -309,6 +319,7 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
     gpuCount: 1,
     contextTokens: raw.contextTokens,
     imageDigest,
+    ...(containerRegistryAuthId ? { containerRegistryAuthId } : {}),
     ...(networkVolumeId ? { networkVolumeId } : {}),
     ...(modelArtifacts ? { modelArtifacts } : {}),
     maxGpuHourlyUsd: boundedNumber(
@@ -368,6 +379,9 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
   if (raw.enabled && raw.defaultBackend === "runpod_pod") {
     const active = profiles.find((profile) => profile.id === raw.activeProfileId)!;
     if (!active.imageDigest) invalid("the active RunPod profile requires an immutable imageDigest");
+    if (!active.containerRegistryAuthId) {
+      invalid("the active RunPod profile requires containerRegistryAuthId for the private image");
+    }
     if (!active.networkVolumeId) invalid("the active RunPod profile requires networkVolumeId");
     if (!active.modelArtifacts) {
       invalid("the active RunPod profile requires checksum-bound modelArtifacts");

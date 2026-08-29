@@ -30,6 +30,7 @@ describe("RunPodClient", () => {
     const input: RunPodCreatePodInput = {
       name: "glimmer-test",
       imageName: `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`,
+      containerRegistryAuthId: "registry_auth_1",
       cloudType: "SECURE",
       computeType: "GPU",
       gpuTypeIds: ["NVIDIA A100 80GB PCIe"],

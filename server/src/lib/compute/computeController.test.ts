@@ -22,6 +22,7 @@ const config: ComputeConfigV1 = {
       gpuCount: 1,
       contextTokens: 65_536,
       imageDigest: `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`,
+      containerRegistryAuthId: "registry_auth_1",
       networkVolumeId: "volume_1",
       modelArtifacts: {
         model: { url: "https://models.example.com/model.gguf", sha256: "b".repeat(64) },
@@ -276,6 +277,7 @@ describe("ComputeController authenticated worker startup", () => {
     });
     const input = fakeClient.createPod.mock.calls[0][0];
     expect(input.ports).toEqual(["4318/http"]);
+    expect(input.containerRegistryAuthId).toBe("registry_auth_1");
     expect(input.env).toMatchObject({
       GLIMMER_CONTEXT_TOKENS: "65536",
       GLIMMER_WORKER_BOOTSTRAP_TOKEN: "B".repeat(43),

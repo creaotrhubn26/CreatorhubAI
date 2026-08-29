@@ -9,6 +9,7 @@ import type { ComputeConfigV1, ComputeConfigUpdateV1 } from "@glimmer/shared";
 const UI_ORIGIN = "http://127.0.0.1:5183";
 const API_KEY = "runpod-route-secret";
 const IMAGE = `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`;
+const REGISTRY_AUTH_ID = "registry_auth_1";
 const MODEL_ARTIFACTS = {
   model: { url: "https://models.example.com/model.gguf", sha256: "b".repeat(64) },
   mmproj: { url: "https://models.example.com/mmproj.gguf", sha256: "c".repeat(64) },
@@ -59,6 +60,7 @@ async function configuredUpdate(patch: Partial<ComputeConfigUpdateV1> = {}) {
       ({ hasApiKey: _hasApiKey, watchdogConfigured: _watchdog, ...profile }) => ({
         ...profile,
         imageDigest: IMAGE,
+        containerRegistryAuthId: REGISTRY_AUTH_ID,
         networkVolumeId: "network_volume_1",
         modelArtifacts: MODEL_ARTIFACTS,
       }),
@@ -89,6 +91,8 @@ describe("compute configuration API", () => {
       cloudType: "SECURE",
       gpuCount: 1,
       contextTokens: 65536,
+      imageDigest:
+        "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f",
       hasApiKey: false,
       watchdogConfigured: false,
     });
@@ -139,6 +143,7 @@ describe("compute configuration API", () => {
       (value: any) => (value.profiles[0].cloudType = "COMMUNITY"),
       (value: any) => (value.profiles[0].gpuCount = 2),
       (value: any) => (value.profiles[0].imageDigest = "ghcr.io/example/glimmer:latest"),
+      (value: any) => (value.profiles[0].containerRegistryAuthId = "../../invalid"),
       (value: any) => (value.profiles[0].gpuTypeIds = ["NVIDIA H100 PCIe"]),
     ]) {
       const input = structuredClone(base);
@@ -151,14 +156,16 @@ describe("compute configuration API", () => {
     }
   });
 
-  it("requires an immutable image, network volume, and key before enabling RunPod", async () => {
+  it("requires registry auth, a network volume, model artifacts, and a key before enabling RunPod", async () => {
     const defaults = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
     const response = await request(app)
       .put("/api/compute/config")
       .set("Origin", UI_ORIGIN)
       .send(updateFrom(defaults, { enabled: true, defaultBackend: "runpod_pod" }));
     expect(response.status).toBe(400);
-    expect(response.body.error).toMatch(/imageDigest|networkVolumeId|modelArtifacts|API key/);
+    expect(response.body.error).toMatch(
+      /containerRegistryAuthId|networkVolumeId|modelArtifacts|API key/,
+    );
   });
 
   it("rejects unallowlisted, credentialed, or non-checksummed model artifacts", async () => {
@@ -171,6 +178,7 @@ describe("compute configuration API", () => {
         ({ hasApiKey: _hasApiKey, watchdogConfigured: _watchdog, ...profile }) => ({
           ...profile,
           imageDigest: IMAGE,
+          containerRegistryAuthId: REGISTRY_AUTH_ID,
           networkVolumeId: "network_volume_1",
           modelArtifacts: MODEL_ARTIFACTS,
         }),
@@ -327,6 +335,7 @@ describe("RunPod compute lifecycle", () => {
       gpuCount: 1,
       gpuTypeIds: ["NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"],
       imageName: IMAGE,
+      containerRegistryAuthId: REGISTRY_AUTH_ID,
       networkVolumeId: "network_volume_1",
       interruptible: false,
       ports: ["4318/http"],

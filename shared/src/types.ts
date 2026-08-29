@@ -2793,6 +2793,8 @@ export interface ComputeProfileV1 {
   contextTokens: 65_536 | 131_072;
   /** Immutable OCI reference: registry/repository@sha256:<64 hex>. */
   imageDigest: string;
+  /** Existing RunPod registry credential used to pull the private worker image. */
+  containerRegistryAuthId?: string;
   /** Existing RunPod network volume. The gateway never creates one implicitly. */
   networkVolumeId?: string;
   /** Public, checksum-bound model artifacts. No model credential is accepted here. */

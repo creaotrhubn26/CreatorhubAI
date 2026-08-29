@@ -18,6 +18,7 @@ export interface RunPodPod {
 export interface RunPodCreatePodInput {
   name: string;
   imageName: string;
+  containerRegistryAuthId: string;
   cloudType: "SECURE";
   computeType: "GPU";
   gpuTypeIds: string[];

@@ -22,6 +22,7 @@ const config: ComputeConfigV1 = {
       gpuCount: 1,
       contextTokens: 65_536,
       imageDigest: `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`,
+      containerRegistryAuthId: "registry_auth_1",
       networkVolumeId: "network_volume_1",
       maxGpuHourlyUsd: 1.75,
       idleTimeoutSeconds: 300,
@@ -42,6 +43,7 @@ const config: ComputeConfigV1 = {
       gpuCount: 1,
       contextTokens: 65_536,
       imageDigest: `ghcr.io/example/glimmer@sha256:${"b".repeat(64)}`,
+      containerRegistryAuthId: "registry_auth_1",
       networkVolumeId: "network_volume_1",
       maxGpuHourlyUsd: 3.75,
       idleTimeoutSeconds: 300,
@@ -79,6 +81,7 @@ describe("ComputeSettings", () => {
     const key = (await screen.findByLabelText(/API key/i)) as HTMLInputElement;
     expect(key.type).toBe("password");
     expect(key.value).toBe("");
+    expect(screen.getByLabelText(/Container registry auth id/i)).toHaveValue("registry_auth_1");
     expect(screen.getByText(/no independently deployed watchdog/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText(/Enable external compute configuration/i));
