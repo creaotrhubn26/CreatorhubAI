@@ -20,6 +20,7 @@ export interface ComputeLeaseV1 {
   workerProtocolVersion?: 1;
   workerBuildId?: string;
   workerReadyAt?: string;
+  providerTerminationConfirmedAt?: string;
   error?: string;
 }
 
@@ -53,6 +54,8 @@ function isLease(value: unknown): value is ComputeLeaseV1 {
         raw.workerBuildId.length >= 1 &&
         raw.workerBuildId.length <= 128)) &&
     (raw.workerReadyAt === undefined || validTimestamp(raw.workerReadyAt)) &&
+    (raw.providerTerminationConfirmedAt === undefined ||
+      validTimestamp(raw.providerTerminationConfirmedAt)) &&
     (raw.error === undefined || typeof raw.error === "string")
   );
 }

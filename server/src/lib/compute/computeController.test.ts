@@ -85,7 +85,6 @@ function harness(options: {
   saveLeaseFailureCall?: number;
   readUsageFailureCall?: number;
   beginUsageFailure?: Error;
-  finishUsageFailure?: Error;
 }) {
   let currentLease: ComputeLeaseV1 | null =
     "currentLease" in options ? (options.currentLease ?? null) : lease();
@@ -93,9 +92,7 @@ function harness(options: {
   const beginUsage = options.beginUsageFailure
     ? vi.fn().mockRejectedValue(options.beginUsageFailure)
     : vi.fn().mockResolvedValue(undefined);
-  const finishUsage = options.finishUsageFailure
-    ? vi.fn().mockRejectedValue(options.finishUsageFailure)
-    : vi.fn().mockResolvedValue(undefined);
+  const finishUsage = vi.fn().mockResolvedValue(undefined);
   const clearLease = vi.fn().mockImplementation(async (id: string) => {
     if (currentLease?.id !== id) return false;
     currentLease = null as any;
@@ -812,29 +809,45 @@ describe("ComputeController exact-id termination", () => {
     expect(currentLease()).toBeNull();
   });
 
-  it("keeps duplicate cleanup pending when usage intervals cannot be closed", async () => {
-    const { controller, fakeClient, deleteWorkerSecret, currentLease } = harness({
-      currentLease: lease({ podId: undefined, state: "terminating" }),
-      finishUsageFailure: new Error("usage ledger unavailable"),
-    });
-    fakeClient.listPods.mockResolvedValue([
-      {
-        id: "pod_duplicate_1",
-        name: "glimmer-test-lease",
-        desiredStatus: "RUNNING",
-        adjustedCostPerHr: 1.39,
-      },
-      {
-        id: "pod_duplicate_2",
-        name: "glimmer-test-lease",
-        desiredStatus: "RUNNING",
-        adjustedCostPerHr: 1.49,
-      },
-    ]);
+  it("retries local finalization directly when usage closing fails once", async () => {
+    vi.useFakeTimers();
+    try {
+      const { controller, fakeClient, finishUsage, deleteWorkerSecret, currentLease } = harness({
+        currentLease: lease({ podId: undefined, state: "terminating" }),
+      });
+      finishUsage
+        .mockRejectedValueOnce(new Error("usage ledger unavailable"))
+        .mockResolvedValue(undefined);
+      fakeClient.listPods.mockResolvedValue([
+        {
+          id: "pod_duplicate_1",
+          name: "glimmer-test-lease",
+          desiredStatus: "RUNNING",
+          adjustedCostPerHr: 1.39,
+        },
+        {
+          id: "pod_duplicate_2",
+          name: "glimmer-test-lease",
+          desiredStatus: "RUNNING",
+          adjustedCostPerHr: 1.49,
+        },
+      ]);
 
-    await expect(controller.stop()).rejects.toThrow(/termination is still pending/);
-    expect(deleteWorkerSecret).not.toHaveBeenCalled();
-    expect(currentLease()).toMatchObject({ state: "terminating", podId: undefined });
+      await expect(controller.stop()).rejects.toThrow(/termination is still pending/);
+      expect(deleteWorkerSecret).not.toHaveBeenCalled();
+      expect(currentLease()).toMatchObject({
+        state: "terminating",
+        podId: undefined,
+        providerTerminationConfirmedAt: NOW.toISOString(),
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(finishUsage).toHaveBeenCalledTimes(2);
+      expect(deleteWorkerSecret).toHaveBeenCalledTimes(1);
+      expect(currentLease()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the lease and usage open when deletion cannot be confirmed", async () => {

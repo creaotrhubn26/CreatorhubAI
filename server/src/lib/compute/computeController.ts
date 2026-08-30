@@ -454,19 +454,10 @@ export class ComputeController {
       this.scheduleCleanupRetry("retry ambiguous Pod termination");
       return false;
     }
-    try {
-      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-      await this.dependencies.deleteWorkerSecret(lease.id);
-      await this.deleteWatchdogLeaseBestEffort(lease.id);
-      await this.dependencies.clearLease(lease.id);
-      return true;
-    } catch (error) {
-      console.error(
-        `[compute] ambiguous Pod cleanup is incomplete: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      this.scheduleCleanupRetry("retry ambiguous Pod state cleanup");
-      return false;
-    }
+    const confirmed = await this.markProviderTerminationConfirmed(lease);
+    if (await this.finalizeTerminatedLease(confirmed)) return true;
+    this.scheduleFinalizationRetry(confirmed, "retry ambiguous Pod finalization");
+    return false;
   }
 
   private createInput(
@@ -596,6 +587,67 @@ export class ComputeController {
     return this.terminateAllocatedPod(client, lease, reason);
   }
 
+  private async markProviderTerminationConfirmed(lease: ComputeLeaseV1): Promise<ComputeLeaseV1> {
+    const confirmed: ComputeLeaseV1 = {
+      ...lease,
+      state: "terminating",
+      providerTerminationConfirmedAt: this.dependencies.now().toISOString(),
+    };
+    try {
+      return await this.dependencies.saveLease(confirmed);
+    } catch (error) {
+      console.error(
+        `[compute] could not persist provider-termination confirmation: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return confirmed;
+    }
+  }
+
+  private async finalizeTerminatedLease(lease: ComputeLeaseV1): Promise<boolean> {
+    this.clearWatchdogHeartbeat();
+    try {
+      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+      await this.dependencies.deleteWorkerSecret(lease.id);
+      await this.deleteWatchdogLeaseBestEffort(lease.id);
+      const cleared = await this.dependencies.clearLease(lease.id);
+      if (!cleared) {
+        const current = await this.dependencies.readLease();
+        if (current?.id === lease.id) throw new Error("confirmed lease could not be cleared");
+      }
+      return true;
+    } catch (error) {
+      console.error(
+        `[compute] terminated Pod finalization is incomplete: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private scheduleFinalizationRetry(lease: ComputeLeaseV1, reason: string) {
+    this.clearSafetyTimer();
+    this.safetyTimer = setTimeout(() => {
+      void (async () => {
+        const current = await this.dependencies.readLease();
+        if (!current || current.id !== lease.id) return;
+        const confirmed = current.providerTerminationConfirmedAt
+          ? current
+          : await this.markProviderTerminationConfirmed({
+              ...current,
+              providerTerminationConfirmedAt: lease.providerTerminationConfirmedAt,
+            });
+        if (!(await this.finalizeTerminatedLease(confirmed))) {
+          this.scheduleFinalizationRetry(confirmed, reason);
+        }
+      })().catch((error) => {
+        console.error(
+          `[compute] ${reason} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        this.scheduleFinalizationRetry(lease, reason);
+      });
+    }, 5_000);
+    this.safetyTimer.unref?.();
+  }
+
   private async terminateAllocatedPod(
     client: RunPodClient,
     lease: ComputeLeaseV1,
@@ -631,19 +683,10 @@ export class ComputeController {
       this.scheduleCleanupRetry("retry provider termination");
       return false;
     }
-    try {
-      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-      await this.dependencies.deleteWorkerSecret(lease.id);
-      await this.deleteWatchdogLeaseBestEffort(lease.id);
-      await this.dependencies.clearLease(lease.id);
-      return true;
-    } catch (error) {
-      console.error(
-        `[compute] terminated Pod cleanup is incomplete: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      this.scheduleCleanupRetry("retry terminated allocation cleanup");
-      return false;
-    }
+    const confirmed = await this.markProviderTerminationConfirmed(lease);
+    if (await this.finalizeTerminatedLease(confirmed)) return true;
+    this.scheduleFinalizationRetry(confirmed, "retry terminated allocation finalization");
+    return false;
   }
 
   private validateAllocatedPod(profile: ComputeProfileV1, pod: RunPodPod): string | null {
@@ -1093,6 +1136,20 @@ export class ComputeController {
       const config = await this.dependencies.readConfig();
       let lease = await this.dependencies.readLease();
       if (!lease) return { stopped: false, status: await this.statusFrom(config, null, null) };
+      if (lease.providerTerminationConfirmedAt) {
+        if (!(await this.finalizeTerminatedLease(lease))) {
+          this.scheduleFinalizationRetry(lease, "retry confirmed termination finalization");
+          throw new ComputeControlError(
+            "RunPod is terminated, but local compute finalization is still pending",
+            500,
+          );
+        }
+        return {
+          stopped: true,
+          terminated: true,
+          status: await this.statusFrom(config, null, null, "RunPod Pod terminated."),
+        };
+      }
       const client = await this.client();
       if (!lease.podId) {
         const provisionalPodName = lease.podName;
@@ -1146,10 +1203,14 @@ export class ComputeController {
           );
         }
         if (!pod) {
-          await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-          await this.dependencies.clearLease(lease.id);
-          await this.dependencies.deleteWorkerSecret(lease.id);
-          await this.deleteWatchdogLeaseBestEffort(lease.id);
+          const confirmed = await this.markProviderTerminationConfirmed(lease);
+          if (!(await this.finalizeTerminatedLease(confirmed))) {
+            this.scheduleFinalizationRetry(confirmed, "retry absent provisional finalization");
+            throw new ComputeControlError(
+              "RunPod is absent, but local compute finalization is still pending",
+              500,
+            );
+          }
           return {
             stopped: false,
             status: await this.statusFrom(config, null, null, "The recorded Pod no longer exists."),
@@ -1230,6 +1291,19 @@ export class ComputeController {
       if (!lease) return { recovered: false, cleaned: false, detail: "no compute lease" };
       const config = await this.dependencies.readConfig();
       const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+      if (lease.providerTerminationConfirmedAt) {
+        const cleaned = await this.finalizeTerminatedLease(lease);
+        if (!cleaned) {
+          this.scheduleFinalizationRetry(lease, "retry startup termination finalization");
+        }
+        return {
+          recovered: false,
+          cleaned,
+          detail: cleaned
+            ? "confirmed provider termination finalized"
+            : "local termination finalization is still pending",
+        };
+      }
       const client = await this.client();
       let pod: RunPodPod | null;
       try {
@@ -1314,11 +1388,16 @@ export class ComputeController {
             detail: "provisional Pod reconciliation is still pending",
           };
         }
-        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-        await this.dependencies.clearLease(lease.id);
-        await this.dependencies.deleteWorkerSecret(lease.id);
-        await this.deleteWatchdogLeaseBestEffort(lease.id);
-        return { recovered: false, cleaned: true, detail: "missing Pod lease cleared" };
+        const confirmed = await this.markProviderTerminationConfirmed(lease);
+        const cleaned = await this.finalizeTerminatedLease(confirmed);
+        if (!cleaned) {
+          this.scheduleFinalizationRetry(confirmed, "retry missing Pod finalization");
+        }
+        return {
+          recovered: false,
+          cleaned,
+          detail: cleaned ? "missing Pod lease cleared" : "local finalization is still pending",
+        };
       }
       const recoveredPodId = lease.podId ?? pod.id;
       const trackedHourlyUsd = profile?.maxGpuHourlyUsd ?? lease.observedHourlyUsd ?? 0;
