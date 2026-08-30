@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import signal
@@ -10,6 +11,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENTRYPOINT = ROOT / "docker" / "runpod" / "entrypoint.sh"
+BOOTSTRAP_STATUS = ROOT / "docker" / "runpod" / "bootstrap_status.py"
+LEASE_ID = "12345678-1234-4234-9234-123456789abc"
 
 
 class EntrypointStaticContractTests(unittest.TestCase):
@@ -29,6 +32,8 @@ class EntrypointStaticContractTests(unittest.TestCase):
         self.assertIn('MODEL_PATH="$MODEL_ROOT/model.$GLIMMER_MODEL_SHA256.gguf"', source)
         self.assertIn('MMPROJ_PATH="$MODEL_ROOT/mmproj.$GLIMMER_MMPROJ_SHA256.gguf"', source)
         self.assertIn('DFLASH_PATH="$MODEL_ROOT/dflash.$GLIMMER_DFLASH_SHA256.gguf"', source)
+        self.assertIn('PREWARM_ONLY="${GLIMMER_PREWARM_ONLY:-0}"', source)
+        self.assertIn('BOOTSTRAP_STATUS_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"', source)
         self.assertLess(
             source.index("docker/runpod/healthcheck.py"),
             source.index('touch "$READY_MARKER"'),
@@ -55,7 +60,14 @@ class EntrypointBehaviorTests(unittest.TestCase):
         path.write_text(source, encoding="utf-8")
         path.chmod(0o755)
 
-    def _prepare(self, download_mode, worker_mode="hold"):
+    def _prepare(
+        self,
+        download_mode,
+        worker_mode="hold",
+        prewarm=False,
+        expected_build_id="r2-abcdef012345",
+        preexisting_marker=False,
+    ):
         state = self.root / "state"
         models = self.root / "models"
         recovery = self.root / "recovery"
@@ -74,6 +86,13 @@ class EntrypointBehaviorTests(unittest.TestCase):
             source = source.replace(old, new)
         script = self.root / "entrypoint.sh"
         self._write_executable(script, source)
+        self._write_executable(
+            app / "docker" / "runpod" / "bootstrap_status.py",
+            BOOTSTRAP_STATUS.read_text(encoding="utf-8"),
+        )
+        if preexisting_marker:
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "model.ready").write_text("stale", encoding="utf-8")
 
         self._write_executable(
             bin_root / "gosu",
@@ -146,7 +165,14 @@ record(f"worker_marker_at_start:{int((key.parent / 'model.ready').exists())}")
 record(f"worker_listening:{os.getpid()}")
 worker_mode = os.environ["TEST_WORKER_MODE"]
 if worker_mode == "exit_during_download":
-    time.sleep(0.3)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if Path(events).exists() and "download_start:" in Path(events).read_text(encoding="utf-8"):
+            break
+        time.sleep(0.02)
+    else:
+        record(f"worker_download_wait_timeout:{os.getpid()}")
+        raise SystemExit(10)
     record(f"worker_exit:{os.getpid()}")
     raise SystemExit(9)
 if worker_mode == "exit_during_llama":
@@ -175,12 +201,16 @@ def record(value):
 def stop(_signal, _frame):
     record(f"download_term:{os.getpid()}")
     raise SystemExit(143)
-record(f"download_start:{os.getpid()}:{output.name}")
 mode = os.environ["TEST_DOWNLOAD_MODE"]
 signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == "ignore" else stop)
+record(f"download_start:{os.getpid()}:{output.name}")
 if mode in {"hold", "ignore"}:
     while True:
         time.sleep(0.1)
+if mode == "checksum_failure":
+    raise SystemExit(20)
+if mode == "download_failure":
+    raise SystemExit(21)
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_bytes(b"fixture")
 record(f"download_exit:{os.getpid()}")
@@ -235,7 +265,13 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
             "GLIMMER_DFLASH_SHA256": "c" * 64,
             "GLIMMER_ARTIFACT_HOSTS": "artifacts.example",
             "GLIMMER_CONTEXT_TOKENS": "65536",
+            "GLIMMER_LEASE_ID": LEASE_ID,
+            "GLIMMER_WORKER_BUILD_ID": "r2-abcdef012345",
         }
+        if prewarm:
+            environment["GLIMMER_PREWARM_ONLY"] = "1"
+            environment["GLIMMER_PREWARM_EXPECTED_BUILD_ID"] = expected_build_id
+            environment.pop("GLIMMER_WORKER_BOOTSTRAP_TOKEN")
         self.process = subprocess.Popen(
             ["bash", str(script)],
             env=environment,
@@ -280,6 +316,16 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
         final_events = self.events.read_text(encoding="utf-8")
         self.assertIn("worker_term:", final_events)
         self.assertIn("download_term:", final_events)
+        status = json.loads(
+            (
+                self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["failureCode"], "bootstrap_interrupted")
+        self.assertEqual(status["exitCode"], 143)
+        self.assertEqual(status["artifact"]["kind"], "model")
+        self.assertNotIn("fixture-bootstrap", json.dumps(status))
+        self.assertNotIn("artifacts.example", json.dumps(status))
 
     def test_ready_boot_sequence_cleanup_kills_llama_and_worker(self):
         state = self._prepare("complete")
@@ -297,6 +343,68 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
         final_events = self.events.read_text(encoding="utf-8")
         self.assertIn("worker_term:", final_events)
         self.assertIn("llama_term:", final_events)
+        status = json.loads(
+            (
+                self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["stage"], "ready")
+        self.assertEqual(status["outcome"], "ready")
+
+    def test_cpu_prewarm_rejects_a_mismatched_build_before_download_or_ready_marker(self):
+        state = self._prepare(
+            "complete",
+            prewarm=True,
+            expected_build_id="r2-000000000000",
+            preexisting_marker=True,
+        )
+        stdout, stderr = self.process.communicate(timeout=8)
+
+        self.assertEqual(self.process.returncode, 2, (stdout, stderr))
+        self.assertEqual(stdout, "")
+        events = self.events.read_text(encoding="utf-8") if self.events.exists() else ""
+        self.assertNotIn("download_start:", events)
+        self.assertNotIn("worker_listening:", events)
+        self.assertNotIn("llama_start:", events)
+        self.assertFalse((state / "model.ready").exists())
+        status_path = self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(status["failureCode"], "configuration_invalid")
+        self.assertEqual(status["exitCode"], 2)
+
+    def test_cpu_prewarm_downloads_all_artifacts_without_worker_llama_or_bootstrap_token(self):
+        self._prepare("complete", prewarm=True)
+        stdout, stderr = self.process.communicate(timeout=8)
+
+        self.assertEqual(self.process.returncode, 0, (stdout, stderr))
+        events = self.events.read_text(encoding="utf-8")
+        self.assertEqual(events.count("download_start:"), 3)
+        self.assertNotIn("worker_listening:", events)
+        self.assertNotIn("llama_start:", events)
+        status_path = self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(status["stage"], "ready")
+        self.assertEqual(status["outcome"], "ready")
+        self.assertEqual(stdout, f"GLIMMER_PREWARM_READY {LEASE_ID}\n")
+
+    def test_artifact_failures_are_mapped_to_allowlisted_diagnostics(self):
+        for mode, expected_code, expected_exit in (
+            ("checksum_failure", "artifact_checksum_failed", 20),
+            ("download_failure", "artifact_download_failed", 21),
+        ):
+            with self.subTest(mode=mode):
+                self._prepare(mode)
+                stdout, stderr = self.process.communicate(timeout=8)
+                self.assertEqual(self.process.returncode, expected_exit, (stdout, stderr))
+                status_path = (
+                    self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+                )
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                self.assertEqual(status["stage"], "failed")
+                self.assertEqual(status["failureCode"], expected_code)
+                self.assertEqual(status["exitCode"], expected_exit)
+                self.process = None
+                status_path.unlink()
 
     def test_cleanup_force_kills_a_downloader_that_ignores_term(self):
         self._prepare("ignore")
@@ -319,6 +427,13 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
         self.assertIn("download_start:", final_events)
         self.assertIn("worker_exit:", final_events)
         self.assertIn("download_term:", final_events)
+        status = json.loads(
+            (
+                self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["failureCode"], "worker_start_failed")
+        self.assertEqual(status["exitCode"], 5)
 
     def test_worker_death_during_llama_readiness_stops_llama_and_exits_five(self):
         self._prepare("complete", worker_mode="exit_during_llama")
@@ -329,6 +444,13 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
         self.assertIn("llama_start:", final_events)
         self.assertIn("worker_exit:", final_events)
         self.assertIn("llama_term:", final_events)
+        status = json.loads(
+            (
+                self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["failureCode"], "worker_start_failed")
+        self.assertEqual(status["exitCode"], 5)
 
 
 if __name__ == "__main__":

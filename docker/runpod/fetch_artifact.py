@@ -15,15 +15,22 @@ import signal
 import socket
 import ssl
 import stat
+import sys
 from pathlib import Path
-from typing import Any, BinaryIO, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Optional, Tuple
 from urllib import error, parse, request
+
+try:
+    from .bootstrap_status import BootstrapStatusError, transition
+except ImportError:  # Direct execution inside the worker image.
+    from bootstrap_status import BootstrapStatusError, transition
 
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
 SYNC_INTERVAL_BYTES = 256 * 1024 * 1024
 SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 CONTENT_RANGE_PATTERN = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
+ProgressReporter = Callable[[str, Optional[int], Optional[int]], None]
 
 
 class ArtifactIntegrityError(ValueError):
@@ -259,7 +266,23 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str]) -> None:
+def _report(
+    reporter: Optional[ProgressReporter],
+    phase: str,
+    completed: Optional[int] = None,
+    total: Optional[int] = None,
+) -> None:
+    if reporter is not None:
+        reporter(phase, completed, total)
+
+
+def fetch(
+    url: str,
+    expected_sha256: str,
+    target: Path,
+    allowed_hosts: set[str],
+    reporter: Optional[ProgressReporter] = None,
+) -> None:
     if not SHA256_PATTERN.fullmatch(expected_sha256):
         raise ValueError("artifact SHA-256 is invalid")
     validate_url(url, allowed_hosts)
@@ -274,19 +297,25 @@ def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str])
     # checksum-specific partial, and publication. The production entrypoint
     # additionally uses checksum-addressed final names so rolling versions
     # never compete for one pathname after this function returns.
+    _report(reporter, "locking")
     with _open_target_lock(target):
         if _target_matches(target, expected_sha256):
+            _report(reporter, "cached")
             return
         _clean_obsolete_partials(target, expected_sha256)
         with _open_locked_partial(temporary) as output:
             try:
                 if _target_matches(target, expected_sha256):
                     _unlink_locked_path_if_same(temporary, output)
+                    _report(reporter, "cached")
                     return
                 digest, offset = _seed_digest(output)
+                downloaded_total = offset
                 if offset > MAX_ARTIFACT_BYTES:
                     raise ArtifactIntegrityError("artifact partial exceeds the safe size limit")
                 if not (offset and hmac.compare_digest(digest.hexdigest(), expected_sha256)):
+                    if offset:
+                        _report(reporter, "resuming", offset)
                     artifact_request = request.Request(
                         url,
                         headers={
@@ -305,6 +334,12 @@ def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str])
                         raise
                     with response_context as response:
                         expected_response_bytes = _validate_response(response, offset)
+                        expected_total = (
+                            offset + expected_response_bytes
+                            if expected_response_bytes is not None
+                            else None
+                        )
+                        _report(reporter, "downloading", offset, expected_total)
                         response_bytes = 0
                         unsynced_bytes = 0
                         total = offset
@@ -314,6 +349,7 @@ def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str])
                                 break
                             response_bytes += len(chunk)
                             total += len(chunk)
+                            downloaded_total = total
                             if total > MAX_ARTIFACT_BYTES:
                                 raise ArtifactIntegrityError("artifact exceeds the safe size limit")
                             if (
@@ -329,6 +365,7 @@ def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str])
                             if unsynced_bytes >= SYNC_INTERVAL_BYTES:
                                 output.flush()
                                 os.fsync(output.fileno())
+                                _report(reporter, "downloading", total, expected_total)
                                 unsynced_bytes = 0
                         if (
                             expected_response_bytes is not None
@@ -337,6 +374,7 @@ def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str])
                             raise OSError("artifact download ended before the declared range")
                 output.flush()
                 os.fsync(output.fileno())
+                _report(reporter, "verifying", downloaded_total, downloaded_total)
                 final_digest, final_size = _seed_digest(output)
                 if final_size > MAX_ARTIFACT_BYTES or not hmac.compare_digest(
                     final_digest.hexdigest(), expected_sha256
@@ -346,6 +384,7 @@ def fetch(url: str, expected_sha256: str, target: Path, allowed_hosts: set[str])
                     raise ArtifactIntegrityError("artifact partial pathname changed")
                 os.replace(temporary, target)
                 _sync_directory(target.parent)
+                _report(reporter, "complete", final_size, final_size)
             except ArtifactIntegrityError:
                 _unlink_locked_path_if_same(temporary, output)
                 raise
@@ -368,11 +407,55 @@ def main() -> int:
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--allowed-host", action="append", required=True)
+    parser.add_argument("--status-file")
+    parser.add_argument("--lease-id")
+    parser.add_argument("--artifact-kind", choices=("model", "mmproj", "draft"))
     args = parser.parse_args()
     hosts = {value.strip().lower() for value in args.allowed_host if value.strip()}
+    status_arguments = (args.status_file, args.lease_id, args.artifact_kind)
+    if any(status_arguments) and not all(status_arguments):
+        parser.error("status-file, lease-id, and artifact-kind must be supplied together")
+    reporter: Optional[ProgressReporter] = None
+    if all(status_arguments):
+
+        def report(phase: str, completed: Optional[int], total: Optional[int]) -> None:
+            stage = {
+                "locking": "artifact_preparing",
+                "cached": "artifact_preparing",
+                "resuming": "artifact_preparing",
+                "downloading": "artifact_downloading",
+                "verifying": "artifact_verifying",
+                "complete": "artifact_verifying",
+            }[phase]
+            artifact: dict[str, Any] = {"kind": args.artifact_kind, "phase": phase}
+            if completed is not None:
+                artifact["bytesCompleted"] = completed
+            if total is not None:
+                artifact["bytesTotal"] = total
+            try:
+                transition(
+                    Path(args.status_file),
+                    args.lease_id,
+                    stage,
+                    artifact=artifact,
+                )
+            except (OSError, BootstrapStatusError) as exc:
+                raise BootstrapStatusError("bootstrap status update failed") from exc
+
+        reporter = report
     signal.signal(signal.SIGTERM, _interrupt_download)
     signal.signal(signal.SIGINT, _interrupt_download)
-    fetch(args.url, args.sha256.lower(), Path(args.output), hosts)
+    try:
+        fetch(args.url, args.sha256.lower(), Path(args.output), hosts, reporter=reporter)
+    except BootstrapStatusError:
+        print('{"event":"startup_failed","reason":"status_persistence_failed"}', file=sys.stderr)
+        return 6
+    except ArtifactIntegrityError:
+        print('{"event":"startup_failed","reason":"artifact_checksum_failed"}', file=sys.stderr)
+        return 20
+    except Exception:
+        print('{"event":"startup_failed","reason":"artifact_download_failed"}', file=sys.stderr)
+        return 21
     return 0
 
 

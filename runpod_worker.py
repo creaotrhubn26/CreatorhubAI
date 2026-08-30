@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
+from docker.runpod import bootstrap_status
 from glimmer_remote import (
     CHECKPOINT_CHUNK_BYTES,
     MAX_MANIFEST_BYTES,
@@ -243,6 +244,8 @@ class WorkerService:
         context_tokens: int,
         model_ready: Callable[[], bool],
         runner: Optional[ProcessJobRunner] = None,
+        bootstrap_status_path: Optional[Path] = None,
+        bootstrap_lease_id: Optional[str] = None,
     ) -> None:
         if not bootstrap_token or len(bootstrap_token) > 512:
             raise ValueError("worker bootstrap token is required")
@@ -256,6 +259,8 @@ class WorkerService:
         self.context_tokens = context_tokens
         self.model_ready = model_ready
         self.runner = runner or ProcessJobRunner(Path(__file__).resolve().parent)
+        self.bootstrap_status_path = bootstrap_status_path
+        self.bootstrap_lease_id = bootstrap_lease_id
         self.bootstrap = bootstrap_token.encode("utf-8")
         self.bootstrap_hash = hashlib.sha256(self.bootstrap).hexdigest()
         self.capability: Optional[bytes] = None
@@ -333,12 +338,33 @@ class WorkerService:
             None,
         )
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "buildId": self.build_id,
             "ready": ready,
             "model": {"ready": model_ready, "contextTokens": self.context_tokens},
             "workerState": "bootstrapping" if not ready else ("busy" if active else "ready"),
+            "bootstrap": self._bootstrap_health(),
         }
+
+    def _bootstrap_health(self) -> Dict[str, Any]:
+        try:
+            if self.bootstrap_status_path is None or self.bootstrap_lease_id is None:
+                raise bootstrap_status.BootstrapStatusError(
+                    "bootstrap status is not configured"
+                )
+            return bootstrap_status.read_public(
+                self.bootstrap_status_path, self.bootstrap_lease_id
+            )
+        except (OSError, bootstrap_status.BootstrapStatusError):
+            now = bootstrap_status.utc_now()
+            return {
+                "stage": "failed",
+                "outcome": "failed",
+                "stageStartedAt": now,
+                "updatedAt": now,
+                "failureCode": "status_persistence_failed",
+                "exitCode": 6,
+            }
 
     def register_idempotency(self, key: str, method: str, path: str, body: bytes) -> None:
         fingerprint = sha256_hex(
@@ -963,6 +989,10 @@ def main() -> int:
     bootstrap = os.environ.pop("GLIMMER_WORKER_BOOTSTRAP_TOKEN", "")
     build_id = os.environ.get("GLIMMER_WORKER_BUILD_ID", "unverified")
     context = int(os.environ.get("GLIMMER_CONTEXT_TOKENS", "65536"))
+    bootstrap_status_file = os.environ.pop("GLIMMER_BOOTSTRAP_STATUS_FILE", "")
+    bootstrap_lease_id = os.environ.pop("GLIMMER_LEASE_ID", "")
+    if not bootstrap_status_file or not bootstrap_lease_id:
+        raise SystemExit("bootstrap diagnostics are required")
     service = WorkerService(
         Path(args.state_root),
         Path(args.recovery_root),
@@ -970,6 +1000,8 @@ def main() -> int:
         build_id,
         context,
         lambda: _model_ready(args.health_url, Path(args.ready_marker)),
+        bootstrap_status_path=Path(bootstrap_status_file),
+        bootstrap_lease_id=bootstrap_lease_id,
     )
     server = GlimmerWorkerServer((args.host, args.port), service)
     print(canonical_json_bytes({"event": "worker_listening", "port": args.port}).decode("utf-8"))

@@ -44,7 +44,7 @@ LABEL org.opencontainers.image.title="Muse Glimmer RunPod worker" \
       org.opencontainers.image.revision="${SOURCE_COMMIT}" \
       no.creatorhub.glimmer.worker-build="${BUILD_ID}" \
       no.creatorhub.glimmer.llama-commit="${LLAMA_CPP_COMMIT}" \
-      no.creatorhub.glimmer.protocol="1"
+      no.creatorhub.glimmer.protocol="2"
 COPY docker/runpod/jammy-snapshot.sources.list /etc/apt/sources.list
 RUN find /etc/apt/sources.list.d -maxdepth 1 -type f -delete \
     && apt-get update \
@@ -60,10 +60,10 @@ COPY glimmer-v2.py glimmer-engineer.py glimmer-visual.py /opt/glimmer/
 COPY glimmer_events.py glimmer_journal.py glimmer_models.py /opt/glimmer/
 COPY glimmer_memory.py glimmer_quality.py glimmer_semantic.py glimmer_verification.py /opt/glimmer/
 COPY glimmer_remote.py runpod_worker.py /opt/glimmer/
-COPY docker/runpod/fetch_artifact.py docker/runpod/healthcheck.py /opt/glimmer/docker/runpod/
+COPY docker/runpod/bootstrap_status.py docker/runpod/fetch_artifact.py docker/runpod/healthcheck.py /opt/glimmer/docker/runpod/
 COPY docker/runpod/entrypoint.sh /opt/glimmer/docker/runpod/entrypoint.sh
 RUN chmod 0555 /opt/glimmer/docker/runpod/entrypoint.sh \
-    && python3 -m py_compile /opt/glimmer/*.py \
+    && python3 -m py_compile /opt/glimmer/*.py /opt/glimmer/docker/runpod/*.py \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin glimmer \
     && install -d -o glimmer -g glimmer -m 0700 /run/glimmer-worker /workspace
 EXPOSE 4318

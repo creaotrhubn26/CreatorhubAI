@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -7,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from docker.runpod import fetch_artifact
+from docker.runpod import bootstrap_status, fetch_artifact
+
+LEASE_ID = "12345678-1234-4234-9234-123456789abc"
 
 
 class FakeResponse:
@@ -88,12 +91,18 @@ class FetchArtifactTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def fetch_with(self, opener, expected_sha256):
+    def fetch_with(self, opener, expected_sha256, reporter=None):
         with (
             mock.patch.object(fetch_artifact, "validate_url", return_value=self.url),
             mock.patch.object(fetch_artifact.request, "build_opener", return_value=opener),
         ):
-            fetch_artifact.fetch(self.url, expected_sha256, self.target, self.hosts)
+            fetch_artifact.fetch(
+                self.url,
+                expected_sha256,
+                self.target,
+                self.hosts,
+                reporter=reporter,
+            )
 
     def test_interruption_preserves_checksum_bound_partial_and_resumes(self):
         content = b"hello world"
@@ -132,6 +141,108 @@ class FetchArtifactTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), content)
         self.assertFalse(partial.exists())
         self.assertEqual(self.target.stat().st_mode & 0o777, 0o600)
+
+    def test_resume_and_periodic_fsync_emit_only_bounded_structured_progress(self):
+        content = b"abcdefghij"
+        expected = hashlib.sha256(content).hexdigest()
+        partial = fetch_artifact.partial_path(self.target, expected)
+        partial.write_bytes(content[:3])
+        remaining = content[3:]
+        opener = QueueOpener(
+            FakeResponse(
+                206,
+                {
+                    "Content-Length": str(len(remaining)),
+                    "Content-Range": f"bytes 3-{len(content) - 1}/{len(content)}",
+                },
+                [remaining[:3], remaining[3:]],
+            )
+        )
+        progress = []
+
+        with mock.patch.object(fetch_artifact, "SYNC_INTERVAL_BYTES", 3):
+            self.fetch_with(
+                opener,
+                expected,
+                reporter=lambda phase, completed, total: progress.append(
+                    (phase, completed, total)
+                ),
+            )
+
+        self.assertEqual(progress[0], ("locking", None, None))
+        self.assertIn(("resuming", 3, None), progress)
+        self.assertIn(("downloading", 3, 10), progress)
+        self.assertIn(("downloading", 6, 10), progress)
+        self.assertEqual(progress[-2], ("verifying", 10, 10))
+        self.assertEqual(progress[-1], ("complete", 10, 10))
+        self.assertTrue(
+            all(
+                phase in {"locking", "resuming", "downloading", "verifying", "complete"}
+                and (completed is None or type(completed) is int)
+                and (total is None or type(total) is int)
+                for phase, completed, total in progress
+            )
+        )
+
+    def test_cache_hit_reports_cached_without_network_request(self):
+        content = b"verified cache"
+        expected = hashlib.sha256(content).hexdigest()
+        self.target.write_bytes(content)
+        opener = QueueOpener()
+        progress = []
+
+        self.fetch_with(opener, expected, reporter=lambda *event: progress.append(event))
+
+        self.assertEqual(opener.requests, [])
+        self.assertEqual(progress, [("locking", None, None), ("cached", None, None)])
+
+    def test_cli_persists_complete_artifact_progress_without_url_or_checksum(self):
+        content = b"status-integrated artifact"
+        expected = hashlib.sha256(content).hexdigest()
+        opener = QueueOpener(FakeResponse(200, {"Content-Length": str(len(content))}, [content]))
+        recovery = self.root / "recovery"
+        recovery.mkdir(mode=0o700)
+        status_path = recovery / "bootstrap" / LEASE_ID / "status.json"
+        bootstrap_status.initialize(status_path, LEASE_ID)
+        arguments = [
+            "fetch_artifact.py",
+            "--url",
+            self.url,
+            "--sha256",
+            expected,
+            "--output",
+            str(self.target),
+            "--allowed-host",
+            "artifacts.example",
+            "--status-file",
+            str(status_path),
+            "--lease-id",
+            LEASE_ID,
+            "--artifact-kind",
+            "draft",
+        ]
+
+        with (
+            mock.patch.object(fetch_artifact, "validate_url", return_value=self.url),
+            mock.patch.object(fetch_artifact.request, "build_opener", return_value=opener),
+            mock.patch("sys.argv", arguments),
+        ):
+            self.assertEqual(fetch_artifact.main(), 0)
+
+        status = bootstrap_status.read(status_path, LEASE_ID)
+        self.assertEqual(status["stage"], "artifact_verifying")
+        self.assertEqual(
+            status["artifact"],
+            {
+                "kind": "draft",
+                "phase": "complete",
+                "bytesCompleted": len(content),
+                "bytesTotal": len(content),
+            },
+        )
+        serialized = json.dumps(status)
+        self.assertNotIn(self.url, serialized)
+        self.assertNotIn(expected, serialized)
 
     def test_legacy_pid_partial_is_preserved_when_liveness_cannot_be_proven(self):
         content = b"new artifact"

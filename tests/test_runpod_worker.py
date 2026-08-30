@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 from urllib import request
 
+from docker.runpod import bootstrap_status
 from glimmer_remote import decrypt_checkpoint, parse_remote_job_manifest, request_signature
 from runpod_worker import (
     GlimmerWorkerServer,
@@ -20,6 +21,8 @@ from runpod_worker import (
     WorkerService,
     _model_ready,
 )
+
+LEASE_ID = "12345678-1234-4234-9234-123456789abc"
 
 
 def manifest(data=b"bundle", **changes):
@@ -76,6 +79,10 @@ class WorkerServiceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.runner = FakeRunner()
+        self.bootstrap_path = root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+        (root / "recovery").mkdir(mode=0o700)
+        bootstrap_status.initialize(self.bootstrap_path, LEASE_ID)
+        bootstrap_status.transition(self.bootstrap_path, LEASE_ID, "worker_starting")
         self.service = WorkerService(
             root / "state",
             root / "recovery",
@@ -84,6 +91,8 @@ class WorkerServiceTests(unittest.TestCase):
             65_536,
             lambda: True,
             runner=self.runner,
+            bootstrap_status_path=self.bootstrap_path,
+            bootstrap_lease_id=LEASE_ID,
         )
 
     def tearDown(self):
@@ -98,7 +107,10 @@ class WorkerServiceTests(unittest.TestCase):
 
     def test_health_is_secret_free_and_handshake_rotates_idempotently(self):
         health = self.service.health()
+        self.assertEqual(health["schemaVersion"], 2)
         self.assertFalse(health["ready"])
+        self.assertEqual(health["bootstrap"]["stage"], "worker_starting")
+        self.assertNotIn("leaseId", health["bootstrap"])
         self.assertNotIn("bootstrap-secret", json.dumps(health))
 
         first = self.handshake()
@@ -112,6 +124,29 @@ class WorkerServiceTests(unittest.TestCase):
                 "different-key",
                 {"controllerInstanceId": "control-1", "nonce": "abcdefghijklmnop"},
             )
+
+    def test_tampered_bootstrap_status_is_sanitized_and_never_controls_readiness(self):
+        bootstrap_status.transition(
+            self.bootstrap_path,
+            LEASE_ID,
+            "ready",
+            "ready",
+        )
+        reported = self.service.health()
+        self.assertEqual(reported["bootstrap"]["stage"], "ready")
+        self.assertFalse(reported["ready"])
+
+        self.bootstrap_path.write_text(
+            json.dumps({"detail": "bootstrap-secret https://private.invalid"}),
+            encoding="utf-8",
+        )
+        sanitized = self.service.health()
+        self.assertEqual(
+            sanitized["bootstrap"]["failureCode"], "status_persistence_failed"
+        )
+        self.assertEqual(sanitized["bootstrap"]["exitCode"], 6)
+        self.assertNotIn("bootstrap-secret", json.dumps(sanitized))
+        self.assertNotIn("private.invalid", json.dumps(sanitized))
 
     def test_health_stays_bootstrapping_after_handshake_until_model_is_ready(self):
         ready = False
@@ -312,6 +347,10 @@ class WorkerHttpContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        bootstrap_path = root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+        (root / "recovery").mkdir(mode=0o700)
+        bootstrap_status.initialize(bootstrap_path, LEASE_ID)
+        bootstrap_status.transition(bootstrap_path, LEASE_ID, "worker_listening")
         self.service = WorkerService(
             root / "state",
             root / "recovery",
@@ -320,6 +359,8 @@ class WorkerHttpContractTests(unittest.TestCase):
             65_536,
             lambda: True,
             runner=FakeRunner(),
+            bootstrap_status_path=bootstrap_path,
+            bootstrap_lease_id=LEASE_ID,
         )
         self.server = GlimmerWorkerServer(("127.0.0.1", 0), self.service)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -344,6 +385,8 @@ class WorkerHttpContractTests(unittest.TestCase):
     def test_public_health_then_authenticated_signed_job_create(self):
         status, _, body = self.request("GET", "/v1/health")
         self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["schemaVersion"], 2)
+        self.assertEqual(json.loads(body)["bootstrap"]["stage"], "worker_listening")
         self.assertNotIn(b"secret", body.lower())
         invalid, _, _ = self.request("GET", "/v1/health", headers={"Authorization": "Bearer wrong"})
         self.assertEqual(invalid, 401)
