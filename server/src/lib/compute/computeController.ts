@@ -60,6 +60,7 @@ class PermanentWorkerValidationError extends Error {}
 const ALLOCATION_EVIDENCE_MAX_WAIT_MS = 25_000;
 const ALLOCATION_EVIDENCE_RETRY_MS = 2_500;
 const CREATE_OUTCOME_POLL_ATTEMPTS = 3;
+const DEFINITIVE_CREATE_REJECTION_STATUSES = new Set([400, 401, 403]);
 
 interface ControllerDependencies {
   now: () => Date;
@@ -133,6 +134,14 @@ function allocationReadErrorIsPermanent(error: unknown): boolean {
     return error.message === "RunPod Pod id is invalid";
   }
   return error.status >= 400 && error.status < 500 && !new Set([408, 425, 429]).has(error.status);
+}
+
+function createRejectionIsDefinitive(error: unknown): error is RunPodApiError {
+  return (
+    error instanceof RunPodApiError &&
+    error.status !== undefined &&
+    DEFINITIVE_CREATE_REJECTION_STATUSES.has(error.status)
+  );
 }
 
 function podSummary(pod: RunPodPod) {
@@ -1051,6 +1060,20 @@ export class ComputeController {
       try {
         pod = await client.createPod(createRequest);
       } catch (error) {
+        if (createRejectionIsDefinitive(error)) {
+          const confirmed = await this.markProviderTerminationConfirmed(lease);
+          const cleaned = await this.finalizeTerminatedLease(confirmed);
+          if (!cleaned) {
+            this.scheduleFinalizationRetry(
+              confirmed,
+              "retry definitively rejected create finalization",
+            );
+          }
+          throw new ComputeControlError(
+            `RunPod rejected Pod creation with HTTP ${error.status}; local cleanup ${cleaned ? "completed" : "is pending"}`,
+            502,
+          );
+        }
         // Creation has no documented idempotency key. Recover an exact-name
         // Pod before declaring failure so a lost response cannot orphan spend.
         const matches = await this.waitForCreateOutcome(client, podName);

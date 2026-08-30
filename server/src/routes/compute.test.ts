@@ -463,6 +463,45 @@ describe("RunPod compute lifecycle", () => {
     });
   });
 
+  it.each([401, 403])(
+    "maps a definitive RunPod HTTP %i create rejection to a secret-free 502 without retry",
+    async (providerStatus) => {
+      await configuredUpdate();
+      await verifyWatchdog();
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const watchdog = watchdogResponse(input, init);
+        if (watchdog) return watchdog;
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.includes("/billing/pods") && method === "GET") {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url.endsWith("/pods") && method === "POST") {
+          return new Response(JSON.stringify({ error: "provider-secret-body" }), {
+            status: providerStatus,
+          });
+        }
+        throw new Error(`unexpected request ${method} ${url}`);
+      });
+
+      const response = await request(app).post("/api/compute/start").set("Origin", UI_ORIGIN);
+
+      expect(response.status).toBe(502);
+      expect(response.body.error).toBe(
+        `RunPod rejected Pod creation with HTTP ${providerStatus}; local cleanup completed`,
+      );
+      expect(JSON.stringify(response.body)).not.toContain("provider-secret-body");
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url, init]) => String(url).endsWith("/pods") && init?.method === "POST",
+        ),
+      ).toHaveLength(1);
+      await expect(fs.stat(path.join(stateRoot, "compute-state.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
   it("immediately terminates an allocation above the configured ceiling", async () => {
     await configuredUpdate();
     await verifyWatchdog();

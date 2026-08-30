@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ComputeConfigV1, ComputeUsageSummary } from "@glimmer/shared";
-import { ComputeController } from "./computeController.js";
+import { ComputeControlError, ComputeController } from "./computeController.js";
 import type { ComputeLeaseV1 } from "./computeLeaseStore.js";
 import { RunPodApiError } from "./runpodClient.js";
 import { RunPodSchemaError } from "./runpodSchemas.js";
@@ -600,6 +600,106 @@ describe("ComputeController authenticated worker startup", () => {
     await expect(controller.start()).rejects.toThrow(/watchdog rejected its lease/);
     expect(fakeClient.createPod).not.toHaveBeenCalled();
     expect(currentLease()).toBeNull();
+  });
+
+  it.each([400, 401, 403])(
+    "clears a definitively rejected HTTP %i create without name reconciliation",
+    async (status) => {
+      const {
+        controller,
+        fakeClient,
+        clearLease,
+        deleteWorkerSecret,
+        watchdogClient,
+        currentLease,
+      } = harness({ currentLease: null });
+      fakeClient.createPod.mockRejectedValue(
+        new RunPodApiError("provider-secret-body-must-not-surface", status),
+      );
+
+      const failure = await controller.start().catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ComputeControlError);
+      expect(failure).toMatchObject({
+        message: `RunPod rejected Pod creation with HTTP ${status}; local cleanup completed`,
+        statusCode: 502,
+      });
+      expect((failure as Error).message).not.toContain("provider-secret-body");
+      expect(fakeClient.createPod).toHaveBeenCalledTimes(1);
+      expect(fakeClient.listPods).not.toHaveBeenCalled();
+      expect(deleteWorkerSecret).toHaveBeenCalledTimes(1);
+      expect(watchdogClient.deleteLease).toHaveBeenCalledTimes(1);
+      expect(clearLease).toHaveBeenCalledTimes(1);
+      expect(currentLease()).toBeNull();
+    },
+  );
+
+  it.each([
+    ["HTTP 408", new RunPodApiError("RunPod API request failed with HTTP 408", 408)],
+    ["HTTP 409", new RunPodApiError("RunPod API request failed with HTTP 409", 409)],
+    ["HTTP 425", new RunPodApiError("RunPod API request failed with HTTP 425", 425)],
+    ["HTTP 429", new RunPodApiError("RunPod API request failed with HTTP 429", 429)],
+    ["HTTP 404", new RunPodApiError("RunPod API request failed with HTTP 404", 404)],
+    ["HTTP 422", new RunPodApiError("RunPod API request failed with HTTP 422", 422)],
+    ["unknown HTTP 418", new RunPodApiError("RunPod API request failed with HTTP 418", 418)],
+    ["HTTP 500", new RunPodApiError("RunPod API request failed with HTTP 500", 500)],
+    ["HTTP 200 parse failure", new RunPodApiError("RunPod API returned invalid JSON", 200)],
+    ["network failure", new RunPodApiError("RunPod API request failed: network unavailable")],
+    ["generic failure", new Error("create response lost")],
+    ["post-create schema failure", new RunPodSchemaError("RunPod Pod response is malformed")],
+  ])("keeps protected exact-name convergence after %s", async (_label, providerError) => {
+    const { controller, fakeClient, clearLease, deleteWorkerSecret, watchdogClient, currentLease } =
+      harness({ currentLease: null });
+    fakeClient.createPod.mockRejectedValue(providerError);
+
+    await expect(controller.start()).rejects.toThrow(/protected exact-name reconciliation/);
+
+    expect(fakeClient.listPods).toHaveBeenCalledTimes(3);
+    expect(fakeClient.createPod).toHaveBeenCalledTimes(1);
+    expect(deleteWorkerSecret).not.toHaveBeenCalled();
+    expect(watchdogClient.deleteLease).not.toHaveBeenCalled();
+    expect(clearLease).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ state: "terminating" });
+    expect(currentLease()?.podId).toBeUndefined();
+  });
+
+  it("retains a confirmed lease and retries when definitive rejection cleanup is incomplete", async () => {
+    vi.useFakeTimers();
+    try {
+      const {
+        controller,
+        fakeClient,
+        clearLease,
+        deleteWorkerSecret,
+        watchdogClient,
+        currentLease,
+      } = harness({ currentLease: null });
+      fakeClient.createPod.mockRejectedValue(
+        new RunPodApiError("provider-secret-body-must-not-surface", 401),
+      );
+      deleteWorkerSecret.mockRejectedValueOnce(new Error("secret store unavailable"));
+
+      await expect(controller.start()).rejects.toMatchObject({
+        message: "RunPod rejected Pod creation with HTTP 401; local cleanup is pending",
+        statusCode: 502,
+      });
+
+      expect(currentLease()).toMatchObject({
+        state: "terminating",
+        providerTerminationConfirmedAt: NOW.toISOString(),
+      });
+      expect(clearLease).not.toHaveBeenCalled();
+      expect(watchdogClient.deleteLease).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(deleteWorkerSecret).toHaveBeenCalledTimes(2);
+      expect(watchdogClient.deleteLease).toHaveBeenCalledTimes(1);
+      expect(clearLease).toHaveBeenCalledTimes(1);
+      expect(currentLease()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retains protection after a lost create response until a delayed Pod is terminated", async () => {
