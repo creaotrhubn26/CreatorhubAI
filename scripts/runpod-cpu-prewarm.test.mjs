@@ -6,6 +6,8 @@ import test from "node:test";
 
 import {
   PrewarmError,
+  ProviderHttpError,
+  RunPodV2Client,
   buildCreatePodRequest,
   containsExactContainerLogLine,
   extractSseLogEvents,
@@ -15,6 +17,8 @@ import {
   parseExactPod,
   parseNetworkVolume,
   parsePod,
+  parseProviderProblemDetails,
+  parseRegistryIdentity,
   readPrivateRegularFile,
   resolveStatePaths,
   runReadOnlyPreflight,
@@ -231,10 +235,37 @@ test("active profile parser preserves immutable registry, volume and artifacts",
   );
 });
 
-test("CPU selector uses exact volume data center, Secure availability and price ceiling", () => {
+test("registry response must prove the exact configured identity and contain no secret fields", () => {
+  assert.deepEqual(
+    parseRegistryIdentity(
+      { id: "registry_credential_1", name: "private registry" },
+      "registry_credential_1",
+    ),
+    { id: "registry_credential_1", name: "private registry" },
+  );
+  expectCode(
+    () =>
+      parseRegistryIdentity(
+        { id: "different_registry", name: "private registry" },
+        "registry_credential_1",
+      ),
+    "invalid_registry",
+  );
+  expectCode(
+    () =>
+      parseRegistryIdentity(
+        { id: "registry_credential_1", name: "private registry", password: "must-not-exist" },
+        "registry_credential_1",
+      ),
+    "invalid_registry",
+  );
+});
+
+test("CPU selector ranks exact-data-center availability before price within the ceiling", () => {
   const cpu = selectedCpu();
-  assert.equal(cpu.id, "cpu-cheap");
-  assert.equal(cpu.hourlyUsd, 0.2);
+  assert.equal(cpu.id, "cpu-expensive");
+  assert.equal(cpu.hourlyUsd, 0.4);
+  assert.equal(cpu.dataCenterAvailability, "HIGH");
   expectCode(
     () =>
       selectCpuOffer(
@@ -261,8 +292,9 @@ test("create request uses explicit image and exact two-vCPU prewarm contract", (
   const request = expected.request;
   assert.equal(request.image, image);
   assert.notEqual(request.image, expected.profile.configuredImage);
-  assert.deepEqual(request.cpu, { id: "cpu-cheap", vcpuCount: 2 });
+  assert.deepEqual(request.cpu, { id: "cpu-expensive", vcpuCount: 2 });
   assert.equal(request.cloud, "SECURE");
+  assert.equal(request.disk, 20);
   assert.deepEqual(request.ports, []);
   assert.equal("gpu" in request, false);
   assert.equal(request.registry, expected.profile.registry);
@@ -275,7 +307,7 @@ test("create request uses explicit image and exact two-vCPU prewarm contract", (
   assert.equal(request.env.GLIMMER_LEASE_ID, expected.leaseId);
   assert.equal(request.startSsh, false);
   assert.equal(request.startJupyter, false);
-  assert.equal(request.globalNetworking, false);
+  assert.equal("globalNetworking" in request, false);
 });
 
 test("Pod proof rejects missing no-port evidence, extra env and EXITED over-price", () => {
@@ -301,12 +333,16 @@ test("Pod proof rejects missing no-port evidence, extra env and EXITED over-pric
   expectCode(() => validateOwnedPod(overpricedExited, expected, true), "price_ceiling_exceeded");
   const changedArgs = parsePod(providerPod(contract, { args: "unexpected" }));
   expectCode(() => validateOwnedPod(changedArgs, expected, true), "pod_contract_mismatch");
-  const changedDisk = parsePod(providerPod(contract, { disk: 51 }));
+  const changedDisk = parsePod(providerPod(contract, { disk: 21 }));
   expectCode(() => validateOwnedPod(changedDisk, expected, true), "pod_contract_mismatch");
-  const sshEnabled = parsePod(
+  const proxyMetadata = parsePod(
     providerPod(contract, { ssh: { proxy: { host: "proxy" }, direct: null } }),
   );
-  expectCode(() => validateOwnedPod(sshEnabled, expected, true), "pod_contract_mismatch");
+  assert.equal(validateOwnedPod(proxyMetadata, expected, true), proxyMetadata);
+  const directSsh = parsePod(
+    providerPod(contract, { ssh: { proxy: null, direct: { host: "direct" } } }),
+  );
+  expectCode(() => validateOwnedPod(directSsh, expected, true), "pod_contract_mismatch");
 });
 
 test("SSE parsing requires the exact container marker line across chunks", () => {
@@ -341,6 +377,76 @@ test("timeline sanitizer removes secret-bearing fields and redacts values", () =
   assert.equal(sanitized.status, "ok");
   assert.equal(sanitized.message.includes("rpa_supersecret"), false);
   assert.equal(sanitized.message.includes("https://"), false);
+});
+
+test("bounded Problem Details are strict and redact the active key, URLs and Bearer values", async () => {
+  const apiKey = "opaque-active-api-key-value";
+  const rawProblem = {
+    title: `Bad Request ${apiKey}`,
+    status: 400,
+    detail: `Could not place https://private.example/path?token=value with Bearer opaque-token`,
+    errors: [`credential=${apiKey}`],
+  };
+  const parsed = parseProviderProblemDetails(rawProblem, 400, [apiKey]);
+  assert.ok(parsed);
+  const serialized = JSON.stringify(parsed);
+  assert.equal(serialized.includes(apiKey), false);
+  assert.equal(serialized.includes("https://"), false);
+  assert.equal(serialized.includes("opaque-token"), false);
+
+  assert.equal(parseProviderProblemDetails({ ...rawProblem, status: 422 }, 400, [apiKey]), null);
+  assert.equal(parseProviderProblemDetails({ ...rawProblem, traceId: "unexpected" }, 400), null);
+  assert.equal(
+    parseProviderProblemDetails({ ...rawProblem, detail: "x".repeat(2_049) }, 400),
+    null,
+  );
+
+  let postCount = 0;
+  const client = new RunPodV2Client({
+    apiKey,
+    fetchImpl: async (_url, options) => {
+      assert.equal(options.method, "POST");
+      postCount += 1;
+      return new Response(JSON.stringify(rawProblem), {
+        status: 400,
+        headers: { "Content-Type": "application/problem+json" },
+      });
+    },
+  });
+  await assert.rejects(client.createPodRaw(expectedContract().request), (error) => {
+    assert.equal(error instanceof ProviderHttpError, true);
+    assert.equal(error.status, 400);
+    assert.deepEqual(error.providerProblem, parsed);
+    return true;
+  });
+  assert.equal(postCount, 1);
+});
+
+test("malformed and oversized provider problems fall back to generic HTTP errors", async () => {
+  const bodies = [
+    "{not-json",
+    JSON.stringify({ title: "Bad", status: 400, detail: "x".repeat(20_000) }),
+  ];
+  for (const body of bodies) {
+    let postCount = 0;
+    const client = new RunPodV2Client({
+      apiKey: "opaque-active-api-key-value",
+      fetchImpl: async () => {
+        postCount += 1;
+        return new Response(body, {
+          status: 400,
+          headers: { "Content-Type": "application/problem+json" },
+        });
+      },
+    });
+    await assert.rejects(client.createPodRaw(expectedContract().request), (error) => {
+      assert.equal(error instanceof ProviderHttpError, true);
+      assert.equal(error.status, 400);
+      assert.equal(error.providerProblem, null);
+      return true;
+    });
+    assert.equal(postCount, 1);
+  }
 });
 
 test("private file reader rejects symlinks, hardlinks and group-readable files", async (context) => {
@@ -398,6 +504,9 @@ test("read-only preflight uses authenticated GETs only and writes a private sani
     if (url.endsWith("/v2/pods?includeClusterPods=true")) {
       return Response.json({ pods: [] });
     }
+    if (url.endsWith("/v2/registries/registry_credential_1")) {
+      return Response.json({ id: "registry_credential_1", name: "private registry" });
+    }
     if (url.endsWith("/v2/network-volumes/network-volume_1")) {
       return Response.json({
         id: "network-volume_1",
@@ -429,7 +538,7 @@ test("read-only preflight uses authenticated GETs only and writes a private sani
     randomUUID: () => "11111111-2222-4333-8444-555555555555",
   });
   assert.equal(exitCode, 0);
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 6);
   assert.equal(
     calls.every((call) => call.method === "GET"),
     true,
@@ -451,8 +560,59 @@ test("read-only preflight uses authenticated GETs only and writes a private sani
   assert.equal(result.mode, "preflight");
   assert.equal(result.outcome, "succeeded");
   assert.equal(result.preflightValidated, true);
+  assert.equal(result.cpu.availability, "HIGH");
+  assert.equal(result.cpu.dataCenterAvailability, "HIGH");
   assert.equal(result.cleanup.readOnly, true);
   assert.equal(result.cleanup.providerPodCount, 0);
   assert.equal(resultText.includes(key), false);
   assert.equal(resultText.includes("https://artifacts.example.com"), false);
+});
+
+test("registry identity mismatch fails preflight before volume, CPU, or any mutation", async (context) => {
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-registry-test-"));
+  context.after(async () => fs.rm(stateRoot, { recursive: true, force: true }));
+  await fs.chmod(stateRoot, 0o700);
+  const keyDirectory = path.join(stateRoot, "compute-keys");
+  await fs.mkdir(keyDirectory, { mode: 0o700 });
+  await fs.writeFile(path.join(keyDirectory, "runpod.key"), "opaque-active-key\n", { mode: 0o600 });
+  await fs.writeFile(
+    path.join(stateRoot, "compute.json"),
+    `${JSON.stringify(configuration(stateRoot))}\n`,
+    { mode: 0o600 },
+  );
+
+  const calls = [];
+  const exitCode = await runReadOnlyPreflight(argumentsFor("--preflight"), {
+    environment: { GLIMMER_STATE_ROOT: stateRoot },
+    randomUUID: () => "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, method: options.method });
+      if (url.endsWith("/v2/pods?includeClusterPods=true")) return Response.json({ pods: [] });
+      if (url.endsWith("/v2/registries/registry_credential_1")) {
+        return Response.json({ id: "different_registry", name: "wrong registry" });
+      }
+      throw new Error("preflight continued after registry mismatch");
+    },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(calls.length, 3);
+  assert.equal(
+    calls.every((call) => call.method === "GET"),
+    true,
+  );
+  assert.equal(
+    calls.filter((call) => call.url.endsWith("/v2/registries/registry_credential_1")).length,
+    1,
+  );
+  assert.equal(
+    calls.some((call) => call.method === "POST" || call.method === "DELETE"),
+    false,
+  );
+  const result = JSON.parse(
+    await fs.readFile(path.join(stateRoot, "runpod-cpu-prewarm-result.json"), "utf8"),
+  );
+  assert.equal(result.outcome, "failed");
+  assert.equal(result.preflightValidated, false);
+  assert.equal(result.failure.code, "invalid_registry");
 });

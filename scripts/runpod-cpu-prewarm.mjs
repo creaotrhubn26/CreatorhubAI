@@ -13,7 +13,7 @@ const CONFIRMATION = "CREATE_EXACTLY_ONE_CAPPED_RUNPOD_CPU_POD";
 const RESULT_FILE = "runpod-cpu-prewarm-result.json";
 const LOCK_FILE = ".runpod-cpu-prewarm.lock";
 const VCPU_COUNT = 2;
-const CONTAINER_DISK_GB = 50;
+const CONTAINER_DISK_GB = 20;
 const VOLUME_MOUNT_PATH = "/workspace";
 
 const MIN_HARD_DEADLINE_SECONDS = 60;
@@ -28,6 +28,11 @@ const RECOVERY_STABLE_EMPTY_MS = 30_000;
 const POLL_INTERVAL_MS = 2_000;
 const POD_POLL_INTERVAL_MS = 5_000;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
+const MAX_PROBLEM_BYTES = 16 * 1024;
+const MAX_PROBLEM_TITLE_LENGTH = 256;
+const MAX_PROBLEM_DETAIL_LENGTH = 2_048;
+const MAX_PROBLEM_ERRORS = 16;
+const MAX_PROBLEM_ERROR_LENGTH = 512;
 const MAX_CONFIG_BYTES = 512 * 1024;
 const MAX_KEY_BYTES = 16 * 1024;
 const MAX_LOG_BYTES = 1024 * 1024;
@@ -48,6 +53,7 @@ const HOST_PATTERN =
 const ACTIVE_STATUSES = new Set(["PROVISIONING", "STARTING", "RUNNING"]);
 const POD_STATUSES = new Set([...ACTIVE_STATUSES, "EXITED", "ERROR", "TERMINATED"]);
 const AVAILABLE = new Set(["LOW", "MEDIUM", "HIGH"]);
+const AVAILABILITY_RANK = Object.freeze({ HIGH: 0, MEDIUM: 1, LOW: 2 });
 
 export class PrewarmError extends Error {
   constructor(code, message, options = {}) {
@@ -58,10 +64,11 @@ export class PrewarmError extends Error {
 }
 
 export class ProviderHttpError extends PrewarmError {
-  constructor(operation, status) {
+  constructor(operation, status, providerProblem = null) {
     super("provider_http_error", `${operation} returned HTTP ${status}`);
     this.name = "ProviderHttpError";
     this.status = status;
+    this.providerProblem = providerProblem;
   }
 }
 
@@ -112,6 +119,51 @@ function exactStringMap(value, label) {
     result[key] = entry;
   }
   return result;
+}
+
+function redactProviderText(value, maximum, sensitiveValues) {
+  let sanitized = value;
+  const secrets = [
+    ...new Set(sensitiveValues.filter((entry) => typeof entry === "string" && entry)),
+  ].sort((left, right) => right.length - left.length);
+  for (const secret of secrets) sanitized = sanitized.split(secret).join("[REDACTED_CREDENTIAL]");
+  return redactText(sanitized, maximum);
+}
+
+export function parseProviderProblemDetails(value, expectedStatus, sensitiveValues = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const allowedKeys = new Set(["title", "status", "detail", "errors"]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) return null;
+  if (
+    typeof value.title !== "string" ||
+    value.title.length < 1 ||
+    value.title.length > MAX_PROBLEM_TITLE_LENGTH ||
+    !Number.isInteger(value.status) ||
+    value.status !== expectedStatus ||
+    typeof value.detail !== "string" ||
+    value.detail.length < 1 ||
+    value.detail.length > MAX_PROBLEM_DETAIL_LENGTH
+  ) {
+    return null;
+  }
+  if (
+    value.errors !== undefined &&
+    (!Array.isArray(value.errors) ||
+      value.errors.length > MAX_PROBLEM_ERRORS ||
+      value.errors.some(
+        (entry) =>
+          typeof entry !== "string" || entry.length < 1 || entry.length > MAX_PROBLEM_ERROR_LENGTH,
+      ))
+  ) {
+    return null;
+  }
+  return {
+    title: redactProviderText(value.title, MAX_PROBLEM_TITLE_LENGTH, sensitiveValues),
+    detail: redactProviderText(value.detail, MAX_PROBLEM_DETAIL_LENGTH, sensitiveValues),
+    errors: (value.errors ?? []).map((entry) =>
+      redactProviderText(entry, MAX_PROBLEM_ERROR_LENGTH, sensitiveValues),
+    ),
+  };
 }
 
 export function usage() {
@@ -354,6 +406,19 @@ export function parseNetworkVolume(value, expectedId) {
   return { id, dataCenter, size, type };
 }
 
+export function parseRegistryIdentity(value, expectedId) {
+  const raw = object(value, "container registry credential");
+  if (Object.keys(raw).some((key) => key !== "id" && key !== "name")) {
+    fail("invalid_registry", "provider returned unexpected registry credential fields");
+  }
+  const id = text(raw.id, "container registry credential id", 191);
+  const name = text(raw.name, "container registry credential name", 191);
+  if (!REGISTRY_ID_PATTERN.test(id) || id !== expectedId) {
+    fail("invalid_registry", "provider returned an unexpected registry credential identity");
+  }
+  return { id, name };
+}
+
 export function parseCpuCatalog(value) {
   const raw = object(value, "CPU catalog response");
   if (!Array.isArray(raw.cpus) || raw.cpus.length > MAX_CPUS) {
@@ -371,41 +436,62 @@ export function parseCpuCatalog(value) {
     if (dataCenters !== undefined && (!Array.isArray(dataCenters) || dataCenters.length > 256)) {
       fail("invalid_cpu_catalog", "CPU data center availability is invalid");
     }
+    const parsedDataCenters = (dataCenters ?? []).map((candidate) => {
+      const dc = object(candidate, "CPU data center availability");
+      const idValue = text(dc.id, "CPU data center id", 32);
+      const availability = text(dc.availability, "CPU availability", 16);
+      if (!DATA_CENTER_PATTERN.test(idValue)) {
+        fail("invalid_cpu_catalog", "CPU data center id is invalid");
+      }
+      return { id: idValue, availability };
+    });
+    if (
+      new Set(parsedDataCenters.map((candidate) => candidate.id)).size !== parsedDataCenters.length
+    ) {
+      fail("invalid_cpu_catalog", "CPU data center availability contains duplicate identities");
+    }
     return {
       id,
       minimumVcpu: integer(vcpu.min, "CPU minimum vCPU", 1),
       maximumVcpu: integer(vcpu.max, "CPU maximum vCPU", 1),
       securePerVcpu: finiteNumber(price.securePerVcpu, "CPU Secure price", 0),
       availability: typeof cpu.availability === "string" ? cpu.availability : null,
-      dataCenters: (dataCenters ?? []).map((candidate) => {
-        const dc = object(candidate, "CPU data center availability");
-        const idValue = text(dc.id, "CPU data center id", 32);
-        const availability = text(dc.availability, "CPU availability", 16);
-        if (!DATA_CENTER_PATTERN.test(idValue)) {
-          fail("invalid_cpu_catalog", "CPU data center id is invalid");
-        }
-        return { id: idValue, availability };
-      }),
+      dataCenters: parsedDataCenters,
     };
   });
 }
 
 export function selectCpuOffer(cpus, dataCenter, maxHourlyUsd) {
   const candidates = cpus
-    .filter(
-      (cpu) =>
-        cpu.minimumVcpu <= VCPU_COUNT &&
-        cpu.maximumVcpu >= VCPU_COUNT &&
-        AVAILABLE.has(cpu.availability) &&
-        cpu.dataCenters.some(
-          (candidate) => candidate.id === dataCenter && AVAILABLE.has(candidate.availability),
-        ),
-    )
-    .map((cpu) => ({ ...cpu, hourlyUsd: cpu.securePerVcpu * VCPU_COUNT }))
+    .flatMap((cpu) => {
+      if (
+        cpu.minimumVcpu > VCPU_COUNT ||
+        cpu.maximumVcpu < VCPU_COUNT ||
+        !AVAILABLE.has(cpu.availability)
+      ) {
+        return [];
+      }
+      const exactDataCenter = cpu.dataCenters.find((candidate) => candidate.id === dataCenter);
+      if (!exactDataCenter || !AVAILABLE.has(exactDataCenter.availability)) return [];
+      return [
+        {
+          ...cpu,
+          hourlyUsd: cpu.securePerVcpu * VCPU_COUNT,
+          dataCenterAvailability: exactDataCenter.availability,
+        },
+      ];
+    })
     .filter(
       (cpu) => Number.isFinite(cpu.hourlyUsd) && cpu.hourlyUsd > 0 && cpu.hourlyUsd <= maxHourlyUsd,
     )
-    .sort((left, right) => left.hourlyUsd - right.hourlyUsd || left.id.localeCompare(right.id));
+    .sort(
+      (left, right) =>
+        AVAILABILITY_RANK[left.dataCenterAvailability] -
+          AVAILABILITY_RANK[right.dataCenterAvailability] ||
+        left.hourlyUsd - right.hourlyUsd ||
+        AVAILABILITY_RANK[left.availability] - AVAILABILITY_RANK[right.availability] ||
+        left.id.localeCompare(right.id),
+    );
   if (!candidates.length) {
     fail(
       "cpu_unavailable",
@@ -527,13 +613,15 @@ export function buildCreatePodRequest({ profile, image, buildId, leaseId, podNam
     mounts: {
       network: [{ volumeId: profile.networkVolumeId, path: VOLUME_MOUNT_PATH }],
     },
-    globalNetworking: false,
     startJupyter: false,
     startSsh: false,
   };
 }
 
 export function validateOwnedPod(pod, expected, requireDataCenter = false) {
+  // RunPod may report proxy routing metadata even when startSsh is false. The
+  // no-access contract is the create flag plus no PUBLIC_KEY, no 22/tcp port,
+  // and no direct SSH endpoint; those are all verified here.
   if (
     pod.name !== expected.podName ||
     pod.image !== expected.request.image ||
@@ -545,7 +633,6 @@ export function validateOwnedPod(pod, expected, requireDataCenter = false) {
     pod.cpu?.vcpuCount !== VCPU_COUNT ||
     pod.gpuPresent ||
     pod.globalNetworkingEnabled ||
-    pod.sshProxyPresent ||
     pod.sshDirectPresent ||
     pod.ports.length !== 0 ||
     pod.networkMounts.length !== 1 ||
@@ -659,6 +746,20 @@ async function readResponseBytes(response, maximumBytes) {
   return bytes;
 }
 
+async function readProviderProblem(response, sensitiveValues) {
+  if (!/^application\/problem\+json(?:;|$)/i.test(response.headers.get("content-type") ?? "")) {
+    return null;
+  }
+  try {
+    const bytes = await readResponseBytes(response, MAX_PROBLEM_BYTES);
+    if (!bytes.byteLength) return null;
+    const value = JSON.parse(new TextDecoder().decode(bytes));
+    return parseProviderProblemDetails(value, response.status, sensitiveValues);
+  } catch {
+    return null;
+  }
+}
+
 function linkedAbortController(signal, timeoutMs) {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -675,7 +776,7 @@ function linkedAbortController(signal, timeoutMs) {
   };
 }
 
-class RunPodV2Client {
+export class RunPodV2Client {
   constructor({ apiKey, fetchImpl = fetch }) {
     if (typeof apiKey !== "string" || !apiKey || /\s/.test(apiKey)) {
       fail("invalid_api_key", "RunPod API key is empty or malformed");
@@ -711,7 +812,8 @@ class RunPodV2Client {
       const expectedStatuses = options.expectedStatuses ?? [200];
       if (options.nullOn404 && response.status === 404) return null;
       if (!expectedStatuses.includes(response.status)) {
-        throw new ProviderHttpError(operation, response.status);
+        const providerProblem = await readProviderProblem(response, [this.apiKey]);
+        throw new ProviderHttpError(operation, response.status, providerProblem);
       }
       if (response.status === 204) return null;
       let bytes;
@@ -750,6 +852,17 @@ class RunPodV2Client {
         options,
       ),
       volumeId,
+    );
+  }
+
+  async getRegistry(registryId, options = {}) {
+    return parseRegistryIdentity(
+      await this.requestJson(
+        "get container registry credential",
+        `/v2/registries/${encodeURIComponent(registryId)}`,
+        options,
+      ),
+      registryId,
     );
   }
 
@@ -877,6 +990,13 @@ function safeFailure(error) {
     code: error instanceof PrewarmError ? error.code : "unexpected_failure",
     message: redactText(error instanceof Error ? error.message : "unexpected failure", 512),
     ...(error instanceof ProviderHttpError ? { httpStatus: error.status } : {}),
+    ...(error instanceof ProviderHttpError && error.providerProblem
+      ? {
+          providerTitle: error.providerProblem.title,
+          providerDetail: error.providerProblem.detail,
+          providerErrors: error.providerProblem.errors,
+        }
+      : {}),
   };
 }
 
@@ -1315,6 +1435,11 @@ async function executePrewarm(args, dependencies = {}) {
     }
     timeline.add("v2_auth_and_empty_provider_confirmed");
 
+    const registry = await client.getRegistry(profile.registry, {
+      signal: runAbort.signal,
+    });
+    timeline.add("container_registry_verified", { registryId: registry.id });
+
     volume = await client.getNetworkVolume(profile.networkVolumeId, {
       signal: runAbort.signal,
     });
@@ -1331,6 +1456,7 @@ async function executePrewarm(args, dependencies = {}) {
       vcpuCount: VCPU_COUNT,
       hourlyUsd: cpu.hourlyUsd,
       availability: cpu.availability,
+      dataCenterAvailability: cpu.dataCenterAvailability,
     });
 
     const recheckedConfig = await readPrivateRegularFile(
@@ -1501,7 +1627,15 @@ async function executePrewarm(args, dependencies = {}) {
       imageFingerprint: sha256(Buffer.from(args.image, "utf8")),
       volumeId: volume?.id ?? profile?.networkVolumeId ?? null,
       dataCenter: volume?.dataCenter ?? null,
-      cpu: cpu ? { id: cpu.id, vcpuCount: VCPU_COUNT, hourlyUsd: cpu.hourlyUsd } : null,
+      cpu: cpu
+        ? {
+            id: cpu.id,
+            vcpuCount: VCPU_COUNT,
+            hourlyUsd: cpu.hourlyUsd,
+            availability: cpu.availability,
+            dataCenterAvailability: cpu.dataCenterAvailability,
+          }
+        : null,
       maxHourlyUsd: args.maxHourlyUsd,
       hardDeadlineAt,
       preflightValidated,
