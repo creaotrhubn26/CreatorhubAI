@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { probeRuntimeReadiness, sanitizeText } from "./diagnostics.js";
+import { BUNDLED_ORCHESTRATOR_SHA256, probeRuntimeReadiness, sanitizeText } from "./diagnostics.js";
 
 let root: string;
 
@@ -84,6 +84,12 @@ async function writeBundledPython() {
 }
 
 describe("runtime diagnostics", () => {
+  it("pins diagnostics to the race-safe RunPod worker artifact", () => {
+    expect(BUNDLED_ORCHESTRATOR_SHA256["runpod_worker.py"]).toBe(
+      "971aaa7c537d810a860ba213da06e0185dd9b5525869dffb147313f57d1eba68",
+    );
+  });
+
   it("keeps core ready while reporting an offline optional model as degraded", async () => {
     const orchestratorFiles = await writeBundledOrchestrator();
     const python = await writeBundledPython();

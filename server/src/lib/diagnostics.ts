@@ -30,7 +30,7 @@ import { readSessionPage } from "./sessionRegistry.js";
 const startTime = Date.now();
 const SUPPORT_LOG_BYTES = 16 * 1024;
 const SUPPORT_LOG_SESSIONS = 3;
-const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
+export const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
   "glimmer-v2.py": "ecd0952e83bc9fd658230e4aa2707d92e90151e994529e78aacbd011b067ee4a",
   "glimmer-engineer.py": "16be8ca1c4ec368e3247a1f034a0db5b8418235129cf964962d12ee9bda3f7db",
   "glimmer_events.py": "2fd4aa0afbe32b58150be442c0e2b4cbb70f1c5ab65f2a9d2e857b239cd34454",
@@ -42,7 +42,7 @@ const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
   "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
   "glimmer_remote.py": "5771ff5870bfc74b35cdad90c7011da5f23ca88bf2d54eb2f9a8a59188926bfd",
-  "runpod_worker.py": "08c0533b22745829e4e288a784ebafa4d2764f683de4f7cf8e15f8187cdef61e",
+  "runpod_worker.py": "971aaa7c537d810a860ba213da06e0185dd9b5525869dffb147313f57d1eba68",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
   "eval-baselines/baseline-stub.json":
     "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
