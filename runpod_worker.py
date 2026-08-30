@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -54,9 +55,7 @@ JOB_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)$")
 START_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/start$")
 CANCEL_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/cancel$")
 CHECKPOINT_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/checkpoints/([0-9]{1,6})$")
-ACK_ROUTE = re.compile(
-    r"^/v1/jobs/([A-Za-z0-9._-]+)/checkpoints/([0-9]{1,6})/ack$"
-)
+ACK_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/checkpoints/([0-9]{1,6})/ack$")
 
 
 class WorkerError(RuntimeError):
@@ -135,7 +134,9 @@ class ProcessJobRunner:
                 timeout=120,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise WorkerError("remote repository preparation failed", HTTPStatus.UNPROCESSABLE_ENTITY) from exc
+            raise WorkerError(
+                "remote repository preparation failed", HTTPStatus.UNPROCESSABLE_ENTITY
+            ) from exc
 
     def _prepare_workspace(self, job_dir: Path, manifest: RemoteJobManifestV1) -> Path:
         bundle = job_dir / "input.bundle"
@@ -143,7 +144,9 @@ class ProcessJobRunner:
         if workspace.exists():
             raise WorkerError("remote workspace already exists", HTTPStatus.CONFLICT)
         self._run_checked(["git", "clone", "--quiet", str(bundle), str(workspace)], job_dir)
-        self._run_checked(["git", "cat-file", "-e", f"{manifest.baseline_sha}^{{commit}}"], workspace)
+        self._run_checked(
+            ["git", "cat-file", "-e", f"{manifest.baseline_sha}^{{commit}}"], workspace
+        )
         self._run_checked(
             ["git", "switch", "--quiet", "--create", manifest.branch, manifest.baseline_sha],
             workspace,
@@ -209,7 +212,9 @@ class ProcessJobRunner:
             )
         except OSError as exc:
             log_handle.close()
-            raise WorkerError("remote orchestrator could not start", HTTPStatus.SERVICE_UNAVAILABLE) from exc
+            raise WorkerError(
+                "remote orchestrator could not start", HTTPStatus.SERVICE_UNAVAILABLE
+            ) from exc
 
         def monitor() -> None:
             code = process.wait()
@@ -317,7 +322,8 @@ class WorkerService:
                 continue
 
     def health(self) -> Dict[str, Any]:
-        ready = bool(self.model_ready()) and self.capability is not None
+        model_ready = bool(self.model_ready())
+        ready = model_ready and self.capability is not None
         active = next(
             (
                 job_id
@@ -330,13 +336,11 @@ class WorkerService:
             "schemaVersion": 1,
             "buildId": self.build_id,
             "ready": ready,
-            "model": {"ready": bool(self.model_ready()), "contextTokens": self.context_tokens},
-            "workerState": "busy" if active else ("ready" if ready else "bootstrapping"),
+            "model": {"ready": model_ready, "contextTokens": self.context_tokens},
+            "workerState": "bootstrapping" if not ready else ("busy" if active else "ready"),
         }
 
-    def register_idempotency(
-        self, key: str, method: str, path: str, body: bytes
-    ) -> None:
+    def register_idempotency(self, key: str, method: str, path: str, body: bytes) -> None:
         fingerprint = sha256_hex(
             b"\n".join((method.upper().encode("ascii"), path.encode("ascii"), body))
         )
@@ -444,11 +448,17 @@ class WorkerService:
         manifest = parse_remote_job_manifest(manifest_value)
         with self.lock:
             if self.controller_instance_id != manifest.instance_id:
-                raise WorkerError("manifest instance does not own this worker", HTTPStatus.FORBIDDEN)
+                raise WorkerError(
+                    "manifest instance does not own this worker", HTTPStatus.FORBIDDEN
+                )
             existing = self.jobs.get(manifest.job_id)
             if existing:
-                if canonical_json_bytes(existing["manifest"]) != canonical_json_bytes(manifest.as_dict()):
-                    raise WorkerError("job id already exists with a different manifest", HTTPStatus.CONFLICT)
+                if canonical_json_bytes(existing["manifest"]) != canonical_json_bytes(
+                    manifest.as_dict()
+                ):
+                    raise WorkerError(
+                        "job id already exists with a different manifest", HTTPStatus.CONFLICT
+                    )
                 return self._public_job(existing)
             for state in self.jobs.values():
                 if state.get("state") in {"created", "uploading", "running", "cancelling"}:
@@ -468,7 +478,9 @@ class WorkerService:
             self._save_job(state)
             return self._public_job(state)
 
-    def upload_part(self, job_id: str, part: int, body: bytes, supplied_sha256: str) -> Dict[str, Any]:
+    def upload_part(
+        self, job_id: str, part: int, body: bytes, supplied_sha256: str
+    ) -> Dict[str, Any]:
         if len(body) == 0 or len(body) > MAX_PART_BYTES:
             raise WorkerError("input part has an invalid size", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         if not re.fullmatch(r"[a-f0-9]{64}", supplied_sha256 or ""):
@@ -489,7 +501,9 @@ class WorkerService:
             previous = state["receivedParts"].get(key)
             if previous:
                 if previous["sha256"] != actual or previous["bytes"] != len(body):
-                    raise WorkerError("input part conflicts with the stored part", HTTPStatus.CONFLICT)
+                    raise WorkerError(
+                        "input part conflicts with the stored part", HTTPStatus.CONFLICT
+                    )
                 return self._public_job(state)
             new_total = int(state["receivedBytes"]) + len(body)
             if new_total > state["manifest"]["input"]["bytes"]:
@@ -516,15 +530,21 @@ class WorkerService:
                 try:
                     data = source.read_bytes()
                 except OSError as exc:
-                    raise WorkerError("an uploaded input part is unavailable", HTTPStatus.CONFLICT) from exc
+                    raise WorkerError(
+                        "an uploaded input part is unavailable", HTTPStatus.CONFLICT
+                    ) from exc
                 digest.update(data)
                 total += len(data)
                 output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        if total != manifest.input.bytes or not hmac.compare_digest(digest.hexdigest(), manifest.input.sha256):
+        if total != manifest.input.bytes or not hmac.compare_digest(
+            digest.hexdigest(), manifest.input.sha256
+        ):
             temporary.unlink(missing_ok=True)
-            raise WorkerError("assembled input does not match the manifest", HTTPStatus.UNPROCESSABLE_ENTITY)
+            raise WorkerError(
+                "assembled input does not match the manifest", HTTPStatus.UNPROCESSABLE_ENTITY
+            )
         os.replace(temporary, target)
         return target
 
@@ -536,7 +556,11 @@ class WorkerService:
             if state["state"] == "running":
                 return self._public_job(state)
             if state["state"] not in {"created", "uploading"}:
-                raise WorkerError("remote job cannot be started in its current state", HTTPStatus.CONFLICT)
+                raise WorkerError(
+                    "remote job cannot be started in its current state", HTTPStatus.CONFLICT
+                )
+            if not self.model_ready():
+                raise WorkerError("worker model is not ready", HTTPStatus.SERVICE_UNAVAILABLE)
             self._assemble_input(state)
             manifest = parse_remote_job_manifest(state["manifest"])
             running = self.runner.start(
@@ -552,7 +576,9 @@ class WorkerService:
             self._save_job(state)
             return self._public_job(state)
 
-    def _result_archive(self, job_id: str, workspace: Path, session_dir: Path, exit_code: int) -> Path:
+    def _result_archive(
+        self, job_id: str, workspace: Path, session_dir: Path, exit_code: int
+    ) -> Path:
         job_dir = self._job_dir(job_id)
         metadata_path = job_dir / "result.json"
         result: Dict[str, Any] = {
@@ -626,7 +652,9 @@ class WorkerService:
         if sequence == 0:
             raise RuntimeError("result archive was empty")
 
-    def _complete_job(self, job_id: str, exit_code: int, workspace: Path, session_dir: Path) -> None:
+    def _complete_job(
+        self, job_id: str, exit_code: int, workspace: Path, session_dir: Path
+    ) -> None:
         try:
             artifact = self._result_archive(job_id, workspace, session_dir, exit_code)
             with self.lock:
@@ -670,12 +698,18 @@ class WorkerService:
                 data = target.read_bytes()
             except OSError as exc:
                 raise WorkerError("remote checkpoint was not found", HTTPStatus.NOT_FOUND) from exc
-            if len(data) != item["bytes"] or not hmac.compare_digest(sha256_hex(data), item["sha256"]):
+            if len(data) != item["bytes"] or not hmac.compare_digest(
+                sha256_hex(data), item["sha256"]
+            ):
                 raise WorkerError("remote checkpoint integrity check failed", HTTPStatus.CONFLICT)
             return data, dict(item)
 
-    def acknowledge_checkpoint(self, job_id: str, sequence: int, supplied_sha256: Any) -> Dict[str, Any]:
-        if not isinstance(supplied_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", supplied_sha256):
+    def acknowledge_checkpoint(
+        self, job_id: str, sequence: int, supplied_sha256: Any
+    ) -> Dict[str, Any]:
+        if not isinstance(supplied_sha256, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", supplied_sha256
+        ):
             raise WorkerError("checkpoint acknowledgement checksum is invalid")
         with self.lock:
             state = self.jobs.get(job_id)
@@ -688,7 +722,9 @@ class WorkerService:
             if not item:
                 raise WorkerError("remote checkpoint was not found", HTTPStatus.NOT_FOUND)
             if not hmac.compare_digest(item["sha256"], supplied_sha256):
-                raise WorkerError("checkpoint acknowledgement checksum does not match", HTTPStatus.CONFLICT)
+                raise WorkerError(
+                    "checkpoint acknowledgement checksum does not match", HTTPStatus.CONFLICT
+                )
             target = self.recovery_root / job_id / f"checkpoint-{sequence:06d}.bin"
             target.unlink(missing_ok=True)
             item["acknowledged"] = True
@@ -752,7 +788,9 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise WorkerError("Content-Length is required", HTTPStatus.LENGTH_REQUIRED) from exc
         if length <= 0 or length > maximum:
-            raise WorkerError("request body exceeds the safe size limit", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            raise WorkerError(
+                "request body exceeds the safe size limit", HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            )
         data = self.rfile.read(length)
         if len(data) != length:
             raise WorkerError("request body ended early")
@@ -786,9 +824,7 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 if self.headers.get("Authorization") and not self.service.authorized(
                     self.headers.get("Authorization")
                 ):
-                    raise WorkerError(
-                        "worker authentication failed", HTTPStatus.UNAUTHORIZED
-                    )
+                    raise WorkerError("worker authentication failed", HTTPStatus.UNAUTHORIZED)
                 self._send_json(HTTPStatus.OK, self.service.health())
                 return
             self._require_auth()
@@ -899,14 +935,17 @@ class GlimmerWorkerServer(ThreadingHTTPServer):
             self._request_slots.release()
 
 
-def _model_ready(url: str) -> bool:
+def _model_ready(url: str, ready_marker: Path) -> bool:
     from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
 
     try:
+        marker = ready_marker.lstat()
+        if not stat.S_ISREG(marker.st_mode) or marker.st_nlink != 1:
+            return False
         with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=2) as response:
             return 200 <= response.status < 300
-    except (HTTPError, URLError, TimeoutError, OSError):
+    except (FileNotFoundError, HTTPError, URLError, TimeoutError, OSError):
         return False
 
 
@@ -917,6 +956,7 @@ def main() -> int:
     parser.add_argument("--state-root", default="/run/glimmer-worker")
     parser.add_argument("--recovery-root", default="/workspace/recovery")
     parser.add_argument("--health-url", default="http://127.0.0.1:8080/health")
+    parser.add_argument("--ready-marker", default="/run/glimmer-worker/model.ready")
     args = parser.parse_args()
     if args.host != "0.0.0.0" or args.port != WORKER_PORT:
         raise SystemExit("production worker must bind 0.0.0.0:4318")
@@ -929,7 +969,7 @@ def main() -> int:
         bootstrap,
         build_id,
         context,
-        lambda: _model_ready(args.health_url),
+        lambda: _model_ready(args.health_url, Path(args.ready_marker)),
     )
     server = GlimmerWorkerServer((args.host, args.port), service)
     print(canonical_json_bytes({"event": "worker_listening", "port": args.port}).decode("utf-8"))

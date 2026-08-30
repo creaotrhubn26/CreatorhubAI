@@ -51,7 +51,11 @@ assert "jammy-security" in snapshot
 print("RunPod image contract: PASS")
 PY
 
-python3 -m unittest tests.test_glimmer_remote tests.test_runpod_worker
+python3 -m unittest \
+  tests.test_glimmer_remote \
+  tests.test_runpod_worker \
+  tests.test_fetch_artifact \
+  tests.test_runpod_entrypoint
 
 if [ -z "$IMAGE" ]; then
   echo "RunPod image runtime check: SKIPPED (pass an already built image tag)"

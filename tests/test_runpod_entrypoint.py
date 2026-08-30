@@ -1,0 +1,335 @@
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ENTRYPOINT = ROOT / "docker" / "runpod" / "entrypoint.sh"
+
+
+class EntrypointStaticContractTests(unittest.TestCase):
+    def test_listener_and_cleanup_are_installed_before_artifact_downloads(self):
+        source = ENTRYPOINT.read_text(encoding="utf-8")
+        worker_start = source.index("/opt/glimmer/runpod_worker.py")
+        first_download = source.index("run_download --url")
+        self.assertLess(source.index("trap cleanup EXIT"), first_download)
+        self.assertLess(worker_start, first_download)
+        self.assertLess(source.index('python3 - "$MODEL_KEY" "$MODEL_CONFIG"'), worker_start)
+        self.assertLess(source.index('export GLIMMER_API_KEY_FILE="$MODEL_KEY"'), worker_start)
+        self.assertLess(source.index('export GLIMMER_MODEL_CONFIG="$MODEL_CONFIG"'), worker_start)
+        self.assertLess(source.index("export GLIMMER_URL="), worker_start)
+        self.assertIn('local pids=("$DOWNLOAD_PID" "$LLAMA_PID" "$WORKER_PID")', source)
+        self.assertIn('kill -KILL "$pid"', source)
+        self.assertIn('"workerState") == "bootstrapping"', source)
+        self.assertIn('MODEL_PATH="$MODEL_ROOT/model.$GLIMMER_MODEL_SHA256.gguf"', source)
+        self.assertIn('MMPROJ_PATH="$MODEL_ROOT/mmproj.$GLIMMER_MMPROJ_SHA256.gguf"', source)
+        self.assertIn('DFLASH_PATH="$MODEL_ROOT/dflash.$GLIMMER_DFLASH_SHA256.gguf"', source)
+        self.assertLess(
+            source.index("docker/runpod/healthcheck.py"),
+            source.index('touch "$READY_MARKER"'),
+        )
+        subprocess.run(["bash", "-n", ENTRYPOINT], check=True)
+
+
+class EntrypointBehaviorTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.events = self.root / "events.log"
+        self.process = None
+
+    def tearDown(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _write_executable(path, source):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+
+    def _prepare(self, download_mode, worker_mode="hold"):
+        state = self.root / "state"
+        models = self.root / "models"
+        recovery = self.root / "recovery"
+        app = self.root / "opt" / "glimmer"
+        bin_root = self.root / "bin"
+        source = ENTRYPOINT.read_text(encoding="utf-8")
+        replacements = {
+            "STATE_ROOT=/run/glimmer-worker": f"STATE_ROOT={shlex.quote(str(state))}",
+            "MODEL_ROOT=/workspace/models": f"MODEL_ROOT={shlex.quote(str(models))}",
+            "/workspace/recovery": str(recovery),
+            "/opt/glimmer": str(app),
+            "sleep 5": "sleep 0.3",
+        }
+        for old, new in replacements.items():
+            self.assertIn(old, source)
+            source = source.replace(old, new)
+        script = self.root / "entrypoint.sh"
+        self._write_executable(script, source)
+
+        self._write_executable(
+            bin_root / "gosu",
+            '#!/usr/bin/env bash\nset -euo pipefail\nshift\nexec "$@"\n',
+        )
+        self._write_executable(
+            bin_root / "install",
+            """#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) shift ;;
+    -o|-g|-m) shift 2 ;;
+    *) mkdir -p "$1"; shift ;;
+  esac
+done
+""",
+        )
+        self._write_executable(bin_root / "chown", "#!/usr/bin/env bash\nexit 0\n")
+        self._write_executable(
+            bin_root / "ps",
+            """#!/usr/bin/env bash
+set -euo pipefail
+pid="${@: -1}"
+if grep -Eq "^(worker_exit|download_exit|download_term):$pid$" "$TEST_EVENTS" 2>/dev/null; then
+  echo Z
+else
+  echo S
+fi
+""",
+        )
+        self._write_executable(
+            bin_root / "python3",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "-c" ]; then
+  case "${2:-}" in
+    *127.0.0.1:4318/v1/health*) grep -q '^worker_listening:' "$TEST_EVENTS"; exit ;;
+  esac
+fi
+exec "$TEST_REAL_PYTHON" "$@"
+""",
+        )
+
+        self._write_executable(
+            app / "runpod_worker.py",
+            """#!/usr/bin/env python3
+import json
+import os
+import signal
+import time
+from pathlib import Path
+
+events = os.environ["TEST_EVENTS"]
+def record(value):
+    with open(events, "a", encoding="utf-8") as output:
+        output.write(value + "\\n")
+def stop(_signal, _frame):
+    record(f"worker_term:{os.getpid()}")
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+key = Path(os.environ.get("GLIMMER_API_KEY_FILE", ""))
+config = Path(os.environ.get("GLIMMER_MODEL_CONFIG", ""))
+valid_environment = False
+if key.is_file() and config.is_file() and os.environ.get("GLIMMER_URL") == "http://127.0.0.1:8080":
+    value = json.loads(config.read_text(encoding="utf-8"))
+    valid_environment = value["models"][0]["apiKeyFile"] == str(key)
+record(f"worker_env_ready:{int(valid_environment)}")
+record(f"worker_marker_at_start:{int((key.parent / 'model.ready').exists())}")
+record(f"worker_listening:{os.getpid()}")
+worker_mode = os.environ["TEST_WORKER_MODE"]
+if worker_mode == "exit_during_download":
+    time.sleep(0.3)
+    record(f"worker_exit:{os.getpid()}")
+    raise SystemExit(9)
+if worker_mode == "exit_during_llama":
+    while "llama_start:" not in Path(events).read_text(encoding="utf-8"):
+        time.sleep(0.02)
+    record(f"worker_exit:{os.getpid()}")
+    raise SystemExit(9)
+while True:
+    time.sleep(0.1)
+""",
+        )
+        self._write_executable(
+            app / "docker" / "runpod" / "fetch_artifact.py",
+            """#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+events = os.environ["TEST_EVENTS"]
+output = Path(sys.argv[sys.argv.index("--output") + 1])
+def record(value):
+    with open(events, "a", encoding="utf-8") as stream:
+        stream.write(value + "\\n")
+def stop(_signal, _frame):
+    record(f"download_term:{os.getpid()}")
+    raise SystemExit(143)
+record(f"download_start:{os.getpid()}:{output.name}")
+mode = os.environ["TEST_DOWNLOAD_MODE"]
+signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == "ignore" else stop)
+if mode in {"hold", "ignore"}:
+    while True:
+        time.sleep(0.1)
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_bytes(b"fixture")
+record(f"download_exit:{os.getpid()}")
+""",
+        )
+        self._write_executable(
+            app / "bin" / "llama-server",
+            """#!/usr/bin/env python3
+import os
+import signal
+import time
+
+events = os.environ["TEST_EVENTS"]
+def record(value):
+    with open(events, "a", encoding="utf-8") as output:
+        output.write(value + "\\n")
+def stop(_signal, _frame):
+    record(f"llama_term:{os.getpid()}")
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+record(f"llama_start:{os.getpid()}")
+while True:
+    time.sleep(0.1)
+""",
+        )
+        self._write_executable(
+            app / "docker" / "runpod" / "healthcheck.py",
+            """#!/usr/bin/env python3
+import os
+from pathlib import Path
+
+events = Path(os.environ["TEST_EVENTS"])
+if os.environ["TEST_WORKER_MODE"] == "exit_during_llama":
+    raise SystemExit(1)
+raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 1)
+""",
+        )
+
+        environment = {
+            **os.environ,
+            "PATH": f"{bin_root}:{os.environ.get('PATH', '')}",
+            "TEST_EVENTS": str(self.events),
+            "TEST_REAL_PYTHON": sys.executable,
+            "TEST_DOWNLOAD_MODE": download_mode,
+            "TEST_WORKER_MODE": worker_mode,
+            "GLIMMER_WORKER_BOOTSTRAP_TOKEN": "fixture-bootstrap",
+            "GLIMMER_MODEL_URL": "https://artifacts.example/model.gguf",
+            "GLIMMER_MODEL_SHA256": "a" * 64,
+            "GLIMMER_MMPROJ_URL": "https://artifacts.example/mmproj.gguf",
+            "GLIMMER_MMPROJ_SHA256": "b" * 64,
+            "GLIMMER_DFLASH_URL": "https://artifacts.example/dflash.gguf",
+            "GLIMMER_DFLASH_SHA256": "c" * 64,
+            "GLIMMER_ARTIFACT_HOSTS": "artifacts.example",
+            "GLIMMER_CONTEXT_TOKENS": "65536",
+        }
+        self.process = subprocess.Popen(
+            ["bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return state
+
+    def _wait_for(self, expected, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            events = self.events.read_text(encoding="utf-8") if self.events.exists() else ""
+            if expected(events):
+                return events.splitlines()
+            if self.process.poll() is not None:
+                stdout, stderr = self.process.communicate()
+                self.fail(f"entrypoint exited early ({self.process.returncode}): {stdout} {stderr}")
+            time.sleep(0.02)
+        self.fail("timed out waiting for entrypoint fixture event")
+
+    def _terminate(self):
+        self.process.send_signal(signal.SIGTERM)
+        self.process.communicate(timeout=8)
+        self.assertEqual(self.process.returncode, 143)
+
+    def test_listener_precedes_download_and_interrupt_kills_both_processes(self):
+        self._prepare("hold")
+        events = self._wait_for(lambda value: "download_start:" in value)
+        listener_index = next(
+            i for i, value in enumerate(events) if value.startswith("worker_listening:")
+        )
+        download_index = next(
+            i for i, value in enumerate(events) if value.startswith("download_start:")
+        )
+        self.assertLess(listener_index, download_index)
+        self.assertIn("worker_env_ready:1", events)
+        self.assertIn("worker_marker_at_start:0", events)
+
+        self._terminate()
+
+        final_events = self.events.read_text(encoding="utf-8")
+        self.assertIn("worker_term:", final_events)
+        self.assertIn("download_term:", final_events)
+
+    def test_ready_boot_sequence_cleanup_kills_llama_and_worker(self):
+        state = self._prepare("complete")
+        events = self._wait_for(
+            lambda value: value.count("download_start:") == 3 and "llama_start:" in value
+        )
+        self.assertLess(
+            next(i for i, value in enumerate(events) if value.startswith("worker_listening:")),
+            next(i for i, value in enumerate(events) if value.startswith("download_start:")),
+        )
+        self._wait_for(lambda _value: (state / "model.ready").exists())
+
+        self._terminate()
+
+        final_events = self.events.read_text(encoding="utf-8")
+        self.assertIn("worker_term:", final_events)
+        self.assertIn("llama_term:", final_events)
+
+    def test_cleanup_force_kills_a_downloader_that_ignores_term(self):
+        self._prepare("ignore")
+        self._wait_for(lambda value: "download_start:" in value)
+
+        started = time.monotonic()
+        self._terminate()
+
+        self.assertLess(time.monotonic() - started, 3)
+        final_events = self.events.read_text(encoding="utf-8")
+        self.assertIn("worker_term:", final_events)
+        self.assertNotIn("download_term:", final_events)
+
+    def test_worker_death_during_download_stops_the_downloader_and_exits_five(self):
+        self._prepare("hold", worker_mode="exit_during_download")
+        stdout, stderr = self.process.communicate(timeout=5)
+
+        self.assertEqual(self.process.returncode, 5, (stdout, stderr))
+        final_events = self.events.read_text(encoding="utf-8")
+        self.assertIn("download_start:", final_events)
+        self.assertIn("worker_exit:", final_events)
+        self.assertIn("download_term:", final_events)
+
+    def test_worker_death_during_llama_readiness_stops_llama_and_exits_five(self):
+        self._prepare("complete", worker_mode="exit_during_llama")
+        stdout, stderr = self.process.communicate(timeout=6)
+
+        self.assertEqual(self.process.returncode, 5, (stdout, stderr))
+        final_events = self.events.read_text(encoding="utf-8")
+        self.assertIn("llama_start:", final_events)
+        self.assertIn("worker_exit:", final_events)
+        self.assertIn("llama_term:", final_events)
+
+
+if __name__ == "__main__":
+    unittest.main()

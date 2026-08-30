@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib import request
 
 from glimmer_remote import decrypt_checkpoint, parse_remote_job_manifest, request_signature
 from runpod_worker import (
@@ -17,6 +18,7 @@ from runpod_worker import (
     RunningProcess,
     WorkerError,
     WorkerService,
+    _model_ready,
 )
 
 
@@ -111,18 +113,81 @@ class WorkerServiceTests(unittest.TestCase):
                 {"controllerInstanceId": "control-1", "nonce": "abcdefghijklmnop"},
             )
 
+    def test_health_stays_bootstrapping_after_handshake_until_model_is_ready(self):
+        ready = False
+        root = Path(self.temporary.name)
+        service = WorkerService(
+            root / "boot-state",
+            root / "boot-recovery",
+            "boot-token",
+            "build-abc",
+            65_536,
+            lambda: ready,
+            runner=self.runner,
+        )
+        service.handshake(
+            "Bearer boot-token",
+            "boot-handshake",
+            {"controllerInstanceId": "control-1", "nonce": "abcdefghijklmnop"},
+        )
+
+        bootstrapping = service.health()
+        self.assertFalse(bootstrapping["ready"])
+        self.assertFalse(bootstrapping["model"]["ready"])
+        self.assertEqual(bootstrapping["workerState"], "bootstrapping")
+
+        service.jobs["early-job"] = {"state": "created"}
+        self.assertEqual(service.health()["workerState"], "bootstrapping")
+
+        ready = True
+        self.assertEqual(service.health()["workerState"], "busy")
+        service.jobs.clear()
+        running = service.health()
+        self.assertTrue(running["ready"])
+        self.assertTrue(running["model"]["ready"])
+        self.assertEqual(running["workerState"], "ready")
+
+    def test_start_job_fails_closed_until_model_gate_is_ready(self):
+        ready = False
+        root = Path(self.temporary.name)
+        service = WorkerService(
+            root / "guard-state",
+            root / "guard-recovery",
+            "guard-token",
+            "build-abc",
+            65_536,
+            lambda: ready,
+            runner=self.runner,
+        )
+        service.handshake(
+            "Bearer guard-token",
+            "guard-handshake",
+            {"controllerInstanceId": "control-1", "nonce": "abcdefghijklmnop"},
+        )
+        body = b"bundle"
+        service.create_job(manifest(body))
+        service.upload_part("job-1", 0, body, hashlib.sha256(body).hexdigest())
+
+        with self.assertRaisesRegex(WorkerError, "model is not ready") as failure:
+            service.start_job("job-1")
+        self.assertEqual(failure.exception.status, 503)
+        self.assertEqual(service.job_status("job-1")["state"], "uploading")
+
+        ready = True
+        self.assertEqual(service.start_job("job-1")["state"], "running")
+        deadline = time.time() + 2
+        while service.job_status("job-1")["state"] == "running" and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(service.job_status("job-1")["state"], "succeeded")
+
     def test_upload_start_encrypted_checkpoint_and_ack(self):
         handshake = self.handshake()
         body = b"bundle"
         created = self.service.create_job(manifest(body))
         self.assertEqual(created["state"], "created")
-        uploaded = self.service.upload_part(
-            "job-1", 0, body, hashlib.sha256(body).hexdigest()
-        )
+        uploaded = self.service.upload_part("job-1", 0, body, hashlib.sha256(body).hexdigest())
         self.assertEqual(uploaded["receivedParts"], 1)
-        duplicate = self.service.upload_part(
-            "job-1", 0, body, hashlib.sha256(body).hexdigest()
-        )
+        duplicate = self.service.upload_part("job-1", 0, body, hashlib.sha256(body).hexdigest())
         self.assertEqual(duplicate["receivedParts"], 1)
         self.service.start_job("job-1")
 
@@ -154,9 +219,7 @@ class WorkerServiceTests(unittest.TestCase):
         with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r:") as archive:
             self.assertIn("result.json", archive.getnames())
             self.assertIn("session/task-report.json", archive.getnames())
-        acknowledged = self.service.acknowledge_checkpoint(
-            "job-1", 0, metadata["sha256"]
-        )
+        acknowledged = self.service.acknowledge_checkpoint("job-1", 0, metadata["sha256"])
         self.assertTrue(acknowledged["checkpoints"][0]["acknowledged"])
         with self.assertRaisesRegex(WorkerError, "not found"):
             self.service.checkpoint("job-1", 0)
@@ -179,9 +242,7 @@ class WorkerServiceTests(unittest.TestCase):
         self.service.register_idempotency("mutation-1", "POST", "/v1/jobs", b"one")
         self.service.register_idempotency("mutation-1", "POST", "/v1/jobs", b"one")
         with self.assertRaisesRegex(WorkerError, "different mutation"):
-            self.service.register_idempotency(
-                "mutation-1", "POST", "/v1/jobs/job-1/start", b"{}"
-            )
+            self.service.register_idempotency("mutation-1", "POST", "/v1/jobs/job-1/start", b"{}")
 
 
 class ProcessJobRunnerTests(unittest.TestCase):
@@ -217,6 +278,34 @@ class ProcessJobRunnerTests(unittest.TestCase):
             )
             self.assertEqual(environment["GLIMMER_STATE_ROOT"], str(job_dir))
             self.assertNotIn("GLIMMER_EVENTS_PATH", environment)
+
+
+class ModelReadinessGateTests(unittest.TestCase):
+    class HealthyResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def test_shallow_llama_health_cannot_bypass_the_strong_ready_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "model.ready"
+            with mock.patch.object(
+                request, "urlopen", return_value=self.HealthyResponse()
+            ) as urlopen:
+                self.assertFalse(_model_ready("http://127.0.0.1:8080/health", marker))
+                urlopen.assert_not_called()
+
+                marker.write_text("", encoding="utf-8")
+                self.assertTrue(_model_ready("http://127.0.0.1:8080/health", marker))
+                urlopen.assert_called_once()
+
+                marker.unlink()
+                marker.symlink_to(Path(temporary) / "missing")
+                self.assertFalse(_model_ready("http://127.0.0.1:8080/health", marker))
 
 
 class WorkerHttpContractTests(unittest.TestCase):
@@ -256,9 +345,7 @@ class WorkerHttpContractTests(unittest.TestCase):
         status, _, body = self.request("GET", "/v1/health")
         self.assertEqual(status, 200)
         self.assertNotIn(b"secret", body.lower())
-        invalid, _, _ = self.request(
-            "GET", "/v1/health", headers={"Authorization": "Bearer wrong"}
-        )
+        invalid, _, _ = self.request("GET", "/v1/health", headers={"Authorization": "Bearer wrong"})
         self.assertEqual(invalid, 401)
 
         handshake_body = json.dumps(

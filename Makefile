@@ -18,7 +18,14 @@ PYTHON_FILES := \
 	glimmer_remote.py \
 	glimmer_semantic.py \
 	glimmer_verification.py \
+	docker/runpod/fetch_artifact.py \
 	runpod_worker.py
+
+RUNPOD_TESTS := \
+	tests.test_glimmer_remote \
+	tests.test_runpod_worker \
+	tests.test_fetch_artifact \
+	tests.test_runpod_entrypoint
 
 .PHONY: quality lint typecheck compile selfcheck remote-test image-contract
 
@@ -55,7 +62,7 @@ selfcheck:
 	$(PYTHON) glimmer-eval.py --selfcheck
 
 remote-test:
-	$(PYTHON) -m unittest tests.test_glimmer_remote tests.test_runpod_worker
+	$(PYTHON) -m unittest $(RUNPOD_TESTS)
 
 image-contract:
 	$(PYTHON) scripts/verify-runpod-workflow.py
