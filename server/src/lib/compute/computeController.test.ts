@@ -82,11 +82,20 @@ function harness(options: {
   watchdogStatusFailure?: Error;
   watchdogUpsertFailure?: Error;
   watchdogIdentityFailure?: Error;
+  saveLeaseFailureCall?: number;
+  readUsageFailureCall?: number;
+  beginUsageFailure?: Error;
+  finishUsageFailure?: Error;
 }) {
   let currentLease: ComputeLeaseV1 | null =
     "currentLease" in options ? (options.currentLease ?? null) : lease();
   const deletePod = vi.fn().mockResolvedValue(undefined);
-  const finishUsage = vi.fn().mockResolvedValue(undefined);
+  const beginUsage = options.beginUsageFailure
+    ? vi.fn().mockRejectedValue(options.beginUsageFailure)
+    : vi.fn().mockResolvedValue(undefined);
+  const finishUsage = options.finishUsageFailure
+    ? vi.fn().mockRejectedValue(options.finishUsageFailure)
+    : vi.fn().mockResolvedValue(undefined);
   const clearLease = vi.fn().mockImplementation(async (id: string) => {
     if (currentLease?.id !== id) return false;
     currentLease = null as any;
@@ -105,10 +114,14 @@ function harness(options: {
       adjustedCostPerHr: 1.39,
       gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
     } as const);
+  let activeProviderPod = providerPod;
   const fakeClient = {
-    getPod: vi.fn().mockImplementation(async () => (deleted ? null : providerPod)),
+    getPod: vi.fn().mockImplementation(async () => (deleted ? null : activeProviderPod)),
     listPods: vi.fn().mockResolvedValue([]),
-    createPod: vi.fn().mockResolvedValue(providerPod),
+    createPod: vi.fn().mockImplementation(async (input: { name: string }) => {
+      activeProviderPod = { ...providerPod, name: input.name };
+      return activeProviderPod;
+    }),
     deletePod,
     getPodBilling: vi.fn().mockResolvedValue([]),
   };
@@ -168,6 +181,24 @@ function harness(options: {
     createdAt: NOW.toISOString(),
     rotatedAt: NOW.toISOString(),
   }));
+  let saveLeaseCalls = 0;
+  const saveLease = vi.fn().mockImplementation(async (next: ComputeLeaseV1) => {
+    saveLeaseCalls += 1;
+    if (saveLeaseCalls === options.saveLeaseFailureCall) {
+      throw new Error("lease persistence unavailable");
+    }
+    currentLease = next;
+    return next;
+  });
+  let readUsageCalls = 0;
+  const readUsage = vi.fn().mockImplementation(async () => {
+    readUsageCalls += 1;
+    if (readUsageCalls === options.readUsageFailureCall) {
+      throw new Error("usage summary unavailable");
+    }
+    return usage;
+  });
+  const readWorkerSecret = vi.fn();
   const controller = new ComputeController({
     now: () => NOW,
     readConfig: vi.fn().mockResolvedValue(options.currentConfig ?? config),
@@ -179,19 +210,16 @@ function harness(options: {
     }),
     markWatchdogVerified: vi.fn(),
     readLease: vi.fn().mockImplementation(async () => currentLease),
-    saveLease: vi.fn().mockImplementation(async (next: ComputeLeaseV1) => {
-      currentLease = next;
-      return next;
-    }),
+    saveLease,
     updateLease: vi.fn().mockImplementation(async (mutate: any) => {
       if (!currentLease) return null;
       currentLease = mutate(currentLease);
       return currentLease;
     }),
     clearLease,
-    beginUsage: vi.fn(),
+    beginUsage,
     finishUsage,
-    readUsage: vi.fn().mockResolvedValue(usage),
+    readUsage,
     readTrackedPodIds: vi.fn().mockResolvedValue(["pod_123"]),
     storeReconciledUsage: vi.fn(),
     clientFactory: () => fakeClient as any,
@@ -205,7 +233,7 @@ function harness(options: {
       controllerNonce: "N".repeat(43),
       createdAt: NOW.toISOString(),
     })),
-    readWorkerSecret: vi.fn(),
+    readWorkerSecret,
     storeWorkerHandshake,
     deleteWorkerSecret,
     sleep: vi.fn().mockResolvedValue(undefined),
@@ -214,19 +242,44 @@ function harness(options: {
   return {
     controller,
     deletePod,
+    beginUsage,
     finishUsage,
     clearLease,
     deleteWorkerSecret,
     fakeClient,
     workerClient,
     watchdogClient,
+    saveLease,
+    readUsage,
+    readWorkerSecret,
     currentLease: () => currentLease,
   };
 }
 
 describe("ComputeController startup recovery", () => {
+  it("retains a name-only lease through its hard deadline while visibility converges", async () => {
+    const { controller, clearLease, deleteWorkerSecret, currentLease } = harness({
+      currentLease: lease({
+        podId: undefined,
+        state: "terminating",
+        createdAt: "2026-08-29T11:00:00.000Z",
+        idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+        hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+      }),
+    });
+
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      recovered: false,
+      cleaned: false,
+      detail: "provisional Pod reconciliation is still pending",
+    });
+    expect(clearLease).not.toHaveBeenCalled();
+    expect(deleteWorkerSecret).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ state: "terminating", podId: undefined });
+  });
+
   it("terminates a recovered Pod when the independent watchdog is unavailable", async () => {
-    const { controller, deletePod, currentLease } = harness({
+    const { controller, deletePod, beginUsage, currentLease } = harness({
       currentLease: lease({
         idleDeadlineAt: "2026-08-29T12:05:00.000Z",
         hardDeadlineAt: "2026-08-29T14:00:00.000Z",
@@ -238,6 +291,14 @@ describe("ComputeController startup recovery", () => {
       cleaned: true,
       detail: expect.stringContaining("watchdog is unavailable"),
     });
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leaseId: "lease-1",
+        podId: "pod_123",
+        startedAt: "2026-08-29T11:00:00.000Z",
+        hourlyUsd: 1.75,
+      }),
+    );
     expect(deletePod).toHaveBeenCalledWith("pod_123");
     expect(currentLease()).toBeNull();
   });
@@ -255,14 +316,86 @@ describe("ComputeController startup recovery", () => {
   });
 
   it("terminates instead of guessing when the persisted profile no longer exists", async () => {
-    const { controller, deletePod } = harness({
-      currentLease: lease({ profileId: "removed-profile" }),
+    const { controller, deletePod, beginUsage } = harness({
+      currentLease: lease({ profileId: "removed-profile", observedHourlyUsd: undefined }),
     });
     await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
       cleaned: true,
       detail: "Pod terminated because its compute profile is missing",
     });
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ podId: "pod_123", hourlyUsd: 0 }),
+    );
     expect(deletePod).toHaveBeenCalledWith("pod_123");
+  });
+
+  it("polls delayed allocation evidence and restores the original usage interval", async () => {
+    const incomplete = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const complete = { ...incomplete, gpu: { ...incomplete.gpu, count: 1 } };
+    const { controller, fakeClient, beginUsage, readWorkerSecret, currentLease } = harness({
+      currentLease: lease({
+        idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+        hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+      }),
+      pod: incomplete,
+    });
+    fakeClient.getPod.mockReset().mockResolvedValueOnce(incomplete).mockResolvedValue(complete);
+    readWorkerSecret.mockResolvedValue({
+      version: 1,
+      leaseId: "lease-1",
+      capability: "C".repeat(43),
+      checkpointKey: "K".repeat(43),
+      handshakeIdempotencyKey: "I".repeat(43),
+      controllerNonce: "N".repeat(43),
+      createdAt: NOW.toISOString(),
+    });
+
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      recovered: true,
+      cleaned: false,
+    });
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leaseId: "lease-1",
+        podId: "pod_123",
+        startedAt: "2026-08-29T11:00:00.000Z",
+        hourlyUsd: 1.75,
+      }),
+    );
+    expect(currentLease()).toMatchObject({ podId: "pod_123", state: "ready" });
+  });
+
+  it("never rebinds a durable lease to a mismatched startup response", async () => {
+    const { controller, fakeClient, deletePod, beginUsage, workerClient, currentLease } = harness({
+      currentLease: lease({
+        idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+        hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+      }),
+    });
+    fakeClient.getPod.mockResolvedValue({
+      id: "pod_other",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING",
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+    });
+
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      recovered: false,
+      cleaned: false,
+      detail: expect.stringContaining("exact-id termination is still pending"),
+    });
+    expect(beginUsage).toHaveBeenCalledWith(expect.objectContaining({ podId: "pod_123" }));
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(deletePod).not.toHaveBeenCalledWith("pod_other");
+    expect(workerClient.health).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ podId: "pod_123", state: "terminating" });
   });
 
   it("terminates a recovered allocation that violates the price ceiling", async () => {
@@ -319,12 +452,96 @@ describe("ComputeController authenticated worker startup", () => {
     expect(currentLease()).toBeNull();
   });
 
+  it("retains protection after a lost create response until a delayed Pod is terminated", async () => {
+    const {
+      controller,
+      fakeClient,
+      deletePod,
+      beginUsage,
+      deleteWorkerSecret,
+      watchdogClient,
+      currentLease,
+    } = harness({ currentLease: null });
+    let createdName = "";
+    fakeClient.createPod.mockImplementation(async (input: { name: string }) => {
+      createdName = input.name;
+      throw new Error("create response lost");
+    });
+    fakeClient.listPods
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockImplementation(async () => [
+        {
+          id: "pod_delayed",
+          name: createdName,
+          desiredStatus: "RUNNING",
+          adjustedCostPerHr: 1.39,
+          gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+        },
+      ]);
+
+    await expect(controller.start()).rejects.toThrow(/protected exact-name reconciliation/);
+    expect(currentLease()).toMatchObject({
+      podName: createdName,
+      state: "terminating",
+    });
+    expect(currentLease()?.podId).toBeUndefined();
+    expect(deleteWorkerSecret).not.toHaveBeenCalled();
+    expect(watchdogClient.deleteLease).not.toHaveBeenCalled();
+
+    await expect(controller.stop()).resolves.toMatchObject({ stopped: true, terminated: true });
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ podId: "pod_delayed", hourlyUsd: 1.75 }),
+    );
+    expect(deletePod).toHaveBeenCalledWith("pod_delayed");
+    expect(currentLease()).toBeNull();
+  });
+
+  it("terminates every exact-name Pod after an ambiguous create outcome", async () => {
+    const { controller, fakeClient, deletePod, beginUsage, currentLease } = harness({
+      currentLease: null,
+    });
+    let createdName = "";
+    fakeClient.createPod.mockImplementation(async (input: { name: string }) => {
+      createdName = input.name;
+      throw new Error("create response lost");
+    });
+    fakeClient.listPods.mockImplementation(async () => [
+      {
+        id: "pod_ambiguous_1",
+        name: createdName,
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.39,
+      },
+      {
+        id: "pod_ambiguous_2",
+        name: createdName,
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.49,
+      },
+    ]);
+
+    await expect(controller.start()).rejects.toThrow(/create outcome was ambiguous/);
+    expect(deletePod).toHaveBeenCalledWith("pod_ambiguous_1");
+    expect(deletePod).toHaveBeenCalledWith("pod_ambiguous_2");
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ podId: "pod_ambiguous_1", hourlyUsd: 1.75 }),
+    );
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ podId: "pod_ambiguous_2", hourlyUsd: 1.75 }),
+    );
+    expect(currentLease()).toBeNull();
+  });
+
   it("terminates an allocated Pod if the watchdog rejects its exact identity", async () => {
     const { controller, fakeClient, deletePod, currentLease } = harness({
       currentLease: null,
       watchdogIdentityFailure: new Error("identity rejected"),
     });
-    await expect(controller.start()).rejects.toThrow(/watchdog did not accept its identity/);
+    await expect(controller.start()).rejects.toThrow(
+      /watchdog did not accept the allocated Pod identity/,
+    );
     expect(fakeClient.createPod).toHaveBeenCalledTimes(1);
     expect(deletePod).toHaveBeenCalledWith("pod_123");
     expect(currentLease()).toBeNull();
@@ -383,6 +600,160 @@ describe("ComputeController authenticated worker startup", () => {
     expect(JSON.stringify(input.env)).not.toContain("RunPod");
   });
 
+  it("polls the exact Pod until an incomplete create response proves one approved GPU", async () => {
+    const { controller, fakeClient, deletePod } = harness({ currentLease: null });
+    let createdName = "";
+    fakeClient.createPod.mockImplementation(async (input: { name: string }) => {
+      createdName = input.name;
+      return {
+        id: "pod_123",
+        name: input.name,
+        desiredStatus: "RUNNING" as const,
+        adjustedCostPerHr: 1.39,
+        gpu: { id: "NVIDIA A100 80GB PCIe" },
+      };
+    });
+    fakeClient.getPod.mockImplementation(async () => ({
+      id: "pod_123",
+      name: createdName,
+      desiredStatus: "RUNNING",
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+    }));
+
+    await expect(controller.start()).resolves.toMatchObject({
+      started: true,
+      status: { state: "ready", pod: { gpuCount: 1 } },
+    });
+    expect(fakeClient.getPod).toHaveBeenCalledWith("pod_123");
+    expect(deletePod).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when exact Pod reads never prove the allocated GPU count", async () => {
+    const incompletePod = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const { controller, fakeClient, deletePod, beginUsage, workerClient, currentLease } = harness({
+      currentLease: null,
+      pod: incompletePod,
+    });
+
+    await expect(controller.start()).rejects.toThrow(
+      "RunPod did not prove that exactly one GPU was allocated",
+    );
+    // Three bounded evidence reads plus the existing post-delete confirmation.
+    expect(fakeClient.getPod).toHaveBeenCalledTimes(4);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ podId: "pod_123", startedAt: NOW.toISOString(), hourlyUsd: 1.75 }),
+    );
+    expect(workerClient.health).not.toHaveBeenCalled();
+    expect(currentLease()).toBeNull();
+  });
+
+  it("tracks an unknown-rate allocation conservatively before evidence polling", async () => {
+    const incompletePod = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const { controller, beginUsage, deletePod } = harness({
+      currentLease: null,
+      pod: incompletePod,
+    });
+
+    await expect(controller.start()).rejects.toThrow(
+      "RunPod did not report a verifiable hourly rate",
+    );
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        podId: "pod_123",
+        startedAt: NOW.toISOString(),
+        hourlyUsd: 1.75,
+      }),
+    );
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+  });
+
+  it("never trusts or deletes a mismatched refreshed Pod identity", async () => {
+    const { controller, fakeClient, deletePod, workerClient } = harness({ currentLease: null });
+    fakeClient.createPod.mockImplementation(async () => ({
+      id: "pod_123",
+      name: "not-the-leased-name",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+    }));
+
+    await expect(controller.start()).rejects.toThrow(
+      "RunPod did not preserve the allocated Pod identity",
+    );
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it("ignores a mismatched exact GET and only terminates the original allocation", async () => {
+    const { controller, fakeClient, deletePod, workerClient } = harness({ currentLease: null });
+    let createdName = "";
+    fakeClient.createPod.mockImplementation(async (input: { name: string }) => {
+      createdName = input.name;
+      return {
+        id: "pod_123",
+        name: input.name,
+        desiredStatus: "RUNNING" as const,
+        adjustedCostPerHr: 1.39,
+        gpu: { id: "NVIDIA A100 80GB PCIe" },
+      };
+    });
+    const mismatched = {
+      id: "pod_other",
+      name: createdName,
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+    };
+    fakeClient.getPod
+      .mockReset()
+      .mockImplementationOnce(async () => ({ ...mismatched, name: createdName }))
+      .mockImplementationOnce(async () => ({ ...mismatched, name: createdName }))
+      .mockImplementationOnce(async () => ({ ...mismatched, name: createdName }))
+      .mockResolvedValue(null);
+
+    await expect(controller.start()).rejects.toThrow(
+      "RunPod did not prove that exactly one GPU was allocated",
+    );
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(deletePod).not.toHaveBeenCalledWith("pod_other");
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it("deletes the exact Pod when persisting its allocated identity fails", async () => {
+    const { controller, deletePod, currentLease } = harness({
+      currentLease: null,
+      saveLeaseFailureCall: 2,
+    });
+
+    await expect(controller.start()).rejects.toThrow(/post-create bookkeeping failed/);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(currentLease()).toBeNull();
+  });
+
+  it("deletes the exact Pod when local safety scheduling fails", async () => {
+    const { controller, deletePod, currentLease } = harness({
+      currentLease: null,
+      readUsageFailureCall: 2,
+    });
+
+    await expect(controller.start()).rejects.toThrow(/post-create bookkeeping failed/);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(currentLease()).toBeNull();
+  });
+
   it("terminates immediately and clears worker secrets when authenticated readiness fails", async () => {
     const { controller, deletePod, deleteWorkerSecret, currentLease } = harness({
       currentLease: null,
@@ -392,5 +763,104 @@ describe("ComputeController authenticated worker startup", () => {
     expect(deletePod).toHaveBeenCalledWith("pod_123");
     expect(deleteWorkerSecret).toHaveBeenCalledTimes(1);
     expect(currentLease()).toBeNull();
+  });
+});
+
+describe("ComputeController exact-id termination", () => {
+  it("keeps one stable usage lease across partial duplicate-cleanup retries", async () => {
+    const { controller, fakeClient, deletePod, beginUsage, finishUsage, currentLease } = harness({
+      currentLease: lease({ podId: undefined, state: "terminating" }),
+    });
+    const first = {
+      id: "pod_duplicate_1",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING",
+      adjustedCostPerHr: 1.39,
+    };
+    const second = { ...first, id: "pod_duplicate_2", adjustedCostPerHr: 1.49 };
+    fakeClient.listPods
+      .mockReset()
+      .mockResolvedValueOnce([first, second])
+      .mockResolvedValueOnce([second]);
+    const deletedIds = new Set<string>();
+    let secondDeleteAttempts = 0;
+    deletePod.mockReset().mockImplementation(async (podId: string) => {
+      if (podId === second.id) {
+        secondDeleteAttempts += 1;
+        if (secondDeleteAttempts === 1) throw new Error("delete unavailable");
+      }
+      deletedIds.add(podId);
+    });
+    fakeClient.getPod.mockImplementation(async (podId: string) => {
+      if (deletedIds.has(podId)) return null;
+      throw new Error("confirmation unavailable");
+    });
+
+    await expect(controller.stop()).rejects.toThrow(/termination is still pending/);
+    expect(finishUsage).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ state: "terminating", podId: undefined });
+
+    await expect(controller.stop()).resolves.toMatchObject({ stopped: true, terminated: true });
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ leaseId: "lease-1", podId: first.id }),
+    );
+    expect(beginUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ leaseId: "lease-1", podId: second.id }),
+    );
+    expect(beginUsage.mock.calls.every(([entry]) => entry.leaseId === "lease-1")).toBe(true);
+    expect(finishUsage).toHaveBeenCalledWith("lease-1", NOW.toISOString());
+    expect(currentLease()).toBeNull();
+  });
+
+  it("keeps duplicate cleanup pending when usage intervals cannot be closed", async () => {
+    const { controller, fakeClient, deleteWorkerSecret, currentLease } = harness({
+      currentLease: lease({ podId: undefined, state: "terminating" }),
+      finishUsageFailure: new Error("usage ledger unavailable"),
+    });
+    fakeClient.listPods.mockResolvedValue([
+      {
+        id: "pod_duplicate_1",
+        name: "glimmer-test-lease",
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.39,
+      },
+      {
+        id: "pod_duplicate_2",
+        name: "glimmer-test-lease",
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.49,
+      },
+    ]);
+
+    await expect(controller.stop()).rejects.toThrow(/termination is still pending/);
+    expect(deleteWorkerSecret).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ state: "terminating", podId: undefined });
+  });
+
+  it("keeps the lease and usage open when deletion cannot be confirmed", async () => {
+    const { controller, fakeClient, deletePod, finishUsage, currentLease } = harness({});
+    deletePod.mockReset().mockRejectedValue(new Error("delete response unavailable"));
+    fakeClient.getPod.mockRejectedValue(new Error("exact read unavailable"));
+
+    await expect(controller.stop()).rejects.toThrow(/termination is pending/);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(finishUsage).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ podId: "pod_123", state: "terminating" });
+  });
+
+  it("does not accept a terminated response for a different Pod id", async () => {
+    const { controller, fakeClient, deletePod, finishUsage, currentLease } = harness({});
+    deletePod.mockReset().mockResolvedValue(undefined);
+    fakeClient.getPod.mockResolvedValue({
+      id: "pod_other",
+      name: "glimmer-test-lease",
+      desiredStatus: "TERMINATED",
+    });
+
+    await expect(controller.stop()).rejects.toThrow(/termination is pending/);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(deletePod).not.toHaveBeenCalledWith("pod_other");
+    expect(finishUsage).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({ podId: "pod_123", state: "terminating" });
   });
 });

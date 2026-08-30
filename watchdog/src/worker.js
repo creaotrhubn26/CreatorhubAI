@@ -216,13 +216,17 @@ function podRate(pod) {
   return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? rate : null;
 }
 
-async function findPod(env, lease) {
-  if (lease.podId) return runPodRequest(env, `/pods/${encodeURIComponent(lease.podId)}`);
+async function findPods(env, lease) {
+  if (lease.podId) {
+    const pod = await runPodRequest(env, `/pods/${encodeURIComponent(lease.podId)}`);
+    if (pod && (pod.id !== lease.podId || pod.name !== lease.podName)) {
+      throw new Error("RUNPOD_POD_IDENTITY_MISMATCH");
+    }
+    return pod ? [pod] : [];
+  }
   const pods = await runPodRequest(env, "/pods");
   if (!Array.isArray(pods)) throw new Error("RUNPOD_POD_LIST_INVALID");
-  const matches = pods.filter((pod) => pod?.name === lease.podName);
-  if (matches.length > 1) throw new Error("RUNPOD_POD_NAME_AMBIGUOUS");
-  return matches[0] ?? null;
+  return pods.filter((pod) => pod?.name === lease.podName);
 }
 
 function terminationReason(lease, pod, nowMs, staleAfterMs) {
@@ -265,8 +269,31 @@ export async function sweep(env, nowMs = Date.now()) {
       try {
         const raw = await env.LEASES.get(key, "json");
         const lease = parseLease(raw, nowMs);
-        const pod = await findPod(env, lease);
-        if (!pod || pod.desiredStatus === "TERMINATED") {
+        const pods = await findPods(env, lease);
+        if (lease.podId && pods.length === 0) {
+          await env.LEASES.delete(key);
+          continue;
+        }
+        if (!lease.podId && pods.length === 0) {
+          if (nowMs >= Date.parse(lease.hardDeadlineAt)) await env.LEASES.delete(key);
+          continue;
+        }
+        if (!lease.podId && pods.length > 1) {
+          for (const match of pods) {
+            try {
+              if (!SAFE_ID.test(match?.id ?? "")) throw new Error("RUNPOD_POD_ID_INVALID");
+              result.terminationRequests += 1;
+              await runPodRequest(env, `/pods/${encodeURIComponent(match.id)}`, {
+                method: "DELETE",
+              });
+            } catch (error) {
+              result.errors.push(error instanceof Error ? error.message : "LEASE_SWEEP_FAILED");
+            }
+          }
+          continue;
+        }
+        const pod = pods[0];
+        if (pod.desiredStatus === "TERMINATED") {
           await env.LEASES.delete(key);
           continue;
         }
@@ -274,11 +301,11 @@ export async function sweep(env, nowMs = Date.now()) {
         if (!reason) continue;
         const podId = lease.podId ?? pod.id;
         if (!SAFE_ID.test(podId ?? "")) throw new Error("RUNPOD_POD_ID_INVALID");
+        result.terminationRequests += 1;
         const deletion = await runPodRequest(env, `/pods/${encodeURIComponent(podId)}`, {
           method: "DELETE",
         });
-        result.terminationRequests += 1;
-        if (deletion === null) await env.LEASES.delete(key);
+        if (deletion === null && lease.podId) await env.LEASES.delete(key);
       } catch (error) {
         result.errors.push(error instanceof Error ? error.message : "LEASE_SWEEP_FAILED");
       }

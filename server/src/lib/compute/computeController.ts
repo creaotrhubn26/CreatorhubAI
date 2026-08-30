@@ -56,6 +56,10 @@ export class ComputeControlError extends Error {
 
 class PermanentWorkerValidationError extends Error {}
 
+const ALLOCATION_EVIDENCE_ATTEMPTS = 3;
+const ALLOCATION_EVIDENCE_RETRY_MS = 1_000;
+const CREATE_OUTCOME_POLL_ATTEMPTS = 3;
+
 interface ControllerDependencies {
   now: () => Date;
   readConfig: typeof readComputeConfig;
@@ -334,7 +338,16 @@ export class ComputeController {
     lease: ComputeLeaseV1,
     persistRecoveredId = false,
   ): Promise<RunPodPod | null> {
-    if (lease.podId) return client.getPod(lease.podId);
+    if (lease.podId) {
+      const pod = await client.getPod(lease.podId);
+      if (pod && (pod.id !== lease.podId || pod.name !== lease.podName)) {
+        throw new ComputeControlError(
+          "RunPod returned a Pod identity that does not match the durable compute lease",
+          502,
+        );
+      }
+      return pod;
+    }
     const matches = (await client.listPods()).filter((pod) => pod.name === lease.podName);
     if (matches.length > 1) {
       throw new ComputeControlError(
@@ -347,6 +360,113 @@ export class ComputeController {
       await this.dependencies.updateLease((current) => ({ ...current, podId: matches[0].id }));
     }
     return matches[0];
+  }
+
+  private async waitForCreateOutcome(client: RunPodClient, podName: string): Promise<RunPodPod[]> {
+    for (let attempt = 0; attempt < CREATE_OUTCOME_POLL_ATTEMPTS; attempt += 1) {
+      try {
+        const matches = (await client.listPods()).filter((pod) => pod.name === podName);
+        if (matches.length > 0) return matches;
+      } catch {
+        // A lost create response plus a transient list failure is ambiguous.
+        // Retain the provisional lease and retry rather than declaring absence.
+      }
+      if (attempt + 1 < CREATE_OUTCOME_POLL_ATTEMPTS) {
+        await this.dependencies.sleep(ALLOCATION_EVIDENCE_RETRY_MS);
+      }
+    }
+    return [];
+  }
+
+  private provisionalAbsenceNeedsReconciliation(lease: ComputeLeaseV1): boolean {
+    return !lease.podId && this.dependencies.now().getTime() < Date.parse(lease.hardDeadlineAt);
+  }
+
+  private async retainProvisionalLease(lease: ComputeLeaseV1, reason: string): Promise<void> {
+    try {
+      await this.dependencies.saveLease({
+        ...lease,
+        state: "terminating",
+        error: reason,
+      });
+    } catch (error) {
+      console.error(
+        `[compute] could not persist provisional reconciliation state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    this.scheduleCleanupRetry("retry ambiguous create outcome reconciliation");
+  }
+
+  private async terminateNameMatchedPods(
+    client: RunPodClient,
+    lease: ComputeLeaseV1,
+    pods: RunPodPod[],
+    profile: ComputeProfileV1 | undefined,
+    reason: string,
+  ): Promise<boolean> {
+    this.clearSafetyTimer();
+    this.clearWatchdogHeartbeat();
+    const exactMatches = [
+      ...new Map(
+        pods.filter((pod) => pod.name === lease.podName).map((pod) => [pod.id, pod]),
+      ).values(),
+    ];
+    if (exactMatches.length === 0) return false;
+    try {
+      await this.dependencies.saveLease({
+        ...lease,
+        state: "terminating",
+        error: reason,
+      });
+    } catch (error) {
+      console.error(
+        `[compute] could not persist ambiguous-Pod cleanup state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    let allConfirmedAbsent = true;
+    for (const pod of exactMatches) {
+      const hourlyUsd = Math.max(
+        profile?.maxGpuHourlyUsd ?? lease.observedHourlyUsd ?? 0,
+        price(pod) ?? 0,
+      );
+      try {
+        await this.dependencies.beginUsage({
+          leaseId: lease.id,
+          podId: pod.id,
+          startedAt: lease.createdAt,
+          hourlyUsd,
+        });
+      } catch (error) {
+        console.error(
+          `[compute] could not track ambiguous Pod ${pod.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      try {
+        await client.deletePod(pod.id);
+      } catch {
+        // Confirmation below decides whether this exact id is gone.
+      }
+      if (!(await this.waitForTermination(client, pod.id))) {
+        allConfirmedAbsent = false;
+      }
+    }
+    if (!allConfirmedAbsent) {
+      this.scheduleCleanupRetry("retry ambiguous Pod termination");
+      return false;
+    }
+    try {
+      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+      await this.dependencies.deleteWorkerSecret(lease.id);
+      await this.deleteWatchdogLeaseBestEffort(lease.id);
+      await this.dependencies.clearLease(lease.id);
+      return true;
+    } catch (error) {
+      console.error(
+        `[compute] ambiguous Pod cleanup is incomplete: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.scheduleCleanupRetry("retry ambiguous Pod state cleanup");
+      return false;
+    }
   }
 
   private createInput(
@@ -473,29 +593,57 @@ export class ComputeController {
     lease: ComputeLeaseV1,
     reason: string,
   ): Promise<boolean> {
+    return this.terminateAllocatedPod(client, lease, reason);
+  }
+
+  private async terminateAllocatedPod(
+    client: RunPodClient,
+    lease: ComputeLeaseV1,
+    reason: string,
+  ): Promise<boolean> {
+    this.clearSafetyTimer();
+    this.clearWatchdogHeartbeat();
     const podId = lease.podId;
     if (!podId) {
-      this.clearWatchdogHeartbeat();
       await this.dependencies.deleteWorkerSecret(lease.id);
       await this.deleteWatchdogLeaseBestEffort(lease.id);
-      return true;
-    }
-    await this.dependencies.saveLease({
-      ...lease,
-      state: "terminating",
-      error: `${reason}; termination requested immediately`,
-    });
-    await client.deletePod(podId);
-    if (await this.waitForTermination(client, podId)) {
-      this.clearWatchdogHeartbeat();
-      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
       await this.dependencies.clearLease(lease.id);
-      await this.dependencies.deleteWorkerSecret(lease.id);
-      await this.deleteWatchdogLeaseBestEffort(lease.id);
       return true;
     }
-    this.scheduleCleanupRetry("retry failed worker bootstrap termination");
-    return false;
+    try {
+      await this.dependencies.saveLease({
+        ...lease,
+        state: "terminating",
+        error: `${reason}; termination requested immediately`,
+      });
+    } catch (error) {
+      console.error(
+        `[compute] could not persist terminating state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try {
+      await client.deletePod(podId);
+    } catch {
+      // DELETE may have reached the provider even when its response was lost.
+      // Exact-id absence below is the only condition that permits cleanup.
+    }
+    if (!(await this.waitForTermination(client, podId))) {
+      this.scheduleCleanupRetry("retry provider termination");
+      return false;
+    }
+    try {
+      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+      await this.dependencies.deleteWorkerSecret(lease.id);
+      await this.deleteWatchdogLeaseBestEffort(lease.id);
+      await this.dependencies.clearLease(lease.id);
+      return true;
+    } catch (error) {
+      console.error(
+        `[compute] terminated Pod cleanup is incomplete: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.scheduleCleanupRetry("retry terminated allocation cleanup");
+      return false;
+    }
   }
 
   private validateAllocatedPod(profile: ComputeProfileV1, pod: RunPodPod): string | null {
@@ -519,6 +667,46 @@ export class ComputeController {
     return null;
   }
 
+  private allocationEvidenceIsPending(profile: ComputeProfileV1, pod: RunPodPod): boolean {
+    if (pod.desiredStatus !== "RUNNING") return false;
+    const observedPrice = price(pod);
+    if (observedPrice !== undefined && observedPrice > profile.maxGpuHourlyUsd) return false;
+    if (pod.gpu?.count !== undefined && pod.gpu.count !== 1) return false;
+    if (pod.gpu?.id && !profile.gpuTypeIds.some((gpuTypeId) => gpuTypeId === pod.gpu?.id)) {
+      return false;
+    }
+    return observedPrice === undefined || pod.gpu?.count === undefined || !pod.gpu?.id;
+  }
+
+  private async waitForAllocationEvidence(
+    client: RunPodClient,
+    profile: ComputeProfileV1,
+    initial: RunPodPod,
+    expectedName: string,
+  ): Promise<RunPodPod> {
+    let observed = initial;
+    for (let attempt = 0; attempt < ALLOCATION_EVIDENCE_ATTEMPTS; attempt += 1) {
+      const validationError = this.validateAllocatedPod(profile, observed);
+      if (!validationError || !this.allocationEvidenceIsPending(profile, observed)) {
+        return observed;
+      }
+      if (attempt > 0) {
+        await this.dependencies.sleep(ALLOCATION_EVIDENCE_RETRY_MS);
+      }
+      try {
+        const refreshed = await client.getPod(initial.id);
+        if (refreshed?.id === initial.id && refreshed.name === expectedName) {
+          observed = refreshed;
+        }
+      } catch {
+        // A transient read failure cannot promote an incomplete create response.
+        // Keep polling the exact Pod id, then fail closed through the existing
+        // allocation rejection and termination path if proof never arrives.
+      }
+    }
+    return observed;
+  }
+
   private clearSafetyTimer() {
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     this.safetyTimer = null;
@@ -527,10 +715,20 @@ export class ComputeController {
   private scheduleCleanupRetry(reason: string) {
     this.clearSafetyTimer();
     this.safetyTimer = setTimeout(() => {
-      void this.stop(reason).catch((error) => {
+      void this.stop(reason).catch(async (error) => {
         console.error(
           `[compute] cleanup retry failed: ${error instanceof Error ? error.message : String(error)}`,
         );
+        try {
+          if (await this.dependencies.readLease()) {
+            this.scheduleCleanupRetry(reason);
+          }
+        } catch (leaseError) {
+          console.error(
+            `[compute] could not inspect lease after cleanup failure: ${leaseError instanceof Error ? leaseError.message : String(leaseError)}`,
+          );
+          this.scheduleCleanupRetry(reason);
+        }
       });
     }, 5_000);
     this.safetyTimer.unref?.();
@@ -538,8 +736,15 @@ export class ComputeController {
 
   private async waitForTermination(client: RunPodClient, podId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const pod = await client.getPod(podId);
-      if (!pod || pod.desiredStatus === "TERMINATED") return true;
+      let pod: RunPodPod | null;
+      try {
+        pod = await client.getPod(podId);
+      } catch {
+        return false;
+      }
+      if (!pod) return true;
+      if (pod.id !== podId) return false;
+      if (pod.desiredStatus === "TERMINATED") return true;
       if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 500));
     }
     return false;
@@ -759,123 +964,125 @@ export class ComputeController {
       } catch (error) {
         // Creation has no documented idempotency key. Recover an exact-name
         // Pod before declaring failure so a lost response cannot orphan spend.
-        let providerListSucceeded = false;
-        const matches = await client.listPods().then(
-          (pods) => {
-            providerListSucceeded = true;
-            return pods.filter((candidate) => candidate.name === podName);
-          },
-          () => [],
-        );
-        if (matches.length !== 1) {
-          this.clearWatchdogHeartbeat();
-          await this.dependencies.saveLease({
-            ...lease,
-            state: "failed",
-            error:
-              matches.length > 1
-                ? "RunPod create outcome is ambiguous; multiple Pods have the lease name"
-                : `RunPod create failed: ${error instanceof Error ? error.message : "unknown error"}`,
-          });
-          if (matches.length === 0 && providerListSucceeded) {
-            await this.dependencies.clearLease(leaseId);
-            await this.dependencies.deleteWorkerSecret(leaseId);
-            await this.deleteWatchdogLeaseBestEffort(leaseId);
-          }
-          throw error;
+        const matches = await this.waitForCreateOutcome(client, podName);
+        if (matches.length > 1) {
+          const cleaned = await this.terminateNameMatchedPods(
+            client,
+            lease,
+            matches,
+            profile,
+            "RunPod create outcome is ambiguous; terminating every exact-name match",
+          );
+          throw new ComputeControlError(
+            `RunPod create outcome was ambiguous; exact-name Pod termination ${cleaned ? "completed" : "is pending"}`,
+            502,
+          );
+        }
+        if (matches.length === 0) {
+          await this.retainProvisionalLease(
+            lease,
+            `RunPod create outcome is unknown after a lost response: ${error instanceof Error ? error.message : "unknown error"}`,
+          );
+          throw new ComputeControlError(
+            "RunPod create outcome is unknown; protected exact-name reconciliation is scheduled",
+            502,
+          );
         }
         pod = matches[0];
       }
-      lease = await this.dependencies.saveLease({ ...lease, podId: pod.id });
+      const allocatedPodId = pod.id;
+      let allocatedLease: ComputeLeaseV1 = {
+        ...lease,
+        podId: allocatedPodId,
+        observedHourlyUsd: profile.maxGpuHourlyUsd,
+      };
       try {
-        await watchdog.upsertLease(this.watchdogLease(lease, profile));
-      } catch (error) {
-        await this.dependencies.saveLease({
-          ...lease,
-          state: "terminating",
-          error: "watchdog did not accept the allocated Pod identity; termination requested",
+        await this.dependencies.beginUsage({
+          leaseId,
+          podId: allocatedPodId,
+          startedAt: allocatedLease.createdAt,
+          hourlyUsd: profile.maxGpuHourlyUsd,
         });
-        this.clearWatchdogHeartbeat();
-        await client.deletePod(pod.id);
-        if (await this.waitForTermination(client, pod.id)) {
-          this.clearWatchdogHeartbeat();
-          await this.dependencies.clearLease(lease.id);
-          await this.dependencies.deleteWorkerSecret(lease.id);
-          await this.deleteWatchdogLeaseBestEffort(lease.id);
-        } else {
-          this.scheduleCleanupRetry("retry watchdog publication failure termination");
+        const persistedAllocation = await this.dependencies.saveLease(allocatedLease);
+        allocatedLease = {
+          ...persistedAllocation,
+          id: leaseId,
+          podId: allocatedPodId,
+          observedHourlyUsd: profile.maxGpuHourlyUsd,
+        };
+        try {
+          await watchdog.upsertLease(this.watchdogLease(allocatedLease, profile));
+        } catch (error) {
+          throw new ComputeControlError(
+            `watchdog did not accept the allocated Pod identity: ${error instanceof Error ? error.message : "unknown error"}`,
+            503,
+          );
         }
+        await this.scheduleSafety(allocatedLease, profile);
+
+        pod = await this.waitForAllocationEvidence(client, profile, pod, podName);
+        const identityError =
+          pod.id !== allocatedPodId || pod.name !== podName
+            ? "RunPod did not preserve the allocated Pod identity"
+            : null;
+        const allocationError = identityError ?? this.validateAllocatedPod(profile, pod);
+        if (allocationError) throw new ComputeControlError(allocationError, 409);
+
+        const observedHourlyUsd = price(pod)!;
+        const persistedBootstrap = await this.dependencies.saveLease({
+          ...allocatedLease,
+          state: "bootstrapping",
+          observedHourlyUsd,
+        });
+        allocatedLease = {
+          ...persistedBootstrap,
+          id: leaseId,
+          podId: allocatedPodId,
+          observedHourlyUsd,
+        };
+        await this.scheduleSafety(allocatedLease, profile);
+
+        let worker: ComputeWorkerStatus;
+        try {
+          worker = await this.bootstrapWorker(allocatedPodId, profile, workerSecret);
+        } catch (error) {
+          throw new ComputeControlError(
+            `Worker bootstrap failed: ${error instanceof Error ? error.message : "unknown error"}`,
+            502,
+          );
+        }
+        const persistedReady = await this.dependencies.saveLease({
+          ...allocatedLease,
+          state: "ready",
+          workerProtocolVersion: 1,
+          workerBuildId: worker.buildId,
+          workerReadyAt: this.dependencies.now().toISOString(),
+          error: undefined,
+        });
+        allocatedLease = {
+          ...persistedReady,
+          id: leaseId,
+          podId: allocatedPodId,
+          observedHourlyUsd,
+        };
+        return {
+          started: true,
+          status: await this.statusFrom(config, allocatedLease, pod, undefined, worker),
+        };
+      } catch (error) {
+        const failure =
+          error instanceof ComputeControlError
+            ? error
+            : new ComputeControlError(
+                `local post-create bookkeeping failed: ${error instanceof Error ? error.message : "unknown error"}`,
+                500,
+              );
+        const cleaned = await this.terminateAllocatedPod(client, allocatedLease, failure.message);
         throw new ComputeControlError(
-          `RunPod allocation was terminated because the watchdog did not accept its identity: ${error instanceof Error ? error.message : "unknown error"}`,
-          503,
+          `RunPod allocation ${cleaned ? "was terminated" : "termination is pending"}: ${failure.message}`,
+          failure.statusCode,
         );
       }
-      const allocationError = this.validateAllocatedPod(profile, pod);
-      if (allocationError) {
-        const rejectedRate = price(pod);
-        if (rejectedRate !== undefined) {
-          await this.dependencies.beginUsage({
-            leaseId,
-            podId: pod.id,
-            startedAt: this.dependencies.now().toISOString(),
-            hourlyUsd: rejectedRate,
-          });
-        }
-        await this.dependencies.saveLease({
-          ...lease,
-          state: "budget_blocked",
-          observedHourlyUsd: rejectedRate,
-          error: `${allocationError}; termination requested immediately`,
-        });
-        this.clearWatchdogHeartbeat();
-        await client.deletePod(pod.id);
-        if (await this.waitForTermination(client, pod.id)) {
-          if (rejectedRate !== undefined) {
-            await this.dependencies.finishUsage(leaseId, this.dependencies.now().toISOString());
-          }
-          await this.dependencies.clearLease(leaseId);
-          await this.dependencies.deleteWorkerSecret(leaseId);
-          this.clearWatchdogHeartbeat();
-          await this.deleteWatchdogLeaseBestEffort(leaseId);
-        } else {
-          this.scheduleCleanupRetry("retry rejected allocation termination");
-        }
-        throw new ComputeControlError(allocationError, 409);
-      }
-      const observedHourlyUsd = price(pod)!;
-      const startedAt = this.dependencies.now().toISOString();
-      await this.dependencies.beginUsage({
-        leaseId,
-        podId: pod.id,
-        startedAt,
-        hourlyUsd: observedHourlyUsd,
-      });
-      lease = await this.dependencies.saveLease({
-        ...lease,
-        state: "bootstrapping",
-        observedHourlyUsd,
-      });
-      await this.scheduleSafety(lease, profile);
-      let worker: ComputeWorkerStatus;
-      try {
-        worker = await this.bootstrapWorker(pod.id, profile, workerSecret);
-      } catch (error) {
-        const reason = `Worker bootstrap failed: ${error instanceof Error ? error.message : "unknown error"}`;
-        await this.terminateFailedBootstrap(client, lease, reason);
-        throw new ComputeControlError(reason, 502);
-      }
-      lease = await this.dependencies.saveLease({
-        ...lease,
-        state: "ready",
-        workerProtocolVersion: 1,
-        workerBuildId: worker.buildId,
-        workerReadyAt: this.dependencies.now().toISOString(),
-        error: undefined,
-      });
-      return {
-        started: true,
-        status: await this.statusFrom(config, lease, pod, undefined, worker),
-      };
     });
   }
 
@@ -887,42 +1094,93 @@ export class ComputeController {
       let lease = await this.dependencies.readLease();
       if (!lease) return { stopped: false, status: await this.statusFrom(config, null, null) };
       const client = await this.client();
-      const pod = await this.findLeasePod(client, lease, true);
-      if (!pod) {
-        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-        await this.dependencies.clearLease(lease.id);
-        await this.dependencies.deleteWorkerSecret(lease.id);
-        await this.deleteWatchdogLeaseBestEffort(lease.id);
-        return {
-          stopped: false,
-          status: await this.statusFrom(config, null, null, "The recorded Pod no longer exists."),
-        };
+      if (!lease.podId) {
+        const provisionalPodName = lease.podName;
+        const provisionalProfileId = lease.profileId;
+        let matches: RunPodPod[];
+        try {
+          matches = (await client.listPods()).filter((pod) => pod.name === provisionalPodName);
+        } catch (error) {
+          this.scheduleCleanupRetry("retry provisional Pod lookup");
+          throw new ComputeControlError(
+            `RunPod provisional Pod lookup failed: ${error instanceof Error ? error.message : "unknown error"}`,
+            502,
+          );
+        }
+        const profile = config.profiles.find((candidate) => candidate.id === provisionalProfileId);
+        if (matches.length > 1) {
+          if (
+            !(await this.terminateNameMatchedPods(
+              client,
+              lease,
+              matches,
+              profile,
+              "multiple Pods matched the unique provisional lease name",
+            ))
+          ) {
+            throw new ComputeControlError(
+              "RunPod exact-name Pod termination is still pending",
+              502,
+            );
+          }
+          return {
+            stopped: true,
+            terminated: true,
+            status: await this.statusFrom(
+              config,
+              null,
+              null,
+              "All exact-name RunPod Pods terminated.",
+            ),
+          };
+        }
+        const pod = matches[0];
+        if (!pod && this.provisionalAbsenceNeedsReconciliation(lease)) {
+          await this.retainProvisionalLease(
+            lease,
+            "RunPod create outcome remains unknown during the convergence window",
+          );
+          throw new ComputeControlError(
+            "RunPod create outcome remains unknown; exact-name reconciliation is pending",
+            502,
+          );
+        }
+        if (!pod) {
+          await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
+          await this.dependencies.clearLease(lease.id);
+          await this.dependencies.deleteWorkerSecret(lease.id);
+          await this.deleteWatchdogLeaseBestEffort(lease.id);
+          return {
+            stopped: false,
+            status: await this.statusFrom(config, null, null, "The recorded Pod no longer exists."),
+          };
+        }
+        const trackedHourlyUsd = Math.max(
+          profile?.maxGpuHourlyUsd ?? lease.observedHourlyUsd ?? 0,
+          price(pod) ?? 0,
+        );
+        try {
+          await this.dependencies.beginUsage({
+            leaseId: lease.id,
+            podId: pod.id,
+            startedAt: lease.createdAt,
+            hourlyUsd: trackedHourlyUsd,
+          });
+        } catch (error) {
+          console.error(
+            `[compute] could not restore provisional Pod usage tracking: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        lease = { ...lease, podId: pod.id, observedHourlyUsd: trackedHourlyUsd };
       }
-      lease =
-        (await this.dependencies.updateLease((current) => ({
-          ...current,
-          state: "terminating",
-          error: reason,
-        }))) ?? lease;
       // R1 profiles require a network volume. RunPod documents that such
       // Pods cannot be stopped, so idle cleanup must terminate the Pod.
-      await client.deletePod(pod.id);
-      if (!(await this.waitForTermination(client, pod.id))) {
-        await this.dependencies.saveLease({
-          ...lease,
-          state: "terminating",
-          error: "RunPod still reports the Pod while termination is pending",
-        });
-        this.scheduleCleanupRetry("retry provider termination");
+      if (!(await this.terminateAllocatedPod(client, lease, reason))) {
         throw new ComputeControlError(
           "RunPod still reports the Pod while termination is pending",
           502,
         );
       }
-      await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-      await this.dependencies.clearLease(lease.id);
-      await this.dependencies.deleteWorkerSecret(lease.id);
-      await this.deleteWatchdogLeaseBestEffort(lease.id);
       return {
         stopped: true,
         terminated: true,
@@ -973,37 +1231,147 @@ export class ComputeController {
       const config = await this.dependencies.readConfig();
       const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
       const client = await this.client();
-      const pod = await this.findLeasePod(client, lease, true);
-      if (!pod) {
-        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-        await this.dependencies.clearLease(lease.id);
-        await this.dependencies.deleteWorkerSecret(lease.id);
-        await this.deleteWatchdogLeaseBestEffort(lease.id);
-        return { recovered: false, cleaned: true, detail: "missing Pod lease cleared" };
-      }
-      if (!profile) {
-        await client.deletePod(pod.id);
-        if (!(await this.waitForTermination(client, pod.id))) {
-          await this.dependencies.updateLease((current) => ({
-            ...current,
-            state: "terminating",
-            error: "Pod termination is pending after its compute profile was removed",
-          }));
-          this.scheduleCleanupRetry("retry missing-profile termination");
+      let pod: RunPodPod | null;
+      try {
+        pod = await this.findLeasePod(client, lease, true);
+      } catch (error) {
+        if (!lease.podId) {
+          let matches: RunPodPod[] = [];
+          try {
+            matches = (await client.listPods()).filter(
+              (candidate) => candidate.name === lease.podName,
+            );
+          } catch {
+            // Keep the durable provisional lease when provider convergence
+            // cannot be observed during startup.
+          }
+          if (matches.length > 0) {
+            const cleaned = await this.terminateNameMatchedPods(
+              client,
+              lease,
+              matches,
+              profile,
+              "ambiguous provisional Pods found during startup recovery",
+            );
+            return {
+              recovered: false,
+              cleaned,
+              detail: cleaned
+                ? "ambiguous provisional Pods terminated"
+                : "provisional Pod termination is still pending",
+            };
+          }
+          await this.retainProvisionalLease(
+            lease,
+            `provisional Pod lookup remains ambiguous during startup: ${error instanceof Error ? error.message : "unknown error"}`,
+          );
           return {
             recovered: false,
             cleaned: false,
-            detail: "Pod termination is still pending",
+            detail: "provisional Pod reconciliation is still pending",
+          };
+        }
+        const trackedHourlyUsd = profile?.maxGpuHourlyUsd ?? lease.observedHourlyUsd ?? 0;
+        const trackedLease = {
+          ...lease,
+          podId: lease.podId,
+          observedHourlyUsd: trackedHourlyUsd,
+        };
+        try {
+          await this.dependencies.beginUsage({
+            leaseId: lease.id,
+            podId: lease.podId,
+            startedAt: lease.createdAt,
+            hourlyUsd: trackedHourlyUsd,
+          });
+        } catch (usageError) {
+          console.error(
+            `[compute] could not restore usage tracking before identity cleanup: ${usageError instanceof Error ? usageError.message : String(usageError)}`,
+          );
+        }
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          "RunPod returned a mismatched identity during startup recovery",
+        );
+        return {
+          recovered: false,
+          cleaned,
+          detail: cleaned
+            ? "mismatched Pod identity terminated"
+            : "Pod identity is untrusted and exact-id termination is still pending",
+        };
+      }
+      if (!pod) {
+        if (this.provisionalAbsenceNeedsReconciliation(lease)) {
+          await this.retainProvisionalLease(
+            lease,
+            "provisional Pod absence is not yet stable during startup recovery",
+          );
+          return {
+            recovered: false,
+            cleaned: false,
+            detail: "provisional Pod reconciliation is still pending",
           };
         }
         await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
         await this.dependencies.clearLease(lease.id);
         await this.dependencies.deleteWorkerSecret(lease.id);
         await this.deleteWatchdogLeaseBestEffort(lease.id);
+        return { recovered: false, cleaned: true, detail: "missing Pod lease cleared" };
+      }
+      const recoveredPodId = lease.podId ?? pod.id;
+      const trackedHourlyUsd = profile?.maxGpuHourlyUsd ?? lease.observedHourlyUsd ?? 0;
+      const trackedLease: ComputeLeaseV1 = {
+        ...lease,
+        podId: recoveredPodId,
+        observedHourlyUsd: trackedHourlyUsd,
+      };
+      try {
+        await this.dependencies.beginUsage({
+          leaseId: lease.id,
+          podId: recoveredPodId,
+          startedAt: lease.createdAt,
+          hourlyUsd: trackedHourlyUsd,
+        });
+      } catch (error) {
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          "compute usage tracking failed during startup recovery",
+        );
         return {
           recovered: false,
-          cleaned: true,
-          detail: "Pod terminated because its compute profile is missing",
+          cleaned,
+          detail: "Pod termination requested because usage tracking could not be recovered",
+        };
+      }
+      if (!lease.podId) {
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          "a name-only provisional Pod cannot be reattached after restart",
+        );
+        return {
+          recovered: false,
+          cleaned,
+          detail: cleaned
+            ? "provisional Pod terminated after startup recovery"
+            : "provisional Pod termination is still pending",
+        };
+      }
+      if (!profile) {
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          "compute profile was removed",
+        );
+        return {
+          recovered: false,
+          cleaned,
+          detail: cleaned
+            ? "Pod terminated because its compute profile is missing"
+            : "Pod termination is still pending",
         };
       }
       try {
@@ -1015,63 +1383,54 @@ export class ComputeController {
         if (!watchdogStatus.ready || !watchdogStatus.lastSweepAt) {
           throw new WatchdogProtocolError("scheduled sweep is not ready");
         }
-        await watchdog.upsertLease(this.watchdogLease({ ...lease, podId: pod.id }, profile));
+        await watchdog.upsertLease(this.watchdogLease(trackedLease, profile));
         this.scheduleWatchdogHeartbeat();
       } catch (error) {
-        await client.deletePod(pod.id);
-        if (!(await this.waitForTermination(client, pod.id))) {
-          await this.dependencies.updateLease((current) => ({
-            ...current,
-            podId: pod.id,
-            state: "terminating",
-            error: "independent watchdog unavailable during startup recovery",
-          }));
-          this.scheduleCleanupRetry("retry missing-watchdog startup termination");
-          return {
-            recovered: false,
-            cleaned: false,
-            detail: "Pod termination is pending because the independent watchdog is unavailable",
-          };
-        }
-        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-        await this.dependencies.clearLease(lease.id);
-        await this.dependencies.deleteWorkerSecret(lease.id);
-        await this.deleteWatchdogLeaseBestEffort(lease.id);
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          "independent watchdog unavailable during startup recovery",
+        );
         return {
           recovered: false,
-          cleaned: true,
-          detail: `Pod terminated because the independent watchdog is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+          cleaned,
+          detail: cleaned
+            ? `Pod terminated because the independent watchdog is unavailable: ${error instanceof Error ? error.message : "unknown error"}`
+            : "Pod termination is pending because the independent watchdog is unavailable",
         };
       }
-      const allocationError = this.validateAllocatedPod(profile, pod);
+      try {
+        await this.scheduleSafety(trackedLease, profile);
+      } catch (error) {
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          "compute safety scheduling failed during startup recovery",
+        );
+        return {
+          recovered: false,
+          cleaned,
+          detail: "Pod termination requested because local safety scheduling failed",
+        };
+      }
       const deadlinePassed =
         this.dependencies.now().getTime() >=
         Math.min(Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt));
+      let allocationError: string | null = null;
+      if (!deadlinePassed) {
+        pod = await this.waitForAllocationEvidence(client, profile, pod, lease.podName);
+        allocationError =
+          pod.id !== trackedLease.podId || pod.name !== lease.podName
+            ? "RunPod did not preserve the allocated Pod identity"
+            : this.validateAllocatedPod(profile, pod);
+      }
       if (allocationError || deadlinePassed) {
-        this.clearWatchdogHeartbeat();
-        await client.deletePod(pod.id);
-        if (!(await this.waitForTermination(client, pod.id))) {
-          await this.dependencies.updateLease((current) => ({
-            ...current,
-            state: "terminating",
-            error: allocationError ?? "expired compute lease termination is pending",
-          }));
-          this.scheduleCleanupRetry("retry startup safety termination");
-          return {
-            recovered: false,
-            cleaned: false,
-            detail: "Pod termination is still pending",
-          };
-        }
-        await this.dependencies.finishUsage(lease.id, this.dependencies.now().toISOString());
-        await this.dependencies.clearLease(lease.id);
-        await this.dependencies.deleteWorkerSecret(lease.id);
-        this.clearWatchdogHeartbeat();
-        await this.deleteWatchdogLeaseBestEffort(lease.id);
+        const reason = allocationError ?? "expired compute lease";
+        const cleaned = await this.terminateAllocatedPod(client, trackedLease, reason);
         return {
           recovered: false,
-          cleaned: true,
-          detail: allocationError ?? "expired compute lease terminated",
+          cleaned,
+          detail: cleaned ? `${reason} terminated` : "Pod termination is still pending",
         };
       }
       let worker: ComputeWorkerStatus | undefined;
@@ -1080,7 +1439,7 @@ export class ComputeController {
         if (!secret) {
           const cleaned = await this.terminateFailedBootstrap(
             client,
-            { ...lease, podId: pod.id },
+            trackedLease,
             "worker secret is missing after gateway restart",
           );
           return {
@@ -1092,22 +1451,18 @@ export class ComputeController {
           };
         }
         try {
-          worker = await this.bootstrapWorker(pod.id, profile, secret);
+          worker = await this.bootstrapWorker(recoveredPodId, profile, secret);
         } catch (error) {
           const reason = `worker recovery failed: ${error instanceof Error ? error.message : "unknown error"}`;
-          const cleaned = await this.terminateFailedBootstrap(
-            client,
-            { ...lease, podId: pod.id },
-            reason,
-          );
+          const cleaned = await this.terminateFailedBootstrap(client, trackedLease, reason);
           return { recovered: false, cleaned, detail: reason };
         }
       }
-      const updated =
-        (await this.dependencies.updateLease((current) => ({
+      try {
+        const updated = await this.dependencies.updateLease((current) => ({
           ...current,
-          podId: pod.id,
-          observedHourlyUsd: price(pod),
+          podId: recoveredPodId,
+          observedHourlyUsd: price(pod) ?? trackedHourlyUsd,
           state: worker?.ready
             ? "ready"
             : pod.desiredStatus === "RUNNING"
@@ -1121,9 +1476,24 @@ export class ComputeController {
                 error: undefined,
               }
             : {}),
-        }))) ?? lease;
-      await this.scheduleSafety(updated, profile);
-      return { recovered: true, cleaned: false, detail: "compute lease reattached" };
+        }));
+        if (!updated || updated.id !== lease.id || updated.podId !== recoveredPodId) {
+          throw new Error("durable compute lease disappeared during startup recovery");
+        }
+        await this.scheduleSafety(updated, profile);
+        return { recovered: true, cleaned: false, detail: "compute lease reattached" };
+      } catch (error) {
+        const cleaned = await this.terminateAllocatedPod(
+          client,
+          trackedLease,
+          `startup recovery bookkeeping failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        );
+        return {
+          recovered: false,
+          cleaned,
+          detail: "Pod termination requested because startup recovery could not be persisted",
+        };
+      }
     });
   }
 }

@@ -77,7 +77,10 @@ async function writeLedger(ledger: UsageLedgerV1): Promise<void> {
 
 export async function beginUsageInterval(input: UsageIntervalV1): Promise<void> {
   const ledger = await readLedger();
-  if (ledger.intervals.some((entry) => entry.leaseId === input.leaseId)) return;
+  if (
+    ledger.intervals.some((entry) => entry.leaseId === input.leaseId && entry.podId === input.podId)
+  )
+    return;
   ledger.intervals = [...ledger.intervals, input].slice(-MAX_INTERVALS);
   await writeLedger(ledger);
 }

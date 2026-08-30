@@ -141,6 +141,106 @@ describe("watchdog HTTP contract", () => {
 });
 
 describe("watchdog sweep", () => {
+  it("retains a provisional lease with no name match until its hard deadline", async () => {
+    const env = environment();
+    await env.LEASES.put("lease:lease-1", JSON.stringify(lease({ podId: undefined })));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => Response.json([]));
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(await env.LEASES.get("lease:lease-1", "json")).not.toBeNull();
+
+    await expect(sweep(env, NOW + 3_600_000)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(await env.LEASES.get("lease:lease-1", "json")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods",
+      expect.objectContaining({ headers: expect.any(Object) }),
+    );
+  });
+
+  it("terminates every exact-name match and retains the provisional lease when one fails", async () => {
+    const env = environment();
+    await env.LEASES.put("lease:lease-1", JSON.stringify(lease({ podId: undefined })));
+    let firstPodDeleteAttempts = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/pods") && !init?.method) {
+        return Response.json([
+          { id: "pod_first", name: "glimmer-instance-1-lease-1" },
+          { id: "pod_second", name: "glimmer-instance-1-lease-1" },
+          { id: "pod_unrelated", name: "another-lease" },
+        ]);
+      }
+      if (url.endsWith("/pods/pod_first") && init?.method === "DELETE") {
+        firstPodDeleteAttempts += 1;
+        return firstPodDeleteAttempts === 1
+          ? Response.json({ error: "unavailable" }, { status: 503 })
+          : new Response(null, { status: 204 });
+      }
+      if (url.endsWith("/pods/pod_second") && init?.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: false,
+      checked: 1,
+      terminationRequests: 2,
+      errorCodes: ["RUNPOD_HTTP_503"],
+    });
+    expect(await env.LEASES.get("lease:lease-1", "json")).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods/pod_first",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods/pod_second",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("pod_unrelated"))).toBe(false);
+
+    await expect(sweep(env, NOW + 120_000)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 2,
+      errorCodes: [],
+    });
+    expect(firstPodDeleteAttempts).toBe(2);
+    expect(await env.LEASES.get("lease:lease-1", "json")).not.toBeNull();
+  });
+
+  it("retains an exact-id lease when the provider response body has another identity", async () => {
+    const env = environment();
+    await env.LEASES.put("lease:lease-1", JSON.stringify(lease()));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        id: "pod_other",
+        name: "glimmer-instance-1-lease-1",
+        desiredStatus: "TERMINATED",
+      }),
+    );
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: false,
+      checked: 1,
+      terminationRequests: 0,
+      errorCodes: ["RUNPOD_POD_IDENTITY_MISMATCH"],
+    });
+    expect(await env.LEASES.get("lease:lease-1", "json")).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("retries exact-id termination for a stale lease until the provider confirms removal", async () => {
     const env = environment();
     await env.LEASES.put(
