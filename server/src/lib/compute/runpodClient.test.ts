@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RunPodApiError, RunPodClient } from "./runpodClient.js";
-import type { RunPodCreatePodInput } from "./runpodSchemas.js";
+import { parseRunPodPod, type RunPodCreatePodInput } from "./runpodSchemas.js";
 
 const API_KEY = "runpod-test-secret";
 const POD = {
@@ -9,6 +9,15 @@ const POD = {
   desiredStatus: "RUNNING",
   adjustedCostPerHr: 1.39,
   gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+};
+const LIVE_POD = {
+  id: "pod_live",
+  name: "glimmer-live",
+  desiredStatus: "RUNNING",
+  costPerHr: 1.59,
+  gpuCount: 1,
+  gpu: null,
+  machine: { gpuTypeId: "NVIDIA A100-SXM4-80GB" },
 };
 
 function client(fetchImpl: typeof fetch, timeoutMs?: number) {
@@ -60,9 +69,53 @@ describe("RunPodClient", () => {
   it("uses exact encoded Pod paths and treats a provider 404 as absent", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 404 }));
     await expect(client(fetchImpl).getPod("pod_123")).resolves.toBeNull();
-    expect(fetchImpl.mock.calls[0][0]).toBe("https://rest.runpod.io/v1/pods/pod_123");
+    expect(fetchImpl.mock.calls[0][0]).toBe(
+      "https://rest.runpod.io/v1/pods/pod_123?includeMachine=true",
+    );
     await expect(client(fetchImpl).getPod("../unsafe")).rejects.toThrow("Pod id is invalid");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("normalizes the live top-level allocation shape from an exact machine-inclusive read", async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json(LIVE_POD, { status: 200 }));
+
+    await expect(client(fetchImpl).getPod("pod_live", { timeoutMs: 2_500 })).resolves.toMatchObject(
+      {
+        id: "pod_live",
+        costPerHr: 1.59,
+        gpu: { count: 1, id: "NVIDIA A100-SXM4-80GB" },
+      },
+    );
+    expect(fetchImpl.mock.calls[0][0]).toBe(
+      "https://rest.runpod.io/v1/pods/pod_live?includeMachine=true",
+    );
+  });
+
+  it("rejects contradictory nested and live allocation evidence", () => {
+    expect(() =>
+      parseRunPodPod({
+        ...LIVE_POD,
+        gpu: { count: 2, id: "NVIDIA A100-SXM4-80GB" },
+      }),
+    ).toThrow("GPU counts conflict");
+    expect(() =>
+      parseRunPodPod({
+        ...LIVE_POD,
+        gpu: { count: 1, id: "NVIDIA H100 PCIe" },
+      }),
+    ).toThrow("GPU types conflict");
+  });
+
+  it.each([
+    ["negative top-level", { ...LIVE_POD, gpuCount: -1 }],
+    ["fractional top-level", { ...LIVE_POD, gpuCount: 1.5 }],
+    ["oversized top-level", { ...LIVE_POD, gpuCount: 65 }],
+    ["fractional nested", { ...LIVE_POD, gpuCount: undefined, gpu: { count: 1.5 } }],
+    ["oversized nested", { ...LIVE_POD, gpuCount: undefined, gpu: { count: 65 } }],
+  ])("rejects an invalid %s GPU count", (_label, payload) => {
+    expect(() => parseRunPodPod(payload)).toThrow(/non-negative|integer between 0 and 64/);
   });
 
   it("aborts exact Pod reads at the smaller of the requested and client timeouts", async () => {

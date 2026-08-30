@@ -141,6 +141,66 @@ describe("watchdog HTTP contract", () => {
 });
 
 describe("watchdog sweep", () => {
+  it.each([
+    ["nested numeric", { gpu: { count: 1 } }],
+    ["nested numeric string", { gpu: { count: "1" } }],
+    ["top-level numeric", { gpuCount: 1 }],
+    ["top-level numeric string", { gpuCount: "1" }],
+    ["matching nested and top-level", { gpu: { count: "1" }, gpuCount: 1 }],
+  ])("retains a valid Pod with %s GPU count metadata", async (_label, gpuMetadata) => {
+    const env = environment();
+    await env.LEASES.put("lease:lease-1", JSON.stringify(lease()));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        id: "pod_1",
+        name: "glimmer-instance-1-lease-1",
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.59,
+        ...gpuMetadata,
+      }),
+    );
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(await env.LEASES.get("lease:lease-1", "json")).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["missing", {}],
+    ["fractional", { gpuCount: 1.5 }],
+    ["negative", { gpu: { count: -1 } }],
+    ["non-numeric string", { gpuCount: "one" }],
+    ["unsafe integer", { gpuCount: "9007199254740992" }],
+    ["contradictory", { gpu: { count: 1 }, gpuCount: 2 }],
+  ])("terminates a Pod with %s GPU count metadata", async (_label, gpuMetadata) => {
+    const env = environment();
+    await env.LEASES.put("lease:lease-1", JSON.stringify(lease()));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      return Response.json({
+        id: "pod_1",
+        name: "glimmer-instance-1-lease-1",
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.59,
+        ...gpuMetadata,
+      });
+    });
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://rest.runpod.io/v1/pods/pod_1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
   it("retains a provisional lease with no name match until its hard deadline", async () => {
     const env = environment();
     await env.LEASES.put("lease:lease-1", JSON.stringify(lease({ podId: undefined })));

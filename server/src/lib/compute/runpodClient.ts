@@ -154,7 +154,11 @@ export class RunPodClient {
   async getPod(podId: string, options: { timeoutMs?: number } = {}): Promise<RunPodPod | null> {
     try {
       return parseRunPodPod(
-        await this.request(`/pods/${encodeURIComponent(validPodId(podId))}`, {}, options.timeoutMs),
+        await this.request(
+          `/pods/${encodeURIComponent(validPodId(podId))}?includeMachine=true`,
+          {},
+          options.timeoutMs,
+        ),
       );
     } catch (error) {
       if (error instanceof RunPodApiError && error.status === 404) return null;

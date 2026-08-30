@@ -397,7 +397,7 @@ describe("RunPod compute lifecycle", () => {
           { status: 201 },
         );
       }
-      if (url.endsWith("/pods/pod_123") && method === "GET") {
+      if (url.endsWith("/pods/pod_123?includeMachine=true") && method === "GET") {
         return exists
           ? new Response(
               JSON.stringify({
@@ -492,7 +492,7 @@ describe("RunPod compute lifecycle", () => {
         deleted = true;
         return new Response(null, { status: 204 });
       }
-      if (url.endsWith("/pods/pod_expensive") && method === "GET") {
+      if (url.endsWith("/pods/pod_expensive?includeMachine=true") && method === "GET") {
         return new Response("", { status: deleted ? 404 : 200 });
       }
       throw new Error(`unexpected request ${method} ${url}`);

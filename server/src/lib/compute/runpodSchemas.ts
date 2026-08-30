@@ -44,6 +44,8 @@ export interface RunPodBillingRecord {
 
 export class RunPodSchemaError extends Error {}
 
+const MAX_POD_GPU_COUNT = 64;
+
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new RunPodSchemaError(`${label} must be an object`);
@@ -56,6 +58,14 @@ function optionalFiniteNumber(value: unknown, label: string): number | undefined
   const parsed = typeof value === "string" && value.trim() ? Number(value) : value;
   if (typeof parsed !== "number" || !Number.isFinite(parsed) || parsed < 0) {
     throw new RunPodSchemaError(`${label} must be a non-negative number`);
+  }
+  return parsed;
+}
+
+function optionalGpuCount(value: unknown, label: string): number | undefined {
+  const parsed = optionalFiniteNumber(value, label);
+  if (parsed !== undefined && (!Number.isInteger(parsed) || parsed > MAX_POD_GPU_COUNT)) {
+    throw new RunPodSchemaError(`${label} must be an integer between 0 and ${MAX_POD_GPU_COUNT}`);
   }
   return parsed;
 }
@@ -84,13 +94,37 @@ export function parseRunPodPod(value: unknown): RunPodPod {
   if (typeof raw.lastStartedAt === "string" && raw.lastStartedAt) {
     pod.lastStartedAt = raw.lastStartedAt;
   }
+  let nestedGpu: Record<string, unknown> | undefined;
   if (raw.gpu !== undefined && raw.gpu !== null) {
-    const gpuRaw = object(raw.gpu, "RunPod Pod gpu");
-    const count = optionalFiniteNumber(gpuRaw.count, "RunPod gpu.count");
+    nestedGpu = object(raw.gpu, "RunPod Pod gpu");
+  }
+  let machine: Record<string, unknown> | undefined;
+  if (raw.machine !== undefined && raw.machine !== null) {
+    machine = object(raw.machine, "RunPod Pod machine");
+  }
+  const nestedCount = optionalGpuCount(nestedGpu?.count, "RunPod gpu.count");
+  const topLevelCount = optionalGpuCount(raw.gpuCount, "RunPod gpuCount");
+  if (nestedCount !== undefined && topLevelCount !== undefined && nestedCount !== topLevelCount) {
+    throw new RunPodSchemaError("RunPod nested and top-level GPU counts conflict");
+  }
+  const nestedType = typeof nestedGpu?.id === "string" ? nestedGpu.id : undefined;
+  const machineType = typeof machine?.gpuTypeId === "string" ? machine.gpuTypeId : undefined;
+  if (nestedType !== undefined && machineType !== undefined && nestedType !== machineType) {
+    throw new RunPodSchemaError("RunPod nested and machine GPU types conflict");
+  }
+  const count = nestedCount ?? topLevelCount;
+  const id = nestedType ?? machineType;
+  const displayName =
+    typeof nestedGpu?.displayName === "string"
+      ? nestedGpu.displayName
+      : typeof machine?.gpuDisplayName === "string"
+        ? machine.gpuDisplayName
+        : undefined;
+  if (nestedGpu || count !== undefined || id !== undefined || displayName !== undefined) {
     pod.gpu = {
-      ...(typeof gpuRaw.id === "string" ? { id: gpuRaw.id } : {}),
+      ...(id !== undefined ? { id } : {}),
       ...(count !== undefined ? { count } : {}),
-      ...(typeof gpuRaw.displayName === "string" ? { displayName: gpuRaw.displayName } : {}),
+      ...(displayName !== undefined ? { displayName } : {}),
     };
   }
   return pod;

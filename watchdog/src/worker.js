@@ -216,6 +216,29 @@ function podRate(pod) {
   return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? rate : null;
 }
 
+function podGpuCount(pod) {
+  const nestedRaw = pod?.gpu?.count;
+  const topLevelRaw = pod?.gpuCount;
+  const hasNested = nestedRaw !== undefined;
+  const hasTopLevel = topLevelRaw !== undefined;
+  if (!hasNested && !hasTopLevel) return null;
+
+  const normalize = (raw) => {
+    const count = typeof raw === "string" && raw.trim() ? Number(raw) : raw;
+    return typeof count === "number" &&
+      Number.isFinite(count) &&
+      Number.isSafeInteger(count) &&
+      count >= 0
+      ? count
+      : null;
+  };
+  const nested = hasNested ? normalize(nestedRaw) : null;
+  const topLevel = hasTopLevel ? normalize(topLevelRaw) : null;
+  if ((hasNested && nested === null) || (hasTopLevel && topLevel === null)) return null;
+  if (hasNested && hasTopLevel && nested !== topLevel) return null;
+  return hasNested ? nested : topLevel;
+}
+
 async function findPods(env, lease) {
   if (lease.podId) {
     const pod = await runPodRequest(env, `/pods/${encodeURIComponent(lease.podId)}`);
@@ -234,7 +257,7 @@ function terminationReason(lease, pod, nowMs, staleAfterMs) {
   if (pod?.desiredStatus !== "RUNNING") return "provider-state-not-running";
   if (pod?.name !== lease.podName) return "pod-identity-mismatch";
   if (lease.podId && pod?.id !== lease.podId) return "pod-identity-mismatch";
-  if (pod?.gpu?.count !== 1) return "gpu-count-policy";
+  if (podGpuCount(pod) !== 1) return "gpu-count-policy";
   const rate = podRate(pod);
   if (rate === null) return "provider-rate-unavailable";
   if (rate > lease.maxHourlyUsd) return "provider-rate-ceiling";
