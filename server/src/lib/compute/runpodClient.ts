@@ -60,9 +60,23 @@ export class RunPodClient {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
-  private async request(path: string, init: RequestInit = {}): Promise<unknown> {
+  private async request(
+    path: string,
+    init: RequestInit = {},
+    requestedTimeoutMs?: number,
+  ): Promise<unknown> {
+    if (
+      requestedTimeoutMs !== undefined &&
+      (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs <= 0)
+    ) {
+      throw new RunPodApiError("RunPod API request timeout must be positive");
+    }
+    const timeoutMs =
+      requestedTimeoutMs === undefined
+        ? this.timeoutMs
+        : Math.max(1, Math.min(this.timeoutMs, Math.floor(requestedTimeoutMs)));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
     try {
       const headers = new Headers(init.headers);
@@ -137,9 +151,11 @@ export class RunPodClient {
     return parseRunPodPodList(await this.request("/pods"));
   }
 
-  async getPod(podId: string): Promise<RunPodPod | null> {
+  async getPod(podId: string, options: { timeoutMs?: number } = {}): Promise<RunPodPod | null> {
     try {
-      return parseRunPodPod(await this.request(`/pods/${encodeURIComponent(validPodId(podId))}`));
+      return parseRunPodPod(
+        await this.request(`/pods/${encodeURIComponent(validPodId(podId))}`, {}, options.timeoutMs),
+      );
     } catch (error) {
       if (error instanceof RunPodApiError && error.status === 404) return null;
       throw error;

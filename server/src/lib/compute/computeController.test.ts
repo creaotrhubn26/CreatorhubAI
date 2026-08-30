@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { ComputeConfigV1, ComputeUsageSummary } from "@glimmer/shared";
 import { ComputeController } from "./computeController.js";
 import type { ComputeLeaseV1 } from "./computeLeaseStore.js";
+import { RunPodApiError } from "./runpodClient.js";
+import { RunPodSchemaError } from "./runpodSchemas.js";
 
 const NOW = new Date("2026-08-29T12:00:00.000Z");
 
@@ -85,6 +87,10 @@ function harness(options: {
   saveLeaseFailureCall?: number;
   readUsageFailureCall?: number;
   beginUsageFailure?: Error;
+  now?: () => Date;
+  monotonicNow?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
+  usageSummary?: ComputeUsageSummary;
 }) {
   let currentLease: ComputeLeaseV1 | null =
     "currentLease" in options ? (options.currentLease ?? null) : lease();
@@ -193,11 +199,19 @@ function harness(options: {
     if (readUsageCalls === options.readUsageFailureCall) {
       throw new Error("usage summary unavailable");
     }
-    return usage;
+    return options.usageSummary ?? usage;
   });
   const readWorkerSecret = vi.fn();
+  let monotonicMs = 0;
+  const monotonicNow = options.monotonicNow ?? (() => monotonicMs);
+  const sleep =
+    options.sleep ??
+    vi.fn().mockImplementation(async (milliseconds: number) => {
+      monotonicMs += milliseconds;
+    });
   const controller = new ComputeController({
-    now: () => NOW,
+    now: options.now ?? (() => NOW),
+    monotonicNow,
     readConfig: vi.fn().mockResolvedValue(options.currentConfig ?? config),
     saveConfig: vi.fn(),
     readApiKey: vi.fn().mockResolvedValue("key"),
@@ -233,7 +247,7 @@ function harness(options: {
     readWorkerSecret,
     storeWorkerHandshake,
     deleteWorkerSecret,
-    sleep: vi.fn().mockResolvedValue(undefined),
+    sleep,
     workerReadyAttempts: 1,
   } as any);
   return {
@@ -249,6 +263,8 @@ function harness(options: {
     saveLease,
     readUsage,
     readWorkerSecret,
+    monotonicNow,
+    sleep,
     currentLease: () => currentLease,
   };
 }
@@ -366,6 +382,143 @@ describe("ComputeController startup recovery", () => {
       }),
     );
     expect(currentLease()).toMatchObject({ podId: "pod_123", state: "ready" });
+  });
+
+  it.each([
+    {
+      label: "idle",
+      leasePatch: {
+        idleDeadlineAt: new Date(NOW.getTime() + 20_000).toISOString(),
+        hardDeadlineAt: new Date(NOW.getTime() + 3_600_000).toISOString(),
+      },
+      detail: "idle deadline elapsed before worker bootstrap",
+    },
+    {
+      label: "hard session",
+      leasePatch: {
+        idleDeadlineAt: new Date(NOW.getTime() + 3_600_000).toISOString(),
+        hardDeadlineAt: new Date(NOW.getTime() + 20_000).toISOString(),
+      },
+      detail: "hard session deadline elapsed before worker bootstrap",
+    },
+  ])(
+    "terminates recovery when the $label deadline passes during evidence polling",
+    async (testCase) => {
+      const incomplete = {
+        id: "pod_123",
+        name: "glimmer-test-lease",
+        desiredStatus: "RUNNING" as const,
+        adjustedCostPerHr: 1.39,
+        gpu: { id: "NVIDIA A100 80GB PCIe" },
+      };
+      let elapsedMs = 0;
+      const sleep = vi.fn().mockImplementation(async (milliseconds: number) => {
+        elapsedMs += milliseconds;
+      });
+      const { controller, fakeClient, deletePod, workerClient, readWorkerSecret } = harness({
+        currentLease: lease(testCase.leasePatch),
+        pod: incomplete,
+        now: () => new Date(NOW.getTime() + elapsedMs),
+        monotonicNow: () => elapsedMs,
+        sleep,
+      });
+      let evidenceReads = 0;
+      fakeClient.getPod.mockImplementation(
+        async (_podId: string, requestOptions?: { timeoutMs?: number }) => {
+          if (!requestOptions) return deletePod.mock.calls.length ? null : incomplete;
+          elapsedMs += Math.min(10_000, requestOptions.timeoutMs ?? 10_000);
+          evidenceReads += 1;
+          return {
+            ...incomplete,
+            gpu: { ...incomplete.gpu, ...(evidenceReads >= 2 ? { count: 1 } : {}) },
+          };
+        },
+      );
+
+      await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+        recovered: false,
+        cleaned: true,
+        detail: expect.stringContaining(testCase.detail),
+      });
+      expect(elapsedMs).toBe(22_500);
+      expect(deletePod).toHaveBeenCalledWith("pod_123");
+      expect(readWorkerSecret).not.toHaveBeenCalled();
+      expect(workerClient.health).not.toHaveBeenCalled();
+    },
+  );
+
+  it("terminates recovery when the budget is exhausted during evidence polling", async () => {
+    const incomplete = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const complete = { ...incomplete, gpu: { ...incomplete.gpu, count: 1 } };
+    const { controller, fakeClient, deletePod, readUsage, readWorkerSecret, workerClient } =
+      harness({
+        currentLease: lease({
+          idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+          hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+        }),
+        pod: incomplete,
+      });
+    fakeClient.getPod
+      .mockReset()
+      .mockResolvedValueOnce(incomplete)
+      .mockResolvedValueOnce(complete)
+      .mockResolvedValueOnce(null);
+    readUsage
+      .mockReset()
+      .mockResolvedValueOnce(usage)
+      .mockResolvedValue({
+        ...usage,
+        estimatedTodayUsd: 10,
+        estimatedMonthUsd: 10,
+        estimatedTotalUsd: 10,
+      });
+
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      recovered: false,
+      cleaned: true,
+      detail: expect.stringContaining("daily compute budget is exhausted"),
+    });
+    expect(readUsage).toHaveBeenCalledTimes(2);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(readWorkerSecret).not.toHaveBeenCalled();
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it("terminates the exact recovered Pod when a permanent evidence read fails", async () => {
+    const incomplete = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const { controller, fakeClient, deletePod, readWorkerSecret, workerClient } = harness({
+      currentLease: lease({
+        idleDeadlineAt: "2026-08-29T12:05:00.000Z",
+        hardDeadlineAt: "2026-08-29T14:00:00.000Z",
+      }),
+      pod: incomplete,
+    });
+    fakeClient.getPod
+      .mockReset()
+      .mockResolvedValueOnce(incomplete)
+      .mockRejectedValueOnce(new RunPodApiError("RunPod API request failed with HTTP 401", 401))
+      .mockResolvedValueOnce(null);
+
+    await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
+      recovered: false,
+      cleaned: true,
+      detail: "Pod terminated because allocation evidence could not be verified",
+    });
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(readWorkerSecret).not.toHaveBeenCalled();
+    expect(workerClient.health).not.toHaveBeenCalled();
   });
 
   it("never rebinds a durable lease to a mismatched startup response", async () => {
@@ -598,8 +751,9 @@ describe("ComputeController authenticated worker startup", () => {
   });
 
   it("polls the exact Pod until an incomplete create response proves one approved GPU", async () => {
-    const { controller, fakeClient, deletePod } = harness({ currentLease: null });
+    const { controller, fakeClient, deletePod, sleep } = harness({ currentLease: null });
     let createdName = "";
+    let exactReads = 0;
     fakeClient.createPod.mockImplementation(async (input: { name: string }) => {
       createdName = input.name;
       return {
@@ -610,19 +764,31 @@ describe("ComputeController authenticated worker startup", () => {
         gpu: { id: "NVIDIA A100 80GB PCIe" },
       };
     });
-    fakeClient.getPod.mockImplementation(async () => ({
-      id: "pod_123",
-      name: createdName,
-      desiredStatus: "RUNNING",
-      adjustedCostPerHr: 1.39,
-      gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
-    }));
+    fakeClient.getPod.mockImplementation(async () => {
+      exactReads += 1;
+      return {
+        id: "pod_123",
+        name: createdName,
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.39,
+        gpu: {
+          id: "NVIDIA A100 80GB PCIe",
+          ...(exactReads >= 6 ? { count: 1 } : {}),
+        },
+      };
+    });
 
     await expect(controller.start()).resolves.toMatchObject({
       started: true,
       status: { state: "ready", pod: { gpuCount: 1 } },
     });
-    expect(fakeClient.getPod).toHaveBeenCalledWith("pod_123");
+    expect(fakeClient.getPod).toHaveBeenCalledWith(
+      "pod_123",
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+    expect(exactReads).toBe(6);
+    expect(sleep).toHaveBeenCalledTimes(5);
+    expect(sleep).toHaveBeenCalledWith(2_500);
     expect(deletePod).not.toHaveBeenCalled();
   });
 
@@ -634,22 +800,215 @@ describe("ComputeController authenticated worker startup", () => {
       adjustedCostPerHr: 1.39,
       gpu: { id: "NVIDIA A100 80GB PCIe" },
     };
-    const { controller, fakeClient, deletePod, beginUsage, workerClient, currentLease } = harness({
-      currentLease: null,
-      pod: incompletePod,
-    });
+    const { controller, fakeClient, deletePod, beginUsage, workerClient, sleep, currentLease } =
+      harness({
+        currentLease: null,
+        pod: incompletePod,
+      });
 
     await expect(controller.start()).rejects.toThrow(
       "RunPod did not prove that exactly one GPU was allocated",
     );
-    // Three bounded evidence reads plus the existing post-delete confirmation.
-    expect(fakeClient.getPod).toHaveBeenCalledTimes(4);
+    // Ten immediate/transient exact reads span the monotonic 25-second
+    // deadline. The eleventh read is the exact-id post-delete confirmation.
+    expect(fakeClient.getPod).toHaveBeenCalledTimes(11);
+    expect(sleep).toHaveBeenCalledTimes(10);
+    expect(sleep).toHaveBeenCalledWith(2_500);
     expect(deletePod).toHaveBeenCalledWith("pod_123");
     expect(beginUsage).toHaveBeenCalledWith(
       expect.objectContaining({ podId: "pod_123", startedAt: NOW.toISOString(), hourlyUsd: 1.75 }),
     );
     expect(workerClient.health).not.toHaveBeenCalled();
     expect(currentLease()).toBeNull();
+  });
+
+  it("bounds slow exact reads and retry sleeps to one monotonic 25-second window", async () => {
+    const incompletePod = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    let elapsedMs = 0;
+    const sleep = vi.fn().mockImplementation(async (milliseconds: number) => {
+      elapsedMs += milliseconds;
+    });
+    const { controller, fakeClient, deletePod, workerClient } = harness({
+      currentLease: null,
+      pod: incompletePod,
+      monotonicNow: () => elapsedMs,
+      sleep,
+    });
+    fakeClient.getPod.mockImplementation(
+      async (_podId: string, requestOptions?: { timeoutMs?: number }) => {
+        if (!requestOptions) return null;
+        elapsedMs += Math.min(10_000, requestOptions.timeoutMs ?? 10_000);
+        return { ...incompletePod, name: fakeClient.createPod.mock.calls[0][0].name };
+      },
+    );
+
+    await expect(controller.start()).rejects.toThrow(
+      "RunPod did not prove that exactly one GPU was allocated",
+    );
+    const evidenceReads = fakeClient.getPod.mock.calls.filter((call) => call.length === 2);
+    expect(evidenceReads).toHaveLength(2);
+    expect(evidenceReads.map(([, options]) => options.timeoutMs)).toEqual([25_000, 12_500]);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(elapsedMs).toBe(25_000);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "GPU count",
+      observed: { gpu: { id: "NVIDIA A100 80GB PCIe", count: 2 } },
+      error: /allocated 2 GPUs/,
+    },
+    {
+      label: "GPU type",
+      observed: { gpu: { id: "NVIDIA H100 PCIe", count: 1 } },
+      error: /outside the active profile/,
+    },
+    {
+      label: "provider rate",
+      observed: {
+        adjustedCostPerHr: 1.8,
+        gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+      },
+      error: /exceeds the configured/,
+    },
+  ])("fails immediately when late $label evidence violates policy", async (scenario) => {
+    const incompletePod = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const { controller, fakeClient, deletePod, workerClient, sleep } = harness({
+      currentLease: null,
+      pod: incompletePod,
+    });
+    fakeClient.getPod
+      .mockImplementationOnce(async () => ({
+        ...incompletePod,
+        name: fakeClient.createPod.mock.calls[0][0].name,
+        ...scenario.observed,
+      }))
+      .mockResolvedValueOnce(null);
+
+    await expect(controller.start()).rejects.toThrow(scenario.error);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fakeClient.getPod).toHaveBeenCalledTimes(2);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    new RunPodApiError("RunPod API request failed with HTTP 401", 401),
+    new RunPodSchemaError("RunPod Pod allocation metadata is malformed"),
+  ])("fails immediately on permanent allocation read error: %s", async (providerError) => {
+    const incompletePod = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const { controller, fakeClient, deletePod, workerClient, sleep } = harness({
+      currentLease: null,
+      pod: incompletePod,
+    });
+    fakeClient.getPod.mockRejectedValueOnce(providerError).mockResolvedValueOnce(null);
+
+    await expect(controller.start()).rejects.toThrow(providerError.message);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fakeClient.getPod).toHaveBeenCalledTimes(2);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "idle",
+      profilePatch: { idleTimeoutSeconds: 20 },
+      error: "idle deadline elapsed before worker bootstrap",
+    },
+    {
+      label: "hard session",
+      profilePatch: { hardSessionLimitSeconds: 20 },
+      error: "hard session deadline elapsed before worker bootstrap",
+    },
+  ])("re-checks the $label deadline immediately before worker bootstrap", async (scenario) => {
+    const incompletePod = {
+      id: "pod_123",
+      name: "glimmer-test-lease",
+      desiredStatus: "RUNNING" as const,
+      adjustedCostPerHr: 1.39,
+      gpu: { id: "NVIDIA A100 80GB PCIe" },
+    };
+    const shortDeadlineConfig: ComputeConfigV1 = {
+      ...config,
+      profiles: config.profiles.map((profile) => ({ ...profile, ...scenario.profilePatch })),
+    };
+    let elapsedMs = 0;
+    const sleep = vi.fn().mockImplementation(async (milliseconds: number) => {
+      elapsedMs += milliseconds;
+    });
+    const { controller, fakeClient, deletePod, workerClient } = harness({
+      currentLease: null,
+      currentConfig: shortDeadlineConfig,
+      pod: incompletePod,
+      now: () => new Date(NOW.getTime() + elapsedMs),
+      monotonicNow: () => elapsedMs,
+      sleep,
+    });
+    let evidenceReads = 0;
+    fakeClient.getPod.mockImplementation(
+      async (_podId: string, requestOptions?: { timeoutMs?: number }) => {
+        if (!requestOptions) return null;
+        elapsedMs += Math.min(10_000, requestOptions.timeoutMs ?? 10_000);
+        evidenceReads += 1;
+        return {
+          ...incompletePod,
+          name: fakeClient.createPod.mock.calls[0][0].name,
+          gpu: {
+            ...incompletePod.gpu,
+            ...(evidenceReads >= 2 ? { count: 1 } : {}),
+          },
+        };
+      },
+    );
+
+    await expect(controller.start()).rejects.toThrow(scenario.error);
+    expect(elapsedMs).toBe(22_500);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(workerClient.health).not.toHaveBeenCalled();
+  });
+
+  it("re-checks the accrued budget immediately before worker bootstrap", async () => {
+    const { controller, readUsage, deletePod, workerClient } = harness({ currentLease: null });
+    const exhaustedUsage: ComputeUsageSummary = {
+      ...usage,
+      estimatedTodayUsd: 10,
+      estimatedMonthUsd: 10,
+      estimatedTotalUsd: 10,
+    };
+    readUsage
+      .mockReset()
+      .mockResolvedValueOnce(usage)
+      .mockResolvedValueOnce(usage)
+      .mockResolvedValueOnce(usage)
+      .mockResolvedValue(exhaustedUsage);
+
+    await expect(controller.start()).rejects.toThrow(
+      "budget no longer permits worker bootstrap: daily compute budget is exhausted",
+    );
+    expect(readUsage).toHaveBeenCalledTimes(4);
+    expect(deletePod).toHaveBeenCalledWith("pod_123");
+    expect(workerClient.health).not.toHaveBeenCalled();
   });
 
   it("tracks an unknown-rate allocation conservatively before evidence polling", async () => {
@@ -694,8 +1053,10 @@ describe("ComputeController authenticated worker startup", () => {
     expect(workerClient.health).not.toHaveBeenCalled();
   });
 
-  it("ignores a mismatched exact GET and only terminates the original allocation", async () => {
-    const { controller, fakeClient, deletePod, workerClient } = harness({ currentLease: null });
+  it("fails immediately on a mismatched exact GET and only terminates the original allocation", async () => {
+    const { controller, fakeClient, deletePod, workerClient, sleep } = harness({
+      currentLease: null,
+    });
     let createdName = "";
     fakeClient.createPod.mockImplementation(async (input: { name: string }) => {
       createdName = input.name;
@@ -717,13 +1078,13 @@ describe("ComputeController authenticated worker startup", () => {
     fakeClient.getPod
       .mockReset()
       .mockImplementationOnce(async () => ({ ...mismatched, name: createdName }))
-      .mockImplementationOnce(async () => ({ ...mismatched, name: createdName }))
-      .mockImplementationOnce(async () => ({ ...mismatched, name: createdName }))
       .mockResolvedValue(null);
 
     await expect(controller.start()).rejects.toThrow(
-      "RunPod did not prove that exactly one GPU was allocated",
+      "RunPod did not preserve the allocated Pod identity",
     );
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fakeClient.getPod).toHaveBeenCalledTimes(2);
     expect(deletePod).toHaveBeenCalledWith("pod_123");
     expect(deletePod).not.toHaveBeenCalledWith("pod_other");
     expect(workerClient.health).not.toHaveBeenCalled();

@@ -11,11 +11,12 @@ const POD = {
   gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
 };
 
-function client(fetchImpl: typeof fetch) {
+function client(fetchImpl: typeof fetch, timeoutMs?: number) {
   return new RunPodClient({
     baseUrl: "https://rest.runpod.io/v1",
     apiKey: API_KEY,
     fetchImpl,
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   });
 }
 
@@ -62,6 +63,39 @@ describe("RunPodClient", () => {
     expect(fetchImpl.mock.calls[0][0]).toBe("https://rest.runpod.io/v1/pods/pod_123");
     await expect(client(fetchImpl).getPod("../unsafe")).rejects.toThrow("Pod id is invalid");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts exact Pod reads at the smaller of the requested and client timeouts", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      });
+      const api = client(fetchImpl, 50);
+
+      const shorter = expect(api.getPod("pod_123", { timeoutMs: 20 })).rejects.toThrow(
+        "request timed out",
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      await shorter;
+
+      const capped = expect(api.getPod("pod_123", { timeoutMs: 200 })).rejects.toThrow(
+        "request timed out",
+      );
+      await vi.advanceTimersByTimeAsync(49);
+      expect(fetchImpl.mock.calls[1][1]?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await capped;
+      expect(fetchImpl.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses the documented start, stop, and delete lifecycle endpoints", async () => {

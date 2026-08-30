@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import type {
   ComputeBudgetStatus,
   ComputeConfigV1,
@@ -25,8 +26,8 @@ import {
   updateComputeLease,
   type ComputeLeaseV1,
 } from "./computeLeaseStore.js";
-import { RunPodClient } from "./runpodClient.js";
-import type { RunPodCreatePodInput, RunPodPod } from "./runpodSchemas.js";
+import { RunPodApiError, RunPodClient } from "./runpodClient.js";
+import { RunPodSchemaError, type RunPodCreatePodInput, type RunPodPod } from "./runpodSchemas.js";
 import { WorkerClient, WorkerProtocolError, workerBaseUrlForPod } from "./workerClient.js";
 import { WatchdogClient, WatchdogProtocolError, type WatchdogLeaseV1 } from "./watchdogClient.js";
 import {
@@ -56,12 +57,13 @@ export class ComputeControlError extends Error {
 
 class PermanentWorkerValidationError extends Error {}
 
-const ALLOCATION_EVIDENCE_ATTEMPTS = 3;
-const ALLOCATION_EVIDENCE_RETRY_MS = 1_000;
+const ALLOCATION_EVIDENCE_MAX_WAIT_MS = 25_000;
+const ALLOCATION_EVIDENCE_RETRY_MS = 2_500;
 const CREATE_OUTCOME_POLL_ATTEMPTS = 3;
 
 interface ControllerDependencies {
   now: () => Date;
+  monotonicNow: () => number;
   readConfig: typeof readComputeConfig;
   saveConfig: typeof saveComputeConfig;
   readApiKey: typeof readRunPodApiKey;
@@ -89,6 +91,7 @@ interface ControllerDependencies {
 
 const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   now: () => new Date(),
+  monotonicNow: () => performance.now(),
   readConfig: readComputeConfig,
   saveConfig: saveComputeConfig,
   readApiKey: readRunPodApiKey,
@@ -121,6 +124,15 @@ function activeProfile(config: ComputeConfigV1): ComputeProfileV1 | null {
 
 function price(pod: RunPodPod): number | undefined {
   return pod.adjustedCostPerHr ?? pod.costPerHr;
+}
+
+function allocationReadErrorIsPermanent(error: unknown): boolean {
+  if (error instanceof RunPodSchemaError) return true;
+  if (!(error instanceof RunPodApiError)) return false;
+  if (error.status === undefined) {
+    return error.message === "RunPod Pod id is invalid";
+  }
+  return error.status >= 400 && error.status < 500 && !new Set([408, 425, 429]).has(error.status);
 }
 
 function podSummary(pod: RunPodPod) {
@@ -727,27 +739,61 @@ export class ComputeController {
     initial: RunPodPod,
     expectedName: string,
   ): Promise<RunPodPod> {
+    const deadlineMs = this.dependencies.monotonicNow() + ALLOCATION_EVIDENCE_MAX_WAIT_MS;
     let observed = initial;
-    for (let attempt = 0; attempt < ALLOCATION_EVIDENCE_ATTEMPTS; attempt += 1) {
+    for (;;) {
       const validationError = this.validateAllocatedPod(profile, observed);
       if (!validationError || !this.allocationEvidenceIsPending(profile, observed)) {
         return observed;
       }
-      if (attempt > 0) {
-        await this.dependencies.sleep(ALLOCATION_EVIDENCE_RETRY_MS);
-      }
+      const remainingBeforeReadMs = deadlineMs - this.dependencies.monotonicNow();
+      if (remainingBeforeReadMs <= 0) return observed;
       try {
-        const refreshed = await client.getPod(initial.id);
-        if (refreshed?.id === initial.id && refreshed.name === expectedName) {
+        const refreshed = await client.getPod(initial.id, {
+          timeoutMs: Math.ceil(remainingBeforeReadMs),
+        });
+        if (refreshed) {
+          if (refreshed.id !== initial.id || refreshed.name !== expectedName) {
+            return refreshed;
+          }
           observed = refreshed;
+          const refreshedError = this.validateAllocatedPod(profile, observed);
+          if (!refreshedError || !this.allocationEvidenceIsPending(profile, observed)) {
+            return observed;
+          }
         }
-      } catch {
+      } catch (error) {
+        if (allocationReadErrorIsPermanent(error)) throw error;
         // A transient read failure cannot promote an incomplete create response.
         // Keep polling the exact Pod id, then fail closed through the existing
         // allocation rejection and termination path if proof never arrives.
       }
+      const remainingBeforeSleepMs = deadlineMs - this.dependencies.monotonicNow();
+      if (remainingBeforeSleepMs <= 0) return observed;
+      await this.dependencies.sleep(Math.min(ALLOCATION_EVIDENCE_RETRY_MS, remainingBeforeSleepMs));
     }
-    return observed;
+  }
+
+  private async preBootstrapSafetyError(
+    lease: ComputeLeaseV1,
+    profile: ComputeProfileV1,
+  ): Promise<string | null> {
+    const now = this.dependencies.now();
+    const nowMs = now.getTime();
+    if (nowMs >= Date.parse(lease.hardDeadlineAt)) {
+      return "RunPod hard session deadline elapsed before worker bootstrap";
+    }
+    if (nowMs >= Date.parse(lease.idleDeadlineAt)) {
+      return "RunPod idle deadline elapsed before worker bootstrap";
+    }
+    const budget = budgetStatus(
+      profile,
+      await this.dependencies.readUsage(now),
+      lease.observedHourlyUsd,
+    );
+    return budget.allowed
+      ? null
+      : `RunPod budget no longer permits worker bootstrap: ${budget.reason ?? "budget exhausted"}`;
   }
 
   private clearSafetyTimer() {
@@ -1084,6 +1130,9 @@ export class ComputeController {
           observedHourlyUsd,
         };
         await this.scheduleSafety(allocatedLease, profile);
+
+        const bootstrapSafetyError = await this.preBootstrapSafetyError(allocatedLease, profile);
+        if (bootstrapSafetyError) throw new ComputeControlError(bootstrapSafetyError, 409);
 
         let worker: ComputeWorkerStatus;
         try {
@@ -1497,11 +1546,30 @@ export class ComputeController {
         Math.min(Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt));
       let allocationError: string | null = null;
       if (!deadlinePassed) {
-        pod = await this.waitForAllocationEvidence(client, profile, pod, lease.podName);
+        try {
+          pod = await this.waitForAllocationEvidence(client, profile, pod, lease.podName);
+        } catch {
+          const reason = "allocation evidence could not be verified during startup recovery";
+          const cleaned = await this.terminateAllocatedPod(client, trackedLease, reason);
+          return {
+            recovered: false,
+            cleaned,
+            detail: cleaned
+              ? "Pod terminated because allocation evidence could not be verified"
+              : "Pod termination is pending because allocation evidence could not be verified",
+          };
+        }
         allocationError =
           pod.id !== trackedLease.podId || pod.name !== lease.podName
             ? "RunPod did not preserve the allocated Pod identity"
             : this.validateAllocatedPod(profile, pod);
+        if (!allocationError) {
+          try {
+            allocationError = await this.preBootstrapSafetyError(trackedLease, profile);
+          } catch {
+            allocationError = "compute safety validation failed during startup recovery";
+          }
+        }
       }
       if (allocationError || deadlinePassed) {
         const reason = allocationError ?? "expired compute lease";
