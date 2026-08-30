@@ -2889,6 +2889,8 @@ export interface ComputeStatus {
   detail: string;
   budget?: ComputeBudgetStatus;
   worker?: ComputeWorkerStatus;
+  /** Last sanitized worker observation, retained after exact Pod cleanup. */
+  lastDiagnostic?: ComputeLastDiagnostic;
   policy: {
     secureCloudOnly: true;
     maximumGpuCount: 1;
@@ -2897,8 +2899,48 @@ export interface ComputeStatus {
   };
 }
 
+export type ComputeBootstrapStage =
+  | "initializing"
+  | "worker_starting"
+  | "worker_listening"
+  | "artifact_preparing"
+  | "artifact_downloading"
+  | "artifact_verifying"
+  | "model_starting"
+  | "model_healthcheck"
+  | "ready"
+  | "failed";
+
+export type ComputeBootstrapArtifact = "model" | "mmproj" | "draft";
+
+export type ComputeBootstrapFailureCode =
+  | "configuration_invalid"
+  | "status_persistence_failed"
+  | "worker_start_failed"
+  | "artifact_download_failed"
+  | "artifact_checksum_failed"
+  | "model_start_failed"
+  | "model_healthcheck_failed"
+  | "bootstrap_interrupted"
+  | "unexpected_failure";
+
+export interface ComputeBootstrapStatus {
+  stage: ComputeBootstrapStage;
+  outcome: "in_progress" | "ready" | "failed";
+  stageStartedAt: string;
+  updatedAt: string;
+  artifact?: {
+    kind: ComputeBootstrapArtifact;
+    phase: "locking" | "cached" | "resuming" | "downloading" | "verifying" | "complete";
+    bytesCompleted?: number;
+    bytesTotal?: number;
+  };
+  failureCode?: ComputeBootstrapFailureCode;
+  exitCode?: number;
+}
+
 export interface ComputeWorkerStatus {
-  protocolVersion: 1;
+  protocolVersion: 1 | 2;
   buildId: string;
   ready: boolean;
   workerState: "bootstrapping" | "ready" | "busy";
@@ -2906,6 +2948,17 @@ export interface ComputeWorkerStatus {
     ready: boolean;
     contextTokens: 65_536 | 131_072;
   };
+  bootstrap?: ComputeBootstrapStatus;
+}
+
+export interface ComputeLastDiagnostic {
+  schemaVersion: 1;
+  leaseId: string;
+  podId: string;
+  podName: string;
+  observedAt: string;
+  outcome: "bootstrapping" | "ready" | "failed" | "terminated";
+  worker?: ComputeWorkerStatus;
 }
 
 export interface RemoteInputV1 {

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ComputeConfigV1, ComputeUsageSummary } from "@glimmer/shared";
+import type {
+  ComputeConfigV1,
+  ComputeLastDiagnostic,
+  ComputeUsageSummary,
+  ComputeWorkerStatus,
+} from "@glimmer/shared";
 import { ComputeControlError, ComputeController } from "./computeController.js";
 import type { ComputeLeaseV1 } from "./computeLeaseStore.js";
 import { RunPodApiError } from "./runpodClient.js";
@@ -81,6 +86,8 @@ function harness(options: {
   currentConfig?: ComputeConfigV1;
   pod?: any;
   workerFailure?: Error;
+  initialWorker?: ComputeWorkerStatus;
+  readyWorker?: ComputeWorkerStatus;
   workerUnavailableAttempts?: number;
   workerReadyAttempts?: number;
   watchdogStatusFailure?: Error;
@@ -96,6 +103,7 @@ function harness(options: {
 }) {
   let currentLease: ComputeLeaseV1 | null =
     "currentLease" in options ? (options.currentLease ?? null) : lease();
+  let currentDiagnostic: ComputeLastDiagnostic | null = null;
   const deletePod = vi.fn().mockResolvedValue(undefined);
   const beginUsage = options.beginUsageFailure
     ? vi.fn().mockRejectedValue(options.beginUsageFailure)
@@ -131,14 +139,14 @@ function harness(options: {
     deletePod,
     getPodBilling: vi.fn().mockResolvedValue([]),
   };
-  const initialWorker = {
+  const initialWorker: ComputeWorkerStatus = options.initialWorker ?? {
     protocolVersion: 1 as const,
     buildId: "r2-aaaaaaaaaaaa",
     ready: false,
     workerState: "bootstrapping" as const,
     model: { ready: true, contextTokens: 65_536 as const },
   };
-  const readyWorker = {
+  const readyWorker: ComputeWorkerStatus = options.readyWorker ?? {
     ...initialWorker,
     ready: true,
     workerState: "ready" as const,
@@ -242,6 +250,11 @@ function harness(options: {
       return currentLease;
     }),
     clearLease,
+    readDiagnostic: vi.fn().mockImplementation(async () => currentDiagnostic),
+    saveDiagnostic: vi.fn().mockImplementation(async (diagnostic) => {
+      currentDiagnostic = diagnostic;
+      return diagnostic;
+    }),
     beginUsage,
     finishUsage,
     readUsage,
@@ -283,6 +296,7 @@ function harness(options: {
     monotonicNow,
     sleep,
     currentLease: () => currentLease,
+    currentDiagnostic: () => currentDiagnostic,
     setCurrentLease: (next: ComputeLeaseV1 | null) => {
       currentLease = next;
     },
@@ -955,10 +969,67 @@ describe("ComputeController authenticated worker startup", () => {
     expect(input.containerRegistryAuthId).toBe("registry_auth_1");
     expect(input.env).toMatchObject({
       GLIMMER_CONTEXT_TOKENS: "65536",
+      GLIMMER_LEASE_ID: currentLease()?.id,
       GLIMMER_WORKER_BOOTSTRAP_TOKEN: "B".repeat(43),
       GLIMMER_MODEL_SHA256: "b".repeat(64),
     });
     expect(JSON.stringify(input.env)).not.toContain("RunPod");
+  });
+
+  it("retains a sanitized failed bootstrap diagnostic after exact cleanup", async () => {
+    const { controller, currentLease, currentDiagnostic } = harness({
+      currentLease: null,
+      workerFailure: new Error("worker proxy unavailable"),
+      workerReadyAttempts: 1,
+    });
+
+    await expect(controller.start()).resolves.toMatchObject({ started: true });
+    await vi.waitFor(() => expect(currentLease()).toBeNull());
+    expect(currentDiagnostic()).toMatchObject({
+      schemaVersion: 1,
+      outcome: "failed",
+      podId: "pod_123",
+    });
+    await expect(controller.getStatus()).resolves.toMatchObject({
+      state: "offline",
+      lastDiagnostic: { outcome: "failed", podId: "pod_123" },
+    });
+  });
+
+  it("terminates immediately on a deterministic health V2 bootstrap failure", async () => {
+    const failedWorker: ComputeWorkerStatus = {
+      protocolVersion: 2,
+      buildId: "r2-aaaaaaaaaaaa",
+      ready: false,
+      workerState: "bootstrapping",
+      model: { ready: false, contextTokens: 65_536 },
+      bootstrap: {
+        stage: "failed",
+        outcome: "failed",
+        stageStartedAt: "2026-08-29T12:00:00.000Z",
+        updatedAt: "2026-08-29T12:00:01.000Z",
+        failureCode: "artifact_checksum_failed",
+        exitCode: 20,
+      },
+    };
+    const { controller, currentLease, currentDiagnostic, workerClient, sleep } = harness({
+      currentLease: null,
+      initialWorker: failedWorker,
+      readyWorker: failedWorker,
+      workerReadyAttempts: 10,
+    });
+
+    await expect(controller.start()).resolves.toMatchObject({ started: true });
+    await vi.waitFor(() => expect(currentLease()).toBeNull());
+    expect(workerClient.handshake).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+    expect(currentDiagnostic()).toMatchObject({
+      outcome: "failed",
+      worker: {
+        protocolVersion: 2,
+        bootstrap: { failureCode: "artifact_checksum_failed", exitCode: 20 },
+      },
+    });
   });
 
   it("polls the exact Pod until an incomplete create response proves one approved GPU", async () => {

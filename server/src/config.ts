@@ -36,6 +36,7 @@ export const CONFIG = {
   computeKeysDir: path.join(stateRoot, "compute-keys"),
   computeWorkerKeysDir: path.join(stateRoot, "compute-worker-keys"),
   computeStatePath: path.join(stateRoot, "compute-state.json"),
+  computeDiagnosticPath: path.join(stateRoot, "compute-last-diagnostic.json"),
   computeUsagePath: path.join(stateRoot, "compute-usage.json"),
   // Fixed vendor origin: account credentials must never be redirected to a
   // caller-configurable host. Tests inject their own client instead.

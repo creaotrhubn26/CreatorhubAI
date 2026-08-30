@@ -93,6 +93,95 @@ describe("WorkerClient", () => {
     );
   });
 
+  it("accepts the bounded health V2 bootstrap diagnostic and preserves V1 compatibility", () => {
+    expect(parseWorkerHealth(health(false))).toMatchObject({ protocolVersion: 1 });
+    expect(
+      parseWorkerHealth({
+        ...health(false),
+        schemaVersion: 2,
+        bootstrap: {
+          stage: "artifact_downloading",
+          outcome: "in_progress",
+          stageStartedAt: "2026-08-29T10:00:00Z",
+          updatedAt: "2026-08-29T10:00:01Z",
+          artifact: {
+            kind: "model",
+            phase: "downloading",
+            bytesCompleted: 268_435_456,
+            bytesTotal: 19_700_000_000,
+          },
+        },
+      }),
+    ).toMatchObject({
+      protocolVersion: 2,
+      ready: false,
+      bootstrap: {
+        stage: "artifact_downloading",
+        artifact: { kind: "model", bytesCompleted: 268_435_456 },
+      },
+    });
+  });
+
+  it("rejects forged or unbounded health V2 diagnostics", () => {
+    const base = {
+      ...health(true),
+      schemaVersion: 2,
+      bootstrap: {
+        stage: "artifact_downloading",
+        outcome: "in_progress",
+        stageStartedAt: "2026-08-29T10:00:00Z",
+        updatedAt: "2026-08-29T10:00:01Z",
+        artifact: {
+          kind: "model",
+          phase: "downloading",
+          bytesCompleted: 20,
+          bytesTotal: 10,
+        },
+      },
+    };
+    expect(() => parseWorkerHealth(base)).toThrow(/byte progress/);
+    expect(() =>
+      parseWorkerHealth({
+        ...base,
+        bootstrap: { ...base.bootstrap, artifact: undefined, secret: "not allowed" },
+      }),
+    ).toThrow(/unsupported or missing fields/);
+    expect(() =>
+      parseWorkerHealth({
+        ...base,
+        bootstrap: {
+          ...base.bootstrap,
+          artifact: { ...base.bootstrap.artifact, bytesCompleted: 5 },
+        },
+      }),
+    ).toThrow(/readiness conflicts/);
+    expect(
+      parseWorkerHealth({
+        ...health(false),
+        schemaVersion: 2,
+        bootstrap: {
+          stage: "ready",
+          outcome: "ready",
+          stageStartedAt: "2026-08-29T10:00:00Z",
+          updatedAt: "2026-08-29T10:00:01Z",
+        },
+      }),
+    ).toMatchObject({ ready: false, workerState: "bootstrapping" });
+    expect(() =>
+      parseWorkerHealth({
+        ...health(false),
+        schemaVersion: 2,
+        bootstrap: {
+          stage: "failed",
+          outcome: "failed",
+          stageStartedAt: "2026-08-29T10:00:00Z",
+          updatedAt: "2026-08-29T10:00:01Z",
+          failureCode: "unexpected_failure",
+        },
+      }),
+    ).toThrow(/exit code is missing/);
+  });
+
   it("performs the bootstrap and signed job flow against a stateful fake worker", async () => {
     let rotated = false;
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ComputeRunState } from "@glimmer/shared";
+import type { ComputeBootstrapStatus, ComputeRunState } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
 import { StatusBadge } from "../common/StatusBadge";
 
@@ -16,6 +16,18 @@ const ACTIVE_STATES = new Set<ComputeRunState>([
 
 function money(value: number | undefined): string {
   return value === undefined ? "Unavailable" : `$${value.toFixed(4)}`;
+}
+
+function bootstrapStage(value: string | undefined): string {
+  return value ? value.replaceAll("_", " ") : "Unavailable";
+}
+
+function artifactProgress(artifact: NonNullable<ComputeBootstrapStatus["artifact"]>): string {
+  const bytes =
+    artifact.bytesCompleted !== undefined && artifact.bytesTotal !== undefined
+      ? ` — ${artifact.bytesCompleted.toLocaleString()} / ${artifact.bytesTotal.toLocaleString()} bytes`
+      : "";
+  return `${artifact.kind} ${artifact.phase}${bytes}`;
 }
 
 export function ComputeStatusPanel() {
@@ -69,6 +81,8 @@ export function ComputeStatusPanel() {
     data.state === "failed" ||
     (!!data.pod && data.state !== "stopped" && data.state !== "offline");
   const failure = start.error ?? stop.error;
+  const bootstrap = data.worker?.bootstrap;
+  const retained = data.lastDiagnostic;
 
   return (
     <section aria-labelledby="external-compute-heading">
@@ -100,6 +114,14 @@ export function ComputeStatusPanel() {
             ? `${data.worker.model.contextTokens.toLocaleString()} tokens`
             : "Unavailable"}
         </dd>
+        <dt>Bootstrap stage</dt>
+        <dd>{bootstrapStage(bootstrap?.stage)}</dd>
+        <dt>Artifact progress</dt>
+        <dd>{bootstrap?.artifact ? artifactProgress(bootstrap.artifact) : "Unavailable"}</dd>
+        <dt>Last retained outcome</dt>
+        <dd>{retained?.outcome ?? "Unavailable"}</dd>
+        <dt>Last retained observation</dt>
+        <dd>{retained?.observedAt ?? "Unavailable"}</dd>
         <dt>Current rate</dt>
         <dd>{money(data.budget?.currentHourlyUsd)}</dd>
         <dt>Hourly ceiling</dt>
@@ -115,6 +137,9 @@ export function ComputeStatusPanel() {
         <p role="alert">
           Provider capacity is allocated, but authenticated worker readiness is not proven.
         </p>
+      )}
+      {bootstrap?.failureCode && (
+        <p role="alert">Bootstrap failure code: {bootstrap.failureCode}</p>
       )}
       {!data.policy.watchdogConfigured && (
         <p role="note">

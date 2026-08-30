@@ -152,4 +152,54 @@ describe("ComputeStatusPanel", () => {
     expect(screen.getByText("65,536 tokens")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Terminate external compute" })).toBeEnabled();
   });
+
+  it("renders bounded bootstrap progress and the retained outcome", async () => {
+    const worker = {
+      protocolVersion: 2 as const,
+      buildId: "r2-bbbbbbbbbbbb",
+      ready: false,
+      workerState: "bootstrapping" as const,
+      model: { ready: false, contextTokens: 65_536 as const },
+      bootstrap: {
+        stage: "artifact_downloading" as const,
+        outcome: "in_progress" as const,
+        stageStartedAt: "2026-08-29T12:00:00Z",
+        updatedAt: "2026-08-29T12:00:05Z",
+        artifact: {
+          kind: "model" as const,
+          phase: "downloading" as const,
+          bytesCompleted: 268_435_456,
+          bytesTotal: 19_700_000_000,
+        },
+      },
+    };
+    vi.spyOn(glimmerApi, "getComputeStatus").mockResolvedValue({
+      ...offline,
+      state: "bootstrapping",
+      pod: {
+        id: "pod_progress",
+        name: "glimmer-progress",
+        desiredStatus: "RUNNING",
+      },
+      worker,
+      lastDiagnostic: {
+        schemaVersion: 1,
+        leaseId: "lease-progress",
+        podId: "pod_progress",
+        podName: "glimmer-progress",
+        observedAt: "2026-08-29T12:00:05Z",
+        outcome: "bootstrapping",
+        worker,
+      },
+    });
+    mockUsage();
+    renderPanel();
+
+    expect(await screen.findByText("artifact downloading")).toBeInTheDocument();
+    expect(
+      screen.getByText("model downloading — 268,435,456 / 19,700,000,000 bytes"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("bootstrapping", { selector: "dd" })).toHaveLength(2);
+    expect(screen.getByText("2026-08-29T12:00:05Z")).toBeInTheDocument();
+  });
 });

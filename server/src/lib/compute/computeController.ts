@@ -5,6 +5,7 @@ import type {
   ComputeConfigV1,
   ComputeControlResult,
   ComputeCredentialTestResult,
+  ComputeLastDiagnostic,
   ComputeProfileV1,
   ComputeStatus,
   ComputeUsageSummary,
@@ -26,6 +27,7 @@ import {
   updateComputeLease,
   type ComputeLeaseV1,
 } from "./computeLeaseStore.js";
+import { readLastComputeDiagnostic, saveLastComputeDiagnostic } from "./computeDiagnosticStore.js";
 import { RunPodApiError, RunPodClient } from "./runpodClient.js";
 import { RunPodSchemaError, type RunPodCreatePodInput, type RunPodPod } from "./runpodSchemas.js";
 import { WorkerClient, WorkerProtocolError, workerBaseUrlForPod } from "./workerClient.js";
@@ -77,6 +79,8 @@ interface ControllerDependencies {
   saveLease: typeof saveComputeLease;
   updateLease: typeof updateComputeLease;
   clearLease: typeof clearComputeLease;
+  readDiagnostic: typeof readLastComputeDiagnostic;
+  saveDiagnostic: typeof saveLastComputeDiagnostic;
   beginUsage: typeof beginUsageInterval;
   finishUsage: typeof finishUsageInterval;
   readUsage: typeof readUsageSummary;
@@ -105,6 +109,8 @@ const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   saveLease: saveComputeLease,
   updateLease: updateComputeLease,
   clearLease: clearComputeLease,
+  readDiagnostic: readLastComputeDiagnostic,
+  saveDiagnostic: saveLastComputeDiagnostic,
   beginUsage: beginUsageInterval,
   finishUsage: finishUsageInterval,
   readUsage: readUsageSummary,
@@ -241,6 +247,31 @@ function workerBootstrapFailureMessage(error: unknown): string {
   return "unexpected worker bootstrap error";
 }
 
+function bootstrapDetail(worker: ComputeWorkerStatus): string | null {
+  const bootstrap = worker.bootstrap;
+  if (!bootstrap) return null;
+  if (bootstrap.outcome === "failed") {
+    return `Worker bootstrap reported ${bootstrap.failureCode ?? "unexpected_failure"}.`;
+  }
+  if (bootstrap.outcome === "ready") {
+    return `Authenticated worker ${worker.buildId} is ready with ${worker.model.contextTokens} context tokens.`;
+  }
+  const artifact = bootstrap.artifact;
+  if (artifact) {
+    const progress =
+      artifact.bytesCompleted !== undefined && artifact.bytesTotal !== undefined
+        ? ` (${artifact.bytesCompleted.toLocaleString("en-US")} of ${artifact.bytesTotal.toLocaleString("en-US")} bytes)`
+        : "";
+    return `Worker bootstrap: ${artifact.kind} ${artifact.phase}${progress}.`;
+  }
+  return `Worker bootstrap: ${bootstrap.stage.replaceAll("_", " ")}.`;
+}
+
+function diagnosticOutcome(worker: ComputeWorkerStatus): ComputeLastDiagnostic["outcome"] {
+  if (worker.bootstrap?.outcome === "failed") return "failed";
+  return worker.ready ? "ready" : "bootstrapping";
+}
+
 export class ComputeController {
   private operation: Promise<unknown> = Promise.resolve();
   private safetyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -251,6 +282,57 @@ export class ComputeController {
   private lastComputeDetail: string | null = null;
 
   constructor(private readonly dependencies: ControllerDependencies = DEFAULT_DEPENDENCIES) {}
+
+  private async readDiagnosticBestEffort(): Promise<ComputeLastDiagnostic | null> {
+    try {
+      return await this.dependencies.readDiagnostic();
+    } catch {
+      console.error("[compute] retained bootstrap diagnostic is unreadable");
+      return null;
+    }
+  }
+
+  private async saveDiagnosticBestEffort(diagnostic: ComputeLastDiagnostic): Promise<void> {
+    try {
+      await this.dependencies.saveDiagnostic(diagnostic);
+    } catch {
+      console.error("[compute] bootstrap diagnostic could not be persisted");
+    }
+  }
+
+  private recordWorkerDiagnostic(
+    lease: ComputeLeaseV1,
+    podId: string,
+    worker: ComputeWorkerStatus,
+  ): Promise<void> {
+    return this.saveDiagnosticBestEffort({
+      schemaVersion: 1,
+      leaseId: lease.id,
+      podId,
+      podName: lease.podName,
+      observedAt: this.dependencies.now().toISOString(),
+      outcome: diagnosticOutcome(worker),
+      worker,
+    });
+  }
+
+  private async recordTerminalDiagnostic(
+    lease: ComputeLeaseV1,
+    outcome: "failed" | "terminated",
+  ): Promise<void> {
+    if (!lease.podId) return;
+    const existing = await this.readDiagnosticBestEffort();
+    if (existing?.leaseId === lease.id && existing.outcome === "failed") return;
+    await this.saveDiagnosticBestEffort({
+      schemaVersion: 1,
+      leaseId: lease.id,
+      podId: lease.podId,
+      podName: lease.podName,
+      observedAt: this.dependencies.now().toISOString(),
+      outcome,
+      ...(existing?.leaseId === lease.id && existing.worker ? { worker: existing.worker } : {}),
+    });
+  }
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const next = this.operation.catch(() => undefined).then(operation);
@@ -356,7 +438,10 @@ export class ComputeController {
     const profile = lease
       ? config.profiles.find((candidate) => candidate.id === lease.profileId)
       : activeProfile(config);
-    const usage = await this.dependencies.readUsage(this.dependencies.now());
+    const [usage, lastDiagnostic] = await Promise.all([
+      this.dependencies.readUsage(this.dependencies.now()),
+      this.readDiagnosticBestEffort(),
+    ]);
     const observedPrice = pod ? price(pod) : lease?.observedHourlyUsd;
     const budget = profile ? budgetStatus(profile, usage, observedPrice) : undefined;
     if (!lease) {
@@ -368,9 +453,13 @@ export class ComputeController {
         detail:
           detail ??
           this.lastComputeDetail ??
+          (lastDiagnostic?.outcome === "failed"
+            ? `The last worker bootstrap failed at ${lastDiagnostic.worker?.bootstrap?.stage ?? "an unavailable stage"}; no RunPod Pod is active.`
+            : undefined) ??
           (config.defaultBackend === "local_process"
             ? "Local process execution remains selected."
             : "No RunPod Pod is active."),
+        ...(lastDiagnostic ? { lastDiagnostic } : {}),
         policy: this.policy(profile ?? undefined),
       };
     }
@@ -394,9 +483,11 @@ export class ComputeController {
       idleDeadlineAt: lease.idleDeadlineAt,
       hardDeadlineAt: lease.hardDeadlineAt,
       ...(worker ? { worker } : {}),
+      ...(lastDiagnostic ? { lastDiagnostic } : {}),
       detail:
         detail ??
         lease.error ??
+        (worker && bootstrapDetail(worker)) ??
         (worker?.ready
           ? `Authenticated worker ${worker.buildId} is ready with ${worker.model.contextTokens} context tokens.`
           : pod?.desiredStatus === "RUNNING"
@@ -540,6 +631,7 @@ export class ComputeController {
     profile: ComputeProfileV1,
     podName: string,
     bootstrapToken: string,
+    leaseId: string,
   ): RunPodCreatePodInput {
     if (
       !profile.imageDigest ||
@@ -569,6 +661,7 @@ export class ComputeController {
       locked: false,
       env: {
         GLIMMER_CONTEXT_TOKENS: String(profile.contextTokens),
+        GLIMMER_LEASE_ID: leaseId,
         GLIMMER_WORKER_BOOTSTRAP_TOKEN: bootstrapToken,
         GLIMMER_MODEL_URL: profile.modelArtifacts.model.url,
         GLIMMER_MODEL_SHA256: profile.modelArtifacts.model.sha256,
@@ -591,6 +684,9 @@ export class ComputeController {
     }
     if (worker.model.contextTokens !== profile.contextTokens) {
       return `worker context ${worker.model.contextTokens} does not match profile context ${profile.contextTokens}`;
+    }
+    if (worker.bootstrap?.outcome === "failed") {
+      return `worker bootstrap reported ${worker.bootstrap.failureCode ?? "unexpected_failure"}`;
     }
     if (requireReady && (!worker.ready || !worker.model.ready || worker.workerState !== "ready")) {
       return "worker or model did not become ready";
@@ -658,7 +754,17 @@ export class ComputeController {
         });
         await this.assertWorkerBootstrapActive(lease.id, podId);
         const initialError = this.validateWorker(profile, initial, false);
-        if (initialError) throw new PermanentWorkerValidationError(initialError);
+        if (initialError) {
+          if (
+            initial.bootstrap?.outcome === "failed" &&
+            /^r2-[a-f0-9]{12}$/.test(initial.buildId) &&
+            initial.model.contextTokens === profile.contextTokens
+          ) {
+            await this.recordWorkerDiagnostic(lease, podId, initial);
+          }
+          throw new PermanentWorkerValidationError(initialError);
+        }
+        await this.recordWorkerDiagnostic(lease, podId, initial);
         if (!capability) {
           if (!secret.bootstrapToken) {
             throw new WorkerProtocolError("worker bootstrap state is unavailable");
@@ -702,7 +808,14 @@ export class ComputeController {
         });
         await this.assertWorkerBootstrapActive(lease.id, podId);
         const readyError = this.validateWorker(profile, ready, true);
-        if (!readyError) return ready;
+        if (!readyError) {
+          await this.recordWorkerDiagnostic(lease, podId, ready);
+          return ready;
+        }
+        await this.recordWorkerDiagnostic(lease, podId, ready);
+        if (ready.bootstrap?.outcome === "failed") {
+          throw new PermanentWorkerValidationError(readyError);
+        }
         lastError = readyError;
       } catch (error) {
         if (
@@ -790,6 +903,7 @@ export class ComputeController {
         throw error;
       }
       this.lastComputeDetail = boundedComputeDetail(reason);
+      await this.recordTerminalDiagnostic(current, "failed");
       await this.terminateAllocatedPod(client, current, reason);
     });
   }
@@ -825,7 +939,7 @@ export class ComputeController {
         const persistedReady = await this.dependencies.saveLease({
           ...current,
           state: "ready",
-          workerProtocolVersion: 1,
+          workerProtocolVersion: worker.protocolVersion,
           workerBuildId: worker.buildId,
           workerReadyAt: this.dependencies.now().toISOString(),
           error: undefined,
@@ -865,14 +979,16 @@ export class ComputeController {
       state: "terminating",
       providerTerminationConfirmedAt: this.dependencies.now().toISOString(),
     };
+    let persisted = confirmed;
     try {
-      return await this.dependencies.saveLease(confirmed);
+      persisted = await this.dependencies.saveLease(confirmed);
     } catch (error) {
       console.error(
         `[compute] could not persist provider-termination confirmation: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return confirmed;
     }
+    await this.recordTerminalDiagnostic(persisted, "terminated");
+    return persisted;
   }
 
   private async finalizeTerminatedLease(lease: ComputeLeaseV1): Promise<boolean> {
@@ -1151,6 +1267,15 @@ export class ComputeController {
         }
         const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
         const workerError = profile ? this.validateWorker(profile, worker, false) : null;
+        if (
+          !workerError ||
+          (profile &&
+            worker.bootstrap?.outcome === "failed" &&
+            /^r2-[a-f0-9]{12}$/.test(worker.buildId) &&
+            worker.model.contextTokens === profile.contextTokens)
+        ) {
+          await this.recordWorkerDiagnostic(lease, pod.id, worker);
+        }
         return this.statusFrom(
           config,
           lease,
@@ -1282,7 +1407,12 @@ export class ComputeController {
         );
       }
       this.scheduleWatchdogHeartbeat();
-      const createRequest = this.createInput(profile, podName, workerSecret.bootstrapToken);
+      const createRequest = this.createInput(
+        profile,
+        podName,
+        workerSecret.bootstrapToken,
+        leaseId,
+      );
       let pod: RunPodPod;
       try {
         pod = await client.createPod(createRequest);
@@ -1379,6 +1509,14 @@ export class ComputeController {
           podId: allocatedPodId,
           observedHourlyUsd,
         };
+        await this.saveDiagnosticBestEffort({
+          schemaVersion: 1,
+          leaseId,
+          podId: allocatedPodId,
+          podName,
+          observedAt: this.dependencies.now().toISOString(),
+          outcome: "bootstrapping",
+        });
         await this.scheduleSafety(allocatedLease, profile);
 
         const bootstrapSafetyError = await this.preBootstrapSafetyError(allocatedLease, profile);

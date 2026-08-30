@@ -7,7 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "7b043e907ee6d95fbf8a5843d657fa41ad73db4a";
+const EXPECTED_ORCHESTRATOR_COMMIT = "902e7ab8f98646e2b54d9498c33b3fb0bf288e95";
 const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-runpod-r2";
 const EXPECTED_RUNPOD_WORKFLOW_SHA =
   "c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952";
@@ -33,7 +33,7 @@ const EXPECTED_ORCHESTRATOR_FILES = {
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
   "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
   "glimmer_remote.py": "5771ff5870bfc74b35cdad90c7011da5f23ca88bf2d54eb2f9a8a59188926bfd",
-  "runpod_worker.py": "971aaa7c537d810a860ba213da06e0185dd9b5525869dffb147313f57d1eba68",
+  "runpod_worker.py": "b06de735ab48659456f59e188ea173cc839513d918235be4000f9651f6b5e979",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
   "eval-baselines/baseline-stub.json":
     "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",

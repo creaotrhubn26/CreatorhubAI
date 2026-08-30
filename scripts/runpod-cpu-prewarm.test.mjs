@@ -1,0 +1,458 @@
+import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import {
+  PrewarmError,
+  buildCreatePodRequest,
+  containsExactContainerLogLine,
+  extractSseLogEvents,
+  parseArguments,
+  parseComputeConfig,
+  parseCpuCatalog,
+  parseExactPod,
+  parseNetworkVolume,
+  parsePod,
+  readPrivateRegularFile,
+  resolveStatePaths,
+  runReadOnlyPreflight,
+  sanitizeTimelinePayload,
+  selectCpuOffer,
+  validateOwnedPod,
+} from "./runpod-cpu-prewarm.mjs";
+
+const digest = "a".repeat(64);
+const image = `registry.example.com/glimmer@sha256:${digest}`;
+const configuredImage = `registry.example.com/old@sha256:${"b".repeat(64)}`;
+const buildId = "r2-0123456789ab";
+const confirmation = "CREATE_EXACTLY_ONE_CAPPED_RUNPOD_CPU_POD";
+
+function argumentsFor(mode) {
+  return [
+    mode,
+    "--image",
+    image,
+    "--build-id",
+    buildId,
+    "--max-hourly-usd",
+    "0.50",
+    "--hard-deadline-seconds",
+    "300",
+  ];
+}
+
+function expectCode(callback, code) {
+  assert.throws(callback, (error) => error instanceof PrewarmError && error.code === code);
+}
+
+function configuration(stateRoot = "/secure/state") {
+  return {
+    version: 1,
+    enabled: false,
+    defaultBackend: "local_process",
+    activeProfileId: "production",
+    apiKeyFile: path.join(stateRoot, "compute-keys", "runpod.key"),
+    profiles: [
+      {
+        id: "production",
+        provider: "runpod",
+        cloudType: "SECURE",
+        imageDigest: configuredImage,
+        containerRegistryAuthId: "registry_credential_1",
+        networkVolumeId: "network-volume_1",
+        contextTokens: 65_536,
+        modelArtifacts: {
+          allowedHosts: ["artifacts.example.com"],
+          model: {
+            url: "https://artifacts.example.com/model.gguf",
+            sha256: "1".repeat(64),
+          },
+          mmproj: {
+            url: "https://artifacts.example.com/mmproj.gguf",
+            sha256: "2".repeat(64),
+          },
+          draftModel: {
+            url: "https://artifacts.example.com/draft.gguf",
+            sha256: "3".repeat(64),
+          },
+        },
+      },
+    ],
+  };
+}
+
+function parsedProfile() {
+  const keyPath = "/secure/state/compute-keys/runpod.key";
+  return parseComputeConfig(configuration(), keyPath);
+}
+
+function selectedCpu() {
+  return selectCpuOffer(
+    parseCpuCatalog({
+      cpus: [
+        {
+          id: "cpu-expensive",
+          vcpu: { min: 1, max: 8 },
+          price: { securePerVcpu: 0.2 },
+          availability: "HIGH",
+          dataCenters: [{ id: "EU-RO-1", availability: "HIGH" }],
+        },
+        {
+          id: "cpu-cheap",
+          vcpu: { min: 2, max: 4 },
+          price: { securePerVcpu: 0.1 },
+          availability: "MEDIUM",
+          dataCenters: [{ id: "EU-RO-1", availability: "LOW" }],
+        },
+      ],
+    }),
+    "EU-RO-1",
+    0.5,
+  );
+}
+
+function expectedContract() {
+  const profile = parsedProfile();
+  const volume = parseNetworkVolume(
+    {
+      id: profile.networkVolumeId,
+      name: "models",
+      size: 200,
+      dataCenter: "EU-RO-1",
+      type: "NETWORK",
+    },
+    profile.networkVolumeId,
+  );
+  const cpu = selectedCpu();
+  const leaseId = "11111111-2222-4333-8444-555555555555";
+  const podName = `glimmer-cpu-prewarm-${leaseId}`;
+  const request = buildCreatePodRequest({
+    profile,
+    image,
+    buildId,
+    leaseId,
+    podName,
+    cpu,
+    volume,
+  });
+  return { profile, volume, cpu, leaseId, podName, request };
+}
+
+function providerPod(expected, overrides = {}) {
+  return {
+    id: "pod_123",
+    name: expected.podName,
+    status: "EXITED",
+    image: expected.request.image,
+    args: "",
+    disk: expected.request.disk,
+    ports: [],
+    env: { ...expected.request.env },
+    registry: expected.request.registry,
+    cloud: "SECURE",
+    dataCenterId: expected.volume.dataCenter,
+    cost: expected.cpu.hourlyUsd,
+    cpu: { id: expected.cpu.id, vcpuCount: 2, memory: 8 },
+    gpu: null,
+    mounts: { network: expected.request.mounts.network.map((entry) => ({ ...entry })) },
+    globalNetworking: { enabled: false },
+    ssh: { proxy: null, direct: null },
+    ...overrides,
+  };
+}
+
+test("argument parser separates read-only preflight from paid execution", () => {
+  const preflight = parseArguments(argumentsFor("--preflight"), {});
+  assert.equal(preflight.mode, "preflight");
+  assert.equal(preflight.execute, false);
+  assert.equal(preflight.image, image);
+
+  expectCode(() => parseArguments(argumentsFor("--execute"), {}), "authorization_required");
+  const execute = parseArguments(argumentsFor("--execute"), {
+    GLIMMER_RUNPOD_CPU_PREWARM: confirmation,
+  });
+  assert.equal(execute.mode, "execute");
+
+  expectCode(
+    () =>
+      parseArguments([...argumentsFor("--preflight"), "--execute"], {
+        GLIMMER_RUNPOD_CPU_PREWARM: confirmation,
+      }),
+    "invalid_mode",
+  );
+  expectCode(
+    () => parseArguments(argumentsFor("--preflight").with(2, "latest"), {}),
+    "invalid_image",
+  );
+  expectCode(
+    () =>
+      parseArguments(
+        argumentsFor("--preflight")
+          .map((value) => (value === "0.50" ? "1" : value))
+          .map((value) => (value === "300" ? "3600" : value)),
+        {},
+      ),
+    "invalid_cost_cap",
+  );
+});
+
+test("state paths are fixed under the state root and ignore config overrides", () => {
+  const paths = resolveStatePaths({
+    GLIMMER_STATE_ROOT: "/private/state",
+    GLIMMER_COMPUTE_CONFIG: "/tmp/untrusted.json",
+  });
+  assert.equal(paths.configPath, "/private/state/compute.json");
+  assert.equal(paths.keyPath, "/private/state/compute-keys/runpod.key");
+  expectCode(() => resolveStatePaths({ GLIMMER_STATE_ROOT: "relative" }), "invalid_state_root");
+});
+
+test("active profile parser preserves immutable registry, volume and artifacts", () => {
+  const profile = parsedProfile();
+  assert.equal(profile.id, "production");
+  assert.equal(profile.configuredImage, configuredImage);
+  assert.equal(profile.registry, "registry_credential_1");
+  assert.equal(profile.networkVolumeId, "network-volume_1");
+  assert.equal(profile.artifacts.model.sha256, "1".repeat(64));
+
+  const wrongKey = configuration();
+  wrongKey.apiKeyFile = "/tmp/key";
+  expectCode(
+    () => parseComputeConfig(wrongKey, "/secure/state/compute-keys/runpod.key"),
+    "invalid_config",
+  );
+  const queriedArtifact = configuration();
+  queriedArtifact.profiles[0].modelArtifacts.model.url =
+    "https://artifacts.example.com/model.gguf?token=secret";
+  expectCode(
+    () => parseComputeConfig(queriedArtifact, "/secure/state/compute-keys/runpod.key"),
+    "invalid_config",
+  );
+});
+
+test("CPU selector uses exact volume data center, Secure availability and price ceiling", () => {
+  const cpu = selectedCpu();
+  assert.equal(cpu.id, "cpu-cheap");
+  assert.equal(cpu.hourlyUsd, 0.2);
+  expectCode(
+    () =>
+      selectCpuOffer(
+        parseCpuCatalog({
+          cpus: [
+            {
+              id: "wrong-dc",
+              vcpu: { min: 2, max: 2 },
+              price: { securePerVcpu: 0.01 },
+              availability: "HIGH",
+              dataCenters: [{ id: "US-TX-1", availability: "HIGH" }],
+            },
+          ],
+        }),
+        "EU-RO-1",
+        0.5,
+      ),
+    "cpu_unavailable",
+  );
+});
+
+test("create request uses explicit image and exact two-vCPU prewarm contract", () => {
+  const expected = expectedContract();
+  const request = expected.request;
+  assert.equal(request.image, image);
+  assert.notEqual(request.image, expected.profile.configuredImage);
+  assert.deepEqual(request.cpu, { id: "cpu-cheap", vcpuCount: 2 });
+  assert.equal(request.cloud, "SECURE");
+  assert.deepEqual(request.ports, []);
+  assert.equal("gpu" in request, false);
+  assert.equal(request.registry, expected.profile.registry);
+  assert.deepEqual(request.dataCenterIds, [expected.volume.dataCenter]);
+  assert.deepEqual(request.mounts.network, [
+    { volumeId: expected.profile.networkVolumeId, path: "/workspace" },
+  ]);
+  assert.equal(request.env.GLIMMER_PREWARM_ONLY, "1");
+  assert.equal(request.env.GLIMMER_PREWARM_EXPECTED_BUILD_ID, buildId);
+  assert.equal(request.env.GLIMMER_LEASE_ID, expected.leaseId);
+  assert.equal(request.startSsh, false);
+  assert.equal(request.startJupyter, false);
+  assert.equal(request.globalNetworking, false);
+});
+
+test("Pod proof rejects missing no-port evidence, extra env and EXITED over-price", () => {
+  const contract = expectedContract();
+  const expected = { ...contract, maxHourlyUsd: 0.5 };
+  const valid = parsePod(providerPod(contract));
+  assert.equal(validateOwnedPod(valid, expected, true), valid);
+  assert.equal(parseExactPod(providerPod(contract), "pod_123").id, "pod_123");
+  expectCode(() => parseExactPod(providerPod(contract), "pod_other"), "pod_identity_mismatch");
+
+  const missingPorts = providerPod(contract);
+  delete missingPorts.ports;
+  expectCode(() => parsePod(missingPorts), "invalid_pod");
+  const missingArgs = providerPod(contract);
+  delete missingArgs.args;
+  expectCode(() => parsePod(missingArgs), "invalid_pod");
+
+  const extraEnvironment = parsePod(
+    providerPod(contract, { env: { ...contract.request.env, UNEXPECTED: "1" } }),
+  );
+  expectCode(() => validateOwnedPod(extraEnvironment, expected, true), "pod_contract_mismatch");
+  const overpricedExited = parsePod(providerPod(contract, { cost: 0.51 }));
+  expectCode(() => validateOwnedPod(overpricedExited, expected, true), "price_ceiling_exceeded");
+  const changedArgs = parsePod(providerPod(contract, { args: "unexpected" }));
+  expectCode(() => validateOwnedPod(changedArgs, expected, true), "pod_contract_mismatch");
+  const changedDisk = parsePod(providerPod(contract, { disk: 51 }));
+  expectCode(() => validateOwnedPod(changedDisk, expected, true), "pod_contract_mismatch");
+  const sshEnabled = parsePod(
+    providerPod(contract, { ssh: { proxy: { host: "proxy" }, direct: null } }),
+  );
+  expectCode(() => validateOwnedPod(sshEnabled, expected, true), "pod_contract_mismatch");
+});
+
+test("SSE parsing requires the exact container marker line across chunks", () => {
+  const marker = "GLIMMER_PREWARM_READY 11111111-2222-4333-8444-555555555555";
+  const exactFrame = `id: 1\ndata: ${JSON.stringify({
+    source: "container",
+    line: marker,
+    ts: "2026-08-30T00:00:00Z",
+  })}\n\n`;
+  const first = extractSseLogEvents(exactFrame.slice(0, 30));
+  const second = extractSseLogEvents(first.remainder + exactFrame.slice(30));
+  assert.equal(containsExactContainerLogLine(second.events, marker), true);
+  assert.equal(containsExactContainerLogLine(second.events, `${marker} extra`), false);
+  assert.equal(
+    containsExactContainerLogLine(
+      second.events.map((event) => ({ ...event, source: "system" })),
+      marker,
+    ),
+    false,
+  );
+});
+
+test("timeline sanitizer removes secret-bearing fields and redacts values", () => {
+  const sanitized = sanitizeTimelinePayload({
+    token: "secret",
+    artifactUrl: "https://example.com/private",
+    message: "Bearer rpa_supersecret at https://example.com/path",
+    status: "ok",
+  });
+  assert.equal("token" in sanitized, false);
+  assert.equal("artifactUrl" in sanitized, false);
+  assert.equal(sanitized.status, "ok");
+  assert.equal(sanitized.message.includes("rpa_supersecret"), false);
+  assert.equal(sanitized.message.includes("https://"), false);
+});
+
+test("private file reader rejects symlinks, hardlinks and group-readable files", async (context) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-prewarm-test-"));
+  context.after(async () => fs.rm(directory, { recursive: true, force: true }));
+  await fs.chmod(directory, 0o700);
+
+  const privateFile = path.join(directory, "private");
+  await fs.writeFile(privateFile, "value", { mode: 0o600 });
+  assert.equal((await readPrivateRegularFile(privateFile, "test file", 100)).toString(), "value");
+
+  const symbolicLink = path.join(directory, "symbolic");
+  await fs.symlink(privateFile, symbolicLink);
+  await assert.rejects(
+    readPrivateRegularFile(symbolicLink, "test file", 100),
+    (error) => error instanceof PrewarmError && error.code === "unsafe_filesystem",
+  );
+
+  const hardLink = path.join(directory, "hard");
+  await fs.link(privateFile, hardLink);
+  await assert.rejects(
+    readPrivateRegularFile(privateFile, "test file", 100),
+    (error) => error instanceof PrewarmError && error.code === "unsafe_filesystem",
+  );
+  await fs.unlink(hardLink);
+
+  await fs.chmod(privateFile, 0o640);
+  await assert.rejects(
+    readPrivateRegularFile(privateFile, "test file", 100),
+    (error) => error instanceof PrewarmError && error.code === "unsafe_permissions",
+  );
+});
+
+test("read-only preflight uses authenticated GETs only and writes a private sanitized result", async (context) => {
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "glimmer-preflight-test-"));
+  context.after(async () => fs.rm(stateRoot, { recursive: true, force: true }));
+  await fs.chmod(stateRoot, 0o700);
+  const keyDirectory = path.join(stateRoot, "compute-keys");
+  await fs.mkdir(keyDirectory, { mode: 0o700 });
+  const key = "rpa_unit_test_secret";
+  await fs.writeFile(path.join(keyDirectory, "runpod.key"), `${key}\n`, { mode: 0o600 });
+  await fs.writeFile(
+    path.join(stateRoot, "compute.json"),
+    `${JSON.stringify(configuration(stateRoot))}\n`,
+    { mode: 0o600 },
+  );
+
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({
+      url,
+      method: options.method,
+      authorization: options.headers.get("Authorization"),
+    });
+    if (url.endsWith("/v2/pods?includeClusterPods=true")) {
+      return Response.json({ pods: [] });
+    }
+    if (url.endsWith("/v2/network-volumes/network-volume_1")) {
+      return Response.json({
+        id: "network-volume_1",
+        name: "models",
+        size: 200,
+        dataCenter: "EU-RO-1",
+        type: "NETWORK",
+      });
+    }
+    if (url.endsWith("/v2/catalog/cpus?include=AVAILABILITY&product=POD&vcpuCount=2")) {
+      return Response.json({
+        cpus: [
+          {
+            id: "cpu-secure",
+            vcpu: { min: 2, max: 8 },
+            price: { securePerVcpu: 0.1 },
+            availability: "HIGH",
+            dataCenters: [{ id: "EU-RO-1", availability: "HIGH" }],
+          },
+        ],
+      });
+    }
+    throw new Error("unexpected fake-provider request");
+  };
+
+  const exitCode = await runReadOnlyPreflight(argumentsFor("--preflight"), {
+    environment: { GLIMMER_STATE_ROOT: stateRoot },
+    fetchImpl,
+    randomUUID: () => "11111111-2222-4333-8444-555555555555",
+  });
+  assert.equal(exitCode, 0);
+  assert.equal(calls.length, 5);
+  assert.equal(
+    calls.every((call) => call.method === "GET"),
+    true,
+  );
+  assert.equal(
+    calls.some((call) => call.method === "POST" || call.method === "DELETE"),
+    false,
+  );
+  assert.equal(
+    calls.every((call) => call.authorization === `Bearer ${key}`),
+    true,
+  );
+
+  const resultPath = path.join(stateRoot, "runpod-cpu-prewarm-result.json");
+  const metadata = await fs.stat(resultPath);
+  assert.equal(metadata.mode & 0o777, 0o600);
+  const resultText = await fs.readFile(resultPath, "utf8");
+  const result = JSON.parse(resultText);
+  assert.equal(result.mode, "preflight");
+  assert.equal(result.outcome, "succeeded");
+  assert.equal(result.preflightValidated, true);
+  assert.equal(result.cleanup.readOnly, true);
+  assert.equal(result.cleanup.providerPodCount, 0);
+  assert.equal(resultText.includes(key), false);
+  assert.equal(resultText.includes("https://artifacts.example.com"), false);
+});

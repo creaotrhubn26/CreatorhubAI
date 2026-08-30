@@ -86,7 +86,7 @@ async function writeBundledPython() {
 describe("runtime diagnostics", () => {
   it("pins diagnostics to the race-safe RunPod worker artifact", () => {
     expect(BUNDLED_ORCHESTRATOR_SHA256["runpod_worker.py"]).toBe(
-      "971aaa7c537d810a860ba213da06e0185dd9b5525869dffb147313f57d1eba68",
+      "b06de735ab48659456f59e188ea173cc839513d918235be4000f9651f6b5e979",
     );
   });
 

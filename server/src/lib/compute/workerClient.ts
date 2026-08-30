@@ -1,5 +1,13 @@
 import { createDecipheriv, createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { ComputeWorkerStatus, RemoteJobManifestV1, RemoteJobStatusV1 } from "@glimmer/shared";
+import type {
+  ComputeBootstrapArtifact,
+  ComputeBootstrapFailureCode,
+  ComputeBootstrapStage,
+  ComputeBootstrapStatus,
+  ComputeWorkerStatus,
+  RemoteJobManifestV1,
+  RemoteJobStatusV1,
+} from "@glimmer/shared";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
@@ -58,6 +66,21 @@ function exactKeys(value: Record<string, unknown>, expected: string[], label: st
   }
 }
 
+function boundedKeys(
+  value: Record<string, unknown>,
+  required: string[],
+  optional: string[],
+  label: string,
+): void {
+  const allowed = new Set([...required, ...optional]);
+  if (
+    required.some((key) => !(key in value)) ||
+    Object.keys(value).some((key) => !allowed.has(key))
+  ) {
+    throw new WorkerProtocolError(`${label} contains unsupported or missing fields`);
+  }
+}
+
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new WorkerProtocolError(`${label} must be an object`);
@@ -70,6 +93,17 @@ function timestamp(value: unknown, label: string): string {
     throw new WorkerProtocolError(`${label} is invalid`);
   }
   return value;
+}
+
+function utcTimestamp(value: unknown, label: string): string {
+  const parsed = timestamp(value, label);
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(parsed) ||
+    new Date(parsed).toISOString().slice(0, 19) !== parsed.slice(0, 19)
+  ) {
+    throw new WorkerProtocolError(`${label} must be an RFC 3339 UTC timestamp`);
+  }
+  return parsed;
 }
 
 function integer(value: unknown, label: string, maximum = Number.MAX_SAFE_INTEGER): number {
@@ -103,6 +137,146 @@ function contextTokens(value: unknown): 65_536 | 131_072 {
     throw new WorkerProtocolError("worker context is invalid");
   }
   return value;
+}
+
+const BOOTSTRAP_STAGES = new Set<ComputeBootstrapStage>([
+  "initializing",
+  "worker_starting",
+  "worker_listening",
+  "artifact_preparing",
+  "artifact_downloading",
+  "artifact_verifying",
+  "model_starting",
+  "model_healthcheck",
+  "ready",
+  "failed",
+]);
+const BOOTSTRAP_ARTIFACTS = new Set<ComputeBootstrapArtifact>(["model", "mmproj", "draft"]);
+const BOOTSTRAP_PHASES = new Set<NonNullable<ComputeBootstrapStatus["artifact"]>["phase"]>([
+  "locking",
+  "cached",
+  "resuming",
+  "downloading",
+  "verifying",
+  "complete",
+]);
+const BOOTSTRAP_FAILURE_CODES = new Set<ComputeBootstrapFailureCode>([
+  "configuration_invalid",
+  "status_persistence_failed",
+  "worker_start_failed",
+  "artifact_download_failed",
+  "artifact_checksum_failed",
+  "model_start_failed",
+  "model_healthcheck_failed",
+  "bootstrap_interrupted",
+  "unexpected_failure",
+]);
+
+function parseBootstrapStatus(value: unknown): ComputeBootstrapStatus {
+  const raw = object(value, "worker bootstrap health");
+  boundedKeys(
+    raw,
+    ["stage", "outcome", "stageStartedAt", "updatedAt"],
+    ["artifact", "failureCode", "exitCode"],
+    "worker bootstrap health",
+  );
+  if (!BOOTSTRAP_STAGES.has(raw.stage as ComputeBootstrapStage)) {
+    throw new WorkerProtocolError("worker bootstrap stage is invalid");
+  }
+  if (!new Set(["in_progress", "ready", "failed"]).has(String(raw.outcome))) {
+    throw new WorkerProtocolError("worker bootstrap outcome is invalid");
+  }
+  const stage = raw.stage as ComputeBootstrapStage;
+  const outcome = raw.outcome as ComputeBootstrapStatus["outcome"];
+  if (
+    (outcome === "ready" && stage !== "ready") ||
+    (outcome === "failed" && stage !== "failed") ||
+    (outcome === "in_progress" && (stage === "ready" || stage === "failed"))
+  ) {
+    throw new WorkerProtocolError("worker bootstrap stage and outcome conflict");
+  }
+  const stageStartedAt = utcTimestamp(raw.stageStartedAt, "worker bootstrap stage start");
+  const updatedAt = utcTimestamp(raw.updatedAt, "worker bootstrap update");
+  if (Date.parse(updatedAt) < Date.parse(stageStartedAt)) {
+    throw new WorkerProtocolError("worker bootstrap timestamps are inconsistent");
+  }
+  const parsed: ComputeBootstrapStatus = {
+    stage,
+    outcome,
+    stageStartedAt,
+    updatedAt,
+  };
+  if (raw.artifact !== undefined) {
+    if (
+      !new Set(["artifact_preparing", "artifact_downloading", "artifact_verifying", "failed"]).has(
+        stage,
+      )
+    ) {
+      throw new WorkerProtocolError("worker bootstrap artifact is out of stage");
+    }
+    const artifact = object(raw.artifact, "worker bootstrap artifact");
+    boundedKeys(
+      artifact,
+      ["kind", "phase"],
+      ["bytesCompleted", "bytesTotal"],
+      "worker bootstrap artifact",
+    );
+    if (!BOOTSTRAP_ARTIFACTS.has(artifact.kind as ComputeBootstrapArtifact)) {
+      throw new WorkerProtocolError("worker bootstrap artifact kind is invalid");
+    }
+    if (
+      !BOOTSTRAP_PHASES.has(
+        artifact.phase as NonNullable<ComputeBootstrapStatus["artifact"]>["phase"],
+      )
+    ) {
+      throw new WorkerProtocolError("worker bootstrap artifact phase is invalid");
+    }
+    const bytesCompleted =
+      artifact.bytesCompleted === undefined
+        ? undefined
+        : integer(artifact.bytesCompleted, "worker bootstrap completed bytes");
+    const bytesTotal =
+      artifact.bytesTotal === undefined
+        ? undefined
+        : integer(artifact.bytesTotal, "worker bootstrap total bytes");
+    if (bytesCompleted !== undefined && bytesTotal !== undefined && bytesCompleted > bytesTotal) {
+      throw new WorkerProtocolError("worker bootstrap byte progress is invalid");
+    }
+    parsed.artifact = {
+      kind: artifact.kind as ComputeBootstrapArtifact,
+      phase: artifact.phase as NonNullable<ComputeBootstrapStatus["artifact"]>["phase"],
+      ...(bytesCompleted !== undefined ? { bytesCompleted } : {}),
+      ...(bytesTotal !== undefined ? { bytesTotal } : {}),
+    };
+  } else if (
+    stage === "artifact_preparing" ||
+    stage === "artifact_downloading" ||
+    stage === "artifact_verifying"
+  ) {
+    throw new WorkerProtocolError("worker bootstrap artifact is missing");
+  }
+  if (raw.failureCode !== undefined) {
+    if (
+      outcome !== "failed" ||
+      !BOOTSTRAP_FAILURE_CODES.has(raw.failureCode as ComputeBootstrapFailureCode)
+    ) {
+      throw new WorkerProtocolError("worker bootstrap failure code is invalid");
+    }
+    parsed.failureCode = raw.failureCode as ComputeBootstrapFailureCode;
+  }
+  if (outcome === "failed" && parsed.failureCode === undefined) {
+    throw new WorkerProtocolError("worker bootstrap failure code is missing");
+  }
+  if (raw.exitCode !== undefined) {
+    if (outcome !== "failed") {
+      throw new WorkerProtocolError("worker bootstrap exit code is invalid");
+    }
+    parsed.exitCode = integer(raw.exitCode, "worker bootstrap exit code", 255);
+  }
+  if (outcome === "failed" && parsed.exitCode === undefined) {
+    throw new WorkerProtocolError("worker bootstrap exit code is missing");
+  }
+  return parsed;
 }
 
 function normalizedBaseUrl(value: string, allowLoopbackHttp = false): string {
@@ -215,8 +389,15 @@ export function decryptWorkerCheckpoint(
 
 export function parseWorkerHealth(value: unknown): ComputeWorkerStatus {
   const raw = object(value, "worker health");
-  exactKeys(raw, ["schemaVersion", "buildId", "ready", "model", "workerState"], "worker health");
-  if (raw.schemaVersion !== 1 || typeof raw.ready !== "boolean") {
+  const schemaVersion = raw.schemaVersion;
+  exactKeys(
+    raw,
+    schemaVersion === 2
+      ? ["schemaVersion", "buildId", "ready", "model", "workerState", "bootstrap"]
+      : ["schemaVersion", "buildId", "ready", "model", "workerState"],
+    "worker health",
+  );
+  if ((schemaVersion !== 1 && schemaVersion !== 2) || typeof raw.ready !== "boolean") {
     throw new WorkerProtocolError("worker health schema is invalid");
   }
   const model = object(raw.model, "worker model health");
@@ -227,13 +408,29 @@ export function parseWorkerHealth(value: unknown): ComputeWorkerStatus {
   if (!(["bootstrapping", "ready", "busy"] as unknown[]).includes(raw.workerState)) {
     throw new WorkerProtocolError("worker state is invalid");
   }
-  return {
-    protocolVersion: 1,
+  if (
+    (raw.ready && (!model.ready || raw.workerState === "bootstrapping")) ||
+    (!raw.ready && raw.workerState !== "bootstrapping")
+  ) {
+    throw new WorkerProtocolError("worker readiness and state conflict");
+  }
+  const parsed: ComputeWorkerStatus = {
+    protocolVersion: schemaVersion,
     buildId: text(raw.buildId, "worker build id", 128),
     ready: raw.ready,
     workerState: raw.workerState as ComputeWorkerStatus["workerState"],
     model: { ready: model.ready, contextTokens: contextTokens(model.contextTokens) },
   };
+  if (schemaVersion === 2) {
+    parsed.bootstrap = parseBootstrapStatus(raw.bootstrap);
+    if (
+      (parsed.ready && parsed.bootstrap.outcome !== "ready") ||
+      (parsed.bootstrap.outcome === "failed" && parsed.ready)
+    ) {
+      throw new WorkerProtocolError("worker readiness conflicts with bootstrap outcome");
+    }
+  }
+  return parsed;
 }
 
 export function parseWorkerHandshake(value: unknown): WorkerHandshakeV1 {

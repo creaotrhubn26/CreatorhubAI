@@ -17,7 +17,7 @@ export interface ComputeLeaseV1 {
   idleDeadlineAt: string;
   hardDeadlineAt: string;
   observedHourlyUsd?: number;
-  workerProtocolVersion?: 1;
+  workerProtocolVersion?: 1 | 2;
   workerBuildId?: string;
   workerReadyAt?: string;
   providerTerminationConfirmedAt?: string;
@@ -48,7 +48,9 @@ function isLease(value: unknown): value is ComputeLeaseV1 {
       (typeof raw.observedHourlyUsd === "number" &&
         Number.isFinite(raw.observedHourlyUsd) &&
         raw.observedHourlyUsd >= 0)) &&
-    (raw.workerProtocolVersion === undefined || raw.workerProtocolVersion === 1) &&
+    (raw.workerProtocolVersion === undefined ||
+      raw.workerProtocolVersion === 1 ||
+      raw.workerProtocolVersion === 2) &&
     (raw.workerBuildId === undefined ||
       (typeof raw.workerBuildId === "string" &&
         raw.workerBuildId.length >= 1 &&
