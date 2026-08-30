@@ -359,9 +359,20 @@ export class WorkerClient {
     requestPath: string,
     init: RequestInit,
     maximum = MAX_JSON_BYTES,
+    requestedTimeoutMs?: number,
   ): Promise<{ response: Response; bytes: Uint8Array }> {
+    if (
+      requestedTimeoutMs !== undefined &&
+      (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs <= 0)
+    ) {
+      throw new WorkerProtocolError("worker request timeout must be positive");
+    }
+    const timeoutMs =
+      requestedTimeoutMs === undefined
+        ? this.timeoutMs
+        : Math.max(1, Math.min(this.timeoutMs, Math.floor(requestedTimeoutMs)));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
     try {
       const response = await this.fetchImpl(`${this.baseUrl}${requestPath}`, {
@@ -449,19 +460,30 @@ export class WorkerClient {
     return headers;
   }
 
-  async health(capability?: string): Promise<ComputeWorkerStatus> {
+  async health(
+    capability?: string,
+    options: { timeoutMs?: number } = {},
+  ): Promise<ComputeWorkerStatus> {
     const headers = new Headers({ Accept: "application/json" });
     if (capability) headers.set("Authorization", `Bearer ${capability}`);
-    const { bytes } = await this.request("/v1/health", { method: "GET", headers });
+    const { bytes } = await this.request(
+      "/v1/health",
+      { method: "GET", headers },
+      MAX_JSON_BYTES,
+      options.timeoutMs,
+    );
     return parseWorkerHealth(this.json(bytes));
   }
 
-  async handshake(input: {
-    bootstrapToken: string;
-    controllerInstanceId: string;
-    nonce: string;
-    idempotencyKey: string;
-  }): Promise<WorkerHandshakeV1> {
+  async handshake(
+    input: {
+      bootstrapToken: string;
+      controllerInstanceId: string;
+      nonce: string;
+      idempotencyKey: string;
+    },
+    options: { timeoutMs?: number } = {},
+  ): Promise<WorkerHandshakeV1> {
     if (!SAFE_SECRET.test(input.bootstrapToken) || !SAFE_IDEMPOTENCY.test(input.idempotencyKey)) {
       throw new WorkerProtocolError("worker bootstrap input is invalid");
     }
@@ -469,16 +491,21 @@ export class WorkerClient {
       controllerInstanceId: input.controllerInstanceId,
       nonce: input.nonce,
     });
-    const { bytes } = await this.request("/v1/handshake", {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${input.bootstrapToken}`,
-        "Content-Type": "application/json",
-        "Idempotency-Key": input.idempotencyKey,
+    const { bytes } = await this.request(
+      "/v1/handshake",
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${input.bootstrapToken}`,
+          "Content-Type": "application/json",
+          "Idempotency-Key": input.idempotencyKey,
+        },
+        body: Buffer.from(body),
       },
-      body: Buffer.from(body),
-    });
+      MAX_JSON_BYTES,
+      options.timeoutMs,
+    );
     return parseWorkerHandshake(this.json(bytes));
   }
 

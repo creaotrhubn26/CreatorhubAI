@@ -32,14 +32,26 @@ export function ComputeStatusPanel() {
     refetchInterval: 30_000,
     retry: false,
   });
-  const invalidate = async () => {
-    await Promise.all([
+  const invalidate = () => {
+    void Promise.all([
       queryClient.invalidateQueries({ queryKey: ["compute-status"] }),
       queryClient.invalidateQueries({ queryKey: ["compute-usage"] }),
     ]);
   };
-  const start = useMutation({ mutationFn: glimmerApi.startCompute, onSuccess: invalidate });
-  const stop = useMutation({ mutationFn: glimmerApi.stopCompute, onSuccess: invalidate });
+  const start = useMutation({
+    mutationFn: glimmerApi.startCompute,
+    onSuccess: (result) => {
+      queryClient.setQueryData(["compute-status"], result.status);
+      invalidate();
+    },
+  });
+  const stop = useMutation({
+    mutationFn: glimmerApi.stopCompute,
+    onSuccess: (result) => {
+      queryClient.setQueryData(["compute-status"], result.status);
+      invalidate();
+    },
+  });
   const reconcileUsage = useMutation({
     mutationFn: glimmerApi.reconcileComputeUsage,
     onSuccess: (summary) => queryClient.setQueryData(["compute-usage"], summary),

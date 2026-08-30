@@ -344,6 +344,7 @@ describe("RunPod compute lifecycle", () => {
     await verifyWatchdog();
     let exists = false;
     let workerRotated = false;
+    let createdPodName = "";
     const calls: Array<{ url: string; method: string; body?: unknown }> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const watchdog = watchdogResponse(input, init);
@@ -386,6 +387,7 @@ describe("RunPod compute lifecycle", () => {
       if (url.endsWith("/pods") && method === "POST") {
         exists = true;
         const body = JSON.parse(String(init?.body));
+        createdPodName = body.name;
         return new Response(
           JSON.stringify({
             id: "pod_123",
@@ -402,7 +404,7 @@ describe("RunPod compute lifecycle", () => {
           ? new Response(
               JSON.stringify({
                 id: "pod_123",
-                name: "glimmer-development-test",
+                name: createdPodName,
                 desiredStatus: "RUNNING",
                 adjustedCostPerHr: 1.39,
                 gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
@@ -423,9 +425,18 @@ describe("RunPod compute lifecycle", () => {
     expect(started.body.started).toBe(true);
     expect(started.body.status).toMatchObject({
       backend: "runpod_pod",
-      state: "ready",
+      state: "bootstrapping",
       pod: { id: "pod_123", adjustedCostPerHr: 1.39 },
-      worker: { buildId: "r2-aaaaaaaaaaaa", ready: true },
+    });
+    await vi.waitFor(async () => {
+      const status = await request(app).get("/api/compute/status");
+      expect(status.status).toBe(200);
+      expect(status.body).toMatchObject({
+        backend: "runpod_pod",
+        state: "ready",
+        pod: { id: "pod_123", adjustedCostPerHr: 1.39 },
+        worker: { buildId: "r2-aaaaaaaaaaaa", ready: true },
+      });
     });
     const create = calls.find((call) => call.method === "POST" && call.url.endsWith("/pods"));
     expect(create?.body).toMatchObject({

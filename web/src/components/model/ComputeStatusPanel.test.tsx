@@ -73,6 +73,49 @@ describe("ComputeStatusPanel", () => {
     await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
   });
 
+  it("enables termination from the 202 bootstrap response before a slow status refetch", async () => {
+    const configured = {
+      ...offline,
+      policy: { ...offline.policy, watchdogConfigured: true, unattendedUseAllowed: true },
+    };
+    let resolveRefetch!: (status: ComputeStatus) => void;
+    vi.spyOn(glimmerApi, "getComputeStatus")
+      .mockResolvedValueOnce(configured)
+      .mockImplementation(
+        async () =>
+          new Promise<ComputeStatus>((resolve) => {
+            resolveRefetch = resolve;
+          }),
+      );
+    mockUsage();
+    const bootstrapping: ComputeStatus = {
+      ...configured,
+      state: "bootstrapping",
+      detail: "Worker bootstrap is continuing in the background.",
+      pod: {
+        id: "pod_123",
+        name: "glimmer-test",
+        desiredStatus: "RUNNING",
+        gpuTypeId: "NVIDIA A100 80GB PCIe",
+        gpuCount: 1,
+        adjustedCostPerHr: 1.39,
+      },
+    };
+    vi.spyOn(glimmerApi, "startCompute").mockResolvedValue({
+      started: true,
+      status: bootstrapping,
+    });
+
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Start external compute" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Terminate external compute" })).toBeEnabled(),
+    );
+    expect(screen.getByText("pod_123")).toBeInTheDocument();
+    resolveRefetch(bootstrapping);
+  });
+
   it("renders provider-observed GPU/rate and offers termination for an active Pod", async () => {
     vi.spyOn(glimmerApi, "getComputeStatus").mockResolvedValue({
       ...offline,

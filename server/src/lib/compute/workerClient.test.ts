@@ -144,6 +144,41 @@ describe("WorkerClient", () => {
     });
   });
 
+  it("honors a shorter per-request readiness deadline and rejects invalid deadlines", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn(
+        async (_url: string | URL | Request, init?: RequestInit): Promise<Response> =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              },
+              { once: true },
+            );
+          }),
+      ) as typeof fetch;
+      const client = new WorkerClient({
+        baseUrl: "http://127.0.0.1:4318",
+        allowLoopbackHttp: true,
+        fetchImpl,
+        timeoutMs: 10_000,
+      });
+
+      const timedOut = expect(client.health(undefined, { timeoutMs: 25 })).rejects.toThrow(
+        /timed out/,
+      );
+      await vi.advanceTimersByTimeAsync(25);
+      await timedOut;
+      await expect(client.health(undefined, { timeoutMs: 0 })).rejects.toThrow(/must be positive/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds and verifies encrypted checkpoint transport bytes", async () => {
     const checkpoint = new TextEncoder().encode("GLMR1-encrypted-checkpoint");
     const digest = createHash("sha256").update(checkpoint).digest("hex");
