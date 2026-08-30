@@ -160,7 +160,12 @@ class FetchArtifactTests(unittest.TestCase):
         )
         progress = []
 
-        with mock.patch.object(fetch_artifact, "SYNC_INTERVAL_BYTES", 3):
+        with (
+            mock.patch.object(fetch_artifact, "SYNC_INTERVAL_BYTES", 3),
+            mock.patch.object(
+                fetch_artifact, "_seed_digest", wraps=fetch_artifact._seed_digest
+            ) as seed_digest,
+        ):
             self.fetch_with(
                 opener,
                 expected,
@@ -175,6 +180,7 @@ class FetchArtifactTests(unittest.TestCase):
         self.assertIn(("downloading", 6, 10), progress)
         self.assertEqual(progress[-2], ("verifying", 10, 10))
         self.assertEqual(progress[-1], ("complete", 10, 10))
+        self.assertEqual(seed_digest.call_count, 2)
         self.assertTrue(
             all(
                 phase in {"locking", "resuming", "downloading", "verifying", "complete"}
@@ -298,9 +304,13 @@ class FetchArtifactTests(unittest.TestCase):
         wrong = b"unexpected"
         opener = QueueOpener(FakeResponse(200, {"Content-Length": str(len(wrong))}, [wrong]))
 
-        with self.assertRaisesRegex(ValueError, "checksum"):
-            self.fetch_with(opener, expected)
+        with mock.patch.object(
+            fetch_artifact, "_seed_digest", wraps=fetch_artifact._seed_digest
+        ) as seed_digest:
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                self.fetch_with(opener, expected)
 
+        self.assertEqual(seed_digest.call_count, 2)
         self.assertFalse(fetch_artifact.partial_path(self.target, expected).exists())
         self.assertFalse(self.target.exists())
 
@@ -311,11 +321,41 @@ class FetchArtifactTests(unittest.TestCase):
         partial.write_bytes(content)
         opener = QueueOpener()
 
-        self.fetch_with(opener, expected)
+        with mock.patch.object(
+            fetch_artifact, "_seed_digest", wraps=fetch_artifact._seed_digest
+        ) as seed_digest:
+            self.fetch_with(opener, expected)
 
         self.assertEqual(opener.requests, [])
+        seed_digest.assert_called_once()
         self.assertEqual(self.target.read_bytes(), content)
         self.assertFalse(partial.exists())
+
+    def test_complete_partial_path_swap_after_hash_is_never_published(self):
+        content = b"already complete and verified"
+        replacement = b"unverified replacement"
+        expected = hashlib.sha256(content).hexdigest()
+        partial = fetch_artifact.partial_path(self.target, expected)
+        partial.write_bytes(content)
+        opener = QueueOpener()
+        original_seed_digest = fetch_artifact._seed_digest
+
+        def hash_then_swap(output):
+            result = original_seed_digest(output)
+            partial.unlink()
+            partial.write_bytes(replacement)
+            return result
+
+        with mock.patch.object(
+            fetch_artifact, "_seed_digest", side_effect=hash_then_swap
+        ) as seed_digest:
+            with self.assertRaisesRegex(ValueError, "pathname changed"):
+                self.fetch_with(opener, expected)
+
+        self.assertEqual(opener.requests, [])
+        seed_digest.assert_called_once()
+        self.assertFalse(self.target.exists())
+        self.assertEqual(partial.read_bytes(), replacement)
 
     def test_completion_by_another_process_while_waiting_for_lock_is_accepted(self):
         content = b"completed by peer"

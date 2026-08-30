@@ -313,7 +313,10 @@ def fetch(
                 downloaded_total = offset
                 if offset > MAX_ARTIFACT_BYTES:
                     raise ArtifactIntegrityError("artifact partial exceeds the safe size limit")
-                if not (offset and hmac.compare_digest(digest.hexdigest(), expected_sha256)):
+                existing_partial_verified = bool(offset) and hmac.compare_digest(
+                    digest.hexdigest(), expected_sha256
+                )
+                if not existing_partial_verified:
                     if offset:
                         _report(reporter, "resuming", offset)
                     artifact_request = request.Request(
@@ -375,7 +378,10 @@ def fetch(
                 output.flush()
                 os.fsync(output.fileno())
                 _report(reporter, "verifying", downloaded_total, downloaded_total)
-                final_digest, final_size = _seed_digest(output)
+                if existing_partial_verified:
+                    final_digest, final_size = digest, offset
+                else:
+                    final_digest, final_size = _seed_digest(output)
                 if final_size > MAX_ARTIFACT_BYTES or not hmac.compare_digest(
                     final_digest.hexdigest(), expected_sha256
                 ):
