@@ -6,11 +6,14 @@ import {
   RunPodV2HttpError,
   RunPodV2TransportError,
   buildCpuCacheCreateRequest,
+  buildGpuCacheCreateRequest,
   buildGpuWorkerCreateRequest,
   parseRunPodV2CpuCatalog,
+  parseRunPodV2GpuCatalog,
   parseRunPodV2NetworkVolume,
   parseRunPodV2Pod,
   selectCpuOffer,
+  selectGpuOffer,
   validateRunPodV2Configuration,
   validateRunPodV2CreateRequest,
 } from "./runpod-v2.js";
@@ -50,6 +53,14 @@ function gpuRequest(patch = {}) {
   return buildGpuWorkerCreateRequest({
     ...commonCreateInput({ podName: "glimmer-gpu-job-1" }),
     gpuTypeId: "NVIDIA H100 80GB HBM3",
+    ...patch,
+  });
+}
+
+function gpuCacheRequest(patch = {}) {
+  return buildGpuCacheCreateRequest({
+    ...commonCreateInput(),
+    gpuTypeId: "NVIDIA L4",
     ...patch,
   });
 }
@@ -152,6 +163,26 @@ describe("RunPod v2 create request builders", () => {
       gpu: { id: "NVIDIA H100 80GB HBM3", count: 1 },
     });
     expect(validateRunPodV2CreateRequest(gpuRequest())).toEqual(gpuRequest());
+  });
+
+  it("builds a bounded one-GPU cache Pod without exposing the worker port", () => {
+    expect(gpuCacheRequest()).toEqual({
+      name: "glimmer-cache-job-1",
+      image: IMAGE,
+      args: "",
+      disk: 20,
+      ports: [],
+      env: commonCreateInput().environment,
+      registry: "registry_1",
+      cloud: "SECURE",
+      dataCenterIds: ["EU-RO-1"],
+      mounts: { network: [{ volumeId: "volume_1", path: "/workspace" }] },
+      globalNetworking: false,
+      startJupyter: false,
+      startSsh: false,
+      gpu: { id: "NVIDIA L4", count: 1 },
+    });
+    expect(validateRunPodV2CreateRequest(gpuCacheRequest())).toEqual(gpuCacheRequest());
   });
 
   it("rejects mutable images, path-like identities, extra fields, and multi-GPU requests", () => {
@@ -295,6 +326,73 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
   });
 });
 
+describe("RunPod v2 GPU catalog selection", () => {
+  const catalog = () =>
+    parseRunPodV2GpuCatalog({
+      gpus: [
+        {
+          id: "NVIDIA L4",
+          name: "L4",
+          memory: 24,
+          secure: true,
+          price: { secure: 0.49, community: 0.31 },
+          availability: "LOW",
+          dataCenters: [{ id: "EUR-IS-1", name: "EUR-IS-1", availability: "LOW" }],
+        },
+        {
+          id: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+          name: "RTX PRO 6000",
+          memory: 96,
+          secure: true,
+          price: { secure: 2.09, community: 1.69 },
+          availability: "LOW",
+          dataCenters: [{ id: "EUR-IS-1", name: "EUR-IS-1", availability: "LOW" }],
+        },
+      ],
+    });
+
+  it("selects only the exact Secure GPU in the volume data center under its ceiling", () => {
+    expect(
+      selectGpuOffer(catalog(), {
+        gpuTypeId: "NVIDIA L4",
+        dataCenterId: "EUR-IS-1",
+        maxHourlyUsd: 0.49,
+      }),
+    ).toMatchObject({
+      id: "NVIDIA L4",
+      memoryGb: 24,
+      hourlyUsd: 0.49,
+      dataCenterId: "EUR-IS-1",
+      dataCenterAvailability: "LOW",
+    });
+  });
+
+  it("fails closed for another GPU, data center, exhausted stock, or insufficient ceiling", () => {
+    for (const input of [
+      {
+        gpuTypeId: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        dataCenterId: "EUR-IS-1",
+        maxHourlyUsd: 0.49,
+      },
+      { gpuTypeId: "NVIDIA L4", dataCenterId: "US-TX-1", maxHourlyUsd: 0.49 },
+      { gpuTypeId: "NVIDIA L4", dataCenterId: "EUR-IS-1", maxHourlyUsd: 0.48 },
+    ]) {
+      expectCode(() => selectGpuOffer(catalog(), input), "GPU_UNAVAILABLE");
+    }
+    const unavailable = catalog();
+    unavailable[0].dataCenters[0].availability = "NONE";
+    expectCode(
+      () =>
+        selectGpuOffer(unavailable, {
+          gpuTypeId: "NVIDIA L4",
+          dataCenterId: "EUR-IS-1",
+          maxHourlyUsd: 0.49,
+        }),
+      "GPU_UNAVAILABLE",
+    );
+  });
+});
+
 describe("RunPod v2 HTTP client", () => {
   it("uses only the pinned v2 routes and proves exact provider identities", async () => {
     const request = cpuRequest();
@@ -332,6 +430,21 @@ describe("RunPod v2 HTTP client", () => {
             ],
           });
         }
+        if (url.endsWith("/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=SECURE")) {
+          return Response.json({
+            gpus: [
+              {
+                id: "NVIDIA L4",
+                name: "L4",
+                memory: 24,
+                secure: true,
+                price: { secure: 0.49, community: 0.31 },
+                availability: "HIGH",
+                dataCenters: [{ id: "EU-RO-1", name: "EU Romania", availability: "HIGH" }],
+              },
+            ],
+          });
+        }
         if (url.endsWith("/pods?includeClusterPods=true")) {
           return Response.json({ pods: [providerPod(request)] });
         }
@@ -356,11 +469,20 @@ describe("RunPod v2 HTTP client", () => {
       name: "Glimmer registry",
     });
     await expect(client.listCpuTypes()).resolves.toHaveLength(1);
+    await expect(client.listGpuTypes()).resolves.toHaveLength(1);
     await expect(client.findPodByExactName(request.name)).resolves.toMatchObject({ id: "pod_123" });
     await expect(client.getPod("pod_123")).resolves.toMatchObject({ id: "pod_123" });
     await expect(client.deletePod("pod_123")).resolves.toBeUndefined();
 
-    expect(calls.map((call) => call.method)).toEqual(["GET", "GET", "GET", "GET", "GET", "DELETE"]);
+    expect(calls.map((call) => call.method)).toEqual([
+      "GET",
+      "GET",
+      "GET",
+      "GET",
+      "GET",
+      "GET",
+      "DELETE",
+    ]);
     expect(calls.every((call) => call.authorization === `Bearer ${API_KEY}`)).toBe(true);
   });
 

@@ -256,7 +256,7 @@ export function ComputeSettings() {
         <legend>{active.label}</legend>
         <p>
           Secure Cloud · one GPU ·{" "}
-          {active.performance === "economy" ? "A100 economy" : "H100 latency"}
+          {active.performance === "economy" ? "Economy compute" : "H100 latency"}
         </p>
         <p className="mono">{active.gpuTypeIds.join(" → ")}</p>
         <label>

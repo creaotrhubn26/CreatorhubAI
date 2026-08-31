@@ -45,7 +45,7 @@ beforeAll(async () => {
   publicKey = base64url(await webcrypto.subtle.exportKey("raw", pair.publicKey));
 });
 
-function environment() {
+function environment(patch = {}) {
   return {
     RUNPOD_API_KEY: `rpa_${"k".repeat(48)}`,
     RUNPOD_API_BASE_URL: "https://api.runpod.test",
@@ -57,7 +57,11 @@ function environment() {
     CACHE_SIGNING_PUBLIC_KEY: publicKey,
     JOB_ENCRYPTION_KEY: JOB_KEY,
     CPU_CACHE_MAX_HOURLY_USD: "0.0225",
-    CPU_CACHE_TTL_SECONDS: "2700",
+    CPU_CACHE_TTL_SECONDS: "1680",
+    CACHE_REPAIR_GPU_FALLBACK_ID: "NVIDIA L4",
+    CACHE_REPAIR_GPU_MAX_HOURLY_USD: "0.49",
+    CACHE_REPAIR_MAX_TOTAL_USD: "0.25",
+    ...patch,
   };
 }
 
@@ -216,6 +220,28 @@ describe("cloud coordinator ingress", () => {
       signedRequest("PUT", path, jobRequest({ maxHourlyUsd: 1.5 })),
     );
     expect(conflict.status).toBe(409);
+  });
+
+  it("rejects a repair configuration whose TTL plus watchdog margin can exceed its total cap", async () => {
+    const storage = new MemoryStorage();
+    const instance = new ComputeCoordinator(
+      { storage },
+      environment({ CPU_CACHE_TTL_SECONDS: "1800" }),
+    );
+    const status = await instance.fetch(signedRequest("GET", "/v1/status"));
+    expect(status.status).toBe(503);
+    expect(await status.json()).toEqual({ error: "COORDINATOR_NOT_CONFIGURED" });
+  });
+
+  it("rejects a syntactically valid but non-allowlisted cache-repair GPU", async () => {
+    const storage = new MemoryStorage();
+    const instance = new ComputeCoordinator(
+      { storage },
+      environment({ CACHE_REPAIR_GPU_FALLBACK_ID: "NVIDIA RTX 4090" }),
+    );
+    const status = await instance.fetch(signedRequest("GET", "/v1/status"));
+    expect(status.status).toBe(503);
+    expect(await status.json()).toEqual({ error: "COORDINATOR_NOT_CONFIGURED" });
   });
 });
 
@@ -399,6 +425,125 @@ describe("cache-gated lifecycle", () => {
     await instance.alarm();
     expect(creates).toHaveLength(3);
     expect(creates[2].cpu).toEqual({ id: "cpu3c", vcpuCount: 2 });
+  });
+
+  it("uses the exact bounded L4 fallback only when automatic CPU repair is unavailable", async () => {
+    const { instance, storage } = coordinator();
+    const creates = [];
+    const leases = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url, init = {}) => {
+        const target = String(url);
+        if (target.startsWith("https://watchdog.example/")) {
+          if (target.endsWith("/v1/status")) {
+            return Response.json({
+              service: "glimmer-compute-watchdog",
+              schemaVersion: 1,
+              ready: true,
+              checkedAt: new Date(NOW).toISOString(),
+              lastSweepAt: new Date(NOW).toISOString(),
+              staleAfterSeconds: 180,
+            });
+          }
+          const lease = JSON.parse(init.body);
+          leases.push(lease);
+          return Response.json({ accepted: true, leaseId: lease.leaseId });
+        }
+        if (target.endsWith("/network-volumes/volume-1")) {
+          return Response.json({
+            id: "volume-1",
+            dataCenter: "EUR-IS-1",
+            size: 30,
+            type: "STANDARD",
+          });
+        }
+        if (target.endsWith("/registries/registry-1")) {
+          return Response.json({ id: "registry-1", name: "ghcr" });
+        }
+        if (target.includes("/catalog/cpus")) {
+          return Response.json({
+            cpus: [
+              {
+                id: "cpu3c",
+                vcpu: { min: 2, max: 4 },
+                price: { securePerVcpu: 0.03 },
+                availability: "NONE",
+              },
+            ],
+          });
+        }
+        if (target.includes("/catalog/gpus")) {
+          return Response.json({
+            gpus: [
+              {
+                id: "NVIDIA L4",
+                name: "L4",
+                memory: 24,
+                secure: true,
+                price: { secure: 0.49, community: 0.31 },
+                availability: "LOW",
+                dataCenters: [{ id: "EUR-IS-1", name: "EUR-IS-1", availability: "LOW" }],
+              },
+              {
+                id: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                name: "RTX PRO 6000",
+                memory: 96,
+                secure: true,
+                price: { secure: 2.09, community: 1.69 },
+                availability: "LOW",
+                dataCenters: [{ id: "EUR-IS-1", name: "EUR-IS-1", availability: "LOW" }],
+              },
+            ],
+          });
+        }
+        if (target.endsWith("/v2/pods") && init.method === "POST") {
+          const request = JSON.parse(init.body);
+          creates.push(request);
+          return Response.json({ ...responsePod(request, "gpu"), cost: 0.49 }, { status: 201 });
+        }
+        throw new Error(`unexpected request ${init.method ?? "GET"} ${target}`);
+      }),
+    );
+
+    const path = `/v1/jobs/${JOB_ID}`;
+    await instance.fetch(
+      signedRequest(
+        "PUT",
+        path,
+        jobRequest({
+          gpuTypeId: "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+          maxHourlyUsd: 2.09,
+        }),
+      ),
+    );
+    await instance.alarm();
+
+    expect(creates).toHaveLength(1);
+    expect(creates[0]).toMatchObject({
+      disk: 20,
+      ports: [],
+      cloud: "SECURE",
+      dataCenterIds: ["EUR-IS-1"],
+      gpu: { id: "NVIDIA L4", count: 1 },
+    });
+    expect(leases.at(-1)).toMatchObject({
+      jobKind: "gpu_cache",
+      maxHourlyUsd: 0.49,
+      expected: {
+        cloud: "SECURE",
+        gpuCount: 1,
+        gpuTypeId: "NVIDIA L4",
+        networkVolumeId: "volume-1",
+      },
+    });
+    expect(leases.at(-1).hardDeadlineAt).toBe(new Date(NOW + 1_680_000).toISOString());
+    expect((await storage.get(`job:${JOB_ID}`)).internal.repairAllocation).toEqual({
+      kind: "gpu",
+      resourceId: "NVIDIA L4",
+      maxHourlyUsd: 0.49,
+      observedHourlyUsd: 0.49,
+    });
   });
 
   it("uses worker activity for idle expiry and leaves duplicate create outcomes untouched", async () => {

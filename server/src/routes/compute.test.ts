@@ -307,6 +307,31 @@ describe("compute configuration API", () => {
     }
   });
 
+  it("accepts the explicitly allowlisted 96 GB RTX PRO profile without widening Secure Cloud", async () => {
+    const defaults = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
+    const input = updateFrom(defaults);
+    input.profiles[0] = {
+      ...input.profiles[0],
+      label: "RunPod RTX PRO 6000 96 GB",
+      performance: "economy",
+      gpuTypeIds: ["NVIDIA RTX PRO 6000 Blackwell Server Edition"],
+      maxGpuHourlyUsd: 2.09,
+    };
+
+    const response = await request(app)
+      .put("/api/compute/config")
+      .set("Origin", UI_ORIGIN)
+      .send(input);
+
+    expect(response.status).toBe(200);
+    expect(response.body.profiles[0]).toMatchObject({
+      cloudType: "SECURE",
+      gpuCount: 1,
+      gpuTypeIds: ["NVIDIA RTX PRO 6000 Blackwell Server Edition"],
+      maxGpuHourlyUsd: 2.09,
+    });
+  });
+
   it("rejects non-HTTPS, credentialed, and path-bearing watchdog endpoints", async () => {
     const defaults = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
     for (const endpointUrl of [

@@ -6,6 +6,7 @@ const MAX_LEASES = 100;
 const SIGNATURE_WINDOW_MS = 120_000;
 const MAX_HARD_DEADLINE_MS = 86_700_000;
 const SAFE_ID = /^[A-Za-z0-9._-]{1,191}$/;
+const GPU_TYPE = /^[A-Za-z0-9][A-Za-z0-9 ._()+/-]{0,127}$/;
 const HEX_SIGNATURE = /^v1=([a-f0-9]{64})$/;
 
 function json(value, status = 200) {
@@ -123,7 +124,7 @@ function parseLeaseV2(value, nowMs, requireFutureDeadline = false) {
     value.schemaVersion !== 2 ||
     !SAFE_ID.test(value.leaseId) ||
     !SAFE_ID.test(value.ownerInstanceId) ||
-    !["cpu_cache", "gpu_worker"].includes(value.jobKind) ||
+    !["cpu_cache", "gpu_cache", "gpu_worker"].includes(value.jobKind) ||
     !SAFE_ID.test(value.podName) ||
     (value.podId !== undefined && !SAFE_ID.test(value.podId)) ||
     !validTimestamp(value.hardDeadlineAt) ||
@@ -132,13 +133,17 @@ function parseLeaseV2(value, nowMs, requireFutureDeadline = false) {
     !Number.isFinite(value.maxHourlyUsd) ||
     value.maxHourlyUsd <= 0 ||
     value.maxHourlyUsd > 100 ||
-    !exactKeys(value.expected, ["cloud", "gpuCount", "networkVolumeId"]) ||
+    !exactKeys(value.expected, ["cloud", "gpuCount", "networkVolumeId"], ["gpuTypeId"]) ||
     value.expected.cloud !== "SECURE" ||
     !Number.isSafeInteger(value.expected.gpuCount) ||
     ![0, 1].includes(value.expected.gpuCount) ||
     !SAFE_ID.test(value.expected.networkVolumeId) ||
     (value.jobKind === "cpu_cache" && value.expected.gpuCount !== 0) ||
-    (value.jobKind === "gpu_worker" && value.expected.gpuCount !== 1)
+    (value.jobKind === "cpu_cache" && value.expected.gpuTypeId !== undefined) ||
+    (value.jobKind === "gpu_cache" && !GPU_TYPE.test(value.expected.gpuTypeId ?? "")) ||
+    (value.expected.gpuTypeId !== undefined && !GPU_TYPE.test(value.expected.gpuTypeId)) ||
+    ((value.jobKind === "gpu_cache" || value.jobKind === "gpu_worker") &&
+      value.expected.gpuCount !== 1)
   ) {
     throw new Error("INVALID_LEASE_VALUE");
   }
@@ -392,6 +397,15 @@ function terminationReasonV2(lease, pod, nowMs, staleAfterMs) {
   if (podV2GpuCount(pod) !== lease.expected.gpuCount) return "gpu-count-policy";
   if (lease.jobKind === "cpu_cache" && (!pod?.cpu || typeof pod.cpu !== "object")) {
     return "cpu-policy";
+  }
+  if (
+    (lease.jobKind === "gpu_cache" || lease.jobKind === "gpu_worker") &&
+    (!pod?.gpu || typeof pod.gpu !== "object")
+  ) {
+    return "gpu-policy";
+  }
+  if (lease.expected.gpuTypeId && pod.gpu.id !== lease.expected.gpuTypeId) {
+    return "gpu-type-policy";
   }
   const mounts = podV2NetworkMounts(pod);
   if (

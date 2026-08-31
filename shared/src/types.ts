@@ -2766,7 +2766,11 @@ export type ComputeRunState =
   | "unavailable";
 
 export type RunPodGpuTypeId =
-  "NVIDIA A100 80GB PCIe" | "NVIDIA A100-SXM4-80GB" | "NVIDIA H100 PCIe" | "NVIDIA H100 80GB HBM3";
+  | "NVIDIA A100 80GB PCIe"
+  | "NVIDIA A100-SXM4-80GB"
+  | "NVIDIA H100 PCIe"
+  | "NVIDIA H100 80GB HBM3"
+  | "NVIDIA RTX PRO 6000 Blackwell Server Edition";
 
 export interface ComputeArtifactV1 {
   /** Stable public HTTPS URL. Redirect destinations remain host-allowlisted by the worker. */

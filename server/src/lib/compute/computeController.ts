@@ -414,7 +414,7 @@ export class ComputeController {
         (job.phase === "cache_repair"
           ? job.cache.state === "ready"
             ? "The signed model cache is ready; the coordinator is handing off to GPU compute."
-            : "The cloud coordinator is preparing and attesting the model cache on CPU compute."
+            : "The cloud coordinator is preparing and attesting the model cache on bounded repair compute."
           : job.state === "ready"
             ? "The GPU worker is ready under cloud coordinator supervision."
             : "The cloud coordinator is provisioning or validating the GPU worker."),

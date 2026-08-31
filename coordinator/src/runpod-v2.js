@@ -5,6 +5,7 @@ const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_REQUEST_BYTES = 512 * 1024;
 const MAX_PODS = 1_000;
 const MAX_CPUS = 256;
+const MAX_GPUS = 512;
 const VCPU_COUNT = 2;
 const CPU_DISK_GB = 20;
 const GPU_DISK_GB = 50;
@@ -240,6 +241,16 @@ export function buildCpuCachePodRequest(input) {
   };
 }
 
+export function buildGpuCachePodRequest(input) {
+  const request = sharedCreateRequest(input, CPU_DISK_GB, []);
+  const gpuTypeId = boundedText(input.gpuTypeId, "INVALID_CREATE_REQUEST", "GPU type id", 128);
+  if (!GPU_ID.test(gpuTypeId)) fail("INVALID_CREATE_REQUEST", "GPU type id is invalid");
+  return {
+    ...request,
+    gpu: { id: gpuTypeId, count: 1 },
+  };
+}
+
 export function buildGpuWorkerPodRequest(input) {
   const request = sharedCreateRequest(input, GPU_DISK_GB, ["4318/http"]);
   const gpuTypeId = boundedText(input.gpuTypeId, "INVALID_CREATE_REQUEST", "GPU type id", 128);
@@ -251,6 +262,7 @@ export function buildGpuWorkerPodRequest(input) {
 }
 
 export const buildCpuCacheCreateRequest = buildCpuCachePodRequest;
+export const buildGpuCacheCreateRequest = buildGpuCachePodRequest;
 export const buildGpuWorkerCreateRequest = buildGpuWorkerPodRequest;
 
 export function validateRunPodV2CreateRequest(value) {
@@ -310,13 +322,17 @@ export function validateRunPodV2CreateRequest(value) {
     }
     return buildCpuCachePodRequest({ ...input, cpuId: raw.cpu.id });
   }
+  if (!exactKeys(raw.gpu, ["id", "count"]) || raw.gpu.count !== 1) {
+    fail("INVALID_CREATE_REQUEST", "GPU Pod create request has an invalid shape");
+  }
+  if (raw.disk === CPU_DISK_GB && Array.isArray(raw.ports) && raw.ports.length === 0) {
+    return buildGpuCachePodRequest({ ...input, gpuTypeId: raw.gpu.id });
+  }
   if (
     raw.disk !== GPU_DISK_GB ||
     !Array.isArray(raw.ports) ||
     raw.ports.length !== 1 ||
-    raw.ports[0] !== "4318/http" ||
-    !exactKeys(raw.gpu, ["id", "count"]) ||
-    raw.gpu.count !== 1
+    raw.ports[0] !== "4318/http"
   ) {
     fail("INVALID_CREATE_REQUEST", "GPU Pod create request has an invalid shape");
   }
@@ -579,6 +595,128 @@ export function selectRunPodV2CpuOffer(cpus, { dataCenterId, maxHourlyUsd } = {}
 
 export const selectCpuOffer = selectRunPodV2CpuOffer;
 
+export function parseRunPodV2GpuCatalog(value) {
+  const raw = object(value, "INVALID_GPU_CATALOG", "GPU catalog response");
+  if (!Array.isArray(raw.gpus) || raw.gpus.length > MAX_GPUS) {
+    fail("INVALID_GPU_CATALOG", "GPU catalog has an invalid size");
+  }
+  const gpus = raw.gpus.map((entry) => {
+    const gpu = object(entry, "INVALID_GPU_CATALOG", "GPU catalog entry");
+    const id = boundedText(gpu.id, "INVALID_GPU_CATALOG", "GPU id", 128);
+    if (!GPU_ID.test(id)) fail("INVALID_GPU_CATALOG", "GPU id is invalid");
+    const name = boundedText(gpu.name, "INVALID_GPU_CATALOG", "GPU name", 191);
+    if (typeof gpu.secure !== "boolean") {
+      fail("INVALID_GPU_CATALOG", "Secure GPU support is invalid");
+    }
+    const price = object(gpu.price, "INVALID_GPU_CATALOG", "GPU price");
+    const secureHourlyUsd = finiteNumber(
+      price.secure,
+      "INVALID_GPU_CATALOG",
+      "Secure GPU price",
+      Number.MIN_VALUE,
+      10_000,
+    );
+    const availability = boundedText(
+      gpu.availability,
+      "INVALID_GPU_CATALOG",
+      "GPU global availability",
+      16,
+    );
+    if (!AVAILABILITY_LEVELS.has(availability)) {
+      fail("INVALID_GPU_CATALOG", "GPU global availability is invalid");
+    }
+    const dataCenters = gpu.dataCenters ?? [];
+    if (!Array.isArray(dataCenters) || dataCenters.length > 256) {
+      fail("INVALID_GPU_CATALOG", "GPU data center availability is invalid");
+    }
+    const parsedDataCenters = dataCenters.map((candidate) => {
+      const center = object(candidate, "INVALID_GPU_CATALOG", "GPU data center availability");
+      const centerAvailability = boundedText(
+        center.availability,
+        "INVALID_GPU_CATALOG",
+        "GPU availability",
+        16,
+      );
+      if (!AVAILABILITY_LEVELS.has(centerAvailability)) {
+        fail("INVALID_GPU_CATALOG", "GPU availability is invalid");
+      }
+      return {
+        id: validateDataCenterId(center.id, "INVALID_GPU_CATALOG"),
+        name: boundedText(center.name, "INVALID_GPU_CATALOG", "GPU data center name", 191),
+        availability: centerAvailability,
+      };
+    });
+    if (new Set(parsedDataCenters.map((center) => center.id)).size !== parsedDataCenters.length) {
+      fail("INVALID_GPU_CATALOG", "GPU data center availability contains duplicates");
+    }
+    return {
+      id,
+      name,
+      memoryGb: integer(gpu.memory, "INVALID_GPU_CATALOG", "GPU memory", 1, 1_000_000),
+      secure: gpu.secure,
+      secureHourlyUsd,
+      availability,
+      dataCenters: parsedDataCenters,
+    };
+  });
+  if (new Set(gpus.map((gpu) => gpu.id)).size !== gpus.length) {
+    fail("INVALID_GPU_CATALOG", "GPU catalog contains duplicate identities");
+  }
+  return gpus;
+}
+
+export function selectRunPodV2GpuOffer(gpus, { gpuTypeId, dataCenterId, maxHourlyUsd } = {}) {
+  if (!Array.isArray(gpus) || gpus.length > MAX_GPUS) {
+    fail("INVALID_GPU_SELECTION", "GPU candidates are invalid");
+  }
+  const requestedGpu = boundedText(
+    gpuTypeId,
+    "INVALID_GPU_SELECTION",
+    "requested GPU type id",
+    128,
+  );
+  if (!GPU_ID.test(requestedGpu)) fail("INVALID_GPU_SELECTION", "requested GPU type id is invalid");
+  const dataCenter = validateDataCenterId(dataCenterId, "INVALID_GPU_SELECTION");
+  const ceiling = finiteNumber(
+    maxHourlyUsd,
+    "INVALID_GPU_SELECTION",
+    "GPU hourly ceiling",
+    Number.MIN_VALUE,
+    100,
+  );
+  const candidate = gpus.find((gpu) => {
+    if (
+      !gpu ||
+      typeof gpu !== "object" ||
+      gpu.id !== requestedGpu ||
+      gpu.secure !== true ||
+      !IN_STOCK_AVAILABILITY.has(gpu.availability) ||
+      !Number.isFinite(gpu.secureHourlyUsd) ||
+      gpu.secureHourlyUsd <= 0 ||
+      gpu.secureHourlyUsd > ceiling
+    ) {
+      return false;
+    }
+    const center = gpu.dataCenters?.find((entry) => entry.id === dataCenter);
+    return Boolean(center && IN_STOCK_AVAILABILITY.has(center.availability));
+  });
+  if (!candidate) {
+    fail(
+      "GPU_UNAVAILABLE",
+      "the exact Secure GPU is unavailable at the volume data center within the ceiling",
+    );
+  }
+  const exactCenter = candidate.dataCenters.find((entry) => entry.id === dataCenter);
+  return {
+    ...candidate,
+    hourlyUsd: candidate.secureHourlyUsd,
+    dataCenterId: dataCenter,
+    dataCenterAvailability: exactCenter.availability,
+  };
+}
+
+export const selectGpuOffer = selectRunPodV2GpuOffer;
+
 async function readResponseBytes(response, maximumBytes) {
   const contentLength = response.headers?.get?.("content-length");
   if (contentLength !== null && contentLength !== undefined && contentLength !== "") {
@@ -767,6 +905,16 @@ export class RunPodV2Client {
       await this.requestJson(
         "CPU catalog lookup",
         "/catalog/cpus?include=AVAILABILITY&product=POD&vcpuCount=2",
+        options,
+      ),
+    );
+  }
+
+  async listGpuTypes(options = {}) {
+    return parseRunPodV2GpuCatalog(
+      await this.requestJson(
+        "GPU catalog lookup",
+        "/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=SECURE",
         options,
       ),
     );

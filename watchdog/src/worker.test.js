@@ -421,6 +421,75 @@ describe("watchdog V2 leases", () => {
     );
   });
 
+  it("retains an explicitly leased one-GPU cache repair at its bounded rate", async () => {
+    const env = environment();
+    const fallbackLease = leaseV2({
+      jobKind: "gpu_cache",
+      maxHourlyUsd: 0.49,
+      expected: {
+        cloud: "SECURE",
+        gpuCount: 1,
+        gpuTypeId: "NVIDIA L4",
+        networkVolumeId: "volume-1",
+      },
+    });
+    await env.LEASES.put("lease-v2:job-1", JSON.stringify(fallbackLease));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        Response.json(cpuPodV2({ cpu: null, gpu: { id: "NVIDIA L4", count: 1 }, cost: 0.49 })),
+      );
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.runpod.io/v2/pods/pod_v2_1",
+      expect.objectContaining({ headers: expect.any(Object) }),
+    );
+  });
+
+  it("terminates a GPU cache Pod whose exact GPU identity differs from its lease", async () => {
+    const env = environment();
+    await env.LEASES.put(
+      "lease-v2:job-1",
+      JSON.stringify(
+        leaseV2({
+          jobKind: "gpu_cache",
+          maxHourlyUsd: 0.49,
+          expected: {
+            cloud: "SECURE",
+            gpuCount: 1,
+            gpuTypeId: "NVIDIA L4",
+            networkVolumeId: "volume-1",
+          },
+        }),
+      ),
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      return Response.json(
+        cpuPodV2({
+          cpu: null,
+          gpu: { id: "NVIDIA GeForce RTX 4090", count: 1 },
+          cost: 0.44,
+        }),
+      );
+    });
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.runpod.io/v2/pods/pod_v2_1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
   it("terminates an exact-id V2 GPU Pod after a stale heartbeat", async () => {
     const env = environment();
     await env.LEASES.put(

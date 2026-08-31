@@ -34,7 +34,14 @@ export const RUNPOD_A100_GPU_IDS: RunPodGpuTypeId[] = [
   "NVIDIA A100-SXM4-80GB",
 ];
 export const RUNPOD_H100_GPU_IDS: RunPodGpuTypeId[] = ["NVIDIA H100 PCIe", "NVIDIA H100 80GB HBM3"];
-const RUNPOD_GPU_IDS = new Set<RunPodGpuTypeId>([...RUNPOD_A100_GPU_IDS, ...RUNPOD_H100_GPU_IDS]);
+export const RUNPOD_RTX_PRO_GPU_IDS: RunPodGpuTypeId[] = [
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+];
+const RUNPOD_GPU_IDS = new Set<RunPodGpuTypeId>([
+  ...RUNPOD_A100_GPU_IDS,
+  ...RUNPOD_H100_GPU_IDS,
+  ...RUNPOD_RTX_PRO_GPU_IDS,
+]);
 
 type StoredComputeProfile = ComputeProfileUpdateV1;
 

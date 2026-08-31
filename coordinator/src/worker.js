@@ -2,8 +2,10 @@ import {
   RunPodV2Client,
   RunPodV2Error,
   buildCpuCachePodRequest,
+  buildGpuCachePodRequest,
   buildGpuWorkerPodRequest,
   selectRunPodV2CpuOffer,
+  selectRunPodV2GpuOffer,
 } from "./runpod-v2.js";
 
 const PRIMARY_COORDINATOR = "primary";
@@ -16,11 +18,14 @@ const AUTH_WINDOW_MS = 120_000;
 const POLL_MS = 30_000;
 const CREATE_RECOVERY_MS = 5 * 60_000;
 const EXIT_CALLBACK_GRACE_MS = 2 * 60_000;
+const WATCHDOG_DELETE_SAFETY_SECONDS = 120;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,190}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const BUILD_ID = /^r2-[a-f0-9]{12}$/;
 const IMAGE = /^[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
+const GPU_TYPE = /^[A-Za-z0-9][A-Za-z0-9 ._()+/-]{0,127}$/;
+const CACHE_REPAIR_GPU_FALLBACKS = new Set(["NVIDIA L4"]);
 const TOKEN = /^[A-Za-z0-9_-]{43,512}$/;
 const PUBLIC_KEY = /^[A-Za-z0-9_-]{43}$/;
 const PRIVATE_KEY = /^[A-Za-z0-9_-]{64,512}$/;
@@ -288,6 +293,51 @@ async function configuration(env) {
   ) {
     throw new Error("INVALID_COORDINATOR_CONFIG");
   }
+  const cpuMaxHourlyUsd = numberSetting(
+    env.CPU_CACHE_MAX_HOURLY_USD,
+    0.0225,
+    0.001,
+    1,
+    "INVALID_COORDINATOR_CONFIG",
+  );
+  const cacheRepairTtlSeconds = numberSetting(
+    env.CPU_CACHE_TTL_SECONDS,
+    1680,
+    300,
+    7200,
+    "INVALID_COORDINATOR_CONFIG",
+  );
+  const cacheRepairMaxTotalUsd = numberSetting(
+    env.CACHE_REPAIR_MAX_TOTAL_USD,
+    0.25,
+    0.01,
+    10,
+    "INVALID_COORDINATOR_CONFIG",
+  );
+  const fallbackGpuId = env.CACHE_REPAIR_GPU_FALLBACK_ID?.trim() || null;
+  if (
+    fallbackGpuId !== null &&
+    (!GPU_TYPE.test(fallbackGpuId) || !CACHE_REPAIR_GPU_FALLBACKS.has(fallbackGpuId))
+  ) {
+    throw new Error("INVALID_COORDINATOR_CONFIG");
+  }
+  const fallbackGpuMaxHourlyUsd =
+    fallbackGpuId === null
+      ? null
+      : numberSetting(
+          env.CACHE_REPAIR_GPU_MAX_HOURLY_USD,
+          0.49,
+          0.1,
+          10,
+          "INVALID_COORDINATOR_CONFIG",
+        );
+  const maximumRepairHourlyUsd = Math.max(cpuMaxHourlyUsd, fallbackGpuMaxHourlyUsd ?? 0);
+  if (
+    (maximumRepairHourlyUsd * (cacheRepairTtlSeconds + WATCHDOG_DELETE_SAFETY_SECONDS)) / 3600 >
+    cacheRepairMaxTotalUsd
+  ) {
+    throw new Error("INVALID_COORDINATOR_CONFIG");
+  }
   return {
     runpodBaseUrl:
       strictOrigin(
@@ -297,20 +347,13 @@ async function configuration(env) {
     watchdogUrl: strictOrigin(env.WATCHDOG_URL, "INVALID_COORDINATOR_CONFIG"),
     publicUrl: strictOrigin(env.COORDINATOR_PUBLIC_URL, "INVALID_COORDINATOR_CONFIG"),
     cacheKeyId: bytesToHex(await sha256Bytes(publicBytes)),
-    cpuMaxHourlyUsd: numberSetting(
-      env.CPU_CACHE_MAX_HOURLY_USD,
-      0.0225,
-      0.001,
-      1,
-      "INVALID_COORDINATOR_CONFIG",
-    ),
-    cpuTtlSeconds: numberSetting(
-      env.CPU_CACHE_TTL_SECONDS,
-      2700,
-      300,
-      7200,
-      "INVALID_COORDINATOR_CONFIG",
-    ),
+    cpuMaxHourlyUsd,
+    cacheRepairTtlSeconds,
+    cacheRepairMaxTotalUsd,
+    cacheRepairGpuFallback:
+      fallbackGpuId === null
+        ? null
+        : { gpuTypeId: fallbackGpuId, maxHourlyUsd: fallbackGpuMaxHourlyUsd },
   };
 }
 
@@ -551,21 +594,29 @@ async function watchdogRequest(env, config, method, path, body = "") {
 }
 
 function watchdogLease(job, now) {
-  const cpu = job.phase === "cache_repair";
+  const repair = job.phase === "cache_repair";
+  const gpuRepair = repair && job.internal.repairAllocation?.kind === "gpu";
   return {
     schemaVersion: 2,
     leaseId: job.currentLeaseId,
     ownerInstanceId: "glimmer-cloud-coordinator",
-    jobKind: cpu ? "cpu_cache" : "gpu_worker",
+    jobKind: repair ? (gpuRepair ? "gpu_cache" : "cpu_cache") : "gpu_worker",
     podName: job.podName,
     ...(job.podId ? { podId: job.podId } : {}),
     hardDeadlineAt: job.currentDeadlineAt,
     lastHeartbeatAt: now,
-    maxHourlyUsd: cpu ? job.internal.cpuMaxHourlyUsd : job.maxHourlyUsd,
+    maxHourlyUsd: repair
+      ? (job.internal.repairAllocation?.maxHourlyUsd ?? job.internal.cpuMaxHourlyUsd)
+      : job.maxHourlyUsd,
     expected: {
       cloud: "SECURE",
-      gpuCount: cpu ? 0 : 1,
+      gpuCount: repair ? (gpuRepair ? 1 : 0) : 1,
       networkVolumeId: job.internal.request.networkVolumeId,
+      ...(gpuRepair
+        ? { gpuTypeId: job.internal.repairAllocation.resourceId }
+        : repair
+          ? {}
+          : { gpuTypeId: job.internal.request.gpuTypeId }),
     },
   };
 }
@@ -792,7 +843,10 @@ export class ComputeCoordinator {
       currentDeadlineAt:
         request.kind === "gpu_worker" && !cached
           ? new Date(
-              Math.min(Date.parse(request.hardDeadlineAt), nowMs + config.cpuTtlSeconds * 1000),
+              Math.min(
+                Date.parse(request.hardDeadlineAt),
+                nowMs + config.cacheRepairTtlSeconds * 1000,
+              ),
             ).toISOString()
           : request.hardDeadlineAt,
       internal: {
@@ -800,6 +854,7 @@ export class ComputeCoordinator {
         ...(encryptedBootstrap ? { encryptedBootstrap } : {}),
         cpuMaxHourlyUsd:
           request.kind === "cpu_cache" ? request.maxHourlyUsd : config.cpuMaxHourlyUsd,
+        repairAllocation: null,
         createIntentAt: null,
         callbackTokenHash: null,
         workerState: null,
@@ -1057,28 +1112,67 @@ export class ComputeCoordinator {
     };
     let createRequest;
     if (job.phase === "cache_repair") {
-      const offer = selectRunPodV2CpuOffer(await client.listCpuTypes(), {
-        dataCenterId: volume.dataCenterId,
-        maxHourlyUsd: job.internal.cpuMaxHourlyUsd,
-      });
-      createRequest = buildCpuCachePodRequest({
-        podName: job.podName,
-        image: request.image,
-        registryId: request.containerRegistryAuthId,
-        networkVolumeId: request.networkVolumeId,
-        dataCenterId: volume.dataCenterId,
-        cpuId: offer.id,
-        environment: {
-          ...commonEnvironment,
-          GLIMMER_PREWARM_ONLY: "1",
-          GLIMMER_MODEL_URL: request.modelArtifacts.model.url,
-          GLIMMER_MMPROJ_URL: request.modelArtifacts.mmproj.url,
-          GLIMMER_DFLASH_URL: request.modelArtifacts.draftModel.url,
-          GLIMMER_ARTIFACT_HOSTS: request.modelArtifacts.allowedHosts.join(","),
-          GLIMMER_CACHE_SIGNING_PUBLIC_KEY: this.env.CACHE_SIGNING_PUBLIC_KEY,
-          GLIMMER_PREWARM_EXPECTED_BUILD_ID: request.buildId,
-        },
-      });
+      const repairEnvironment = {
+        ...commonEnvironment,
+        GLIMMER_PREWARM_ONLY: "1",
+        GLIMMER_MODEL_URL: request.modelArtifacts.model.url,
+        GLIMMER_MMPROJ_URL: request.modelArtifacts.mmproj.url,
+        GLIMMER_DFLASH_URL: request.modelArtifacts.draftModel.url,
+        GLIMMER_ARTIFACT_HOSTS: request.modelArtifacts.allowedHosts.join(","),
+        GLIMMER_CACHE_SIGNING_PUBLIC_KEY: this.env.CACHE_SIGNING_PUBLIC_KEY,
+        GLIMMER_PREWARM_EXPECTED_BUILD_ID: request.buildId,
+      };
+      try {
+        const offer = selectRunPodV2CpuOffer(await client.listCpuTypes(), {
+          dataCenterId: volume.dataCenterId,
+          maxHourlyUsd: job.internal.cpuMaxHourlyUsd,
+        });
+        job.internal.repairAllocation = {
+          kind: "cpu",
+          resourceId: offer.id,
+          maxHourlyUsd: job.internal.cpuMaxHourlyUsd,
+          observedHourlyUsd: offer.hourlyUsd,
+        };
+        createRequest = buildCpuCachePodRequest({
+          podName: job.podName,
+          image: request.image,
+          registryId: request.containerRegistryAuthId,
+          networkVolumeId: request.networkVolumeId,
+          dataCenterId: volume.dataCenterId,
+          cpuId: offer.id,
+          environment: repairEnvironment,
+        });
+      } catch (error) {
+        if (
+          !(error instanceof RunPodV2Error) ||
+          error.code !== "CPU_UNAVAILABLE" ||
+          request.kind !== "gpu_worker" ||
+          !config.cacheRepairGpuFallback
+        ) {
+          throw error;
+        }
+        const fallback = config.cacheRepairGpuFallback;
+        const offer = selectRunPodV2GpuOffer(await client.listGpuTypes(), {
+          gpuTypeId: fallback.gpuTypeId,
+          dataCenterId: volume.dataCenterId,
+          maxHourlyUsd: fallback.maxHourlyUsd,
+        });
+        job.internal.repairAllocation = {
+          kind: "gpu",
+          resourceId: offer.id,
+          maxHourlyUsd: fallback.maxHourlyUsd,
+          observedHourlyUsd: offer.hourlyUsd,
+        };
+        createRequest = buildGpuCachePodRequest({
+          podName: job.podName,
+          image: request.image,
+          registryId: request.containerRegistryAuthId,
+          networkVolumeId: request.networkVolumeId,
+          dataCenterId: volume.dataCenterId,
+          gpuTypeId: offer.id,
+          environment: repairEnvironment,
+        });
+      }
     } else {
       if (job.cache.state !== "ready") throw new Error("CACHE_NOT_READY");
       const bootstrapToken = await decryptToken(
@@ -1111,7 +1205,9 @@ export class ComputeCoordinator {
     try {
       const pod = await client.createPod(createRequest, {
         maxHourlyUsd:
-          job.phase === "cache_repair" ? job.internal.cpuMaxHourlyUsd : job.maxHourlyUsd,
+          job.phase === "cache_repair"
+            ? (job.internal.repairAllocation?.maxHourlyUsd ?? job.internal.cpuMaxHourlyUsd)
+            : job.maxHourlyUsd,
       });
       job.podId = pod.id;
       job.state = pod.status === "RUNNING" ? "running" : "provisioning";
@@ -1163,7 +1259,7 @@ export class ComputeCoordinator {
     job.phase = "cache_repair";
     job.currentLeaseId = repairJobId;
     job.currentDeadlineAt = new Date(
-      Math.min(Date.parse(job.hardDeadlineAt), Date.now() + config.cpuTtlSeconds * 1000),
+      Math.min(Date.parse(job.hardDeadlineAt), Date.now() + config.cacheRepairTtlSeconds * 1000),
     ).toISOString();
     job.podName = `glimmer-cache-${repairJobId}`;
     job.podId = undefined;
@@ -1175,6 +1271,7 @@ export class ComputeCoordinator {
     job.internal.workerState = null;
     job.internal.workerObservedAt = null;
     job.internal.exitObservedAt = null;
+    job.internal.repairAllocation = null;
     job.internal.repairRequested = false;
     job.internal.cacheRepairAttempts += 1;
     job.state = "awaiting_cache_attestation";
