@@ -544,7 +544,7 @@ describe("watchdog V2 leases", () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "https://api.runpod.io/v2/pods/pod_v2_1",
-      expect.objectContaining({ method: "DELETE", redirect: "error" }),
+      expect.objectContaining({ method: "DELETE", redirect: "manual" }),
     );
   });
 

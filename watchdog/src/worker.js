@@ -252,7 +252,9 @@ async function runPodRequest(env, path, init = {}, apiVersion = "v1") {
   const apiBaseUrl = apiVersion === "v2" ? config.apiV2BaseUrl : config.apiBaseUrl;
   const response = await fetch(`${apiBaseUrl}${path}`, {
     ...init,
-    redirect: "error",
+    // Cloudflare Workers does not implement `error`. `manual` follows no
+    // redirect, and the non-2xx status check below remains fail-closed.
+    redirect: "manual",
     headers: {
       Authorization: `Bearer ${env.RUNPOD_API_KEY}`,
       ...(init.body ? { "Content-Type": "application/json" } : {}),
