@@ -12,6 +12,12 @@
       },
     ],
   },
+  "services": [
+    {
+      "binding": "WATCHDOG",
+      "service": "glimmer-runpod-watchdog",
+    },
+  ],
   "migrations": [
     {
       "tag": "v1",

@@ -137,6 +137,36 @@ beforeEach(() => {
 });
 
 describe("cloud coordinator ingress", () => {
+  it("uses the bound watchdog Worker while preserving HMAC authentication", async () => {
+    const storage = new MemoryStorage();
+    const watchdogFetch = vi.fn(async (request) => {
+      expect(request).toBeInstanceOf(Request);
+      expect(new URL(request.url).pathname).toBe("/v1/status");
+      expect(request.headers.get("X-Glimmer-Signature")).toMatch(/^v1=[a-f0-9]{64}$/);
+      return Response.json({
+        service: "glimmer-compute-watchdog",
+        schemaVersion: 1,
+        ready: true,
+        checkedAt: new Date(NOW).toISOString(),
+        lastSweepAt: new Date(NOW).toISOString(),
+        staleAfterSeconds: 180,
+      });
+    });
+    const env = { ...environment(), WATCHDOG: { fetch: watchdogFetch } };
+    const instance = new ComputeCoordinator({ storage }, env);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Promise.reject(new Error("global fetch disabled"))),
+    );
+
+    const status = await instance.fetch(signedRequest("GET", "/v1/status"));
+
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ ready: true, watchdogReady: true });
+    expect(watchdogFetch).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("is authenticated, idempotent, secret-free, and persists intent before any provider call", async () => {
     const { instance, storage } = coordinator();
     vi.stubGlobal(

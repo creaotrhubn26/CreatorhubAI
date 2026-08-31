@@ -526,7 +526,8 @@ async function watchdogRequest(env, config, method, path, body = "") {
     env.WATCHDOG_INGEST_TOKEN,
     `${method}\n${path}\n${timestamp}\n${body}`,
   );
-  const result = await fetch(`${config.watchdogUrl}${path}`, {
+  const target = `${config.watchdogUrl}${path}`;
+  const init = {
     method,
     headers: {
       Accept: "application/json",
@@ -536,7 +537,11 @@ async function watchdogRequest(env, config, method, path, body = "") {
     },
     ...(body ? { body } : {}),
     redirect: "error",
-  });
+  };
+  const result =
+    env.WATCHDOG && typeof env.WATCHDOG.fetch === "function"
+      ? await env.WATCHDOG.fetch(new Request(target, init))
+      : await fetch(target, init);
   if (!result.ok) throw new Error(`WATCHDOG_HTTP_${result.status}`);
   return result.status === 204
     ? null
