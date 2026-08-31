@@ -75,6 +75,15 @@ function fail(code, message) {
   throw new RunPodV2Error(code, message);
 }
 
+function transportDiagnostic(value) {
+  const name = value instanceof Error ? value.name : "UnknownError";
+  const message = value instanceof Error ? value.message : String(value);
+  return `${name}:${message}`
+    .replace(/rpa_[A-Za-z0-9_-]+/g, "rpa_[redacted]")
+    .replace(/[A-Za-z0-9_-]{43,}/g, "[redacted]")
+    .slice(0, 240);
+}
+
 function object(value, code, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     fail(code, `${label} must be an object`);
@@ -835,7 +844,8 @@ export class RunPodV2Client {
           // follows no redirect, and every 3xx fails the status allowlist.
           redirect: "manual",
         });
-      } catch {
+      } catch (error) {
+        console.warn("[runpod-v2] provider fetch failed", operation, transportDiagnostic(error));
         throw new RunPodV2TransportError(operation, method === "POST");
       }
       if (!response || !Number.isInteger(response.status) || !response.headers) {

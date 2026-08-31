@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   RUNPOD_V2_MAX_JSON_BYTES,
   RunPodError,
@@ -553,6 +553,24 @@ describe("RunPod v2 HTTP client", () => {
       ambiguousCreate: true,
     });
     expect(postCount).toBe(1);
+  });
+
+  it("logs only a bounded redacted diagnostic when provider fetch rejects", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const secret = `rpa_${"s".repeat(48)}`;
+    const client = new RunPodV2Client({
+      apiKey: API_KEY,
+      baseUrl: BASE_URL,
+      fetchImpl: async () => {
+        throw new TypeError(`fetch rejected ${secret} ${"x".repeat(64)}`);
+      },
+    });
+
+    await expect(client.listPods()).rejects.toMatchObject({ code: "RUNPOD_TRANSPORT_ERROR" });
+    expect(warning).toHaveBeenCalledTimes(1);
+    const diagnostic = warning.mock.calls[0].join(" ");
+    expect(diagnostic).toContain("TypeError:fetch rejected rpa_[redacted] [redacted]");
+    expect(diagnostic).not.toContain(secret);
   });
 
   it("rejects a create response that does not prove Secure Cloud", async () => {
