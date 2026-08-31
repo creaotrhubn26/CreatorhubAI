@@ -259,6 +259,36 @@ class WorkerServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerError, "not found"):
             self.service.checkpoint("job-1", 0)
 
+    def test_reports_busy_then_ready_without_affecting_the_result(self):
+        root = Path(self.temporary.name)
+        activity = []
+        service = WorkerService(
+            root / "activity-state",
+            root / "activity-recovery",
+            "activity-token",
+            "build-abc",
+            65_536,
+            lambda: True,
+            runner=self.runner,
+            activity_callback=activity.append,
+        )
+        service.handshake(
+            "Bearer activity-token",
+            "activity-handshake",
+            {"controllerInstanceId": "control-1", "nonce": "abcdefghijklmnop"},
+        )
+        body = b"bundle"
+        service.create_job(manifest(body))
+        service.upload_part("job-1", 0, body, hashlib.sha256(body).hexdigest())
+        service.start_job("job-1")
+
+        deadline = time.time() + 2
+        while service.job_status("job-1")["state"] == "running" and time.time() < deadline:
+            time.sleep(0.02)
+
+        self.assertEqual(service.job_status("job-1")["state"], "succeeded")
+        self.assertEqual(activity, ["busy", "ready"])
+
     def test_rejects_bad_parts_and_a_second_active_job(self):
         self.handshake()
         self.service.create_job(manifest())
@@ -299,6 +329,14 @@ class ProcessJobRunnerTests(unittest.TestCase):
             with (
                 mock.patch.object(runner, "_prepare_workspace", return_value=workspace),
                 mock.patch("runpod_worker.subprocess.Popen", return_value=process) as popen,
+                mock.patch.dict(
+                    "runpod_worker.os.environ",
+                    {
+                        "GLIMMER_COORDINATOR_CALLBACK_TOKEN": "secret-callback",
+                        "RUNPOD_API_KEY": "secret-provider",
+                    },
+                    clear=False,
+                ),
             ):
                 runner.start(
                     job_dir,
@@ -313,6 +351,9 @@ class ProcessJobRunnerTests(unittest.TestCase):
             )
             self.assertEqual(environment["GLIMMER_STATE_ROOT"], str(job_dir))
             self.assertNotIn("GLIMMER_EVENTS_PATH", environment)
+            self.assertNotIn("GLIMMER_COORDINATOR_CALLBACK_TOKEN", environment)
+            self.assertNotIn("RUNPOD_API_KEY", environment)
+            self.assertNotIn("secret-callback", json.dumps(environment))
 
 
 class ModelReadinessGateTests(unittest.TestCase):

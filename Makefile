@@ -19,12 +19,16 @@ PYTHON_FILES := \
 	glimmer_semantic.py \
 	glimmer_verification.py \
 	docker/runpod/bootstrap_status.py \
+	docker/runpod/cache_manifest.py \
+	docker/runpod/coordinator_callback.py \
 	docker/runpod/fetch_artifact.py \
 	runpod_worker.py
 
 RUNPOD_TESTS := \
 	tests.test_glimmer_remote \
 	tests.test_bootstrap_status \
+	tests.test_cache_manifest \
+	tests.test_coordinator_callback \
 	tests.test_runpod_worker \
 	tests.test_fetch_artifact \
 	tests.test_runpod_entrypoint

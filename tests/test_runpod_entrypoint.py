@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import shlex
@@ -9,9 +11,15 @@ import time
 import unittest
 from pathlib import Path
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from docker.runpod import cache_manifest
+
 ROOT = Path(__file__).resolve().parent.parent
 ENTRYPOINT = ROOT / "docker" / "runpod" / "entrypoint.sh"
 BOOTSTRAP_STATUS = ROOT / "docker" / "runpod" / "bootstrap_status.py"
+CACHE_MANIFEST = ROOT / "docker" / "runpod" / "cache_manifest.py"
 LEASE_ID = "12345678-1234-4234-9234-123456789abc"
 
 
@@ -33,6 +41,10 @@ class EntrypointStaticContractTests(unittest.TestCase):
         self.assertIn('MMPROJ_PATH="$MODEL_ROOT/mmproj.$GLIMMER_MMPROJ_SHA256.gguf"', source)
         self.assertIn('DFLASH_PATH="$MODEL_ROOT/dflash.$GLIMMER_DFLASH_SHA256.gguf"', source)
         self.assertIn('PREWARM_ONLY="${GLIMMER_PREWARM_ONLY:-0}"', source)
+        self.assertIn('REQUIRE_READY_CACHE="${GLIMMER_REQUIRE_READY_CACHE:-0}"', source)
+        self.assertIn('python3 "$CACHE_MANIFEST_TOOL" verify', source)
+        self.assertIn('GLIMMER_CACHE_SIGNING_PRIVATE_KEY="$CACHE_SIGNING_PRIVATE_KEY"', source)
+        self.assertIn("BOOTSTRAP_FAILURE_CODE=cache_not_ready", source)
         self.assertIn('BOOTSTRAP_STATUS_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"', source)
         self.assertLess(
             source.index("docker/runpod/healthcheck.py"),
@@ -47,6 +59,20 @@ class EntrypointBehaviorTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.events = self.root / "events.log"
         self.process = None
+        private_key = Ed25519PrivateKey.generate()
+        self.private_key = base64.urlsafe_b64encode(
+            private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        ).decode("ascii").rstrip("=")
+        self.public_key = base64.urlsafe_b64encode(
+            private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("ascii").rstrip("=")
 
     def tearDown(self):
         if self.process is not None and self.process.poll() is None:
@@ -67,6 +93,9 @@ class EntrypointBehaviorTests(unittest.TestCase):
         prewarm=False,
         expected_build_id="r2-abcdef012345",
         preexisting_marker=False,
+        require_ready=False,
+        ready_cache=False,
+        omit_artifact_urls=False,
     ):
         state = self.root / "state"
         models = self.root / "models"
@@ -90,6 +119,10 @@ class EntrypointBehaviorTests(unittest.TestCase):
             app / "docker" / "runpod" / "bootstrap_status.py",
             BOOTSTRAP_STATUS.read_text(encoding="utf-8"),
         )
+        self._write_executable(
+            app / "docker" / "runpod" / "cache_manifest.py",
+            CACHE_MANIFEST.read_text(encoding="utf-8"),
+        )
         if preexisting_marker:
             state.mkdir(parents=True, exist_ok=True)
             (state / "model.ready").write_text("stale", encoding="utf-8")
@@ -102,11 +135,13 @@ class EntrypointBehaviorTests(unittest.TestCase):
             bin_root / "install",
             """#!/usr/bin/env bash
 set -euo pipefail
+mode=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -d) shift ;;
-    -o|-g|-m) shift 2 ;;
-    *) mkdir -p "$1"; shift ;;
+    -o|-g) shift 2 ;;
+    -m) mode="$2"; shift 2 ;;
+    *) mkdir -p "$1"; if [ -n "$mode" ]; then chmod "$mode" "$1"; fi; shift ;;
   esac
 done
 """,
@@ -204,6 +239,7 @@ def stop(_signal, _frame):
 mode = os.environ["TEST_DOWNLOAD_MODE"]
 signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == "ignore" else stop)
 record(f"download_start:{os.getpid()}:{output.name}")
+record(f"download_private_key:{int(bool(os.environ.get('GLIMMER_CACHE_SIGNING_PRIVATE_KEY')))}")
 if mode in {"hold", "ignore"}:
     while True:
         time.sleep(0.1)
@@ -249,6 +285,12 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
 """,
         )
 
+        fixture_digest = hashlib.sha256(b"fixture").hexdigest()
+        hashes = {
+            "model": fixture_digest if require_ready else "a" * 64,
+            "mmproj": fixture_digest if require_ready else "b" * 64,
+            "draft": fixture_digest if require_ready else "c" * 64,
+        }
         environment = {
             **os.environ,
             "PATH": f"{bin_root}:{os.environ.get('PATH', '')}",
@@ -258,11 +300,11 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
             "TEST_WORKER_MODE": worker_mode,
             "GLIMMER_WORKER_BOOTSTRAP_TOKEN": "fixture-bootstrap",
             "GLIMMER_MODEL_URL": "https://artifacts.example/model.gguf",
-            "GLIMMER_MODEL_SHA256": "a" * 64,
+            "GLIMMER_MODEL_SHA256": hashes["model"],
             "GLIMMER_MMPROJ_URL": "https://artifacts.example/mmproj.gguf",
-            "GLIMMER_MMPROJ_SHA256": "b" * 64,
+            "GLIMMER_MMPROJ_SHA256": hashes["mmproj"],
             "GLIMMER_DFLASH_URL": "https://artifacts.example/dflash.gguf",
-            "GLIMMER_DFLASH_SHA256": "c" * 64,
+            "GLIMMER_DFLASH_SHA256": hashes["draft"],
             "GLIMMER_ARTIFACT_HOSTS": "artifacts.example",
             "GLIMMER_CONTEXT_TOKENS": "65536",
             "GLIMMER_LEASE_ID": LEASE_ID,
@@ -272,6 +314,33 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
             environment["GLIMMER_PREWARM_ONLY"] = "1"
             environment["GLIMMER_PREWARM_EXPECTED_BUILD_ID"] = expected_build_id
             environment.pop("GLIMMER_WORKER_BOOTSTRAP_TOKEN")
+        if require_ready:
+            environment["GLIMMER_REQUIRE_READY_CACHE"] = "1"
+            environment["GLIMMER_CACHE_VOLUME_ID"] = "rp5asg2b9x"
+            if prewarm:
+                environment["GLIMMER_CACHE_SIGNING_PRIVATE_KEY"] = self.private_key
+            else:
+                environment["GLIMMER_CACHE_SIGNING_PUBLIC_KEY"] = self.public_key
+        if omit_artifact_urls:
+            for name in (
+                "GLIMMER_MODEL_URL",
+                "GLIMMER_MMPROJ_URL",
+                "GLIMMER_DFLASH_URL",
+                "GLIMMER_ARTIFACT_HOSTS",
+            ):
+                environment.pop(name)
+        if ready_cache:
+            self.assertTrue(require_ready and not prewarm)
+            models.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for expected in cache_manifest._expectations(hashes):
+                (models / expected.name).write_bytes(b"fixture")
+            cache_manifest.publish(
+                models,
+                "rp5asg2b9x",
+                "r2-abcdef012345",
+                hashes,
+                self.private_key,
+            )
         self.process = subprocess.Popen(
             ["bash", str(script)],
             env=environment,
@@ -386,6 +455,80 @@ raise SystemExit(0 if "llama_start:" in events.read_text(encoding="utf-8") else 
         self.assertEqual(status["stage"], "ready")
         self.assertEqual(status["outcome"], "ready")
         self.assertEqual(stdout, f"GLIMMER_PREWARM_READY {LEASE_ID}\n")
+
+    def test_ready_cache_cpu_prewarm_is_the_only_writer_and_seals_signed_artifacts(self):
+        self._prepare("complete", prewarm=True, require_ready=True)
+        stdout, stderr = self.process.communicate(timeout=8)
+
+        self.assertEqual(self.process.returncode, 0, (stdout, stderr))
+        events = self.events.read_text(encoding="utf-8")
+        self.assertEqual(events.count("download_start:"), 3)
+        self.assertNotIn("worker_listening:", events)
+        self.assertNotIn("llama_start:", events)
+        self.assertNotIn("download_private_key:1", events)
+        models = self.root / "models"
+        self.assertEqual(models.stat().st_mode & 0o777, 0o555)
+        self.assertEqual((models / "cache-ready.json").stat().st_mode & 0o777, 0o444)
+        fixture_digest = hashlib.sha256(b"fixture").hexdigest()
+        hashes = {kind: fixture_digest for kind in ("model", "mmproj", "draft")}
+        verified = cache_manifest.verify(
+            models,
+            "rp5asg2b9x",
+            "r2-abcdef012345",
+            hashes,
+            self.public_key,
+        )
+        self.assertEqual([item["kind"] for item in verified["signed"]["artifacts"]], [
+            "model",
+            "mmproj",
+            "draft",
+        ])
+        self.assertIn('{"event":"cache_manifest_published"}', stdout)
+        self.assertTrue(stdout.endswith(f"GLIMMER_PREWARM_READY {LEASE_ID}\n"))
+
+    def test_ready_cache_gpu_fast_path_needs_no_urls_and_never_invokes_downloader(self):
+        state = self._prepare(
+            "download_failure",
+            require_ready=True,
+            ready_cache=True,
+            omit_artifact_urls=True,
+        )
+        events = self._wait_for(lambda value: "llama_start:" in value)
+
+        self.assertIn("worker_listening:", "\n".join(events))
+        self.assertNotIn("download_start:", "\n".join(events))
+        self._wait_for(lambda _value: (state / "model.ready").exists())
+        self._terminate()
+
+        status = json.loads(
+            (
+                self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["stage"], "ready")
+        self.assertEqual(status["outcome"], "ready")
+
+    def test_ready_cache_gpu_missing_manifest_fails_closed_without_download_or_model(self):
+        self._prepare(
+            "complete",
+            require_ready=True,
+            omit_artifact_urls=True,
+        )
+        stdout, stderr = self.process.communicate(timeout=8)
+
+        self.assertEqual(self.process.returncode, 22, (stdout, stderr))
+        events = self.events.read_text(encoding="utf-8")
+        self.assertIn("worker_listening:", events)
+        self.assertNotIn("download_start:", events)
+        self.assertNotIn("llama_start:", events)
+        status = json.loads(
+            (
+                self.root / "recovery" / "bootstrap" / LEASE_ID / "status.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(status["failureCode"], "cache_not_ready")
+        self.assertEqual(status["exitCode"], 22)
+        self.assertIn('"reason":"cache_not_ready"', stderr)
 
     def test_artifact_failures_are_mapped_to_allowlisted_diagnostics(self):
         for mode, expected_code, expected_exit in (

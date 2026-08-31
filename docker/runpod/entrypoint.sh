@@ -9,8 +9,12 @@ MODEL_KEY="$STATE_ROOT/model-api.key"
 MODEL_CONFIG="$STATE_ROOT/models.json"
 READY_MARKER="$STATE_ROOT/model.ready"
 BOOTSTRAP_STATUS_TOOL=/opt/glimmer/docker/runpod/bootstrap_status.py
+CACHE_MANIFEST_TOOL=/opt/glimmer/docker/runpod/cache_manifest.py
+COORDINATOR_CALLBACK_TOOL=/opt/glimmer/docker/runpod/coordinator_callback.py
 CTX="${GLIMMER_CONTEXT_TOKENS:-65536}"
 PREWARM_ONLY="${GLIMMER_PREWARM_ONLY:-0}"
+REQUIRE_READY_CACHE="${GLIMMER_REQUIRE_READY_CACHE:-0}"
+CACHE_SIGNING_PRIVATE_KEY=""
 DOWNLOAD_PID=""
 LLAMA_PID=""
 WORKER_PID=""
@@ -24,7 +28,31 @@ if ! [[ "${GLIMMER_LEASE_ID:-}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89
 fi
 BOOTSTRAP_STATUS_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"
 
-install -d -o glimmer -g glimmer -m 0700 "$STATE_ROOT" "$MODEL_ROOT" "$RECOVERY_ROOT"
+case "$PREWARM_ONLY" in
+  0|1) ;;
+  *)
+    echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+    exit 2
+    ;;
+esac
+case "$REQUIRE_READY_CACHE" in
+  0|1) ;;
+  *)
+    echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+    exit 2
+    ;;
+esac
+
+install -d -o glimmer -g glimmer -m 0700 "$STATE_ROOT" "$RECOVERY_ROOT"
+if [ "$REQUIRE_READY_CACHE" = 1 ]; then
+  if [ "$PREWARM_ONLY" = 1 ]; then
+    install -d -o root -g root -m 0700 "$MODEL_ROOT"
+  else
+    install -d -o root -g root -m 0555 "$MODEL_ROOT"
+  fi
+else
+  install -d -o glimmer -g glimmer -m 0700 "$MODEL_ROOT"
+fi
 if ! gosu glimmer python3 "$BOOTSTRAP_STATUS_TOOL" \
   --path "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" initialize; then
   exit 6
@@ -82,25 +110,53 @@ trap 'BOOTSTRAP_FAILURE_CODE=bootstrap_interrupted; exit 130' INT
 trap 'BOOTSTRAP_FAILURE_CODE=bootstrap_interrupted; exit 143' TERM
 rm -f "$READY_MARKER"
 
-case "$PREWARM_ONLY" in
-  0|1) ;;
-  *)
-    BOOTSTRAP_FAILURE_CODE=configuration_invalid
-    echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
-    exit 2
-    ;;
-esac
-for name in \
-  GLIMMER_MODEL_URL GLIMMER_MODEL_SHA256 \
-  GLIMMER_MMPROJ_URL GLIMMER_MMPROJ_SHA256 \
-  GLIMMER_DFLASH_URL GLIMMER_DFLASH_SHA256 \
-  GLIMMER_ARTIFACT_HOSTS; do
+for name in GLIMMER_MODEL_SHA256 GLIMMER_MMPROJ_SHA256 GLIMMER_DFLASH_SHA256; do
   if [ -z "${!name:-}" ]; then
     BOOTSTRAP_FAILURE_CODE=configuration_invalid
     echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
     exit 2
   fi
 done
+if [ "$REQUIRE_READY_CACHE" != 1 ] || [ "$PREWARM_ONLY" = 1 ]; then
+  for name in \
+    GLIMMER_MODEL_URL GLIMMER_MMPROJ_URL GLIMMER_DFLASH_URL \
+    GLIMMER_ARTIFACT_HOSTS; do
+    if [ -z "${!name:-}" ]; then
+      BOOTSTRAP_FAILURE_CODE=configuration_invalid
+      echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+      exit 2
+    fi
+  done
+fi
+if [ "$REQUIRE_READY_CACHE" = 1 ]; then
+  if [ -z "${GLIMMER_CACHE_VOLUME_ID:-}" ]; then
+    BOOTSTRAP_FAILURE_CODE=configuration_invalid
+    echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+    exit 2
+  fi
+  if [ "$PREWARM_ONLY" = 1 ] && [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" != 1 ]; then
+    CACHE_SIGNING_PRIVATE_KEY="${GLIMMER_CACHE_SIGNING_PRIVATE_KEY:-}"
+    unset GLIMMER_CACHE_SIGNING_PRIVATE_KEY
+    if [ -z "$CACHE_SIGNING_PRIVATE_KEY" ]; then
+      BOOTSTRAP_FAILURE_CODE=configuration_invalid
+      echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+      exit 2
+    fi
+  elif [ -z "${GLIMMER_CACHE_SIGNING_PUBLIC_KEY:-}" ]; then
+    BOOTSTRAP_FAILURE_CODE=configuration_invalid
+    echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+    exit 2
+  fi
+fi
+if [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+  if [ -z "${GLIMMER_COORDINATOR_CALLBACK_URL:-}" ] || \
+    [ -z "${GLIMMER_COORDINATOR_CALLBACK_TOKEN:-}" ] || \
+    [ -z "${GLIMMER_CACHE_KEY:-}" ]; then
+    BOOTSTRAP_FAILURE_CODE=configuration_invalid
+    echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
+    exit 2
+  fi
+fi
 if [ "$PREWARM_ONLY" = 1 ]; then
   if ! [[ "${GLIMMER_PREWARM_EXPECTED_BUILD_ID:-}" =~ ^r2-[a-f0-9]{12}$ ]] || \
     [ "$GLIMMER_PREWARM_EXPECTED_BUILD_ID" != "${GLIMMER_WORKER_BUILD_ID:-}" ]; then
@@ -216,13 +272,24 @@ PY
 fi
 
 HOST_ARGS=()
-IFS=',' read -r -a HOSTS <<< "$GLIMMER_ARTIFACT_HOSTS"
-for host in "${HOSTS[@]}"; do
-  HOST_ARGS+=(--allowed-host "$host")
-done
+if [ -n "${GLIMMER_ARTIFACT_HOSTS:-}" ]; then
+  HOSTS=()
+  IFS=',' read -r -a HOSTS <<< "$GLIMMER_ARTIFACT_HOSTS"
+  for host in "${HOSTS[@]}"; do
+    HOST_ARGS+=(--allowed-host "$host")
+  done
+fi
 
 run_download() {
-  gosu glimmer python3 /opt/glimmer/docker/runpod/fetch_artifact.py "$@" &
+  if [ "$REQUIRE_READY_CACHE" = 1 ] && [ "$PREWARM_ONLY" = 1 ]; then
+    env -u GLIMMER_COORDINATOR_CALLBACK_TOKEN \
+      -u GLIMMER_WORKER_BOOTSTRAP_TOKEN \
+      python3 /opt/glimmer/docker/runpod/fetch_artifact.py "$@" &
+  else
+    env -u GLIMMER_COORDINATOR_CALLBACK_TOKEN \
+      -u GLIMMER_WORKER_BOOTSTRAP_TOKEN \
+      gosu glimmer python3 /opt/glimmer/docker/runpod/fetch_artifact.py "$@" &
+  fi
   DOWNLOAD_PID=$!
   while process_alive "$DOWNLOAD_PID"; do
     if [ "$PREWARM_ONLY" != 1 ] && ! process_alive "$WORKER_PID"; then
@@ -271,9 +338,75 @@ fetch_artifact() {
   return "$status"
 }
 
-fetch_artifact model "$GLIMMER_MODEL_URL" "$GLIMMER_MODEL_SHA256" "$MODEL_PATH"
-fetch_artifact mmproj "$GLIMMER_MMPROJ_URL" "$GLIMMER_MMPROJ_SHA256" "$MMPROJ_PATH"
-fetch_artifact draft "$GLIMMER_DFLASH_URL" "$GLIMMER_DFLASH_SHA256" "$DFLASH_PATH"
+CACHE_MANIFEST_ARGS=(
+  --root "$MODEL_ROOT"
+  --volume-id "${GLIMMER_CACHE_VOLUME_ID:-legacy}"
+  --build-id "${GLIMMER_CACHE_BUILD_ID:-${GLIMMER_WORKER_BUILD_ID:-unverified}}"
+  --model-sha256 "$GLIMMER_MODEL_SHA256"
+  --mmproj-sha256 "$GLIMMER_MMPROJ_SHA256"
+  --draft-sha256 "$GLIMMER_DFLASH_SHA256"
+)
+
+if [ "$REQUIRE_READY_CACHE" = 1 ] && [ "$PREWARM_ONLY" != 1 ]; then
+  status_update --stage cache_checking
+  if ! python3 "$CACHE_MANIFEST_TOOL" verify "${CACHE_MANIFEST_ARGS[@]}"; then
+    BOOTSTRAP_FAILURE_CODE=cache_not_ready
+    if [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+      python3 "$COORDINATOR_CALLBACK_TOOL" cache-invalid \
+        --cache-key "$GLIMMER_CACHE_KEY" || true
+    fi
+    echo '{"event":"startup_failed","reason":"cache_not_ready"}' >&2
+    exit 22
+  fi
+  if [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+    python3 "$COORDINATOR_CALLBACK_TOOL" heartbeat --worker-state bootstrapping || {
+      BOOTSTRAP_FAILURE_CODE=coordinator_callback_failed
+      exit 24
+    }
+  fi
+else
+  fetch_artifact model "$GLIMMER_MODEL_URL" "$GLIMMER_MODEL_SHA256" "$MODEL_PATH"
+  fetch_artifact mmproj "$GLIMMER_MMPROJ_URL" "$GLIMMER_MMPROJ_SHA256" "$MMPROJ_PATH"
+  fetch_artifact draft "$GLIMMER_DFLASH_URL" "$GLIMMER_DFLASH_SHA256" "$DFLASH_PATH"
+  if [ "$REQUIRE_READY_CACHE" = 1 ]; then
+    status_update --stage cache_publishing
+    if [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+      CACHE_ATTESTATION="$STATE_ROOT/cache-attestation.json"
+      CACHE_DOCUMENT="$STATE_ROOT/cache-document.json"
+      python3 "$CACHE_MANIFEST_TOOL" prepare "${CACHE_MANIFEST_ARGS[@]}" \
+        --output "$CACHE_ATTESTATION" || {
+        BOOTSTRAP_FAILURE_CODE=cache_publish_failed
+        exit 23
+      }
+      python3 "$COORDINATOR_CALLBACK_TOOL" cache-attestation \
+        --attestation "$CACHE_ATTESTATION" \
+        --document-out "$CACHE_DOCUMENT" \
+        --cache-key "$GLIMMER_CACHE_KEY" || {
+        BOOTSTRAP_FAILURE_CODE=coordinator_callback_failed
+        exit 24
+      }
+      python3 "$CACHE_MANIFEST_TOOL" install "${CACHE_MANIFEST_ARGS[@]}" \
+        --document "$CACHE_DOCUMENT" || {
+        BOOTSTRAP_FAILURE_CODE=cache_publish_failed
+        exit 23
+      }
+      python3 "$COORDINATOR_CALLBACK_TOOL" cache-published \
+        --manifest "$MODEL_ROOT/cache-ready.json" \
+        --cache-key "$GLIMMER_CACHE_KEY" || {
+        BOOTSTRAP_FAILURE_CODE=coordinator_callback_failed
+        exit 24
+      }
+      rm -f "$CACHE_ATTESTATION" "$CACHE_DOCUMENT"
+    elif ! GLIMMER_CACHE_SIGNING_PRIVATE_KEY="$CACHE_SIGNING_PRIVATE_KEY" \
+      python3 "$CACHE_MANIFEST_TOOL" publish "${CACHE_MANIFEST_ARGS[@]}"; then
+      CACHE_SIGNING_PRIVATE_KEY=""
+      BOOTSTRAP_FAILURE_CODE=cache_publish_failed
+      echo '{"event":"startup_failed","reason":"cache_publish_failed"}' >&2
+      exit 23
+    fi
+    CACHE_SIGNING_PRIVATE_KEY=""
+  fi
+fi
 
 if [ "$PREWARM_ONLY" = 1 ]; then
   status_update --stage ready --outcome ready
@@ -283,7 +416,9 @@ if [ "$PREWARM_ONLY" = 1 ]; then
 fi
 
 status_update --stage model_starting
-gosu glimmer /opt/glimmer/bin/llama-server \
+env -u GLIMMER_COORDINATOR_CALLBACK_TOKEN \
+  -u GLIMMER_WORKER_BOOTSTRAP_TOKEN \
+  gosu glimmer /opt/glimmer/bin/llama-server \
   -m "$MODEL_PATH" \
   --mmproj "$MMPROJ_PATH" \
   -ngl all -c "$CTX" -np 1 --jinja -fa on \
@@ -320,6 +455,13 @@ if [ ! -f "$READY_MARKER" ]; then
   BOOTSTRAP_FAILURE_CODE=model_healthcheck_failed
   echo '{"event":"startup_failed","reason":"readiness_timeout"}' >&2
   exit 4
+fi
+
+if [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+  python3 "$COORDINATOR_CALLBACK_TOOL" heartbeat --worker-state ready || {
+    BOOTSTRAP_FAILURE_CODE=coordinator_callback_failed
+    exit 24
+  }
 fi
 
 wait "$WORKER_PID"

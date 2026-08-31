@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import secrets
 import signal
@@ -29,6 +30,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from docker.runpod import bootstrap_status
+from docker.runpod.coordinator_callback import (
+    CallbackError,
+)
+from docker.runpod.coordinator_callback import (
+    send as send_coordinator_callback,
+)
+from docker.runpod.coordinator_callback import (
+    validate_configuration as validate_callback_configuration,
+)
 from glimmer_remote import (
     CHECKPOINT_CHUNK_BYTES,
     MAX_MANIFEST_BYTES,
@@ -63,6 +73,44 @@ class WorkerError(RuntimeError):
     def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST):
         super().__init__(message)
         self.status = int(status)
+
+
+class CoordinatorActivityReporter:
+    """Serialize worker activity callbacks without delaying the worker API."""
+
+    def __init__(self, endpoint: str, token: str) -> None:
+        self.endpoint, self.token = validate_callback_configuration(endpoint, token)
+        self.events: queue.SimpleQueue[str] = queue.SimpleQueue()
+        threading.Thread(
+            target=self._run,
+            name="glimmer-coordinator-activity",
+            daemon=True,
+        ).start()
+
+    def __call__(self, worker_state: str) -> None:
+        if worker_state not in {"ready", "busy"}:
+            raise ValueError("worker activity state is invalid")
+        self.events.put(worker_state)
+
+    def _run(self) -> None:
+        while True:
+            worker_state = self.events.get()
+            try:
+                send_coordinator_callback(
+                    {
+                        "schemaVersion": 1,
+                        "type": "heartbeat",
+                        "observedAt": utc_now(),
+                        "workerState": worker_state,
+                    },
+                    attempts=3,
+                    endpoint=self.endpoint,
+                    token=self.token,
+                )
+            except CallbackError:
+                # The independent watchdog and hard deadline remain authoritative.
+                # A transient callback failure must not corrupt the remote result.
+                continue
 
 
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -193,8 +241,22 @@ class ProcessJobRunner:
             "--",
             manifest.objective,
         ]
+        inherited_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "GLIMMER_COORDINATOR_CALLBACK_TOKEN",
+                "GLIMMER_WORKER_BOOTSTRAP_TOKEN",
+                "RUNPOD_API_KEY",
+                "CACHE_SIGNING_PRIVATE_KEY",
+                "JOB_ENCRYPTION_KEY",
+                "INGEST_TOKEN",
+                "WATCHDOG_INGEST_TOKEN",
+            }
+        }
         environment = {
-            **os.environ,
+            **inherited_environment,
             "GLIMMER_CTX": str(manifest.context_tokens),
             "GLIMMER_STATE_ROOT": str(job_dir),
             "GLIMMER_SESSION_ID": manifest.session_id,
@@ -246,6 +308,7 @@ class WorkerService:
         runner: Optional[ProcessJobRunner] = None,
         bootstrap_status_path: Optional[Path] = None,
         bootstrap_lease_id: Optional[str] = None,
+        activity_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         if not bootstrap_token or len(bootstrap_token) > 512:
             raise ValueError("worker bootstrap token is required")
@@ -261,6 +324,7 @@ class WorkerService:
         self.runner = runner or ProcessJobRunner(Path(__file__).resolve().parent)
         self.bootstrap_status_path = bootstrap_status_path
         self.bootstrap_lease_id = bootstrap_lease_id
+        self.activity_callback = activity_callback
         self.bootstrap = bootstrap_token.encode("utf-8")
         self.bootstrap_hash = hashlib.sha256(self.bootstrap).hexdigest()
         self.capability: Optional[bytes] = None
@@ -273,6 +337,15 @@ class WorkerService:
         self.lock = threading.RLock()
         self._load_secret_state()
         self._load_jobs()
+
+    def _notify_activity(self, worker_state: str) -> None:
+        if self.activity_callback is None:
+            return
+        try:
+            self.activity_callback(worker_state)
+        except Exception:
+            # Activity reporting is an availability signal, never result data.
+            return
 
     @property
     def secret_path(self) -> Path:
@@ -600,7 +673,9 @@ class WorkerService:
             state["state"] = "running"
             state["startedAt"] = utc_now()
             self._save_job(state)
-            return self._public_job(state)
+            result = self._public_job(state)
+        self._notify_activity("busy")
+        return result
 
     def _result_archive(
         self, job_id: str, workspace: Path, session_dir: Path, exit_code: int
@@ -700,6 +775,8 @@ class WorkerService:
                     state["exitCode"] = exit_code
                     self.running.pop(job_id, None)
                     self._save_job(state)
+        finally:
+            self._notify_activity("ready")
 
     def job_status(self, job_id: str) -> Dict[str, Any]:
         with self.lock:
@@ -759,6 +836,7 @@ class WorkerService:
             return self._public_job(state)
 
     def cancel_job(self, job_id: str) -> Dict[str, Any]:
+        notify_ready = False
         with self.lock:
             state = self.jobs.get(job_id)
             if not state:
@@ -772,8 +850,12 @@ class WorkerService:
             else:
                 state["state"] = "cancelled"
                 state["completedAt"] = utc_now()
+                notify_ready = True
             self._save_job(state)
-            return self._public_job(state)
+            result = self._public_job(state)
+        if notify_ready:
+            self._notify_activity("ready")
+        return result
 
 
 class WorkerRequestHandler(BaseHTTPRequestHandler):
@@ -991,6 +1073,17 @@ def main() -> int:
     context = int(os.environ.get("GLIMMER_CONTEXT_TOKENS", "65536"))
     bootstrap_status_file = os.environ.pop("GLIMMER_BOOTSTRAP_STATUS_FILE", "")
     bootstrap_lease_id = os.environ.pop("GLIMMER_LEASE_ID", "")
+    require_coordinator = os.environ.get("GLIMMER_REQUIRE_COORDINATOR_CALLBACK") == "1"
+    callback_endpoint = os.environ.pop("GLIMMER_COORDINATOR_CALLBACK_URL", "")
+    callback_token = os.environ.pop("GLIMMER_COORDINATOR_CALLBACK_TOKEN", "")
+    try:
+        activity_callback = (
+            CoordinatorActivityReporter(callback_endpoint, callback_token)
+            if require_coordinator
+            else None
+        )
+    except CallbackError as exc:
+        raise SystemExit("coordinator callback configuration is invalid") from exc
     if not bootstrap_status_file or not bootstrap_lease_id:
         raise SystemExit("bootstrap diagnostics are required")
     service = WorkerService(
@@ -1002,6 +1095,7 @@ def main() -> int:
         lambda: _model_ready(args.health_url, Path(args.ready_marker)),
         bootstrap_status_path=Path(bootstrap_status_file),
         bootstrap_lease_id=bootstrap_lease_id,
+        activity_callback=activity_callback,
     )
     server = GlimmerWorkerServer((args.host, args.port), service)
     print(canonical_json_bytes({"event": "worker_listening", "port": args.port}).decode("utf-8"))

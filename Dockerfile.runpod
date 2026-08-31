@@ -60,7 +60,7 @@ COPY glimmer-v2.py glimmer-engineer.py glimmer-visual.py /opt/glimmer/
 COPY glimmer_events.py glimmer_journal.py glimmer_models.py /opt/glimmer/
 COPY glimmer_memory.py glimmer_quality.py glimmer_semantic.py glimmer_verification.py /opt/glimmer/
 COPY glimmer_remote.py runpod_worker.py /opt/glimmer/
-COPY docker/runpod/bootstrap_status.py docker/runpod/fetch_artifact.py docker/runpod/healthcheck.py /opt/glimmer/docker/runpod/
+COPY docker/runpod/bootstrap_status.py docker/runpod/cache_manifest.py docker/runpod/coordinator_callback.py docker/runpod/fetch_artifact.py docker/runpod/healthcheck.py /opt/glimmer/docker/runpod/
 COPY docker/runpod/entrypoint.sh /opt/glimmer/docker/runpod/entrypoint.sh
 RUN chmod 0555 /opt/glimmer/docker/runpod/entrypoint.sh \
     && python3 -m py_compile /opt/glimmer/*.py /opt/glimmer/docker/runpod/*.py \
