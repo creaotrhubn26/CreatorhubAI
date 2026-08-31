@@ -45,6 +45,8 @@ export interface CoordinatorJobRequestV1 {
   };
   maxHourlyUsd: number;
   hardDeadlineAt: string;
+  gpuMaxRuntimeSeconds?: number;
+  maxTotalUsd?: number;
   idleTimeoutSeconds: number;
   gpuTypeId: string;
   bootstrapToken: string;
@@ -206,7 +208,14 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     "createAttempted",
     "cleanup",
   ];
-  exactOptionalKeys(raw, required, ["podId", "lastHeartbeatAt", "repairJobId", "failureCode"]);
+  exactOptionalKeys(raw, required, [
+    "podId",
+    "phaseDeadlineAt",
+    "lastHeartbeatAt",
+    "maxTotalUsd",
+    "repairJobId",
+    "failureCode",
+  ]);
   const cache = object(raw.cache);
   exactOptionalKeys(cache, ["state"], ["manifestSha256", "verifiedAt", "buildId", "volumeId"]);
   const cleanup = object(raw.cleanup);
@@ -231,6 +240,11 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     typeof raw.maxHourlyUsd !== "number" ||
     !Number.isFinite(raw.maxHourlyUsd) ||
     raw.maxHourlyUsd <= 0 ||
+    (raw.maxTotalUsd !== undefined &&
+      (typeof raw.maxTotalUsd !== "number" ||
+        !Number.isFinite(raw.maxTotalUsd) ||
+        raw.maxTotalUsd <= 0 ||
+        raw.maxTotalUsd > 100)) ||
     typeof raw.createAttempted !== "boolean" ||
     typeof cleanup.requested !== "boolean" ||
     typeof cleanup.confirmed !== "boolean" ||
@@ -259,10 +273,14 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     createdAt: timestamp(raw.createdAt, "coordinator job createdAt"),
     updatedAt: timestamp(raw.updatedAt, "coordinator job updatedAt"),
     hardDeadlineAt: timestamp(raw.hardDeadlineAt, "coordinator job hardDeadlineAt"),
+    ...(raw.phaseDeadlineAt !== undefined
+      ? { phaseDeadlineAt: timestamp(raw.phaseDeadlineAt, "coordinator job phaseDeadlineAt") }
+      : {}),
     ...(raw.lastHeartbeatAt !== undefined
       ? { lastHeartbeatAt: timestamp(raw.lastHeartbeatAt, "coordinator job lastHeartbeatAt") }
       : {}),
     maxHourlyUsd: raw.maxHourlyUsd,
+    ...(typeof raw.maxTotalUsd === "number" ? { maxTotalUsd: raw.maxTotalUsd } : {}),
     cache: {
       state: cache.state as ComputeCoordinatorJobV1["cache"]["state"],
       ...(typeof cache.manifestSha256 === "string" ? { manifestSha256: cache.manifestSha256 } : {}),

@@ -243,9 +243,68 @@ describe("cloud coordinator ingress", () => {
     expect(status.status).toBe(503);
     expect(await status.json()).toEqual({ error: "COORDINATOR_NOT_CONFIGURED" });
   });
+
+  it("accepts only a GPU phase runtime whose hourly ceiling plus delete margin fits its total cap", async () => {
+    const accepted = coordinator().instance;
+    const path = `/v1/jobs/${JOB_ID}`;
+    const bounded = await accepted.fetch(
+      signedRequest(
+        "PUT",
+        path,
+        jobRequest({
+          maxHourlyUsd: 2.09,
+          gpuMaxRuntimeSeconds: 480,
+          maxTotalUsd: 0.35,
+        }),
+      ),
+    );
+    expect(bounded.status).toBe(202);
+    expect(await bounded.json()).toMatchObject({
+      phaseDeadlineAt: new Date(NOW + 1_680_000).toISOString(),
+      maxHourlyUsd: 2.09,
+      maxTotalUsd: 0.35,
+    });
+
+    const rejected = coordinator().instance;
+    const overBudget = await rejected.fetch(
+      signedRequest(
+        "PUT",
+        path,
+        jobRequest({
+          maxHourlyUsd: 2.09,
+          gpuMaxRuntimeSeconds: 480,
+          maxTotalUsd: 0.34,
+        }),
+      ),
+    );
+    expect(overBudget.status).toBe(400);
+    expect(await overBudget.json()).toEqual({ error: "INVALID_GPU_BUDGET" });
+  });
 });
 
 describe("cache-gated lifecycle", () => {
+  it("starts the GPU phase with its own bounded deadline instead of the outer cache deadline", async () => {
+    const { instance } = coordinator();
+    const job = {
+      jobId: JOB_ID,
+      hardDeadlineAt: new Date(NOW + 3_600_000).toISOString(),
+      internal: {
+        request: { gpuMaxRuntimeSeconds: 480 },
+        createIntentAt: "stale",
+        callbackTokenHash: "stale",
+        exitObservedAt: "stale",
+        workerObservedAt: "stale",
+        repairRequested: false,
+      },
+    };
+
+    await instance.transitionToGpu(job);
+
+    expect(job.phase).toBe("gpu_worker");
+    expect(job.currentDeadlineAt).toBe(new Date(NOW + 480_000).toISOString());
+    expect(job.state).toBe("cache_ready");
+  });
+
   it("starts CPU first, signs in the coordinator, and starts GPU only after publication", async () => {
     const { instance } = coordinator();
     const creates = [];

@@ -2906,8 +2906,12 @@ export interface ComputeCoordinatorJobV1 {
   createdAt: string;
   updatedAt: string;
   hardDeadlineAt: string;
+  /** Phase-local deadline when the coordinator applies a stricter repair/worker cap. */
+  phaseDeadlineAt?: string;
   lastHeartbeatAt?: string;
   maxHourlyUsd: number;
+  /** Optional conservative total ceiling for the GPU phase, including deletion margin. */
+  maxTotalUsd?: number;
   cache: ComputeCacheStatusV1;
   createAttempted: boolean;
   cleanup: {

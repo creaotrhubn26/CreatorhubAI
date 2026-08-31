@@ -398,7 +398,15 @@ function parseJobRequest(value, jobId, nowMs) {
     "maxHourlyUsd",
     "hardDeadlineAt",
   ];
-  if (!exactKeys(value, required, ["gpuTypeId", "bootstrapToken", "idleTimeoutSeconds"]))
+  if (
+    !exactKeys(value, required, [
+      "gpuTypeId",
+      "bootstrapToken",
+      "idleTimeoutSeconds",
+      "gpuMaxRuntimeSeconds",
+      "maxTotalUsd",
+    ])
+  )
     throw new Error("INVALID_JOB_SHAPE");
   if (
     value.schemaVersion !== 1 ||
@@ -442,7 +450,29 @@ function parseJobRequest(value, jobId, nowMs) {
     ) {
       throw new Error("INVALID_GPU_JOB");
     }
-  } else if (value.gpuTypeId !== undefined || value.bootstrapToken !== undefined) {
+    const hasPhaseBudget =
+      value.gpuMaxRuntimeSeconds !== undefined || value.maxTotalUsd !== undefined;
+    if (
+      hasPhaseBudget &&
+      (!Number.isInteger(value.gpuMaxRuntimeSeconds) ||
+        value.gpuMaxRuntimeSeconds < 60 ||
+        value.gpuMaxRuntimeSeconds > 86_400 ||
+        typeof value.maxTotalUsd !== "number" ||
+        !Number.isFinite(value.maxTotalUsd) ||
+        value.maxTotalUsd <= 0 ||
+        value.maxTotalUsd > 100 ||
+        (value.maxHourlyUsd * (value.gpuMaxRuntimeSeconds + WATCHDOG_DELETE_SAFETY_SECONDS)) /
+          3600 >
+          value.maxTotalUsd)
+    ) {
+      throw new Error("INVALID_GPU_BUDGET");
+    }
+  } else if (
+    value.gpuTypeId !== undefined ||
+    value.bootstrapToken !== undefined ||
+    value.gpuMaxRuntimeSeconds !== undefined ||
+    value.maxTotalUsd !== undefined
+  ) {
     throw new Error("INVALID_CPU_JOB");
   }
   const idleTimeoutSeconds = value.idleTimeoutSeconds ?? 300;
@@ -474,6 +504,10 @@ function parseJobRequest(value, jobId, nowMs) {
     idleTimeoutSeconds,
     ...(value.gpuTypeId ? { gpuTypeId: value.gpuTypeId } : {}),
     ...(value.bootstrapToken ? { bootstrapToken: value.bootstrapToken } : {}),
+    ...(value.gpuMaxRuntimeSeconds !== undefined
+      ? { gpuMaxRuntimeSeconds: value.gpuMaxRuntimeSeconds }
+      : {}),
+    ...(value.maxTotalUsd !== undefined ? { maxTotalUsd: value.maxTotalUsd } : {}),
   };
 }
 
@@ -545,8 +579,12 @@ function publicJob(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     hardDeadlineAt: job.hardDeadlineAt,
+    phaseDeadlineAt: job.currentDeadlineAt,
     ...(job.lastHeartbeatAt ? { lastHeartbeatAt: job.lastHeartbeatAt } : {}),
     maxHourlyUsd: job.maxHourlyUsd,
+    ...(job.internal.request.maxTotalUsd !== undefined
+      ? { maxTotalUsd: job.internal.request.maxTotalUsd }
+      : {}),
     cache: { ...job.cache },
     createAttempted: job.createAttempted,
     cleanup: { ...job.cleanup },
@@ -1240,7 +1278,14 @@ export class ComputeCoordinator {
   async transitionToGpu(job) {
     job.phase = "gpu_worker";
     job.currentLeaseId = job.jobId;
-    job.currentDeadlineAt = job.hardDeadlineAt;
+    job.currentDeadlineAt = new Date(
+      Math.min(
+        Date.parse(job.hardDeadlineAt),
+        job.internal.request.gpuMaxRuntimeSeconds
+          ? Date.now() + job.internal.request.gpuMaxRuntimeSeconds * 1000
+          : Date.parse(job.hardDeadlineAt),
+      ),
+    ).toISOString();
     job.podName = `glimmer-gpu-${job.jobId}`;
     job.podId = undefined;
     job.createAttempted = false;
