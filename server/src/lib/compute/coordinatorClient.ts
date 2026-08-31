@@ -215,6 +215,7 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     "lastHeartbeatAt",
     "maxTotalUsd",
     "repairJobId",
+    "waitingReason",
     "failureCode",
   ]);
   const cache = object(raw.cache);
@@ -238,6 +239,9 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     (raw.podId !== undefined && (typeof raw.podId !== "string" || !SAFE_ID.test(raw.podId))) ||
     (raw.repairJobId !== undefined &&
       (typeof raw.repairJobId !== "string" || !SAFE_JOB_ID.test(raw.repairJobId))) ||
+    (raw.waitingReason !== undefined &&
+      raw.waitingReason !== "GPU_UNAVAILABLE" &&
+      raw.waitingReason !== "RUNPOD_TRANSPORT_ERROR") ||
     typeof raw.maxHourlyUsd !== "number" ||
     !Number.isFinite(raw.maxHourlyUsd) ||
     raw.maxHourlyUsd <= 0 ||
@@ -294,6 +298,9 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     createAttempted: raw.createAttempted,
     cleanup: { requested: cleanup.requested, confirmed: cleanup.confirmed },
     ...(typeof raw.repairJobId === "string" ? { repairJobId: raw.repairJobId } : {}),
+    ...(raw.waitingReason === "GPU_UNAVAILABLE" || raw.waitingReason === "RUNPOD_TRANSPORT_ERROR"
+      ? { waitingReason: raw.waitingReason }
+      : {}),
     ...(typeof raw.failureCode === "string" ? { failureCode: raw.failureCode } : {}),
   };
   return parsed;

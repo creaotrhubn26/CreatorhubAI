@@ -589,6 +589,7 @@ function publicJob(job) {
     createAttempted: job.createAttempted,
     cleanup: { ...job.cleanup },
     ...(job.repairJobId ? { repairJobId: job.repairJobId } : {}),
+    ...(job.waitingReason ? { waitingReason: job.waitingReason } : {}),
     ...(job.failureCode ? { failureCode: job.failureCode } : {}),
   };
 }
@@ -1238,6 +1239,7 @@ export class ComputeCoordinator {
       });
     }
     await this.upsertWatchdog(job, config);
+    job.waitingReason = undefined;
     job.state = "watchdog_registered";
     job.createAttempted = true;
     job.internal.createIntentAt = new Date().toISOString();
@@ -1446,9 +1448,11 @@ export class ComputeCoordinator {
         // Availability is transient. Keep this cloud-owned job cost-free and
         // retry on the normal alarm cadence; never widen the GPU, DC, or cap.
         job.state = "waiting_for_capacity";
+        job.waitingReason = error.code;
         job.failureCode = undefined;
         job.internal.repairAllocation = null;
       } else {
+        job.waitingReason = undefined;
         job.failureCode =
           error instanceof RunPodV2Error
             ? error.code

@@ -412,7 +412,9 @@ export class ComputeController {
       detail:
         job.failureCode ??
         (job.state === "waiting_for_capacity"
-          ? "The cloud coordinator is waiting cost-free for the exact bounded repair GPU in the volume data center."
+          ? job.waitingReason === "RUNPOD_TRANSPORT_ERROR"
+            ? "The cloud coordinator is retrying a safe provider read before any resource is created."
+            : "The cloud coordinator is waiting cost-free for the exact bounded repair GPU in the volume data center."
           : job.phase === "cache_repair"
             ? job.cache.state === "ready"
               ? "The signed model cache is ready; the coordinator is handing off to GPU compute."

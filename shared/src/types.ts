@@ -2920,6 +2920,8 @@ export interface ComputeCoordinatorJobV1 {
     confirmed: boolean;
   };
   repairJobId?: string;
+  /** Closed, secret-free reason while no provider mutation has been attempted. */
+  waitingReason?: "GPU_UNAVAILABLE" | "RUNPOD_TRANSPORT_ERROR";
   failureCode?: string;
 }
 

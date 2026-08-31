@@ -620,10 +620,12 @@ describe("cache-gated lifecycle", () => {
       .mockRejectedValueOnce(new RunPodV2TransportError("GPU catalog lookup"));
 
     await instance.alarm();
+    expect((await instance.getJob(JOB_ID)).waitingReason).toBe("GPU_UNAVAILABLE");
     await instance.alarm();
 
     expect(await instance.getJob(JOB_ID)).toMatchObject({
       state: "waiting_for_capacity",
+      waitingReason: "RUNPOD_TRANSPORT_ERROR",
       phase: "cache_repair",
       createAttempted: false,
       cleanup: { requested: false, confirmed: false },
