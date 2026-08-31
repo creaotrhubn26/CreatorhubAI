@@ -652,7 +652,10 @@ export function parseRunPodV2GpuCatalog(value) {
     return {
       id,
       name,
-      memoryGb: integer(gpu.memory, "INVALID_GPU_CATALOG", "GPU memory", 1, 1_000_000),
+      // RunPod includes a non-Secure, unavailable `unknown` placeholder with
+      // zero memory in the v2 catalog. Preserve the catalog value here and
+      // let the exact Secure/in-stock selector reject the placeholder.
+      memoryGb: integer(gpu.memory, "INVALID_GPU_CATALOG", "GPU memory", 0, 1_000_000),
       secure: gpu.secure,
       secureHourlyUsd,
       availability,
