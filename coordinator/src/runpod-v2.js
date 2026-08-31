@@ -831,7 +831,9 @@ export class RunPodV2Client {
           }),
           body,
           signal: timeout.signal,
-          redirect: "error",
+          // Cloudflare Workers does not support `error`. `manual` still
+          // follows no redirect, and every 3xx fails the status allowlist.
+          redirect: "manual",
         });
       } catch {
         throw new RunPodV2TransportError(operation, method === "POST");

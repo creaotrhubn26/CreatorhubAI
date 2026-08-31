@@ -434,6 +434,7 @@ describe("RunPod v2 HTTP client", () => {
           url,
           method: options.method,
           authorization: options.headers.get("Authorization"),
+          redirect: options.redirect,
         });
         if (url.endsWith("/network-volumes/volume_1")) {
           return Response.json({
@@ -513,6 +514,7 @@ describe("RunPod v2 HTTP client", () => {
       "DELETE",
     ]);
     expect(calls.every((call) => call.authorization === `Bearer ${API_KEY}`)).toBe(true);
+    expect(calls.every((call) => call.redirect === "manual")).toBe(true);
   });
 
   it("sends exactly one POST and returns a parsed, secret-free exact Pod", async () => {
