@@ -1,6 +1,6 @@
 import { createHmac, webcrypto } from "node:crypto";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { RunPodV2Error } from "./runpod-v2.js";
+import { RunPodV2Error, RunPodV2TransportError } from "./runpod-v2.js";
 import { ComputeCoordinator } from "./worker.js";
 
 const NOW = Date.parse("2026-08-31T12:00:00.000Z");
@@ -610,13 +610,16 @@ describe("cache-gated lifecycle", () => {
     const { instance, storage } = coordinator();
     const path = `/v1/jobs/${JOB_ID}`;
     await instance.fetch(signedRequest("PUT", path, jobRequest()));
-    vi.spyOn(instance, "advance").mockRejectedValueOnce(
-      new RunPodV2Error(
-        "GPU_UNAVAILABLE",
-        "the exact Secure GPU is unavailable at the volume data center within the ceiling",
-      ),
-    );
+    vi.spyOn(instance, "advance")
+      .mockRejectedValueOnce(
+        new RunPodV2Error(
+          "GPU_UNAVAILABLE",
+          "the exact Secure GPU is unavailable at the volume data center within the ceiling",
+        ),
+      )
+      .mockRejectedValueOnce(new RunPodV2TransportError("GPU catalog lookup"));
 
+    await instance.alarm();
     await instance.alarm();
 
     expect(await instance.getJob(JOB_ID)).toMatchObject({
@@ -721,9 +724,6 @@ describe("cache-gated lifecycle", () => {
       "fetch",
       vi.fn(async (url, init = {}) => {
         const target = String(url);
-        if (target.endsWith("/v2/pods?includeClusterPods=true")) {
-          return Response.json({ pods: [] });
-        }
         if (target.startsWith("https://watchdog.example/") && init.method === "DELETE") {
           return Response.json({ deleted: true, leaseId: job.currentLeaseId });
         }

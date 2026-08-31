@@ -1106,7 +1106,10 @@ export class ComputeCoordinator {
 
   async cleanupCurrent(job, client, config) {
     job.cleanup.requested = true;
-    if (!job.podId) {
+    if (!job.podId && job.createAttempted === false) {
+      // No provider mutation was attempted, so a Pod cannot exist. Avoid
+      // making cleanup depend on a provider that may currently be unreachable.
+    } else if (!job.podId) {
       const matches = (await client.listPods()).filter((pod) => pod.name === job.podName);
       if (matches.length > 1) throw new Error("DUPLICATE_CREATE_OUTCOME");
       if (matches.length === 1) {
@@ -1433,7 +1436,7 @@ export class ComputeCoordinator {
     } catch (error) {
       const waitingForBoundedRepairCapacity =
         error instanceof RunPodV2Error &&
-        error.code === "GPU_UNAVAILABLE" &&
+        (error.code === "GPU_UNAVAILABLE" || error.code === "RUNPOD_TRANSPORT_ERROR") &&
         job.kind === "gpu_worker" &&
         job.phase === "cache_repair" &&
         job.createAttempted === false &&
