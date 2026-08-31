@@ -249,7 +249,7 @@ describe("cache-gated lifecycle", () => {
             id: "volume-1",
             dataCenter: "EU-RO-1",
             size: 30,
-            type: "NETWORK",
+            type: "STANDARD",
           });
         }
         if (target.endsWith("/registries/registry-1")) {

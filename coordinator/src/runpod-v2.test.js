@@ -8,6 +8,7 @@ import {
   buildCpuCacheCreateRequest,
   buildGpuWorkerCreateRequest,
   parseRunPodV2CpuCatalog,
+  parseRunPodV2NetworkVolume,
   parseRunPodV2Pod,
   selectCpuOffer,
   validateRunPodV2Configuration,
@@ -173,6 +174,57 @@ describe("RunPod v2 create request builders", () => {
 });
 
 describe("RunPod v2 provider parsing and CPU selection", () => {
+  it("parses documented NONE availability without treating it as rentable stock", () => {
+    const cpus = parseRunPodV2CpuCatalog({
+      cpus: [
+        {
+          id: "cpu3c",
+          vcpu: { min: 2, max: 32 },
+          price: { securePerVcpu: 0.03 },
+          availability: "NONE",
+        },
+      ],
+    });
+    expect(cpus).toEqual([
+      {
+        id: "cpu3c",
+        minimumVcpu: 2,
+        maximumVcpu: 32,
+        securePerVcpu: 0.03,
+        availability: "NONE",
+        dataCenters: [],
+      },
+    ]);
+    expectCode(
+      () => selectCpuOffer(cpus, { dataCenterId: "EUR-IS-1", maxHourlyUsd: 0.1 }),
+      "CPU_UNAVAILABLE",
+    );
+  });
+
+  it("accepts only the documented standard and high-performance network volume tiers", () => {
+    for (const type of ["STANDARD", "HIGH_PERFORMANCE"]) {
+      expect(
+        parseRunPodV2NetworkVolume(
+          { id: "volume_1", type, size: 30, dataCenter: "EUR-IS-1" },
+          "volume_1",
+        ),
+      ).toEqual({
+        id: "volume_1",
+        dataCenterId: "EUR-IS-1",
+        sizeGb: 30,
+        type,
+      });
+    }
+    expectCode(
+      () =>
+        parseRunPodV2NetworkVolume(
+          { id: "volume_1", type: "NETWORK", size: 30, dataCenter: "EUR-IS-1" },
+          "volume_1",
+        ),
+      "INVALID_NETWORK_VOLUME",
+    );
+  });
+
   it("returns a secret-free Pod projection and requires exactly one compute type", () => {
     const request = gpuRequest();
     const pod = parseRunPodV2Pod(providerPod(request));
@@ -259,7 +311,7 @@ describe("RunPod v2 HTTP client", () => {
         if (url.endsWith("/network-volumes/volume_1")) {
           return Response.json({
             id: "volume_1",
-            type: "NETWORK",
+            type: "STANDARD",
             size: 200,
             dataCenter: "EU-RO-1",
           });
@@ -297,7 +349,7 @@ describe("RunPod v2 HTTP client", () => {
       id: "volume_1",
       dataCenterId: "EU-RO-1",
       sizeGb: 200,
-      type: "NETWORK",
+      type: "STANDARD",
     });
     await expect(client.getRegistry("registry_1")).resolves.toEqual({
       id: "registry_1",
@@ -400,7 +452,7 @@ describe("RunPod v2 HTTP client", () => {
       fetchImpl: async () =>
         Response.json({
           id: "other_volume",
-          type: "NETWORK",
+          type: "STANDARD",
           size: 200,
           dataCenter: "EU-RO-1",
         }),

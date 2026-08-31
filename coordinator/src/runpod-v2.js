@@ -29,7 +29,9 @@ const POD_STATUSES = new Set([
   "TERMINATED",
   "DELETING",
 ]);
-const AVAILABILITY = new Set(["LOW", "MEDIUM", "HIGH"]);
+const AVAILABILITY_LEVELS = new Set(["NONE", "LOW", "MEDIUM", "HIGH"]);
+const IN_STOCK_AVAILABILITY = new Set(["LOW", "MEDIUM", "HIGH"]);
+const NETWORK_VOLUME_TYPES = new Set(["STANDARD", "HIGH_PERFORMANCE"]);
 const AVAILABILITY_RANK = Object.freeze({ HIGH: 0, MEDIUM: 1, LOW: 2 });
 
 export const RUNPOD_V2_DEFAULT_BASE_URL = DEFAULT_BASE_URL;
@@ -419,7 +421,9 @@ export function parseRunPodV2NetworkVolume(value, expectedId) {
     fail("INVALID_NETWORK_VOLUME", "network volume identity does not match the request");
   }
   const type = boundedText(raw.type, "INVALID_NETWORK_VOLUME", "network volume type", 64);
-  if (type !== "NETWORK") fail("INVALID_NETWORK_VOLUME", "network volume type is invalid");
+  if (!NETWORK_VOLUME_TYPES.has(type)) {
+    fail("INVALID_NETWORK_VOLUME", "network volume type is invalid");
+  }
   return {
     id,
     dataCenterId: validateDataCenterId(raw.dataCenter, "INVALID_NETWORK_VOLUME"),
@@ -479,7 +483,7 @@ export function parseRunPodV2CpuCatalog(value) {
         "CPU availability",
         16,
       );
-      if (!AVAILABILITY.has(availability)) {
+      if (!AVAILABILITY_LEVELS.has(availability)) {
         fail("INVALID_CPU_CATALOG", "CPU availability is invalid");
       }
       return {
@@ -496,7 +500,7 @@ export function parseRunPodV2CpuCatalog(value) {
       "CPU global availability",
       16,
     );
-    if (!AVAILABILITY.has(availability)) {
+    if (!AVAILABILITY_LEVELS.has(availability)) {
       fail("INVALID_CPU_CATALOG", "CPU global availability is invalid");
     }
     return {
@@ -538,12 +542,12 @@ export function selectRunPodV2CpuOffer(cpus, { dataCenterId, maxHourlyUsd } = {}
         typeof cpu !== "object" ||
         cpu.minimumVcpu > VCPU_COUNT ||
         cpu.maximumVcpu < VCPU_COUNT ||
-        !AVAILABILITY.has(cpu.availability)
+        !IN_STOCK_AVAILABILITY.has(cpu.availability)
       ) {
         return [];
       }
       const exactCenter = cpu.dataCenters?.find((center) => center.id === dataCenter);
-      if (!exactCenter || !AVAILABILITY.has(exactCenter.availability)) return [];
+      if (!exactCenter || !IN_STOCK_AVAILABILITY.has(exactCenter.availability)) return [];
       const hourlyUsd = cpu.securePerVcpu * VCPU_COUNT;
       if (!Number.isFinite(hourlyUsd) || hourlyUsd <= 0 || hourlyUsd > ceiling) return [];
       return [
