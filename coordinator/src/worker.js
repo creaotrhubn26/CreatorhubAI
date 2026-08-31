@@ -536,7 +536,9 @@ async function watchdogRequest(env, config, method, path, body = "") {
       "X-Glimmer-Signature": `v1=${signature}`,
     },
     ...(body ? { body } : {}),
-    redirect: "error",
+    // Cloudflare's edge Request implementation does not support `error`.
+    // `manual` still fails closed below because every redirect is non-2xx.
+    redirect: "manual",
   };
   const result =
     env.WATCHDOG && typeof env.WATCHDOG.fetch === "function"
@@ -711,7 +713,19 @@ export class ComputeCoordinator {
         validTimestamp(watchdog.checkedAt) &&
         validTimestamp(watchdog.lastSweepAt),
       );
-    } catch {
+    } catch (error) {
+      const code =
+        error instanceof Error && /^[A-Z0-9_]{1,120}$/.test(error.message)
+          ? error.message
+          : "WATCHDOG_STATUS_UNAVAILABLE";
+      const diagnostic =
+        error instanceof Error
+          ? `${error.name}:${error.message}`
+              .replace(/rpa_[A-Za-z0-9_-]+/g, "rpa_[redacted]")
+              .replace(/[A-Za-z0-9_-]{64,}/g, "[redacted]")
+              .slice(0, 240)
+          : "unknown";
+      console.warn("[coordinator] watchdog status check failed", code, diagnostic);
       watchdogReady = false;
     }
     const activeJobId = (await this.storage.get(ACTIVE_JOB_KEY)) ?? null;

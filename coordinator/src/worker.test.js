@@ -142,6 +142,7 @@ describe("cloud coordinator ingress", () => {
     const watchdogFetch = vi.fn(async (request) => {
       expect(request).toBeInstanceOf(Request);
       expect(new URL(request.url).pathname).toBe("/v1/status");
+      expect(request.redirect).toBe("manual");
       expect(request.headers.get("X-Glimmer-Signature")).toMatch(/^v1=[a-f0-9]{64}$/);
       return Response.json({
         service: "glimmer-compute-watchdog",
