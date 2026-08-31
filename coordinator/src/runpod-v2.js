@@ -613,7 +613,7 @@ export function parseRunPodV2GpuCatalog(value) {
       price.secure,
       "INVALID_GPU_CATALOG",
       "Secure GPU price",
-      Number.MIN_VALUE,
+      0,
       10_000,
     );
     const availability = boundedText(

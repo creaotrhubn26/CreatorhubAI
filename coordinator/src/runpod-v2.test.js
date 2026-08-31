@@ -348,6 +348,14 @@ describe("RunPod v2 GPU catalog selection", () => {
           availability: "LOW",
           dataCenters: [{ id: "EUR-IS-1", name: "EUR-IS-1", availability: "LOW" }],
         },
+        {
+          id: "NVIDIA GeForce RTX 3070",
+          name: "RTX 3070",
+          memory: 8,
+          secure: false,
+          price: { secure: 0, community: 0.2 },
+          availability: "NONE",
+        },
       ],
     });
 
@@ -365,6 +373,26 @@ describe("RunPod v2 GPU catalog selection", () => {
       dataCenterId: "EUR-IS-1",
       dataCenterAvailability: "LOW",
     });
+  });
+
+  it("parses the documented numeric zero price but never treats a non-Secure GPU as stock", () => {
+    const gpus = catalog();
+    expect(gpus.at(-1)).toMatchObject({
+      id: "NVIDIA GeForce RTX 3070",
+      secure: false,
+      secureHourlyUsd: 0,
+      availability: "NONE",
+      dataCenters: [],
+    });
+    expectCode(
+      () =>
+        selectGpuOffer(gpus, {
+          gpuTypeId: "NVIDIA GeForce RTX 3070",
+          dataCenterId: "EUR-IS-1",
+          maxHourlyUsd: 0.49,
+        }),
+      "GPU_UNAVAILABLE",
+    );
   });
 
   it("fails closed for another GPU, data center, exhausted stock, or insufficient ceiling", () => {
