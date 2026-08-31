@@ -10,6 +10,8 @@ export interface ComputeLeaseV1 {
   profileId: string;
   podName: string;
   podId?: string;
+  orchestrationMode?: "local_gateway" | "cloud_coordinator";
+  coordinatorJobId?: string;
   state: ComputeRunState;
   createdAt: string;
   updatedAt: string;
@@ -38,6 +40,13 @@ function isLease(value: unknown): value is ComputeLeaseV1 {
     typeof raw.profileId === "string" &&
     typeof raw.podName === "string" &&
     (!raw.podId || /^[A-Za-z0-9_-]{1,191}$/.test(raw.podId)) &&
+    (raw.orchestrationMode === undefined ||
+      raw.orchestrationMode === "local_gateway" ||
+      raw.orchestrationMode === "cloud_coordinator") &&
+    (raw.coordinatorJobId === undefined ||
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+        raw.coordinatorJobId,
+      )) &&
     typeof raw.state === "string" &&
     validTimestamp(raw.createdAt) &&
     validTimestamp(raw.updatedAt) &&

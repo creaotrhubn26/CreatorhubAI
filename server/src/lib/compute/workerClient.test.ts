@@ -120,6 +120,21 @@ describe("WorkerClient", () => {
         artifact: { kind: "model", bytesCompleted: 268_435_456 },
       },
     });
+    expect(
+      parseWorkerHealth({
+        ...health(false),
+        schemaVersion: 2,
+        bootstrap: {
+          stage: "cache_checking",
+          outcome: "in_progress",
+          stageStartedAt: "2026-08-29T10:00:00Z",
+          updatedAt: "2026-08-29T10:00:01Z",
+        },
+      }),
+    ).toMatchObject({
+      protocolVersion: 2,
+      bootstrap: { stage: "cache_checking" },
+    });
   });
 
   it("rejects forged or unbounded health V2 diagnostics", () => {

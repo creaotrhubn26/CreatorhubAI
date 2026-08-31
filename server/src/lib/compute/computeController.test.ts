@@ -18,6 +18,8 @@ const config: ComputeConfigV1 = {
   defaultBackend: "runpod_pod",
   activeProfileId: "runpod-a100",
   source: "saved",
+  orchestrationMode: "local_gateway",
+  coordinator: { hasIngestToken: false },
   watchdog: {
     endpointUrl: "https://watchdog.example",
     hasIngestToken: true,
@@ -35,6 +37,7 @@ const config: ComputeConfigV1 = {
       gpuCount: 1,
       contextTokens: 65_536,
       imageDigest: `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`,
+      workerBuildId: "r2-aaaaaaaaaaaa",
       containerRegistryAuthId: "registry_auth_1",
       networkVolumeId: "volume_1",
       modelArtifacts: {
@@ -93,6 +96,9 @@ function harness(options: {
   watchdogStatusFailure?: Error;
   watchdogUpsertFailure?: Error;
   watchdogIdentityFailure?: Error;
+  coordinatorStatusFailure?: Error;
+  coordinatorPutFailure?: Error;
+  coordinatorJob?: any;
   saveLeaseFailureCall?: number;
   readUsageFailureCall?: number;
   beginUsageFailure?: Error;
@@ -194,6 +200,54 @@ function harness(options: {
         : vi.fn().mockResolvedValue(undefined),
     deleteLease: vi.fn().mockResolvedValue(undefined),
   };
+  const coordinatorJob = options.coordinatorJob ?? {
+    schemaVersion: 1,
+    jobId: "12345678-1234-4123-8123-123456789abc",
+    kind: "gpu_worker",
+    state: "accepted",
+    phase: "cache_repair",
+    cacheKey: "e".repeat(64),
+    requestFingerprint: "f".repeat(64),
+    podName: "glimmer-cache-12345678-1234-4123-8123-123456789abc",
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString(),
+    hardDeadlineAt: new Date(NOW.getTime() + 7_200_000).toISOString(),
+    maxHourlyUsd: 1.75,
+    cache: { state: "missing" },
+    createAttempted: false,
+    cleanup: { requested: false, confirmed: false },
+  };
+  const coordinatorClient = {
+    status: options.coordinatorStatusFailure
+      ? vi.fn().mockRejectedValue(options.coordinatorStatusFailure)
+      : vi.fn().mockResolvedValue({
+          service: "glimmer-compute-coordinator",
+          schemaVersion: 1,
+          ready: true,
+          checkedAt: NOW.toISOString(),
+          providerApiVersion: "v2",
+          watchdogReady: true,
+          activeJobId: null,
+          cacheSigning: {
+            algorithm: "Ed25519",
+            keyId: "a".repeat(64),
+            publicKey: "A".repeat(43),
+          },
+        }),
+    putJob: options.coordinatorPutFailure
+      ? vi.fn().mockRejectedValue(options.coordinatorPutFailure)
+      : vi.fn().mockImplementation(async (request: any) => ({
+          ...coordinatorJob,
+          jobId: request.jobId,
+          podName: `glimmer-cache-${request.jobId}`,
+        })),
+    getJob: vi.fn().mockResolvedValue(coordinatorJob),
+    deleteJob: vi.fn().mockResolvedValue({
+      ...coordinatorJob,
+      state: "terminating",
+      cleanup: { requested: true, confirmed: false },
+    }),
+  };
   const storeWorkerHandshake = vi.fn().mockImplementation(async (id: string) => ({
     version: 1,
     leaseId: id,
@@ -242,6 +296,11 @@ function harness(options: {
       ingestToken: "watchdog_ingest_token_with_32_chars_minimum",
     }),
     markWatchdogVerified: vi.fn(),
+    readCoordinatorAccess: vi.fn().mockResolvedValue({
+      endpointUrl: "https://coordinator.example",
+      ingestToken: "C".repeat(43),
+    }),
+    markCoordinatorVerified: vi.fn(),
     readLease: vi.fn().mockImplementation(async () => currentLease),
     saveLease,
     updateLease: vi.fn().mockImplementation(async (mutate: any) => {
@@ -262,6 +321,7 @@ function harness(options: {
     storeReconciledUsage: vi.fn(),
     clientFactory: () => fakeClient as any,
     watchdogFactory: vi.fn().mockReturnValue(watchdogClient),
+    coordinatorFactory: vi.fn().mockReturnValue(coordinatorClient),
     workerFactory: vi.fn().mockReturnValue(workerClient),
     createWorkerSecret: vi.fn().mockImplementation(async (id: string) => ({
       version: 1,
@@ -287,6 +347,7 @@ function harness(options: {
     fakeClient,
     workerClient,
     watchdogClient,
+    coordinatorClient,
     saveLease,
     saveConfig,
     readApiKey,
@@ -302,6 +363,95 @@ function harness(options: {
     },
   };
 }
+
+function cloudConfig(): ComputeConfigV1 {
+  return {
+    ...config,
+    orchestrationMode: "cloud_coordinator",
+    coordinator: {
+      endpointUrl: "https://coordinator.example",
+      hasIngestToken: true,
+      verifiedAt: NOW.toISOString(),
+      cacheSigningKeyId: "a".repeat(64),
+    },
+    profiles: config.profiles.map((profile) => ({
+      ...profile,
+      workerBuildId: "r2-aaaaaaaaaaaa",
+      watchdogConfigured: false,
+    })),
+  };
+}
+
+describe("ComputeController cloud coordinator mode", () => {
+  it("submits one durable coordinator job and never creates a Pod from the Mac", async () => {
+    const { controller, coordinatorClient, fakeClient, currentLease } = harness({
+      currentLease: null,
+      currentConfig: cloudConfig(),
+    });
+
+    const result = await controller.start();
+
+    expect(result.started).toBe(true);
+    expect(result.status.coordinatorJob).toMatchObject({ phase: "cache_repair" });
+    expect(coordinatorClient.putJob).toHaveBeenCalledTimes(1);
+    expect(coordinatorClient.putJob.mock.calls[0][0]).toMatchObject({
+      kind: "gpu_worker",
+      buildId: "r2-aaaaaaaaaaaa",
+      networkVolumeId: "volume_1",
+      maxHourlyUsd: 1.75,
+    });
+    expect(coordinatorClient.putJob.mock.calls[0][0].bootstrapToken).toHaveLength(43);
+    expect(fakeClient.createPod).not.toHaveBeenCalled();
+    expect(currentLease()).toMatchObject({
+      orchestrationMode: "cloud_coordinator",
+      coordinatorJobId: expect.any(String),
+    });
+  });
+
+  it("reads and stops through the coordinator without direct provider mutation", async () => {
+    const coordinatorJob = {
+      schemaVersion: 1,
+      jobId: "12345678-1234-4123-8123-123456789abc",
+      kind: "gpu_worker",
+      state: "running",
+      phase: "gpu_worker",
+      cacheKey: "e".repeat(64),
+      requestFingerprint: "f".repeat(64),
+      podName: "glimmer-gpu-12345678-1234-4123-8123-123456789abc",
+      podId: "pod_cloud_1",
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString(),
+      hardDeadlineAt: new Date(NOW.getTime() + 7_200_000).toISOString(),
+      maxHourlyUsd: 1.75,
+      cache: { state: "ready", buildId: "r2-aaaaaaaaaaaa", volumeId: "volume_1" },
+      createAttempted: true,
+      cleanup: { requested: false, confirmed: false },
+    };
+    const { controller, coordinatorClient, deletePod } = harness({
+      currentConfig: cloudConfig(),
+      currentLease: lease({
+        id: coordinatorJob.jobId,
+        podId: undefined,
+        podName: coordinatorJob.podName,
+        orchestrationMode: "cloud_coordinator",
+        coordinatorJobId: coordinatorJob.jobId,
+      }),
+      coordinatorJob,
+    });
+
+    await expect(controller.getStatus()).resolves.toMatchObject({
+      state: "bootstrapping",
+      coordinatorJob: { podId: "pod_cloud_1" },
+    });
+    await expect(controller.stop()).resolves.toMatchObject({
+      stopped: true,
+      terminated: false,
+      status: { state: "terminating" },
+    });
+    expect(coordinatorClient.deleteJob).toHaveBeenCalledWith(coordinatorJob.jobId);
+    expect(deletePod).not.toHaveBeenCalled();
+  });
+});
 
 describe("ComputeController startup recovery", () => {
   it("retains a name-only lease through its hard deadline while visibility converges", async () => {

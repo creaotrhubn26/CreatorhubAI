@@ -11,6 +11,8 @@ const config: ComputeConfigV1 = {
   defaultBackend: "local_process",
   activeProfileId: "runpod-a100",
   source: "saved",
+  orchestrationMode: "local_gateway",
+  coordinator: { hasIngestToken: false },
   watchdog: { hasIngestToken: false },
   profiles: [
     {
@@ -159,5 +161,54 @@ describe("ComputeSettings", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Test independent watchdog" }));
     await waitFor(() => expect(testWatchdog).toHaveBeenCalledTimes(1));
     expect(await screen.findByText(/last external sweep 2026-08-30T11:59/i)).toBeInTheDocument();
+  });
+
+  it("saves and tests cloud coordinator mode without exposing its stored token", async () => {
+    const cloud = {
+      ...config,
+      orchestrationMode: "cloud_coordinator" as const,
+      coordinator: {
+        endpointUrl: "https://coordinator.example",
+        hasIngestToken: true,
+      },
+      profiles: config.profiles.map((profile) => ({
+        ...profile,
+        workerBuildId: "r2-abcdef012345",
+      })),
+    };
+    vi.spyOn(glimmerApi, "getComputeConfig").mockResolvedValue(cloud);
+    const save = vi.spyOn(glimmerApi, "saveComputeConfig").mockResolvedValue(cloud);
+    const testCoordinator = vi.spyOn(glimmerApi, "testComputeCoordinator").mockResolvedValue({
+      service: "glimmer-compute-coordinator",
+      schemaVersion: 1,
+      ready: true,
+      checkedAt: "2026-08-31T12:00:00.000Z",
+      providerApiVersion: "v2",
+      watchdogReady: true,
+      activeJobId: null,
+      cacheSigning: {
+        algorithm: "Ed25519",
+        keyId: "e".repeat(64),
+        publicKey: "P".repeat(43),
+      },
+    });
+    renderSettings();
+
+    expect(await screen.findByLabelText("RunPod orchestration")).toHaveValue("cloud_coordinator");
+    expect(screen.getByText(/no local key is required/i)).toBeInTheDocument();
+    const token = screen.getByLabelText(/Coordinator ingest token/i);
+    expect(token).toHaveAttribute("type", "password");
+    expect(token).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "Save compute settings" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save.mock.calls[0][0]).toMatchObject({
+      orchestrationMode: "cloud_coordinator",
+      coordinator: { endpointUrl: "https://coordinator.example" },
+    });
+    expect(JSON.stringify(save.mock.calls[0][0])).not.toContain("stored-token");
+
+    fireEvent.click(screen.getByRole("button", { name: "Test cloud coordinator" }));
+    await waitFor(() => expect(testCoordinator).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/RunPod API v2.*cache signing key/i)).toBeInTheDocument();
   });
 });

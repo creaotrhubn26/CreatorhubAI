@@ -15,6 +15,7 @@
   ],
   "vars": {
     "RUNPOD_API_BASE_URL": "https://rest.runpod.io/v1",
+    "RUNPOD_API_V2_BASE_URL": "https://api.runpod.io/v2",
     "STALE_AFTER_SECONDS": "180",
   },
   "observability": {

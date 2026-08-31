@@ -2793,6 +2793,8 @@ export interface ComputeProfileV1 {
   contextTokens: 65_536 | 131_072;
   /** Immutable OCI reference: registry/repository@sha256:<64 hex>. */
   imageDigest: string;
+  /** Build identity embedded in that immutable worker image. */
+  workerBuildId?: string;
   /** Existing RunPod registry credential used to pull the private worker image. */
   containerRegistryAuthId?: string;
   /** Existing RunPod network volume. The gateway never creates one implicitly. */
@@ -2832,13 +2834,95 @@ export interface ComputeWatchdogTestResult {
   staleAfterSeconds: number;
 }
 
+export type ComputeOrchestrationMode = "local_gateway" | "cloud_coordinator";
+
+export interface ComputeCoordinatorConfigV1 {
+  endpointUrl?: string;
+  hasIngestToken: boolean;
+  verifiedAt?: string;
+  /** Public Ed25519 key identifier reported by the coordinator. */
+  cacheSigningKeyId?: string;
+}
+
+export interface ComputeCoordinatorUpdateV1 {
+  endpointUrl?: string;
+  /** Omit/blank to preserve the gateway-owned HMAC credential. */
+  ingestToken?: string;
+  clearIngestToken?: boolean;
+}
+
+export interface ComputeCoordinatorTestResult {
+  service: "glimmer-compute-coordinator";
+  schemaVersion: 1;
+  ready: boolean;
+  checkedAt: string;
+  providerApiVersion: "v2";
+  watchdogReady: boolean;
+  activeJobId: string | null;
+  cacheSigning: {
+    algorithm: "Ed25519";
+    keyId: string;
+    publicKey: string;
+  };
+}
+
+export type ComputeCacheState = "missing" | "preparing" | "ready" | "repair_required";
+
+export interface ComputeCacheStatusV1 {
+  state: ComputeCacheState;
+  manifestSha256?: string;
+  verifiedAt?: string;
+  buildId?: string;
+  volumeId?: string;
+}
+
+export type ComputeCoordinatorJobState =
+  | "accepted"
+  | "watchdog_registered"
+  | "recovering_create"
+  | "provisioning"
+  | "running"
+  | "awaiting_cache_attestation"
+  | "cache_ready"
+  | "ready"
+  | "terminating"
+  | "terminated"
+  | "failed";
+
+export interface ComputeCoordinatorJobV1 {
+  schemaVersion: 1;
+  jobId: string;
+  kind: "cpu_cache" | "gpu_worker";
+  state: ComputeCoordinatorJobState;
+  phase: "cache_repair" | "gpu_worker";
+  cacheKey: string;
+  requestFingerprint: string;
+  podName: string;
+  podId?: string;
+  createdAt: string;
+  updatedAt: string;
+  hardDeadlineAt: string;
+  lastHeartbeatAt?: string;
+  maxHourlyUsd: number;
+  cache: ComputeCacheStatusV1;
+  createAttempted: boolean;
+  cleanup: {
+    requested: boolean;
+    confirmed: boolean;
+  };
+  repairJobId?: string;
+  failureCode?: string;
+}
+
 export interface ComputeConfigV1 {
   version: 1;
   enabled: boolean;
   defaultBackend: ComputeBackend;
   profiles: ComputeProfileV1[];
   activeProfileId?: string;
+  orchestrationMode: ComputeOrchestrationMode;
   watchdog: ComputeWatchdogConfigV1;
+  coordinator: ComputeCoordinatorConfigV1;
   source: "default" | "saved";
 }
 
@@ -2850,7 +2934,9 @@ export interface ComputeConfigUpdateV1 {
   defaultBackend: ComputeBackend;
   profiles: ComputeProfileUpdateV1[];
   activeProfileId?: string;
+  orchestrationMode?: ComputeOrchestrationMode;
   watchdog?: ComputeWatchdogUpdateV1;
+  coordinator?: ComputeCoordinatorUpdateV1;
   /** Omit/blank to preserve the gateway-owned RunPod account key. */
   apiKey?: string;
   clearApiKey?: boolean;
@@ -2889,6 +2975,7 @@ export interface ComputeStatus {
   detail: string;
   budget?: ComputeBudgetStatus;
   worker?: ComputeWorkerStatus;
+  coordinatorJob?: ComputeCoordinatorJobV1;
   /** Last sanitized worker observation, retained after exact Pod cleanup. */
   lastDiagnostic?: ComputeLastDiagnostic;
   policy: {
@@ -2903,6 +2990,8 @@ export type ComputeBootstrapStage =
   | "initializing"
   | "worker_starting"
   | "worker_listening"
+  | "cache_checking"
+  | "cache_publishing"
   | "artifact_preparing"
   | "artifact_downloading"
   | "artifact_verifying"
@@ -2919,6 +3008,9 @@ export type ComputeBootstrapFailureCode =
   | "worker_start_failed"
   | "artifact_download_failed"
   | "artifact_checksum_failed"
+  | "cache_not_ready"
+  | "cache_publish_failed"
+  | "coordinator_callback_failed"
   | "model_start_failed"
   | "model_healthcheck_failed"
   | "bootstrap_interrupted"

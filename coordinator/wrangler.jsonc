@@ -1,0 +1,29 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "glimmer-compute-coordinator",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-30",
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COORDINATOR",
+        "class_name": "ComputeCoordinator",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ComputeCoordinator"],
+    },
+  ],
+  "vars": {
+    "RUNPOD_API_BASE_URL": "https://api.runpod.io",
+    "CPU_CACHE_MAX_HOURLY_USD": "0.0225",
+    "CPU_CACHE_TTL_SECONDS": "2700",
+  },
+  "observability": {
+    "enabled": false,
+  },
+}

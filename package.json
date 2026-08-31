@@ -36,6 +36,8 @@
     "structure-mode:e2e": "node scripts/design-workflow-e2e.mjs",
     "watchdog:test": "vitest run watchdog/src/worker.test.js",
     "watchdog:deploy": "wrangler deploy --config watchdog/wrangler.jsonc",
+    "coordinator:test": "vitest run coordinator/src/*.test.js",
+    "coordinator:deploy": "wrangler deploy --config coordinator/wrangler.jsonc",
     "runpod:live-smoke": "npm run build --workspace @glimmer/shared && npm run build --workspace server && node scripts/runpod-live-smoke.mjs",
     "runpod:cpu-prewarm": "node scripts/runpod-cpu-prewarm.mjs",
     "runpod:cpu-prewarm:test": "node --test scripts/runpod-cpu-prewarm.test.mjs"

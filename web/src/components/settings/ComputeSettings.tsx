@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   ComputeBackend,
   ComputeConfigV1,
+  ComputeOrchestrationMode,
   ComputeProfileV1,
   ComputeProfileUpdateV1,
 } from "@glimmer/shared";
@@ -18,6 +19,10 @@ interface Draft {
   watchdogEndpointUrl: string;
   watchdogIngestToken: string;
   clearWatchdogIngestToken: boolean;
+  orchestrationMode: ComputeOrchestrationMode;
+  coordinatorEndpointUrl: string;
+  coordinatorIngestToken: string;
+  clearCoordinatorIngestToken: boolean;
 }
 
 function draftFromConfig(config: ComputeConfigV1): Draft {
@@ -31,6 +36,10 @@ function draftFromConfig(config: ComputeConfigV1): Draft {
     watchdogEndpointUrl: config.watchdog.endpointUrl ?? "",
     watchdogIngestToken: "",
     clearWatchdogIngestToken: false,
+    orchestrationMode: config.orchestrationMode,
+    coordinatorEndpointUrl: config.coordinator.endpointUrl ?? "",
+    coordinatorIngestToken: "",
+    clearCoordinatorIngestToken: false,
   };
 }
 
@@ -60,12 +69,20 @@ export function ComputeSettings() {
         defaultBackend: draft.defaultBackend,
         activeProfileId: draft.activeProfileId,
         profiles: draft.profiles.map(profileUpdate),
+        orchestrationMode: draft.orchestrationMode,
         watchdog: {
           endpointUrl: draft.watchdogEndpointUrl.trim(),
           ...(draft.watchdogIngestToken.trim()
             ? { ingestToken: draft.watchdogIngestToken.trim() }
             : {}),
           ...(draft.clearWatchdogIngestToken ? { clearIngestToken: true } : {}),
+        },
+        coordinator: {
+          endpointUrl: draft.coordinatorEndpointUrl.trim(),
+          ...(draft.coordinatorIngestToken.trim()
+            ? { ingestToken: draft.coordinatorIngestToken.trim() }
+            : {}),
+          ...(draft.clearCoordinatorIngestToken ? { clearIngestToken: true } : {}),
         },
         ...(draft.apiKey.trim() ? { apiKey: draft.apiKey.trim() } : {}),
         ...(draft.clearApiKey ? { clearApiKey: true } : {}),
@@ -80,6 +97,13 @@ export function ComputeSettings() {
   const testCredential = useMutation({ mutationFn: glimmerApi.testComputeCredential });
   const testWatchdog = useMutation({
     mutationFn: glimmerApi.testComputeWatchdog,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["compute-config"] });
+      void queryClient.invalidateQueries({ queryKey: ["compute-status"] });
+    },
+  });
+  const testCoordinator = useMutation({
+    mutationFn: glimmerApi.testComputeCoordinator,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["compute-config"] });
       void queryClient.invalidateQueries({ queryKey: ["compute-status"] });
@@ -148,9 +172,13 @@ export function ComputeSettings() {
         file and are never returned to this screen.
       </p>
       <p role="note">
-        {data?.watchdog.verifiedAt
-          ? `The independent watchdog passed its live test at ${data.watchdog.verifiedAt}.`
-          : "Paid compute remains blocked until an independent watchdog has passed its live test."}
+        {draft.orchestrationMode === "cloud_coordinator"
+          ? data?.coordinator.verifiedAt
+            ? `The cloud coordinator and independent watchdog passed their live test at ${data.coordinator.verifiedAt}.`
+            : "Paid compute remains blocked until the cloud coordinator and its independent watchdog pass a live test."
+          : data?.watchdog.verifiedAt
+            ? `The independent watchdog passed its live test at ${data.watchdog.verifiedAt}.`
+            : "Paid compute remains blocked until an independent watchdog has passed its live test."}
       </p>
       <p className="mono" style={{ fontSize: 12 }}>
         Configuration: {data?.source === "saved" ? "saved" : "local default"}
@@ -203,6 +231,25 @@ export function ComputeSettings() {
             ))}
           </select>
         </label>
+        <label>
+          RunPod orchestration
+          <select
+            value={draft.orchestrationMode}
+            onChange={(event) =>
+              setDraft((current) =>
+                current
+                  ? {
+                      ...current,
+                      orchestrationMode: event.target.value as ComputeOrchestrationMode,
+                    }
+                  : current,
+              )
+            }
+          >
+            <option value="cloud_coordinator">Cloud coordinator (Mac may sleep)</option>
+            <option value="local_gateway">Local gateway (legacy)</option>
+          </select>
+        </label>
       </fieldset>
 
       <fieldset>
@@ -233,6 +280,16 @@ export function ComputeSettings() {
             spellCheck={false}
           />
           <small>Mutable image tags are rejected.</small>
+        </label>
+        <label>
+          Worker build id
+          <input
+            value={active.workerBuildId ?? ""}
+            onChange={(event) => updateProfile({ workerBuildId: event.target.value })}
+            placeholder="r2-0123456789ab"
+            spellCheck={false}
+          />
+          <small>This must match the immutable build label inside the worker image.</small>
         </label>
         <label>
           Container registry auth id
@@ -386,6 +443,11 @@ export function ComputeSettings() {
 
       <fieldset>
         <legend>RunPod credential</legend>
+        {draft.orchestrationMode === "cloud_coordinator" && (
+          <p>
+            The restricted RunPod key is held by the cloud coordinator; no local key is required.
+          </p>
+        )}
         <label>
           API key {hasApiKey ? "(stored; blank keeps it)" : "(required before enabling RunPod)"}
           <input
@@ -413,6 +475,74 @@ export function ComputeSettings() {
             />{" "}
             Remove stored key on save
           </label>
+        )}
+      </fieldset>
+
+      <fieldset>
+        <legend>Cloud coordinator</legend>
+        <p>
+          The coordinator persists the job before provider creation, prepares and signs the model
+          cache, and refreshes the independent watchdog while this Mac sleeps or is offline.
+        </p>
+        <label>
+          Coordinator endpoint URL
+          <input
+            type="url"
+            value={draft.coordinatorEndpointUrl}
+            onChange={(event) =>
+              setDraft((current) =>
+                current ? { ...current, coordinatorEndpointUrl: event.target.value } : current,
+              )
+            }
+            placeholder="https://glimmer-compute-coordinator.example.workers.dev"
+            spellCheck={false}
+          />
+        </label>
+        <label>
+          Coordinator ingest token{" "}
+          {data?.coordinator.hasIngestToken ? "(stored; blank keeps it)" : ""}
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={draft.coordinatorIngestToken}
+            onChange={(event) =>
+              setDraft((current) =>
+                current
+                  ? {
+                      ...current,
+                      coordinatorIngestToken: event.target.value,
+                      clearCoordinatorIngestToken: false,
+                    }
+                  : current,
+              )
+            }
+            placeholder={
+              data?.coordinator.hasIngestToken ? "Keep existing token" : "43-char base64url token"
+            }
+          />
+        </label>
+        {data?.coordinator.hasIngestToken && (
+          <label>
+            <input
+              type="checkbox"
+              checked={draft.clearCoordinatorIngestToken}
+              onChange={(event) =>
+                setDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        clearCoordinatorIngestToken: event.target.checked,
+                        coordinatorIngestToken: "",
+                      }
+                    : current,
+                )
+              }
+            />{" "}
+            Remove stored coordinator token on save
+          </label>
+        )}
+        {data?.coordinator.cacheSigningKeyId && (
+          <small className="mono">Cache signing key: {data.coordinator.cacheSigningKeyId}</small>
         )}
       </fieldset>
 
@@ -503,6 +633,17 @@ export function ComputeSettings() {
       >
         {testWatchdog.isPending ? "Testing watchdog…" : "Test independent watchdog"}
       </button>
+      <button
+        type="button"
+        onClick={() => testCoordinator.mutate()}
+        disabled={
+          testCoordinator.isPending ||
+          !data?.coordinator.endpointUrl ||
+          !data.coordinator.hasIngestToken
+        }
+      >
+        {testCoordinator.isPending ? "Testing coordinator…" : "Test cloud coordinator"}
+      </button>
       {save.isSuccess && <p role="status">Compute settings saved.</p>}
       {save.error && <p role="alert">Could not save — {(save.error as Error).message}</p>}
       {testCredential.data && (
@@ -521,6 +662,15 @@ export function ComputeSettings() {
       )}
       {testWatchdog.error && (
         <p role="alert">Watchdog test failed — {(testWatchdog.error as Error).message}</p>
+      )}
+      {testCoordinator.data && (
+        <p role="status">
+          Cloud coordinator ready on RunPod API v2; independent watchdog confirmed and cache signing
+          key {testCoordinator.data.cacheSigning.keyId} loaded.
+        </p>
+      )}
+      {testCoordinator.error && (
+        <p role="alert">Coordinator test failed — {(testCoordinator.error as Error).message}</p>
       )}
     </section>
   );

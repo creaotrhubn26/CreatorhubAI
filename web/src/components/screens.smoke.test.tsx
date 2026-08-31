@@ -43,6 +43,8 @@ vi.spyOn(client.glimmerApi, "getComputeConfig").mockResolvedValue({
   activeProfileId: "runpod-a100",
   profiles: [],
   watchdog: { hasIngestToken: false },
+  orchestrationMode: "local_gateway",
+  coordinator: { hasIngestToken: false },
   source: "default",
 });
 vi.spyOn(client.glimmerApi, "getComputeStatus").mockResolvedValue({

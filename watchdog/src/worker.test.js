@@ -38,6 +38,7 @@ function environment() {
     INGEST_TOKEN,
     RUNPOD_API_KEY: "restricted-runpod-watchdog-key",
     RUNPOD_API_BASE_URL: "https://rest.runpod.io/v1",
+    RUNPOD_API_V2_BASE_URL: "https://api.runpod.io/v2",
     STALE_AFTER_SECONDS: "180",
   };
 }
@@ -52,6 +53,40 @@ function lease(patch = {}) {
     hardDeadlineAt: new Date(NOW + 3_600_000).toISOString(),
     lastHeartbeatAt: new Date(NOW).toISOString(),
     maxHourlyUsd: 1.75,
+    ...patch,
+  };
+}
+
+function leaseV2(patch = {}) {
+  return {
+    schemaVersion: 2,
+    leaseId: "job-1",
+    ownerInstanceId: "coordinator-1",
+    jobKind: "cpu_cache",
+    podName: "glimmer-cache-job-1",
+    podId: "pod_v2_1",
+    hardDeadlineAt: new Date(NOW + 2_700_000).toISOString(),
+    lastHeartbeatAt: new Date(NOW).toISOString(),
+    maxHourlyUsd: 0.0225,
+    expected: {
+      cloud: "SECURE",
+      gpuCount: 0,
+      networkVolumeId: "volume-1",
+    },
+    ...patch,
+  };
+}
+
+function cpuPodV2(patch = {}) {
+  return {
+    id: "pod_v2_1",
+    name: "glimmer-cache-job-1",
+    status: "RUNNING",
+    cloud: "SECURE",
+    cost: 0.02,
+    cpu: { id: "cpu3c", vcpuCount: 2 },
+    gpu: null,
+    mounts: { network: [{ volumeId: "volume-1", path: "/workspace" }] },
     ...patch,
   };
 }
@@ -356,5 +391,109 @@ describe("watchdog sweep", () => {
       checked: 1,
       terminationRequests: 1,
     });
+  });
+});
+
+describe("watchdog V2 leases", () => {
+  it("stores V2 CPU leases separately without changing the V1 HTTP route", async () => {
+    const env = environment();
+    const body = JSON.stringify(leaseV2());
+    const response = await worker.fetch(signedRequest("PUT", "/v1/leases/job-1", body), env);
+
+    expect(response.status).toBe(201);
+    expect(await env.LEASES.get("lease-v2:job-1", "json")).toEqual(leaseV2());
+    expect(await env.LEASES.get("lease:job-1", "json")).toBeNull();
+  });
+
+  it("retains a conforming V2 CPU Pod below its ceiling", async () => {
+    const env = environment();
+    await env.LEASES.put("lease-v2:job-1", JSON.stringify(leaseV2()));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(cpuPodV2()));
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.runpod.io/v2/pods/pod_v2_1",
+      expect.objectContaining({ headers: expect.any(Object) }),
+    );
+  });
+
+  it("terminates an exact-id V2 GPU Pod after a stale heartbeat", async () => {
+    const env = environment();
+    await env.LEASES.put(
+      "lease-v2:job-1",
+      JSON.stringify(
+        leaseV2({
+          jobKind: "gpu_worker",
+          maxHourlyUsd: 1.75,
+          lastHeartbeatAt: new Date(NOW - 181_000).toISOString(),
+          expected: { cloud: "SECURE", gpuCount: 1, networkVolumeId: "volume-1" },
+        }),
+      ),
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      return Response.json(
+        cpuPodV2({ cpu: null, gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 }, cost: 1.59 }),
+      );
+    });
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.runpod.io/v2/pods/pod_v2_1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("still parses an expired stored V2 lease so the hard deadline deletes its Pod", async () => {
+    const env = environment();
+    await env.LEASES.put(
+      "lease-v2:job-1",
+      JSON.stringify(
+        leaseV2({
+          hardDeadlineAt: new Date(NOW - 1_000).toISOString(),
+          lastHeartbeatAt: new Date(NOW - 10_000).toISOString(),
+        }),
+      ),
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      return Response.json(cpuPodV2());
+    });
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.runpod.io/v2/pods/pod_v2_1",
+      expect.objectContaining({ method: "DELETE", redirect: "error" }),
+    );
+  });
+
+  it("fails closed without deleting when provisional exact-name recovery is ambiguous", async () => {
+    const env = environment();
+    await env.LEASES.put("lease-v2:job-1", JSON.stringify(leaseV2({ podId: undefined })));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        pods: [cpuPodV2({ id: "pod_v2_a" }), cpuPodV2({ id: "pod_v2_b" })],
+      }),
+    );
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: false,
+      checked: 1,
+      terminationRequests: 0,
+      errorCodes: ["RUNPOD_EXACT_NAME_AMBIGUOUS"],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -10,6 +10,8 @@ const UI_ORIGIN = "http://127.0.0.1:5183";
 const API_KEY = "runpod-route-secret";
 const WATCHDOG_TOKEN = "watchdog_route_ingest_token_with_32_chars";
 const WATCHDOG_ENDPOINT = "https://watchdog.example";
+const COORDINATOR_TOKEN = "C".repeat(43);
+const COORDINATOR_ENDPOINT = "https://coordinator.example";
 const IMAGE = `ghcr.io/example/glimmer@sha256:${"a".repeat(64)}`;
 const REGISTRY_AUTH_ID = "registry_auth_1";
 const MODEL_ARTIFACTS = {
@@ -128,6 +130,8 @@ describe("compute configuration API", () => {
     });
     expect(response.body.profiles).toHaveLength(2);
     expect(response.body.watchdog).toEqual({ hasIngestToken: false });
+    expect(response.body.coordinator).toEqual({ hasIngestToken: false });
+    expect(response.body.orchestrationMode).toBe("local_gateway");
     expect(response.body.profiles[0]).toMatchObject({
       cloudType: "SECURE",
       gpuCount: 1,
@@ -188,6 +192,76 @@ describe("compute configuration API", () => {
     await expect(
       fs.stat(path.join(stateRoot, "compute-keys", "watchdog-ingest.key")),
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("stores and verifies the cloud coordinator behind the existing origin guard", async () => {
+    const defaults = (await request(app).get("/api/compute/config")).body as ComputeConfigV1;
+    const update = updateFrom(defaults, {
+      enabled: true,
+      defaultBackend: "runpod_pod",
+      orchestrationMode: "cloud_coordinator",
+      coordinator: {
+        endpointUrl: COORDINATOR_ENDPOINT,
+        ingestToken: COORDINATOR_TOKEN,
+      },
+      profiles: defaults.profiles.map(
+        ({ hasApiKey: _hasApiKey, watchdogConfigured: _watchdog, ...profile }) => ({
+          ...profile,
+          imageDigest: IMAGE,
+          workerBuildId: "r2-abcdef012345",
+          containerRegistryAuthId: REGISTRY_AUTH_ID,
+          networkVolumeId: "network_volume_1",
+          modelArtifacts: MODEL_ARTIFACTS,
+        }),
+      ),
+    });
+    const saved = await request(app)
+      .put("/api/compute/config")
+      .set("Origin", UI_ORIGIN)
+      .send(update);
+    expect(saved.status).toBe(200);
+    expect(saved.body.coordinator).toEqual({
+      endpointUrl: COORDINATOR_ENDPOINT,
+      hasIngestToken: true,
+    });
+    expect(JSON.stringify(saved.body)).not.toContain(COORDINATOR_TOKEN);
+    const tokenFile = path.join(stateRoot, "compute-keys", "coordinator-ingest.key");
+    expect((await fs.stat(tokenFile)).mode & 0o777).toBe(0o600);
+    expect((await fs.readFile(tokenFile, "utf8")).trim()).toBe(COORDINATOR_TOKEN);
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        service: "glimmer-compute-coordinator",
+        schemaVersion: 1,
+        ready: true,
+        checkedAt: "2026-08-31T12:00:00.000Z",
+        providerApiVersion: "v2",
+        watchdogReady: true,
+        activeJobId: null,
+        cacheSigning: {
+          algorithm: "Ed25519",
+          keyId: "e".repeat(64),
+          publicKey: "P".repeat(43),
+        },
+      }),
+    );
+    const rejected = await request(app).post("/api/compute/coordinator/test");
+    expect(rejected.status).toBe(403);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const verified = await request(app)
+      .post("/api/compute/coordinator/test")
+      .set("Origin", UI_ORIGIN);
+    expect(verified.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const requestHeaders = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(requestHeaders.get("X-Glimmer-Signature")).toMatch(/^v1=[a-f0-9]{64}$/);
+    expect(requestHeaders.get("Authorization")).toBeNull();
+    const publicConfig = (await request(app).get("/api/compute/config")).body;
+    expect(publicConfig.coordinator).toMatchObject({
+      verifiedAt: "2026-08-31T12:00:00.000Z",
+      cacheSigningKeyId: "e".repeat(64),
+    });
   });
 
   it("preserves a blank stored key update and clears only the gateway-owned key on request", async () => {

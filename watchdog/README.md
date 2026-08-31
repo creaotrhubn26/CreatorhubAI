@@ -5,6 +5,9 @@ minimal HMAC-signed lease from the local gateway and owns a separate, restricted
 does not receive repositories, prompts, model files, worker capabilities, or the gateway's RunPod
 account key.
 
+Schema-v2 leases use RunPod's current `api.runpod.io/v2` Pod API for both CPU cache repairs and
+single-GPU workers. Schema-v1 leases remain readable during the local-gateway migration window.
+
 The scheduled sweep runs every two minutes. With the default 180-second heartbeat threshold, a
 gateway that disappears causes termination within roughly three to five minutes. The interval also
 keeps the default design within the Workers KV Free daily list/write quotas for one active lease.

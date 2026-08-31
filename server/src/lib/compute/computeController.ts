@@ -4,6 +4,8 @@ import type {
   ComputeBudgetStatus,
   ComputeConfigV1,
   ComputeControlResult,
+  ComputeCoordinatorJobV1,
+  ComputeCoordinatorTestResult,
   ComputeCredentialTestResult,
   ComputeLastDiagnostic,
   ComputeProfileV1,
@@ -14,12 +16,19 @@ import type {
 } from "@glimmer/shared";
 import { CONFIG } from "../../config.js";
 import {
+  markComputeCoordinatorVerified,
   markComputeWatchdogVerified,
   readComputeConfig,
+  readComputeCoordinatorAccess,
   readComputeWatchdogAccess,
   readRunPodApiKey,
   saveComputeConfig,
 } from "./configStore.js";
+import {
+  CoordinatorClient,
+  CoordinatorProtocolError,
+  type CoordinatorJobRequestV1,
+} from "./coordinatorClient.js";
 import {
   clearComputeLease,
   readComputeLease,
@@ -75,6 +84,8 @@ interface ControllerDependencies {
   readApiKey: typeof readRunPodApiKey;
   readWatchdogAccess: typeof readComputeWatchdogAccess;
   markWatchdogVerified: typeof markComputeWatchdogVerified;
+  readCoordinatorAccess: typeof readComputeCoordinatorAccess;
+  markCoordinatorVerified: typeof markComputeCoordinatorVerified;
   readLease: typeof readComputeLease;
   saveLease: typeof saveComputeLease;
   updateLease: typeof updateComputeLease;
@@ -88,6 +99,7 @@ interface ControllerDependencies {
   storeReconciledUsage: typeof storeReconciledUsage;
   clientFactory: (apiKey: string) => RunPodClient;
   watchdogFactory: (endpointUrl: string, ingestToken: string) => WatchdogClient;
+  coordinatorFactory: (endpointUrl: string, ingestToken: string) => CoordinatorClient;
   workerFactory: (podId: string) => WorkerClient;
   createWorkerSecret: typeof createWorkerSecret;
   readWorkerSecret: typeof readWorkerSecret;
@@ -105,6 +117,8 @@ const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   readApiKey: readRunPodApiKey,
   readWatchdogAccess: readComputeWatchdogAccess,
   markWatchdogVerified: markComputeWatchdogVerified,
+  readCoordinatorAccess: readComputeCoordinatorAccess,
+  markCoordinatorVerified: markComputeCoordinatorVerified,
   readLease: readComputeLease,
   saveLease: saveComputeLease,
   updateLease: updateComputeLease,
@@ -119,6 +133,8 @@ const DEFAULT_DEPENDENCIES: ControllerDependencies = {
   clientFactory: (apiKey) => new RunPodClient({ baseUrl: CONFIG.runpodApiBaseUrl, apiKey }),
   watchdogFactory: (endpointUrl, ingestToken) =>
     new WatchdogClient({ baseUrl: endpointUrl, ingestToken }),
+  coordinatorFactory: (endpointUrl, ingestToken) =>
+    new CoordinatorClient({ baseUrl: endpointUrl, ingestToken }),
   workerFactory: (podId) => new WorkerClient({ baseUrl: workerBaseUrlForPod(podId) }),
   createWorkerSecret,
   readWorkerSecret,
@@ -355,6 +371,61 @@ export class ComputeController {
       );
     }
     return this.dependencies.watchdogFactory(access.endpointUrl, access.ingestToken);
+  }
+
+  private async coordinator(): Promise<CoordinatorClient> {
+    const access = await this.dependencies.readCoordinatorAccess();
+    if (!access) {
+      throw new ComputeControlError(
+        "Cloud compute coordinator endpoint and ingest token are not configured",
+        412,
+      );
+    }
+    return this.dependencies.coordinatorFactory(access.endpointUrl, access.ingestToken);
+  }
+
+  private coordinatorRunState(job: ComputeCoordinatorJobV1): ComputeStatus["state"] {
+    if (job.state === "ready") return "ready";
+    if (job.state === "running") return "bootstrapping";
+    if (job.state === "terminating") return "terminating";
+    if (job.state === "terminated") return "offline";
+    if (job.state === "failed") return "failed";
+    return "provisioning";
+  }
+
+  private async cloudStatus(
+    config: ComputeConfigV1,
+    lease: ComputeLeaseV1,
+    job: ComputeCoordinatorJobV1,
+  ): Promise<ComputeStatus> {
+    const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+    const usage = await this.dependencies.readUsage(this.dependencies.now());
+    const budget = profile ? budgetStatus(profile, usage, job.maxHourlyUsd) : undefined;
+    const state = budget && !budget.allowed ? "budget_blocked" : this.coordinatorRunState(job);
+    return {
+      backend: "runpod_pod",
+      state,
+      checkedAt: this.dependencies.now().toISOString(),
+      profileId: lease.profileId,
+      hardDeadlineAt: job.hardDeadlineAt,
+      coordinatorJob: job,
+      detail:
+        job.failureCode ??
+        (job.phase === "cache_repair"
+          ? job.cache.state === "ready"
+            ? "The signed model cache is ready; the coordinator is handing off to GPU compute."
+            : "The cloud coordinator is preparing and attesting the model cache on CPU compute."
+          : job.state === "ready"
+            ? "The GPU worker is ready under cloud coordinator supervision."
+            : "The cloud coordinator is provisioning or validating the GPU worker."),
+      ...(budget ? { budget } : {}),
+      policy: {
+        secureCloudOnly: true,
+        maximumGpuCount: 1,
+        watchdogConfigured: Boolean(config.coordinator.verifiedAt),
+        unattendedUseAllowed: Boolean(config.coordinator.verifiedAt),
+      },
+    };
   }
 
   private watchdogLease(
@@ -1250,6 +1321,27 @@ export class ComputeController {
     const config = await this.dependencies.readConfig();
     const lease = await this.dependencies.readLease();
     if (!lease) return this.statusFrom(config, null, null);
+    if (lease.orchestrationMode === "cloud_coordinator" && lease.coordinatorJobId) {
+      try {
+        const job = await (await this.coordinator()).getJob(lease.coordinatorJobId);
+        return this.cloudStatus(config, lease, job);
+      } catch (error) {
+        return {
+          backend: "runpod_pod",
+          state: "unavailable",
+          checkedAt: this.dependencies.now().toISOString(),
+          profileId: lease.profileId,
+          hardDeadlineAt: lease.hardDeadlineAt,
+          detail: `Cloud coordinator status unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+          policy: {
+            secureCloudOnly: true,
+            maximumGpuCount: 1,
+            watchdogConfigured: Boolean(config.coordinator.verifiedAt),
+            unattendedUseAllowed: Boolean(config.coordinator.verifiedAt),
+          },
+        };
+      }
+    }
     try {
       const pod = await this.findLeasePod(await this.client(), lease);
       if (!pod || pod.desiredStatus !== "RUNNING") return this.statusFrom(config, lease, pod);
@@ -1334,6 +1426,135 @@ export class ComputeController {
     });
   }
 
+  async testCoordinator(): Promise<ComputeCoordinatorTestResult> {
+    return this.exclusive(async () => {
+      let result: ComputeCoordinatorTestResult;
+      try {
+        result = await (await this.coordinator()).status();
+      } catch (error) {
+        throw new ComputeControlError(
+          `Cloud compute coordinator test failed: ${error instanceof Error ? error.message : "unknown error"}`,
+          error instanceof CoordinatorProtocolError && error.status === 401 ? 502 : 503,
+        );
+      }
+      if (!result.ready || !result.watchdogReady) {
+        throw new ComputeControlError(
+          "Cloud compute coordinator is reachable, but its independent watchdog is not ready",
+          503,
+        );
+      }
+      await this.dependencies.markCoordinatorVerified(result);
+      return result;
+    });
+  }
+
+  private async startWithCoordinator(
+    config: ComputeConfigV1,
+    profile: ComputeProfileV1,
+  ): Promise<ComputeControlResult> {
+    if (!config.coordinator.verifiedAt) {
+      throw new ComputeControlError(
+        "RunPod compute cannot start until the cloud coordinator and its watchdog pass a live test",
+        412,
+      );
+    }
+    if (
+      !profile.imageDigest ||
+      !profile.workerBuildId ||
+      !profile.containerRegistryAuthId ||
+      !profile.networkVolumeId ||
+      !profile.modelArtifacts
+    ) {
+      throw new ComputeControlError(
+        "The cloud coordinator requires an immutable worker image/build, registry auth, network volume, and checksum-bound artifacts",
+        412,
+      );
+    }
+    const coordinator = await this.coordinator();
+    let coordinatorStatus: ComputeCoordinatorTestResult;
+    try {
+      coordinatorStatus = await coordinator.status();
+    } catch (error) {
+      throw new ComputeControlError(
+        `Cloud compute cannot start because the coordinator is unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+        503,
+      );
+    }
+    if (!coordinatorStatus.ready || !coordinatorStatus.watchdogReady) {
+      throw new ComputeControlError(
+        "Cloud compute cannot start because the independent watchdog is unavailable",
+        503,
+      );
+    }
+    const now = this.dependencies.now();
+    const jobId = randomUUID();
+    const hardDeadlineAt = new Date(
+      now.getTime() + profile.hardSessionLimitSeconds * 1_000,
+    ).toISOString();
+    const secret = await this.dependencies.createWorkerSecret(jobId);
+    if (!secret.bootstrapToken) {
+      await this.dependencies.deleteWorkerSecret(jobId);
+      throw new ComputeControlError("worker bootstrap secret was not created", 500);
+    }
+    let lease: ComputeLeaseV1 = {
+      version: 1,
+      id: jobId,
+      profileId: profile.id,
+      podName: `glimmer-gpu-${jobId}`,
+      orchestrationMode: "cloud_coordinator",
+      coordinatorJobId: jobId,
+      state: "provisioning",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      lastActivityAt: now.toISOString(),
+      idleDeadlineAt: new Date(now.getTime() + profile.idleTimeoutSeconds * 1_000).toISOString(),
+      hardDeadlineAt,
+      observedHourlyUsd: profile.maxGpuHourlyUsd,
+    };
+    lease = await this.dependencies.saveLease(lease);
+    const request: CoordinatorJobRequestV1 = {
+      schemaVersion: 1,
+      jobId,
+      ownerInstanceId: safeInstanceId(CONFIG.instanceId),
+      kind: "gpu_worker",
+      image: profile.imageDigest,
+      buildId: profile.workerBuildId,
+      containerRegistryAuthId: profile.containerRegistryAuthId,
+      networkVolumeId: profile.networkVolumeId,
+      contextTokens: profile.contextTokens,
+      modelArtifacts: profile.modelArtifacts,
+      maxHourlyUsd: profile.maxGpuHourlyUsd,
+      hardDeadlineAt,
+      idleTimeoutSeconds: profile.idleTimeoutSeconds,
+      gpuTypeId: profile.gpuTypeIds[0],
+      bootstrapToken: secret.bootstrapToken,
+    };
+    try {
+      const job = await coordinator.putJob(request);
+      lease = await this.dependencies.saveLease({
+        ...lease,
+        podName: job.podName,
+        ...(job.podId ? { podId: job.podId } : {}),
+      });
+      return { started: true, status: await this.cloudStatus(config, lease, job) };
+    } catch (error) {
+      const definitive =
+        error instanceof CoordinatorProtocolError &&
+        error.status !== undefined &&
+        [400, 401, 403, 409].includes(error.status);
+      if (definitive) {
+        await this.dependencies.clearLease(jobId);
+        await this.dependencies.deleteWorkerSecret(jobId);
+      }
+      throw new ComputeControlError(
+        definitive
+          ? `The cloud coordinator rejected the job: ${error instanceof Error ? error.message : "unknown error"}`
+          : "The coordinator response was inconclusive; the durable job id was retained for exact reconciliation",
+        502,
+      );
+    }
+  }
+
   async start(): Promise<ComputeControlResult> {
     return this.exclusive(async () => {
       const config = await this.dependencies.readConfig();
@@ -1341,7 +1562,7 @@ export class ComputeController {
       if (!config.enabled || config.defaultBackend !== "runpod_pod" || !profile) {
         throw new ComputeControlError("RunPod compute is not enabled as the active backend", 412);
       }
-      if (!profile.watchdogConfigured) {
+      if (config.orchestrationMode !== "cloud_coordinator" && !profile.watchdogConfigured) {
         throw new ComputeControlError(
           "RunPod compute cannot start until the independent watchdog has passed its live test",
           412,
@@ -1358,6 +1579,9 @@ export class ComputeController {
       const budget = budgetStatus(profile, usage);
       if (!budget.allowed) {
         throw new ComputeControlError(budget.reason ?? "compute budget blocks this start", 409);
+      }
+      if (config.orchestrationMode === "cloud_coordinator") {
+        return this.startWithCoordinator(config, profile);
       }
       let watchdog: WatchdogClient;
       try {
@@ -1560,7 +1784,11 @@ export class ComputeController {
       if (expectedLeaseId !== undefined && lease?.id !== expectedLeaseId) {
         throw new ComputeControlError("leaseId must exactly match the active compute lease", 409);
       }
-      if (expectedPodId !== undefined && lease?.podId !== expectedPodId) {
+      if (
+        expectedPodId !== undefined &&
+        lease?.orchestrationMode !== "cloud_coordinator" &&
+        lease?.podId !== expectedPodId
+      ) {
         throw new ComputeControlError("podId must exactly match the active compute lease", 409);
       }
       if (lease) this.cancelWorkerBootstrap(lease.id);
@@ -1578,6 +1806,45 @@ export class ComputeController {
         this.clearSafetyTimer();
         this.clearWatchdogHeartbeat();
         return { stopped: false, status: await this.statusFrom(config, null, null) };
+      }
+      if (lease.orchestrationMode === "cloud_coordinator" && lease.coordinatorJobId) {
+        let job: ComputeCoordinatorJobV1;
+        try {
+          const coordinator = await this.coordinator();
+          const current = await coordinator.getJob(lease.coordinatorJobId);
+          if (expectedPodId !== undefined && current.podId !== expectedPodId) {
+            throw new ComputeControlError(
+              "podId must exactly match the coordinator's active Pod identity",
+              409,
+            );
+          }
+          job = await coordinator.deleteJob(lease.coordinatorJobId);
+        } catch (error) {
+          if (error instanceof ComputeControlError) throw error;
+          throw new ComputeControlError(
+            `Cloud coordinator termination failed: ${error instanceof Error ? error.message : "unknown error"}`,
+            502,
+          );
+        }
+        if ((job.state === "terminated" || job.state === "failed") && job.cleanup.confirmed) {
+          await this.dependencies.clearLease(lease.id);
+          await this.dependencies.deleteWorkerSecret(lease.id);
+          return {
+            stopped: true,
+            terminated: true,
+            status: await this.statusFrom(
+              config,
+              null,
+              null,
+              "Cloud coordinator confirmed exact Pod cleanup.",
+            ),
+          };
+        }
+        return {
+          stopped: true,
+          terminated: false,
+          status: await this.cloudStatus(config, lease, job),
+        };
       }
       if (lease.providerTerminationConfirmedAt) {
         this.clearSafetyTimer();
@@ -1741,6 +2008,31 @@ export class ComputeController {
       if (!lease) return { recovered: false, cleaned: false, detail: "no compute lease" };
       const config = await this.dependencies.readConfig();
       const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+      if (lease.orchestrationMode === "cloud_coordinator" && lease.coordinatorJobId) {
+        try {
+          const job = await (await this.coordinator()).getJob(lease.coordinatorJobId);
+          if ((job.state === "terminated" || job.state === "failed") && job.cleanup.confirmed) {
+            await this.dependencies.clearLease(lease.id);
+            await this.dependencies.deleteWorkerSecret(lease.id);
+            return {
+              recovered: false,
+              cleaned: true,
+              detail: "cloud coordinator confirmed terminal cleanup",
+            };
+          }
+          return {
+            recovered: true,
+            cleaned: false,
+            detail: `cloud coordinator job recovered in ${job.state}`,
+          };
+        } catch (error) {
+          return {
+            recovered: false,
+            cleaned: false,
+            detail: `cloud coordinator reconciliation is pending: ${error instanceof Error ? error.message : "unknown error"}`,
+          };
+        }
+      }
       if (lease.providerTerminationConfirmedAt) {
         const cleaned = await this.finalizeTerminatedLease(lease);
         if (!cleaned) {

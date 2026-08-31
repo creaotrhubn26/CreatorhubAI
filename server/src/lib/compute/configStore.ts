@@ -3,6 +3,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
   ComputeBackend,
+  ComputeCoordinatorTestResult,
+  ComputeCoordinatorUpdateV1,
   ComputeConfigUpdateV1,
   ComputeConfigV1,
   ComputeProfileUpdateV1,
@@ -18,6 +20,7 @@ const VOLUME_ID_PATTERN = /^[A-Za-z0-9_-]{1,191}$/;
 const REGISTRY_AUTH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,190}$/;
 const IMAGE_DIGEST_PATTERN = /^[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const WORKER_BUILD_ID_PATTERN = /^r2-[a-f0-9]{12}$/;
 const HOST_PATTERN =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MAX_API_KEY_CHARS = 16_384;
@@ -42,14 +45,23 @@ interface StoredWatchdogConfig {
   lastSweepAt?: string;
 }
 
+interface StoredCoordinatorConfig {
+  endpointUrl: string;
+  tokenFile: string | null;
+  verifiedAt?: string;
+  cacheSigningKeyId?: string;
+}
+
 interface StoredComputeConfig {
   version: 1;
   enabled: boolean;
   defaultBackend: ComputeBackend;
   profiles: StoredComputeProfile[];
   activeProfileId?: string;
+  orchestrationMode?: "local_gateway" | "cloud_coordinator";
   apiKeyFile: string | null;
   watchdog?: StoredWatchdogConfig | null;
+  coordinator?: StoredCoordinatorConfig | null;
 }
 
 export class ComputeConfigValidationError extends Error {}
@@ -75,6 +87,7 @@ function defaultProfile(
     gpuCount: 1,
     contextTokens: 65_536,
     imageDigest: DEFAULT_RUNPOD_IMAGE_DIGEST,
+    workerBuildId: "r2-b654f6591e0c",
     maxGpuHourlyUsd,
     idleTimeoutSeconds: 300,
     clarificationTimeoutSeconds: 120,
@@ -100,8 +113,10 @@ function defaultStoredConfig(): StoredComputeConfig {
       ),
     ],
     activeProfileId: "runpod-a100",
+    orchestrationMode: "local_gateway",
     apiKeyFile: null,
     watchdog: null,
+    coordinator: null,
   };
 }
 
@@ -136,6 +151,28 @@ function normalizedWatchdogEndpoint(value: unknown): string | undefined {
   return parsed.origin;
 }
 
+function normalizedCoordinatorEndpoint(value: unknown): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") invalid("coordinator endpointUrl must be a URL");
+  let parsed: URL;
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    invalid("coordinator endpointUrl is invalid");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    invalid("coordinator endpointUrl must be an origin-only HTTPS URL");
+  }
+  return parsed.origin;
+}
+
 function isStoredWatchdog(value: unknown): value is StoredWatchdogConfig {
   if (!value || typeof value !== "object") return false;
   const raw = value as Partial<StoredWatchdogConfig>;
@@ -149,6 +186,22 @@ function isStoredWatchdog(value: unknown): value is StoredWatchdogConfig {
       (typeof raw.tokenFile === "string" && isGatewayOwnedWatchdogPath(raw.tokenFile))) &&
     (raw.verifiedAt === undefined || Number.isFinite(Date.parse(raw.verifiedAt))) &&
     (raw.lastSweepAt === undefined || Number.isFinite(Date.parse(raw.lastSweepAt)))
+  );
+}
+
+function isStoredCoordinator(value: unknown): value is StoredCoordinatorConfig {
+  if (!value || typeof value !== "object") return false;
+  const raw = value as Partial<StoredCoordinatorConfig>;
+  try {
+    if (normalizedCoordinatorEndpoint(raw.endpointUrl) !== raw.endpointUrl) return false;
+  } catch {
+    return false;
+  }
+  return (
+    (raw.tokenFile === null ||
+      (typeof raw.tokenFile === "string" && isGatewayOwnedCoordinatorPath(raw.tokenFile))) &&
+    (raw.verifiedAt === undefined || Number.isFinite(Date.parse(raw.verifiedAt))) &&
+    (raw.cacheSigningKeyId === undefined || /^[a-f0-9]{64}$/.test(raw.cacheSigningKeyId))
   );
 }
 
@@ -173,12 +226,22 @@ function isStoredConfig(value: unknown): value is StoredComputeConfig {
     raw.profiles.length < 1 ||
     raw.profiles.length > MAX_PROFILES ||
     !raw.profiles.every(isStoredProfile) ||
+    (raw.orchestrationMode !== undefined &&
+      raw.orchestrationMode !== "local_gateway" &&
+      raw.orchestrationMode !== "cloud_coordinator") ||
     (raw.apiKeyFile !== null &&
       (typeof raw.apiKeyFile !== "string" || !isGatewayOwnedKeyPath(raw.apiKeyFile)))
   ) {
     return false;
   }
   if (raw.watchdog !== undefined && raw.watchdog !== null && !isStoredWatchdog(raw.watchdog)) {
+    return false;
+  }
+  if (
+    raw.coordinator !== undefined &&
+    raw.coordinator !== null &&
+    !isStoredCoordinator(raw.coordinator)
+  ) {
     return false;
   }
   const ids = new Set(raw.profiles.map((profile) => profile.id));
@@ -195,8 +258,10 @@ async function readStoredConfig(): Promise<{
       return {
         config: {
           ...parsed,
+          orchestrationMode: parsed.orchestrationMode ?? "local_gateway",
           profiles: parsed.profiles.map(normalizeProfile),
           watchdog: parsed.watchdog ?? null,
+          coordinator: parsed.coordinator ?? null,
         },
         source: "saved",
       };
@@ -213,6 +278,7 @@ async function toPublic(
 ): Promise<ComputeConfigV1> {
   const hasApiKey = await exists(config.apiKeyFile);
   const hasIngestToken = await exists(config.watchdog?.tokenFile ?? null);
+  const hasCoordinatorToken = await exists(config.coordinator?.tokenFile ?? null);
   const watchdogConfigured = Boolean(
     config.watchdog?.endpointUrl && hasIngestToken && config.watchdog.verifiedAt,
   );
@@ -227,11 +293,20 @@ async function toPublic(
     defaultBackend: config.defaultBackend,
     profiles,
     ...(config.activeProfileId ? { activeProfileId: config.activeProfileId } : {}),
+    orchestrationMode: config.orchestrationMode ?? "local_gateway",
     watchdog: {
       ...(config.watchdog?.endpointUrl ? { endpointUrl: config.watchdog.endpointUrl } : {}),
       hasIngestToken,
       ...(config.watchdog?.verifiedAt ? { verifiedAt: config.watchdog.verifiedAt } : {}),
       ...(config.watchdog?.lastSweepAt ? { lastSweepAt: config.watchdog.lastSweepAt } : {}),
+    },
+    coordinator: {
+      ...(config.coordinator?.endpointUrl ? { endpointUrl: config.coordinator.endpointUrl } : {}),
+      hasIngestToken: hasCoordinatorToken,
+      ...(config.coordinator?.verifiedAt ? { verifiedAt: config.coordinator.verifiedAt } : {}),
+      ...(config.coordinator?.cacheSigningKeyId
+        ? { cacheSigningKeyId: config.coordinator.cacheSigningKeyId }
+        : {}),
     },
     source,
   };
@@ -349,6 +424,11 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
   if (imageDigest && !IMAGE_DIGEST_PATTERN.test(imageDigest)) {
     invalid(`profile ${raw.id}: imageDigest must be an immutable sha256 OCI reference`);
   }
+  const workerBuildId =
+    typeof raw.workerBuildId === "string" ? raw.workerBuildId.trim() : undefined;
+  if (workerBuildId && !WORKER_BUILD_ID_PATTERN.test(workerBuildId)) {
+    invalid(`profile ${raw.id}: workerBuildId must match r2-<12 lowercase hex>`);
+  }
   const containerRegistryAuthId =
     typeof raw.containerRegistryAuthId === "string"
       ? raw.containerRegistryAuthId.trim()
@@ -384,6 +464,7 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
     gpuCount: 1,
     contextTokens: raw.contextTokens,
     imageDigest,
+    ...(workerBuildId ? { workerBuildId } : {}),
     ...(containerRegistryAuthId ? { containerRegistryAuthId } : {}),
     ...(networkVolumeId ? { networkVolumeId } : {}),
     ...(modelArtifacts ? { modelArtifacts } : {}),
@@ -416,7 +497,12 @@ function normalizeProfile(value: unknown): StoredComputeProfile {
   };
 }
 
-function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfigUpdateV1 {
+function normalizeUpdate(
+  input: unknown,
+  hasExistingKey: boolean,
+  hasExistingCoordinatorToken: boolean,
+  existingCoordinatorEndpoint?: string,
+): ComputeConfigUpdateV1 {
   if (!input || typeof input !== "object") invalid("a compute configuration is required");
   const raw = input as Partial<ComputeConfigUpdateV1>;
   if (raw.version !== 1) invalid("compute configuration version must be 1");
@@ -441,10 +527,22 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
   if (apiKey && apiKey.length > MAX_API_KEY_CHARS) invalid("RunPod API key is too long");
   if (apiKey && raw.clearApiKey) invalid("cannot set and clear the RunPod API key together");
   const watchdog = normalizeWatchdogUpdate(raw.watchdog);
+  const coordinator = normalizeCoordinatorUpdate(raw.coordinator);
+  const orchestrationMode = raw.orchestrationMode ?? "local_gateway";
+  if (orchestrationMode !== "local_gateway" && orchestrationMode !== "cloud_coordinator") {
+    invalid("orchestrationMode must be local_gateway or cloud_coordinator");
+  }
   const willHaveKey = !!apiKey || (hasExistingKey && raw.clearApiKey !== true);
+  const coordinatorEndpoint = coordinator?.endpointUrl ?? existingCoordinatorEndpoint;
+  const willHaveCoordinatorToken =
+    !!coordinator?.ingestToken ||
+    (hasExistingCoordinatorToken && coordinator?.clearIngestToken !== true);
   if (raw.enabled && raw.defaultBackend === "runpod_pod") {
     const active = profiles.find((profile) => profile.id === raw.activeProfileId)!;
     if (!active.imageDigest) invalid("the active RunPod profile requires an immutable imageDigest");
+    if (orchestrationMode === "cloud_coordinator" && !active.workerBuildId) {
+      invalid("cloud coordinator mode requires the worker image build id");
+    }
     if (!active.containerRegistryAuthId) {
       invalid("the active RunPod profile requires containerRegistryAuthId for the private image");
     }
@@ -452,7 +550,15 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
     if (!active.modelArtifacts) {
       invalid("the active RunPod profile requires checksum-bound modelArtifacts");
     }
-    if (!willHaveKey) invalid("the active RunPod backend requires an API key");
+    if (orchestrationMode === "local_gateway" && !willHaveKey) {
+      invalid("the local RunPod gateway requires an API key");
+    }
+    if (orchestrationMode === "cloud_coordinator" && !coordinatorEndpoint) {
+      invalid("cloud coordinator mode requires a coordinator endpointUrl");
+    }
+    if (orchestrationMode === "cloud_coordinator" && !willHaveCoordinatorToken) {
+      invalid("cloud coordinator mode requires a coordinator ingest token");
+    }
   }
   return {
     version: 1,
@@ -460,9 +566,34 @@ function normalizeUpdate(input: unknown, hasExistingKey: boolean): ComputeConfig
     defaultBackend: raw.defaultBackend,
     profiles,
     activeProfileId: raw.activeProfileId,
+    orchestrationMode,
     ...(apiKey ? { apiKey } : {}),
     clearApiKey: raw.clearApiKey === true,
     ...(watchdog ? { watchdog } : {}),
+    ...(coordinator ? { coordinator } : {}),
+  };
+}
+
+function normalizeCoordinatorUpdate(
+  value: ComputeCoordinatorUpdateV1 | undefined,
+): ComputeCoordinatorUpdateV1 | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object") invalid("coordinator must be an object");
+  const endpointUrl = normalizedCoordinatorEndpoint(value.endpointUrl);
+  const ingestToken = typeof value.ingestToken === "string" ? value.ingestToken.trim() : undefined;
+  if (ingestToken && !endpointUrl) {
+    invalid("coordinator endpointUrl is required when setting an ingest token");
+  }
+  if (ingestToken && !WATCHDOG_TOKEN_PATTERN.test(ingestToken)) {
+    invalid("coordinator ingestToken must be 32..512 base64url characters");
+  }
+  if (ingestToken && value.clearIngestToken) {
+    invalid("cannot set and clear the coordinator ingest token together");
+  }
+  return {
+    ...(endpointUrl ? { endpointUrl } : {}),
+    ...(ingestToken ? { ingestToken } : {}),
+    clearIngestToken: value.clearIngestToken === true,
   };
 }
 
@@ -510,6 +641,15 @@ function gatewayOwnedWatchdogPath(): string {
   return path.join(CONFIG.computeKeysDir, "watchdog-ingest.key");
 }
 
+function gatewayOwnedCoordinatorPath(): string {
+  return path.join(CONFIG.computeKeysDir, "coordinator-ingest.key");
+}
+
+function isGatewayOwnedCoordinatorPath(file: string | null): boolean {
+  if (!file) return false;
+  return path.resolve(file) === path.resolve(gatewayOwnedCoordinatorPath());
+}
+
 function isGatewayOwnedWatchdogPath(file: string | null): boolean {
   if (!file) return false;
   return path.resolve(file) === path.resolve(gatewayOwnedWatchdogPath());
@@ -535,6 +675,47 @@ export async function readRunPodApiKey(): Promise<string | null> {
 export interface ComputeWatchdogAccess {
   endpointUrl: string;
   ingestToken: string;
+}
+
+export interface ComputeCoordinatorAccess {
+  endpointUrl: string;
+  ingestToken: string;
+}
+
+export async function readComputeCoordinatorAccess(): Promise<ComputeCoordinatorAccess | null> {
+  const { config } = await readStoredConfig();
+  if (!config.coordinator?.endpointUrl || !config.coordinator.tokenFile) return null;
+  try {
+    const ingestToken = (await fs.readFile(config.coordinator.tokenFile, "utf8")).trim();
+    if (!WATCHDOG_TOKEN_PATTERN.test(ingestToken)) {
+      throw new Error("stored coordinator ingest token is invalid");
+    }
+    return { endpointUrl: config.coordinator.endpointUrl, ingestToken };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export async function markComputeCoordinatorVerified(
+  result: ComputeCoordinatorTestResult,
+): Promise<ComputeConfigV1> {
+  const { config } = await readStoredConfig();
+  if (!config.coordinator?.endpointUrl || !(await exists(config.coordinator.tokenFile))) {
+    throw new ComputeConfigValidationError(
+      "coordinator endpoint and ingest token must be saved before verification",
+    );
+  }
+  const stored: StoredComputeConfig = {
+    ...config,
+    coordinator: {
+      ...config.coordinator,
+      verifiedAt: result.checkedAt,
+      cacheSigningKeyId: result.cacheSigning.keyId,
+    },
+  };
+  await writeAtomic(CONFIG.computeConfigPath, `${JSON.stringify(stored, null, 2)}\n`);
+  return toPublic(stored, "saved");
 }
 
 export async function readComputeWatchdogAccess(): Promise<ComputeWatchdogAccess | null> {
@@ -576,7 +757,13 @@ export async function markComputeWatchdogVerified(
 export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1> {
   const { config: current } = await readStoredConfig();
   const hasExistingKey = await exists(current.apiKeyFile);
-  const update = normalizeUpdate(input, hasExistingKey);
+  const hasExistingCoordinatorToken = await exists(current.coordinator?.tokenFile ?? null);
+  const update = normalizeUpdate(
+    input,
+    hasExistingKey,
+    hasExistingCoordinatorToken,
+    current.coordinator?.endpointUrl,
+  );
   const safeKeyPath = gatewayOwnedKeyPath();
   let apiKeyFile = current.apiKeyFile;
   if (update.apiKey) {
@@ -611,14 +798,44 @@ export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1
         }
       : null;
   }
+  const safeCoordinatorPath = gatewayOwnedCoordinatorPath();
+  let coordinator = current.coordinator ?? null;
+  if (update.coordinator) {
+    const endpointUrl = update.coordinator.endpointUrl;
+    let tokenFile = coordinator?.tokenFile ?? null;
+    if (update.coordinator.ingestToken) {
+      await writeAtomic(safeCoordinatorPath, `${update.coordinator.ingestToken}\n`);
+      tokenFile = safeCoordinatorPath;
+    } else if (update.coordinator.clearIngestToken) {
+      tokenFile = null;
+    }
+    const endpointChanged = endpointUrl !== coordinator?.endpointUrl;
+    const tokenChanged = Boolean(
+      update.coordinator.ingestToken || update.coordinator.clearIngestToken,
+    );
+    coordinator = endpointUrl
+      ? {
+          endpointUrl,
+          tokenFile,
+          ...(!endpointChanged && !tokenChanged && coordinator?.verifiedAt
+            ? { verifiedAt: coordinator.verifiedAt }
+            : {}),
+          ...(!endpointChanged && !tokenChanged && coordinator?.cacheSigningKeyId
+            ? { cacheSigningKeyId: coordinator.cacheSigningKeyId }
+            : {}),
+        }
+      : null;
+  }
   const stored: StoredComputeConfig = {
     version: 1,
     enabled: update.enabled,
     defaultBackend: update.defaultBackend,
     profiles: update.profiles,
     activeProfileId: update.activeProfileId,
+    orchestrationMode: update.orchestrationMode ?? "local_gateway",
     apiKeyFile,
     watchdog,
+    coordinator,
   };
   await writeAtomic(CONFIG.computeConfigPath, `${JSON.stringify(stored, null, 2)}\n`);
   if (
@@ -636,6 +853,16 @@ export async function saveComputeConfig(input: unknown): Promise<ComputeConfigV1
     current.watchdog?.tokenFile !== watchdog?.tokenFile
   ) {
     await fs.unlink(current.watchdog!.tokenFile!).catch((error: any) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
+  if (
+    (update.coordinator?.clearIngestToken ||
+      (update.coordinator !== undefined && coordinator === null)) &&
+    isGatewayOwnedCoordinatorPath(current.coordinator?.tokenFile ?? null) &&
+    current.coordinator?.tokenFile !== coordinator?.tokenFile
+  ) {
+    await fs.unlink(current.coordinator!.tokenFile!).catch((error: any) => {
       if (error?.code !== "ENOENT") throw error;
     });
   }
