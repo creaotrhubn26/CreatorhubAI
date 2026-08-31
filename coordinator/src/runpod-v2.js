@@ -831,7 +831,7 @@ export class RunPodV2Client {
     try {
       let response;
       try {
-        response = await this.fetchImpl(`${this.baseUrl}${requestPath}`, {
+        response = await this.fetchImpl.call(globalThis, `${this.baseUrl}${requestPath}`, {
           method,
           headers: new Headers({
             Accept: "application/json",

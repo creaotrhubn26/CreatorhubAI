@@ -429,7 +429,8 @@ describe("RunPod v2 HTTP client", () => {
     const client = new RunPodV2Client({
       apiKey: API_KEY,
       baseUrl: BASE_URL,
-      fetchImpl: async (url, options) => {
+      fetchImpl: async function (url, options) {
+        expect(this).toBe(globalThis);
         calls.push({
           url,
           method: options.method,
