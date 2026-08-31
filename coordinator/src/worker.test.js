@@ -1,5 +1,6 @@
 import { createHmac, webcrypto } from "node:crypto";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { RunPodV2Error } from "./runpod-v2.js";
 import { ComputeCoordinator } from "./worker.js";
 
 const NOW = Date.parse("2026-08-31T12:00:00.000Z");
@@ -603,6 +604,31 @@ describe("cache-gated lifecycle", () => {
       maxHourlyUsd: 0.49,
       observedHourlyUsd: 0.49,
     });
+  });
+
+  it("waits cost-free for the exact bounded repair GPU instead of failing or widening", async () => {
+    const { instance, storage } = coordinator();
+    const path = `/v1/jobs/${JOB_ID}`;
+    await instance.fetch(signedRequest("PUT", path, jobRequest()));
+    vi.spyOn(instance, "advance").mockRejectedValueOnce(
+      new RunPodV2Error(
+        "GPU_UNAVAILABLE",
+        "the exact Secure GPU is unavailable at the volume data center within the ceiling",
+      ),
+    );
+
+    await instance.alarm();
+
+    expect(await instance.getJob(JOB_ID)).toMatchObject({
+      state: "waiting_for_capacity",
+      phase: "cache_repair",
+      createAttempted: false,
+      cleanup: { requested: false, confirmed: false },
+      internal: { repairAllocation: null, terminalTarget: null },
+    });
+    expect((await instance.getJob(JOB_ID)).failureCode).toBeUndefined();
+    expect(await storage.get("active-job")).toBe(JOB_ID);
+    expect(storage.alarmAt).toBe(NOW + 30_000);
   });
 
   it("uses worker activity for idle expiry and leaves duplicate create outcomes untouched", async () => {

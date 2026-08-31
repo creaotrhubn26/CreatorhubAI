@@ -15,6 +15,7 @@ const SAFE_JOB_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}
 const SAFE_FINGERPRINT = /^[a-f0-9]{64}$/;
 const JOB_STATES = new Set<ComputeCoordinatorJobState>([
   "accepted",
+  "waiting_for_capacity",
   "watchdog_registered",
   "recovering_create",
   "provisioning",

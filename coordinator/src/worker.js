@@ -1431,14 +1431,30 @@ export class ComputeCoordinator {
       const config = await configuration(this.env);
       await this.advance(job, config);
     } catch (error) {
-      job.failureCode =
-        error instanceof RunPodV2Error
-          ? error.code
-          : error instanceof Error
-            ? error.message
-            : "COORDINATOR_FAILURE";
-      job.internal.terminalTarget = "failed";
-      job.state = "terminating";
+      const waitingForBoundedRepairCapacity =
+        error instanceof RunPodV2Error &&
+        error.code === "GPU_UNAVAILABLE" &&
+        job.kind === "gpu_worker" &&
+        job.phase === "cache_repair" &&
+        job.createAttempted === false &&
+        !job.internal.terminalTarget &&
+        Date.now() < Date.parse(job.currentDeadlineAt);
+      if (waitingForBoundedRepairCapacity) {
+        // Availability is transient. Keep this cloud-owned job cost-free and
+        // retry on the normal alarm cadence; never widen the GPU, DC, or cap.
+        job.state = "waiting_for_capacity";
+        job.failureCode = undefined;
+        job.internal.repairAllocation = null;
+      } else {
+        job.failureCode =
+          error instanceof RunPodV2Error
+            ? error.code
+            : error instanceof Error
+              ? error.message
+              : "COORDINATOR_FAILURE";
+        job.internal.terminalTarget = "failed";
+        job.state = "terminating";
+      }
     }
     await this.putJob(job);
     if (!TERMINAL_STATES.has(job.state)) await this.schedule(POLL_MS);

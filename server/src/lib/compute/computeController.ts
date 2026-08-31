@@ -411,13 +411,15 @@ export class ComputeController {
       coordinatorJob: job,
       detail:
         job.failureCode ??
-        (job.phase === "cache_repair"
-          ? job.cache.state === "ready"
-            ? "The signed model cache is ready; the coordinator is handing off to GPU compute."
-            : "The cloud coordinator is preparing and attesting the model cache on bounded repair compute."
-          : job.state === "ready"
-            ? "The GPU worker is ready under cloud coordinator supervision."
-            : "The cloud coordinator is provisioning or validating the GPU worker."),
+        (job.state === "waiting_for_capacity"
+          ? "The cloud coordinator is waiting cost-free for the exact bounded repair GPU in the volume data center."
+          : job.phase === "cache_repair"
+            ? job.cache.state === "ready"
+              ? "The signed model cache is ready; the coordinator is handing off to GPU compute."
+              : "The cloud coordinator is preparing and attesting the model cache on bounded repair compute."
+            : job.state === "ready"
+              ? "The GPU worker is ready under cloud coordinator supervision."
+              : "The cloud coordinator is provisioning or validating the GPU worker."),
       ...(budget ? { budget } : {}),
       policy: {
         secureCloudOnly: true,

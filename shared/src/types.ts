@@ -2882,6 +2882,7 @@ export interface ComputeCacheStatusV1 {
 
 export type ComputeCoordinatorJobState =
   | "accepted"
+  | "waiting_for_capacity"
   | "watchdog_registered"
   | "recovering_create"
   | "provisioning"
