@@ -67,6 +67,26 @@ class CacheManifestTests(unittest.TestCase):
             self.private_key,
         )
 
+    def write_receipts(self):
+        receipt_root = Path(self.temporary.name) / "receipts"
+        receipt_root.mkdir(mode=0o700, exist_ok=True)
+        for expected in cache_manifest._expectations(self.hashes):
+            metadata = (self.root / expected.name).stat()
+            value = {
+                "schemaVersion": 1,
+                "path": expected.name,
+                "sha256": expected.sha256,
+                "bytes": metadata.st_size,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "mtimeNs": metadata.st_mtime_ns,
+                "ctimeNs": metadata.st_ctime_ns,
+            }
+            receipt = receipt_root / f"{expected.kind}.json"
+            receipt.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+            receipt.chmod(0o600)
+        return receipt_root
+
     def verify(self, **changes):
         return cache_manifest.verify(
             self.root,
@@ -152,6 +172,58 @@ class CacheManifestTests(unittest.TestCase):
 
         self.assertEqual(installed, manifest)
         self.assertEqual(verified, manifest)
+
+    def test_ephemeral_receipts_avoid_a_second_artifact_hash_and_seal_exact_inodes(self):
+        receipt_root = self.write_receipts()
+        with mock.patch.object(
+            cache_manifest,
+            "_hash_and_seal_artifact",
+            side_effect=AssertionError("receipted publication must not hash twice"),
+        ):
+            signed = cache_manifest.prepare(
+                self.root,
+                self.volume_id,
+                self.build_id,
+                self.hashes,
+                receipt_root,
+            )
+
+        self.assertEqual([item["kind"] for item in signed["artifacts"]], [
+            "model",
+            "mmproj",
+            "draft",
+        ])
+        for expected in cache_manifest._expectations(self.hashes):
+            self.assertEqual((self.root / expected.name).stat().st_mode & 0o777, 0o444)
+
+    def test_receipted_publication_rejects_artifact_or_receipt_tampering(self):
+        receipt_root = self.write_receipts()
+        model = self.root / cache_manifest._expectations(self.hashes)[0].name
+        model.write_bytes(b"changed after verification")
+        with self.assertRaisesRegex(cache_manifest.CacheManifestError, "changed"):
+            cache_manifest.prepare(
+                self.root,
+                self.volume_id,
+                self.build_id,
+                self.hashes,
+                receipt_root,
+            )
+
+        model.write_bytes(self.contents["model"])
+        receipt_root = self.write_receipts()
+        receipt = receipt_root / "model.json"
+        value = json.loads(receipt.read_text(encoding="utf-8"))
+        value["inode"] += 1
+        receipt.write_text(json.dumps(value) + "\n")
+        receipt.chmod(0o600)
+        with self.assertRaisesRegex(cache_manifest.CacheManifestError, "changed"):
+            cache_manifest.prepare(
+                self.root,
+                self.volume_id,
+                self.build_id,
+                self.hashes,
+                receipt_root,
+            )
 
     def test_tampered_payload_signature_and_wrong_public_key_fail_closed(self):
         manifest = self.publish()

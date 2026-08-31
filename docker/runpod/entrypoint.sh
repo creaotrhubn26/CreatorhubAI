@@ -11,6 +11,7 @@ READY_MARKER="$STATE_ROOT/model.ready"
 BOOTSTRAP_STATUS_TOOL=/opt/glimmer/docker/runpod/bootstrap_status.py
 CACHE_MANIFEST_TOOL=/opt/glimmer/docker/runpod/cache_manifest.py
 COORDINATOR_CALLBACK_TOOL=/opt/glimmer/docker/runpod/coordinator_callback.py
+RECEIPT_ROOT="$STATE_ROOT/artifact-receipts"
 CTX="${GLIMMER_CONTEXT_TOKENS:-65536}"
 PREWARM_ONLY="${GLIMMER_PREWARM_ONLY:-0}"
 REQUIRE_READY_CACHE="${GLIMMER_REQUIRE_READY_CACHE:-0}"
@@ -44,9 +45,12 @@ case "$REQUIRE_READY_CACHE" in
 esac
 
 install -d -o glimmer -g glimmer -m 0700 "$STATE_ROOT" "$RECOVERY_ROOT"
+USE_HASH_RECEIPTS=false
 if [ "$REQUIRE_READY_CACHE" = 1 ]; then
   if [ "$PREWARM_ONLY" = 1 ]; then
     install -d -o root -g root -m 0700 "$MODEL_ROOT"
+    install -d -o root -g root -m 0700 "$RECEIPT_ROOT"
+    USE_HASH_RECEIPTS=true
   else
     install -d -o root -g root -m 0555 "$MODEL_ROOT"
   fi
@@ -321,12 +325,26 @@ fetch_artifact() {
   local status
   status_update --stage artifact_preparing \
     --artifact-kind "$kind" --artifact-phase locking
-  if run_download --url "$url" --sha256 "$sha256" --output "$output" \
-    --status-file "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" \
-    --artifact-kind "$kind" "${HOST_ARGS[@]}"; then
-    return 0
+  if [ "$USE_HASH_RECEIPTS" = true ]; then
+    if run_download --url "$url" --sha256 "$sha256" --output "$output" \
+      --status-file "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" \
+      --artifact-kind "$kind" --receipt "$RECEIPT_ROOT/$kind.json" \
+      "${HOST_ARGS[@]}"; then
+      status=0
+    else
+      status=$?
+    fi
   else
-    status=$?
+    if run_download --url "$url" --sha256 "$sha256" --output "$output" \
+      --status-file "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" \
+      --artifact-kind "$kind" "${HOST_ARGS[@]}"; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  if [ "$status" -eq 0 ]; then
+    return 0
   fi
   case "$status" in
     5) BOOTSTRAP_FAILURE_CODE=worker_start_failed ;;
@@ -374,7 +392,7 @@ else
       CACHE_ATTESTATION="$STATE_ROOT/cache-attestation.json"
       CACHE_DOCUMENT="$STATE_ROOT/cache-document.json"
       python3 "$CACHE_MANIFEST_TOOL" prepare "${CACHE_MANIFEST_ARGS[@]}" \
-        --output "$CACHE_ATTESTATION" || {
+        --output "$CACHE_ATTESTATION" --receipt-dir "$RECEIPT_ROOT" || {
         BOOTSTRAP_FAILURE_CODE=cache_publish_failed
         exit 23
       }
@@ -398,7 +416,8 @@ else
       }
       rm -f "$CACHE_ATTESTATION" "$CACHE_DOCUMENT"
     elif ! GLIMMER_CACHE_SIGNING_PRIVATE_KEY="$CACHE_SIGNING_PRIVATE_KEY" \
-      python3 "$CACHE_MANIFEST_TOOL" publish "${CACHE_MANIFEST_ARGS[@]}"; then
+      python3 "$CACHE_MANIFEST_TOOL" publish "${CACHE_MANIFEST_ARGS[@]}" \
+        --receipt-dir "$RECEIPT_ROOT"; then
       CACHE_SIGNING_PRIVATE_KEY=""
       BOOTSTRAP_FAILURE_CODE=cache_publish_failed
       echo '{"event":"startup_failed","reason":"cache_publish_failed"}' >&2

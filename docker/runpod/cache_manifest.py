@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -34,6 +34,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 CACHE_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024
+MAX_RECEIPT_BYTES = 4 * 1024
+RECEIPT_SCHEMA_VERSION = 1
 CHUNK_BYTES = 1024 * 1024
 MANIFEST_NAME = "cache-ready.json"
 ARTIFACT_ORDER = ("model", "mmproj", "draft")
@@ -224,6 +226,119 @@ def _hash_and_seal_artifact(directory: int, expected: ArtifactExpectation) -> Di
         os.close(descriptor)
 
 
+def _open_receipt_root(root: Path) -> int:
+    try:
+        descriptor = os.open(root, _directory_flags())
+    except OSError as exc:
+        raise CacheManifestError("artifact receipt directory is unavailable") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise CacheManifestError("artifact receipt directory is not private")
+    return descriptor
+
+
+def _read_receipt(directory: int, expected: ArtifactExpectation) -> Dict[str, Any]:
+    name = f"{expected.kind}.json"
+    try:
+        descriptor = os.open(name, _artifact_flags(), dir_fd=directory)
+    except OSError as exc:
+        raise CacheManifestError("artifact receipt is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_RECEIPT_BYTES
+        ):
+            raise CacheManifestError("artifact receipt is invalid")
+        data = bytearray()
+        while len(data) <= MAX_RECEIPT_BYTES:
+            chunk = os.read(descriptor, min(4096, MAX_RECEIPT_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > MAX_RECEIPT_BYTES:
+            raise CacheManifestError("artifact receipt is too large")
+        if not _path_still_names_descriptor(directory, name, descriptor):
+            raise CacheManifestError("artifact receipt pathname changed")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(bytes(data).decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CacheManifestError("artifact receipt is invalid JSON") from exc
+    keys = {
+        "schemaVersion",
+        "path",
+        "sha256",
+        "bytes",
+        "device",
+        "inode",
+        "mtimeNs",
+        "ctimeNs",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        raise CacheManifestError("artifact receipt fields are invalid")
+    if (
+        value["schemaVersion"] != RECEIPT_SCHEMA_VERSION
+        or value["path"] != expected.name
+        or value["sha256"] != expected.sha256
+    ):
+        raise CacheManifestError("artifact receipt identity is invalid")
+    for key in ("bytes", "device", "inode", "mtimeNs", "ctimeNs"):
+        if type(value[key]) is not int or value[key] < 0:
+            raise CacheManifestError("artifact receipt metadata is invalid")
+    if value["bytes"] <= 0 or value["bytes"] > MAX_ARTIFACT_BYTES:
+        raise CacheManifestError("artifact receipt size is invalid")
+    return value
+
+
+def _seal_receipted_artifact(
+    directory: int,
+    receipt_directory: int,
+    expected: ArtifactExpectation,
+) -> Dict[str, Any]:
+    receipt = _read_receipt(receipt_directory, expected)
+    try:
+        descriptor = os.open(expected.name, _artifact_flags(), dir_fd=directory)
+    except OSError as exc:
+        raise CacheManifestError("cache artifact is unavailable") from exc
+    try:
+        metadata = _safe_artifact_metadata(descriptor, sealed=False)
+        actual = {
+            "bytes": metadata.st_size,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "mtimeNs": metadata.st_mtime_ns,
+            "ctimeNs": metadata.st_ctime_ns,
+        }
+        if any(receipt[key] != actual[key] for key in actual):
+            raise CacheManifestError("artifact changed after checksum verification")
+        if not _path_still_names_descriptor(directory, expected.name, descriptor):
+            raise CacheManifestError("cache artifact pathname changed before publication")
+        os.fchown(descriptor, os.geteuid(), os.getegid())
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        if not _path_still_names_descriptor(directory, expected.name, descriptor):
+            raise CacheManifestError("cache artifact pathname changed during publication")
+        return {
+            "kind": expected.kind,
+            "path": expected.name,
+            "sha256": expected.sha256,
+            "bytes": metadata.st_size,
+        }
+    finally:
+        os.close(descriptor)
+
+
 def _sync_directory(descriptor: int) -> None:
     try:
         os.fsync(descriptor)
@@ -266,6 +381,7 @@ def publish(
     build_id: str,
     hashes: Mapping[str, str],
     private_key_value: str,
+    receipt_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Hash once, sign, atomically publish, and seal a prepared cache."""
 
@@ -275,7 +391,7 @@ def publish(
     except ValueError as exc:
         raise CacheManifestError("cache signing private key is invalid") from exc
     public_raw = _public_bytes(private_key.public_key())
-    signed = prepare(root, volume_id, build_id, hashes)
+    signed = prepare(root, volume_id, build_id, hashes, receipt_root)
     manifest = {
         "signed": signed,
         "signature": {
@@ -292,15 +408,22 @@ def prepare(
     volume_id: str,
     build_id: str,
     hashes: Mapping[str, str],
+    receipt_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Hash every artifact once and return the exact payload the coordinator signs."""
 
     _validate_identity(volume_id, build_id)
     expectations = _expectations(hashes)
     directory = _open_cache_root(root, 0o700)
+    receipt_directory = _open_receipt_root(receipt_root) if receipt_root is not None else -1
     try:
         artifacts = [
-            _hash_and_seal_artifact(directory, expectation) for expectation in expectations
+            (
+                _seal_receipted_artifact(directory, receipt_directory, expectation)
+                if receipt_directory >= 0
+                else _hash_and_seal_artifact(directory, expectation)
+            )
+            for expectation in expectations
         ]
         _sync_directory(directory)
         return {
@@ -311,6 +434,8 @@ def prepare(
             "artifacts": artifacts,
         }
     finally:
+        if receipt_directory >= 0:
+            os.close(receipt_directory)
         os.close(directory)
 
 
@@ -546,6 +671,7 @@ def main() -> int:
     parser.add_argument("--draft-sha256", required=True)
     parser.add_argument("--output")
     parser.add_argument("--document")
+    parser.add_argument("--receipt-dir")
     args = parser.parse_args()
     try:
         if args.command == "publish":
@@ -555,12 +681,19 @@ def main() -> int:
                 args.build_id,
                 _hash_arguments(args),
                 os.environ.get("GLIMMER_CACHE_SIGNING_PRIVATE_KEY", ""),
+                Path(args.receipt_dir) if args.receipt_dir else None,
             )
             print('{"event":"cache_manifest_published"}')
         elif args.command == "prepare":
             if not args.output:
                 raise CacheManifestError("cache attestation output is required")
-            signed = prepare(Path(args.root), args.volume_id, args.build_id, _hash_arguments(args))
+            signed = prepare(
+                Path(args.root),
+                args.volume_id,
+                args.build_id,
+                _hash_arguments(args),
+                Path(args.receipt_dir) if args.receipt_dir else None,
+            )
             output = Path(args.output)
             temporary = output.with_name(f".{output.name}.{secrets.token_hex(8)}.tmp")
             temporary.write_bytes(canonical_json_bytes(signed) + b"\n")

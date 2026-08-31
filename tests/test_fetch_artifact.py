@@ -104,6 +104,44 @@ class FetchArtifactTests(unittest.TestCase):
                 reporter=reporter,
             )
 
+    def test_cached_artifact_emits_private_ephemeral_receipt_without_network(self):
+        content = b"already verified"
+        expected = hashlib.sha256(content).hexdigest()
+        self.target.write_bytes(content)
+        receipt_root = self.root / "receipts"
+        receipt_root.mkdir(mode=0o700)
+        receipt = receipt_root / "model.json"
+        opener = QueueOpener()
+        with (
+            mock.patch.object(fetch_artifact, "validate_url", return_value=self.url),
+            mock.patch.object(fetch_artifact.request, "build_opener", return_value=opener),
+        ):
+            fetch_artifact.fetch(
+                self.url,
+                expected,
+                self.target,
+                self.hosts,
+                receipt_path=receipt,
+            )
+
+        value = json.loads(receipt.read_text(encoding="utf-8"))
+        metadata = self.target.stat()
+        self.assertEqual(opener.requests, [])
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            value,
+            {
+                "schemaVersion": 1,
+                "path": "model.gguf",
+                "sha256": expected,
+                "bytes": len(content),
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "mtimeNs": metadata.st_mtime_ns,
+                "ctimeNs": metadata.st_ctime_ns,
+            },
+        )
+
     def test_interruption_preserves_checksum_bound_partial_and_resumes(self):
         content = b"hello world"
         expected = hashlib.sha256(content).hexdigest()

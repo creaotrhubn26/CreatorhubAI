@@ -9,8 +9,10 @@ import fcntl
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 import re
+import secrets
 import signal
 import socket
 import ssl
@@ -26,6 +28,8 @@ except ImportError:  # Direct execution inside the worker image.
     from bootstrap_status import BootstrapStatusError, transition
 
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024
+MAX_RECEIPT_BYTES = 4 * 1024
+RECEIPT_SCHEMA_VERSION = 1
 CHUNK_BYTES = 1024 * 1024
 SYNC_INTERVAL_BYTES = 256 * 1024 * 1024
 SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
@@ -107,6 +111,127 @@ def _target_matches(target: Path, expected_sha256: str) -> bool:
     except FileNotFoundError:
         return False
     return hmac.compare_digest(digest, expected_sha256)
+
+
+def _artifact_receipt(
+    target: Path,
+    descriptor: int,
+    expected_sha256: str,
+    byte_length: int,
+) -> dict[str, Any]:
+    metadata = os.fstat(descriptor)
+    try:
+        path_metadata = target.lstat()
+    except OSError as exc:
+        raise ArtifactIntegrityError("verified artifact identity changed") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size != byte_length
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_nlink != 1
+        or path_metadata.st_dev != metadata.st_dev
+        or path_metadata.st_ino != metadata.st_ino
+    ):
+        raise ArtifactIntegrityError("verified artifact identity changed")
+    return {
+        "schemaVersion": RECEIPT_SCHEMA_VERSION,
+        "path": target.name,
+        "sha256": expected_sha256,
+        "bytes": byte_length,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mtimeNs": metadata.st_mtime_ns,
+        "ctimeNs": metadata.st_ctime_ns,
+    }
+
+
+def _verified_target_receipt(target: Path, expected_sha256: str) -> Optional[dict[str, Any]]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("artifact path must be a private regular file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("artifact path must be a private regular file")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        stable = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if (
+            not stable
+            or total != after.st_size
+            or not hmac.compare_digest(digest.hexdigest(), expected_sha256)
+        ):
+            return None
+        return _artifact_receipt(target, descriptor, expected_sha256, total)
+    finally:
+        os.close(descriptor)
+
+
+def _write_receipt(path: Path, value: dict[str, Any]) -> None:
+    if not re.fullmatch(r"(?:model|mmproj|draft)\.json", path.name):
+        raise ValueError("artifact receipt name is invalid")
+    data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise ValueError("artifact receipt is too large")
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(path.parent, directory_flags)
+    descriptor = -1
+    temporary = f".{path.name}.{secrets.token_hex(8)}.tmp"
+    try:
+        metadata = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ValueError("artifact receipt directory is not private")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory)
+        with os.fdopen(os.dup(descriptor), "wb", buffering=0) as output:
+            _write_all(output, data)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        try:
+            os.fsync(directory)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EROFS}:
+                raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
 
 
 def _clean_obsolete_partials(target: Path, expected_sha256: str) -> None:
@@ -282,6 +407,7 @@ def fetch(
     target: Path,
     allowed_hosts: set[str],
     reporter: Optional[ProgressReporter] = None,
+    receipt_path: Optional[Path] = None,
 ) -> None:
     if not SHA256_PATTERN.fullmatch(expected_sha256):
         raise ValueError("artifact SHA-256 is invalid")
@@ -299,7 +425,10 @@ def fetch(
     # never compete for one pathname after this function returns.
     _report(reporter, "locking")
     with _open_target_lock(target):
-        if _target_matches(target, expected_sha256):
+        receipt = _verified_target_receipt(target, expected_sha256)
+        if receipt is not None:
+            if receipt_path is not None:
+                _write_receipt(receipt_path, receipt)
             _report(reporter, "cached")
             return
         _clean_obsolete_partials(target, expected_sha256)
@@ -390,6 +519,11 @@ def fetch(
                     raise ArtifactIntegrityError("artifact partial pathname changed")
                 os.replace(temporary, target)
                 _sync_directory(target.parent)
+                if receipt_path is not None:
+                    _write_receipt(
+                        receipt_path,
+                        _artifact_receipt(target, output.fileno(), expected_sha256, final_size),
+                    )
                 _report(reporter, "complete", final_size, final_size)
             except ArtifactIntegrityError:
                 _unlink_locked_path_if_same(temporary, output)
@@ -416,6 +550,7 @@ def main() -> int:
     parser.add_argument("--status-file")
     parser.add_argument("--lease-id")
     parser.add_argument("--artifact-kind", choices=("model", "mmproj", "draft"))
+    parser.add_argument("--receipt")
     args = parser.parse_args()
     hosts = {value.strip().lower() for value in args.allowed_host if value.strip()}
     status_arguments = (args.status_file, args.lease_id, args.artifact_kind)
@@ -452,7 +587,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _interrupt_download)
     signal.signal(signal.SIGINT, _interrupt_download)
     try:
-        fetch(args.url, args.sha256.lower(), Path(args.output), hosts, reporter=reporter)
+        fetch(
+            args.url,
+            args.sha256.lower(),
+            Path(args.output),
+            hosts,
+            reporter=reporter,
+            receipt_path=Path(args.receipt) if args.receipt else None,
+        )
     except BootstrapStatusError:
         print('{"event":"startup_failed","reason":"status_persistence_failed"}', file=sys.stderr)
         return 6

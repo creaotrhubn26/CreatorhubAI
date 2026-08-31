@@ -222,6 +222,7 @@ while True:
         self._write_executable(
             app / "docker" / "runpod" / "fetch_artifact.py",
             """#!/usr/bin/env python3
+import json
 import os
 import signal
 import sys
@@ -249,6 +250,21 @@ if mode == "download_failure":
     raise SystemExit(21)
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_bytes(b"fixture")
+if "--receipt" in sys.argv:
+    receipt = Path(sys.argv[sys.argv.index("--receipt") + 1])
+    metadata = output.stat()
+    value = {
+        "schemaVersion": 1,
+        "path": output.name,
+        "sha256": sys.argv[sys.argv.index("--sha256") + 1],
+        "bytes": metadata.st_size,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mtimeNs": metadata.st_mtime_ns,
+        "ctimeNs": metadata.st_ctime_ns,
+    }
+    receipt.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\\n")
+    receipt.chmod(0o600)
 record(f"download_exit:{os.getpid()}")
 """,
         )
