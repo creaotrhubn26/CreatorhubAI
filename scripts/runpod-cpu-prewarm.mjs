@@ -27,6 +27,8 @@ const CLEANUP_DEADLINE_MS = 150_000;
 const RECOVERY_STABLE_EMPTY_MS = 30_000;
 const POLL_INTERVAL_MS = 2_000;
 const POD_POLL_INTERVAL_MS = 5_000;
+const POD_POLL_TRANSPORT_RETRY_DELAY_MS = 250;
+const POD_POLL_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 const MAX_PROBLEM_BYTES = 16 * 1024;
 const MAX_PROBLEM_TITLE_LENGTH = 256;
@@ -1187,11 +1189,30 @@ async function recoverLostCreate(client, podName, deadlineAtMs, signal) {
   );
 }
 
-async function pollUntilExited(client, podId, expected, deadlineAtMs, signal, timeline) {
+export async function pollUntilExited(client, podId, expected, deadlineAtMs, signal, timeline) {
   let previousStatus = null;
+  let consecutiveTransportFailures = 0;
   for (;;) {
     if (performance.now() >= deadlineAtMs) fail("hard_deadline", "prewarm hard deadline elapsed");
-    const pod = await client.getPod(podId, { signal });
+    let pod;
+    try {
+      pod = await client.getPod(podId, { signal });
+      consecutiveTransportFailures = 0;
+    } catch (error) {
+      if (!(error instanceof ProviderTransportError) || error.ambiguous || signal?.aborted) {
+        throw error;
+      }
+      consecutiveTransportFailures += 1;
+      if (consecutiveTransportFailures >= POD_POLL_MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
+        throw error;
+      }
+      timeline.add("pod_poll_transport_retry", {
+        podId,
+        consecutiveFailure: consecutiveTransportFailures,
+      });
+      await boundedDelay(POD_POLL_TRANSPORT_RETRY_DELAY_MS * consecutiveTransportFailures, signal);
+      continue;
+    }
     if (!pod) fail("pod_disappeared", "prewarm Pod disappeared before success proof");
     validateOwnedPod(pod, expected, pod.status === "EXITED");
     if (pod.status !== previousStatus) {

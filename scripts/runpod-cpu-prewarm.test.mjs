@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   PrewarmError,
   ProviderHttpError,
+  ProviderTransportError,
   RunPodV2Client,
   buildCreatePodRequest,
   containsExactContainerLogLine,
@@ -19,6 +20,7 @@ import {
   parsePod,
   parseProviderProblemDetails,
   parseRegistryIdentity,
+  pollUntilExited,
   readPrivateRegularFile,
   resolveStatePaths,
   runReadOnlyPreflight,
@@ -447,6 +449,64 @@ test("malformed and oversized provider problems fall back to generic HTTP errors
     });
     assert.equal(postCount, 1);
   }
+});
+
+test("Pod polling tolerates one bounded transient GET failure without another create", async () => {
+  const expected = { ...expectedContract(), maxHourlyUsd: 0.5 };
+  const exited = parsePod(providerPod(expected));
+  const events = [];
+  let getCalls = 0;
+  const result = await pollUntilExited(
+    {
+      async getPod() {
+        getCalls += 1;
+        if (getCalls === 1) throw new ProviderTransportError("get Pod");
+        return exited;
+      },
+    },
+    exited.id,
+    expected,
+    performance.now() + 5_000,
+    new AbortController().signal,
+    { add: (event, payload) => events.push({ event, ...payload }) },
+  );
+
+  assert.equal(result, exited);
+  assert.equal(getCalls, 2);
+  assert.deepEqual(
+    events.map(({ event }) => event),
+    ["pod_poll_transport_retry", "pod_status"],
+  );
+  assert.equal(events[0].consecutiveFailure, 1);
+});
+
+test("Pod polling fails closed after three consecutive transient GET failures", async () => {
+  const expected = { ...expectedContract(), maxHourlyUsd: 0.5 };
+  const events = [];
+  let getCalls = 0;
+
+  await assert.rejects(
+    pollUntilExited(
+      {
+        async getPod() {
+          getCalls += 1;
+          throw new ProviderTransportError("get Pod");
+        },
+      },
+      "pod_123",
+      expected,
+      performance.now() + 5_000,
+      new AbortController().signal,
+      { add: (event, payload) => events.push({ event, ...payload }) },
+    ),
+    (error) => error instanceof ProviderTransportError,
+  );
+
+  assert.equal(getCalls, 3);
+  assert.deepEqual(
+    events.map(({ event }) => event),
+    ["pod_poll_transport_retry", "pod_poll_transport_retry"],
+  );
 });
 
 test("private file reader rejects symlinks, hardlinks and group-readable files", async (context) => {
