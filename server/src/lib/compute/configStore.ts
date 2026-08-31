@@ -27,7 +27,7 @@ const MAX_API_KEY_CHARS = 16_384;
 const WATCHDOG_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,512}$/;
 const MAX_PROFILES = 8;
 export const DEFAULT_RUNPOD_IMAGE_DIGEST =
-  "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f";
+  "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:1e5c6824ba31add182a65d5b50faef692c6f5c512fa6063c1e609d650c027c4c";
 
 export const RUNPOD_A100_GPU_IDS: RunPodGpuTypeId[] = [
   "NVIDIA A100 80GB PCIe",
@@ -87,7 +87,7 @@ function defaultProfile(
     gpuCount: 1,
     contextTokens: 65_536,
     imageDigest: DEFAULT_RUNPOD_IMAGE_DIGEST,
-    workerBuildId: "r2-b654f6591e0c",
+    workerBuildId: "r2-daf6d33b6642",
     maxGpuHourlyUsd,
     idleTimeoutSeconds: 300,
     clarificationTimeoutSeconds: 120,

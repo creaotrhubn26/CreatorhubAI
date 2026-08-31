@@ -383,7 +383,7 @@ Before the first paid live smoke:
 
 1. Create a RunPod API key for the controller and store it through the Compute settings UI; never commit it.
 2. Create a RunPod container registry auth for the private GHCR package and enter only its ID in the active compute profile. Registry credentials remain in RunPod and are never stored by Glimmer.
-3. Use the published worker image `ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f`. It was built from orchestrator commit `b654f6591e0ce97ea4e994b01d3b4a18e1d3f5c3`, with OCI provenance and SBOM, then pulled and runtime-verified by GitHub Actions run `33277906183`.
+3. Use the published worker image `ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:1e5c6824ba31add182a65d5b50faef692c6f5c512fa6063c1e609d650c027c4c`. It was built from orchestrator commit `daf6d33b664227021c2830e374acc29e775d003a`, with OCI provenance and SBOM, then pulled and runtime-verified by GitHub Actions run `33391127738`.
 4. Create a network volume sized for the verified model/runtime cache; do not store raw repository source there.
 5. Set explicit hourly, daily, and monthly budgets.
 6. Deploy and test the independent watchdog.

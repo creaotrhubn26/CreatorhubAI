@@ -137,7 +137,7 @@ describe("compute configuration API", () => {
       gpuCount: 1,
       contextTokens: 65536,
       imageDigest:
-        "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:27426914e48cc3438a2f88c93b383d73fb6a1776f87874f5c9495e8e3e72b35f",
+        "ghcr.io/creaotrhubn26/glimmer-runpod-worker@sha256:1e5c6824ba31add182a65d5b50faef692c6f5c512fa6063c1e609d650c027c4c",
       hasApiKey: false,
       watchdogConfigured: false,
     });
