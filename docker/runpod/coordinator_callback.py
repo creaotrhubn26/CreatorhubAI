@@ -17,9 +17,45 @@ from urllib import error, parse, request
 
 MAX_MANIFEST_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
+MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 CALLBACK_PATH = re.compile(r"^/v1/jobs/[a-f0-9-]{36}/callback$")
+TIMESTAMP_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
+)
+CACHE_PROGRESS_STAGES = {
+    "initializing",
+    "worker_starting",
+    "worker_listening",
+    "artifact_preparing",
+    "artifact_downloading",
+    "artifact_verifying",
+    "cache_publishing",
+}
+ARTIFACT_KINDS = {"model", "mmproj", "draft"}
+ARTIFACT_PHASES = {
+    "locking",
+    "cached",
+    "resuming",
+    "downloading",
+    "verifying",
+    "complete",
+}
+FAILURE_CODES = {
+    "configuration_invalid",
+    "status_persistence_failed",
+    "worker_start_failed",
+    "artifact_download_failed",
+    "artifact_checksum_failed",
+    "cache_not_ready",
+    "cache_publish_failed",
+    "coordinator_callback_failed",
+    "model_start_failed",
+    "model_healthcheck_failed",
+    "bootstrap_interrupted",
+    "unexpected_failure",
+}
 
 
 class CallbackError(RuntimeError):
@@ -138,6 +174,48 @@ def _json_document(path: Path) -> dict[str, Any]:
     return value
 
 
+def _bounded_integer(value: Any) -> bool:
+    return type(value) is int and 0 <= value <= MAX_ARTIFACT_BYTES
+
+
+def _progress_document(path: Path) -> dict[str, Any]:
+    value = _json_document(path)
+    required = {"stage", "outcome", "stageStartedAt", "updatedAt"}
+    if (
+        set(value) - (required | {"artifact"})
+        or not required.issubset(value)
+        or not isinstance(value["stage"], str)
+        or value["stage"] not in CACHE_PROGRESS_STAGES
+        or value["outcome"] != "in_progress"
+        or not isinstance(value["stageStartedAt"], str)
+        or not TIMESTAMP_PATTERN.fullmatch(value["stageStartedAt"])
+        or not isinstance(value["updatedAt"], str)
+        or not TIMESTAMP_PATTERN.fullmatch(value["updatedAt"])
+    ):
+        raise CallbackError("cache progress is invalid")
+    progress = {key: value[key] for key in required}
+    if "artifact" in value:
+        artifact = value["artifact"]
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) - {"kind", "phase", "bytesCompleted", "bytesTotal"}
+            or not {"kind", "phase"}.issubset(artifact)
+            or not isinstance(artifact["kind"], str)
+            or artifact["kind"] not in ARTIFACT_KINDS
+            or not isinstance(artifact["phase"], str)
+            or artifact["phase"] not in ARTIFACT_PHASES
+            or any(
+                key in artifact and not _bounded_integer(artifact[key])
+                for key in ("bytesCompleted", "bytesTotal")
+            )
+            or artifact.get("bytesCompleted", 0)
+            > artifact.get("bytesTotal", MAX_ARTIFACT_BYTES)
+        ):
+            raise CallbackError("cache progress artifact is invalid")
+        progress["artifact"] = dict(artifact)
+    return progress
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -150,6 +228,12 @@ def main() -> int:
     published.add_argument("--cache-key", required=True)
     invalid = commands.add_parser("cache-invalid")
     invalid.add_argument("--cache-key", required=True)
+    progress = commands.add_parser("cache-progress")
+    progress.add_argument("--status", required=True)
+    progress.add_argument("--cache-key", required=True)
+    failed = commands.add_parser("cache-failed")
+    failed.add_argument("--cache-key", required=True)
+    failed.add_argument("--failure-code", choices=sorted(FAILURE_CODES), required=True)
     heartbeat = commands.add_parser("heartbeat")
     heartbeat.add_argument(
         "--worker-state", choices=("bootstrapping", "ready", "busy"), required=True
@@ -199,6 +283,26 @@ def main() -> int:
                 "observedAt": _timestamp(),
                 "cacheKey": args.cache_key,
             }
+        elif args.command == "cache-progress":
+            if not SHA256_PATTERN.fullmatch(args.cache_key):
+                raise CallbackError("cache key is invalid")
+            payload = {
+                "schemaVersion": 1,
+                "type": "cache_progress",
+                "observedAt": _timestamp(),
+                "cacheKey": args.cache_key,
+                "progress": _progress_document(Path(args.status)),
+            }
+        elif args.command == "cache-failed":
+            if not SHA256_PATTERN.fullmatch(args.cache_key):
+                raise CallbackError("cache key is invalid")
+            payload = {
+                "schemaVersion": 1,
+                "type": "cache_failed",
+                "observedAt": _timestamp(),
+                "cacheKey": args.cache_key,
+                "failureCode": args.failure_code,
+            }
         else:
             payload = {
                 "schemaVersion": 1,
@@ -206,7 +310,7 @@ def main() -> int:
                 "observedAt": _timestamp(),
                 "workerState": args.worker_state,
             }
-        send(payload)
+        send(payload, attempts=1 if args.command in {"cache-progress", "cache-failed"} else 5)
     except CallbackError:
         print('{"event":"coordinator_callback_failed"}', file=sys.stderr)
         return 40

@@ -248,6 +248,9 @@ class FetchArtifactTests(unittest.TestCase):
         recovery.mkdir(mode=0o700)
         status_path = recovery / "bootstrap" / LEASE_ID / "status.json"
         bootstrap_status.initialize(status_path, LEASE_ID)
+        public_recovery = self.root / "public-recovery"
+        public_recovery.mkdir(mode=0o755)
+        mirror_path = public_recovery / "bootstrap" / LEASE_ID / "status.json"
         arguments = [
             "fetch_artifact.py",
             "--url",
@@ -260,6 +263,8 @@ class FetchArtifactTests(unittest.TestCase):
             "artifacts.example",
             "--status-file",
             str(status_path),
+            "--status-mirror-file",
+            str(mirror_path),
             "--lease-id",
             LEASE_ID,
             "--artifact-kind",
@@ -287,6 +292,9 @@ class FetchArtifactTests(unittest.TestCase):
         serialized = json.dumps(status)
         self.assertNotIn(self.url, serialized)
         self.assertNotIn(expected, serialized)
+        mirrored = json.loads(mirror_path.read_text(encoding="utf-8"))
+        self.assertEqual(mirrored, bootstrap_status.public_status(status, LEASE_ID))
+        self.assertEqual(mirror_path.stat().st_mode & 0o777, 0o644)
 
     def test_legacy_pid_partial_is_preserved_when_liveness_cannot_be_proven(self):
         content = b"new artifact"

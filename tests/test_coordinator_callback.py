@@ -86,6 +86,86 @@ class CoordinatorCallbackTests(unittest.TestCase):
             )
         )
 
+    def test_cache_progress_cli_sends_one_bounded_secret_free_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "stage": "artifact_downloading",
+                        "outcome": "in_progress",
+                        "stageStartedAt": "2026-09-01T10:00:00.000Z",
+                        "updatedAt": "2026-09-01T10:00:01.000Z",
+                        "artifact": {
+                            "kind": "model",
+                            "phase": "downloading",
+                            "bytesCompleted": 1024,
+                            "bytesTotal": 2048,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            arguments = [
+                "coordinator_callback.py",
+                "cache-progress",
+                "--status",
+                str(status),
+                "--cache-key",
+                "a" * 64,
+            ]
+            with (
+                mock.patch("sys.argv", arguments),
+                mock.patch.object(
+                    coordinator_callback, "send", return_value={"accepted": True}
+                ) as send,
+            ):
+                self.assertEqual(coordinator_callback.main(), 0)
+
+        payload = send.call_args.args[0]
+        self.assertEqual(send.call_args.kwargs, {"attempts": 1})
+        self.assertEqual(payload["type"], "cache_progress")
+        self.assertEqual(payload["progress"]["artifact"]["bytesCompleted"], 1024)
+        self.assertNotIn("leaseId", json.dumps(payload))
+
+    def test_cache_progress_rejects_private_or_unbounded_status_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "status.json"
+            status.write_text(
+                json.dumps(
+                    {
+                        "stage": "artifact_downloading",
+                        "outcome": "in_progress",
+                        "stageStartedAt": "2026-09-01T10:00:00.000Z",
+                        "updatedAt": "2026-09-01T10:00:01.000Z",
+                        "leaseId": JOB_ID,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(coordinator_callback.CallbackError):
+                coordinator_callback._progress_document(status)
+
+    def test_cache_failed_cli_uses_allowlisted_code_and_one_attempt(self):
+        arguments = [
+            "coordinator_callback.py",
+            "cache-failed",
+            "--cache-key",
+            "b" * 64,
+            "--failure-code",
+            "artifact_download_failed",
+        ]
+        with (
+            mock.patch("sys.argv", arguments),
+            mock.patch.object(
+                coordinator_callback, "send", return_value={"accepted": True}
+            ) as send,
+        ):
+            self.assertEqual(coordinator_callback.main(), 0)
+
+        self.assertEqual(send.call_args.args[0]["failureCode"], "artifact_download_failed")
+        self.assertEqual(send.call_args.kwargs, {"attempts": 1})
+
     def test_install_cli_turns_invalid_json_into_a_sanitized_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             document = Path(temporary) / "document.json"

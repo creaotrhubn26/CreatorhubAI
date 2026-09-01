@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -410,6 +411,95 @@ def read_public(path: Path, lease_id: str) -> Dict[str, Any]:
     return public_status(read(path, lease_id), lease_id)
 
 
+def _open_public_directory(name: str, parent: int, *, create: bool) -> int:
+    if create:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent)
+        except FileExistsError:
+            pass
+    descriptor = os.open(name, _directory_flags(), dir_fd=parent)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise BootstrapStatusError("bootstrap mirror directory is invalid")
+    os.fchmod(descriptor, 0o755)
+    return descriptor
+
+
+def _sync_directory_if_supported(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EROFS}:
+            raise
+
+
+def write_public_mirror(path: Path, lease_id: str, value: Mapping[str, Any]) -> None:
+    """Publish a secret-free diagnostic mirror without trusting it for health."""
+
+    expected_lease = _validate_lease_id(lease_id)
+    if path.name != "status.json" or path.parent.name != expected_lease:
+        raise BootstrapStatusError("bootstrap mirror path is invalid")
+    bootstrap_root = path.parent.parent
+    if bootstrap_root.name != "bootstrap":
+        raise BootstrapStatusError("bootstrap mirror root is invalid")
+    recovery_root = bootstrap_root.parent
+    recovery_descriptor = os.open(recovery_root, _directory_flags())
+    bootstrap_descriptor = -1
+    lease_descriptor = -1
+    file_descriptor = -1
+    temporary = f".status.{secrets.token_hex(8)}.tmp"
+    try:
+        if not stat.S_ISDIR(os.fstat(recovery_descriptor).st_mode):
+            raise BootstrapStatusError("bootstrap mirror recovery root is invalid")
+        bootstrap_descriptor = _open_public_directory(
+            "bootstrap", recovery_descriptor, create=True
+        )
+        lease_descriptor = _open_public_directory(
+            expected_lease, bootstrap_descriptor, create=True
+        )
+        payload = json.dumps(
+            public_status(value, expected_lease),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        if not payload or len(payload) > MAX_STATUS_BYTES:
+            raise BootstrapStatusError("bootstrap mirror payload is too large")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_descriptor = os.open(temporary, flags, 0o644, dir_fd=lease_descriptor)
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise BootstrapStatusError("bootstrap mirror file is invalid")
+        os.fchmod(file_descriptor, 0o644)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(file_descriptor, remaining)
+            if written <= 0:
+                raise OSError("bootstrap mirror write made no progress")
+            remaining = remaining[written:]
+        os.fsync(file_descriptor)
+        os.replace(
+            temporary,
+            "status.json",
+            src_dir_fd=lease_descriptor,
+            dst_dir_fd=lease_descriptor,
+        )
+        _sync_directory_if_supported(lease_descriptor)
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if lease_descriptor >= 0:
+            try:
+                os.unlink(temporary, dir_fd=lease_descriptor)
+            except FileNotFoundError:
+                pass
+            os.close(lease_descriptor)
+        if bootstrap_descriptor >= 0:
+            os.close(bootstrap_descriptor)
+        os.close(recovery_descriptor)
+
+
 def _artifact_from_args(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
     if args.artifact_kind is None and args.artifact_phase is None:
         return None
@@ -426,6 +516,7 @@ def _artifact_from_args(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", required=True)
+    parser.add_argument("--mirror-path")
     parser.add_argument("--lease-id", required=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("initialize")
@@ -443,9 +534,9 @@ def main() -> int:
     path = Path(args.path)
     try:
         if args.command == "initialize":
-            initialize(path, args.lease_id)
+            value = initialize(path, args.lease_id)
         elif args.command == "update":
-            transition(
+            value = transition(
                 path,
                 args.lease_id,
                 args.stage,
@@ -453,7 +544,7 @@ def main() -> int:
                 artifact=_artifact_from_args(args),
             )
         else:
-            transition(
+            value = transition(
                 path,
                 args.lease_id,
                 "failed",
@@ -465,6 +556,11 @@ def main() -> int:
     except (OSError, BootstrapStatusError):
         print('{"event":"startup_failed","reason":"status_persistence_failed"}', file=os.sys.stderr)
         return 6
+    if args.mirror_path:
+        try:
+            write_public_mirror(Path(args.mirror_path), args.lease_id, value)
+        except (OSError, BootstrapStatusError):
+            print('{"event":"bootstrap_status_mirror_failed"}', file=os.sys.stderr)
     return 0
 
 

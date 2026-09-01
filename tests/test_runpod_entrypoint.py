@@ -45,7 +45,19 @@ class EntrypointStaticContractTests(unittest.TestCase):
         self.assertIn('python3 "$CACHE_MANIFEST_TOOL" verify', source)
         self.assertIn('GLIMMER_CACHE_SIGNING_PRIVATE_KEY="$CACHE_SIGNING_PRIVATE_KEY"', source)
         self.assertIn("BOOTSTRAP_FAILURE_CODE=cache_not_ready", source)
-        self.assertIn('BOOTSTRAP_STATUS_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"', source)
+        self.assertIn(
+            'BOOTSTRAP_STATUS_FILE="$STATE_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"',
+            source,
+        )
+        self.assertIn(
+            'BOOTSTRAP_STATUS_MIRROR_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"',
+            source,
+        )
+        self.assertIn("STATUS_RUNNER=(gosu glimmer)", source)
+        self.assertIn("STATUS_RUNNER=(env)", source)
+        self.assertIn('install -d -o root -g root -m 0700 "$STATE_ROOT"', source)
+        self.assertIn('"${STATUS_RUNNER[@]}" python3 "$BOOTSTRAP_STATUS_TOOL"', source)
+        self.assertIn('--status-mirror-file "$BOOTSTRAP_STATUS_MIRROR_FILE"', source)
         self.assertLess(
             source.index("docker/runpod/healthcheck.py"),
             source.index('touch "$READY_MARKER"'),

@@ -23,9 +23,9 @@ from typing import Any, BinaryIO, Callable, Optional, Tuple
 from urllib import error, parse, request
 
 try:
-    from .bootstrap_status import BootstrapStatusError, transition
+    from .bootstrap_status import BootstrapStatusError, transition, write_public_mirror
 except ImportError:  # Direct execution inside the worker image.
-    from bootstrap_status import BootstrapStatusError, transition
+    from bootstrap_status import BootstrapStatusError, transition, write_public_mirror
 
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024
@@ -548,6 +548,7 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--allowed-host", action="append", required=True)
     parser.add_argument("--status-file")
+    parser.add_argument("--status-mirror-file")
     parser.add_argument("--lease-id")
     parser.add_argument("--artifact-kind", choices=("model", "mmproj", "draft"))
     parser.add_argument("--receipt")
@@ -556,6 +557,8 @@ def main() -> int:
     status_arguments = (args.status_file, args.lease_id, args.artifact_kind)
     if any(status_arguments) and not all(status_arguments):
         parser.error("status-file, lease-id, and artifact-kind must be supplied together")
+    if args.status_mirror_file and not all(status_arguments):
+        parser.error("status-mirror-file requires status-file, lease-id, and artifact-kind")
     reporter: Optional[ProgressReporter] = None
     if all(status_arguments):
 
@@ -574,12 +577,22 @@ def main() -> int:
             if total is not None:
                 artifact["bytesTotal"] = total
             try:
-                transition(
+                value = transition(
                     Path(args.status_file),
                     args.lease_id,
                     stage,
                     artifact=artifact,
                 )
+                if args.status_mirror_file:
+                    try:
+                        write_public_mirror(
+                            Path(args.status_mirror_file), args.lease_id, value
+                        )
+                    except (OSError, BootstrapStatusError):
+                        print(
+                            '{"event":"bootstrap_status_mirror_failed"}',
+                            file=sys.stderr,
+                        )
             except (OSError, BootstrapStatusError) as exc:
                 raise BootstrapStatusError("bootstrap status update failed") from exc
 

@@ -20,14 +20,17 @@ DOWNLOAD_PID=""
 LLAMA_PID=""
 WORKER_PID=""
 BOOTSTRAP_STATUS_FILE=""
+BOOTSTRAP_STATUS_MIRROR_FILE=""
 BOOTSTRAP_FAILURE_CODE=""
 BOOTSTRAP_TERMINAL=false
+STATUS_RUNNER=(gosu glimmer)
 
 if ! [[ "${GLIMMER_LEASE_ID:-}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]]; then
   echo '{"event":"startup_failed","reason":"configuration_invalid"}' >&2
   exit 2
 fi
-BOOTSTRAP_STATUS_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"
+BOOTSTRAP_STATUS_FILE="$STATE_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"
+BOOTSTRAP_STATUS_MIRROR_FILE="$RECOVERY_ROOT/bootstrap/$GLIMMER_LEASE_ID/status.json"
 
 case "$PREWARM_ONLY" in
   0|1) ;;
@@ -44,10 +47,16 @@ case "$REQUIRE_READY_CACHE" in
     ;;
 esac
 
-install -d -o glimmer -g glimmer -m 0700 "$STATE_ROOT" "$RECOVERY_ROOT"
+install -d -o glimmer -g glimmer -m 0700 "$STATE_ROOT"
+install -d -o glimmer -g glimmer -m 0755 "$RECOVERY_ROOT" "$RECOVERY_ROOT/bootstrap"
 USE_HASH_RECEIPTS=false
 if [ "$REQUIRE_READY_CACHE" = 1 ]; then
   if [ "$PREWARM_ONLY" = 1 ]; then
+    # Ready-cache prewarm writes root-owned model artifacts.  Its progress
+    # reporter must own the private status inode too; bootstrap_status rejects
+    # cross-UID writers by design.
+    STATUS_RUNNER=(env)
+    install -d -o root -g root -m 0700 "$STATE_ROOT"
     install -d -o root -g root -m 0700 "$MODEL_ROOT"
     install -d -o root -g root -m 0700 "$RECEIPT_ROOT"
     USE_HASH_RECEIPTS=true
@@ -57,14 +66,16 @@ if [ "$REQUIRE_READY_CACHE" = 1 ]; then
 else
   install -d -o glimmer -g glimmer -m 0700 "$MODEL_ROOT"
 fi
-if ! gosu glimmer python3 "$BOOTSTRAP_STATUS_TOOL" \
-  --path "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" initialize; then
+if ! "${STATUS_RUNNER[@]}" python3 "$BOOTSTRAP_STATUS_TOOL" \
+  --path "$BOOTSTRAP_STATUS_FILE" --mirror-path "$BOOTSTRAP_STATUS_MIRROR_FILE" \
+  --lease-id "$GLIMMER_LEASE_ID" initialize; then
   exit 6
 fi
 
 status_update() {
-  if ! gosu glimmer python3 "$BOOTSTRAP_STATUS_TOOL" \
-    --path "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" update "$@"; then
+  if ! "${STATUS_RUNNER[@]}" python3 "$BOOTSTRAP_STATUS_TOOL" \
+    --path "$BOOTSTRAP_STATUS_FILE" --mirror-path "$BOOTSTRAP_STATUS_MIRROR_FILE" \
+    --lease-id "$GLIMMER_LEASE_ID" update "$@"; then
     BOOTSTRAP_FAILURE_CODE=status_persistence_failed
     return 6
   fi
@@ -103,9 +114,16 @@ cleanup() {
   done
   if [ "$BOOTSTRAP_TERMINAL" != true ]; then
     local failure_code="${BOOTSTRAP_FAILURE_CODE:-unexpected_failure}"
-    gosu glimmer python3 "$BOOTSTRAP_STATUS_TOOL" \
-      --path "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" fail \
+    "${STATUS_RUNNER[@]}" python3 "$BOOTSTRAP_STATUS_TOOL" \
+      --path "$BOOTSTRAP_STATUS_FILE" --mirror-path "$BOOTSTRAP_STATUS_MIRROR_FILE" \
+      --lease-id "$GLIMMER_LEASE_ID" fail \
       --failure-code "$failure_code" --exit-code "$status" || true
+    if [ "$PREWARM_ONLY" = 1 ] && [ "$REQUIRE_READY_CACHE" = 1 ] && \
+      [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ] && \
+      [ -n "${GLIMMER_CACHE_KEY:-}" ]; then
+      python3 "$COORDINATOR_CALLBACK_TOOL" cache-failed \
+        --cache-key "$GLIMMER_CACHE_KEY" --failure-code "$failure_code" || true
+    fi
   fi
   exit "$status"
 }
@@ -285,6 +303,7 @@ if [ -n "${GLIMMER_ARTIFACT_HOSTS:-}" ]; then
 fi
 
 run_download() {
+  local next_progress=$SECONDS
   if [ "$REQUIRE_READY_CACHE" = 1 ] && [ "$PREWARM_ONLY" = 1 ]; then
     env -u GLIMMER_COORDINATOR_CALLBACK_TOKEN \
       -u GLIMMER_WORKER_BOOTSTRAP_TOKEN \
@@ -296,6 +315,14 @@ run_download() {
   fi
   DOWNLOAD_PID=$!
   while process_alive "$DOWNLOAD_PID"; do
+    if [ "$PREWARM_ONLY" = 1 ] && [ "$REQUIRE_READY_CACHE" = 1 ] && \
+      [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ] && \
+      [ "$SECONDS" -ge "$next_progress" ]; then
+      python3 "$COORDINATOR_CALLBACK_TOOL" cache-progress \
+        --status "$BOOTSTRAP_STATUS_MIRROR_FILE" \
+        --cache-key "$GLIMMER_CACHE_KEY" || true
+      next_progress=$((SECONDS + 30))
+    fi
     if [ "$PREWARM_ONLY" != 1 ] && ! process_alive "$WORKER_PID"; then
       BOOTSTRAP_FAILURE_CODE=worker_start_failed
       echo '{"event":"startup_failed","reason":"worker_exited"}' >&2
@@ -309,6 +336,12 @@ run_download() {
     local status=$?
     DOWNLOAD_PID=""
     return "$status"
+  fi
+  if [ "$PREWARM_ONLY" = 1 ] && [ "$REQUIRE_READY_CACHE" = 1 ] && \
+    [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+    python3 "$COORDINATOR_CALLBACK_TOOL" cache-progress \
+      --status "$BOOTSTRAP_STATUS_MIRROR_FILE" \
+      --cache-key "$GLIMMER_CACHE_KEY" || true
   fi
   if [ "$PREWARM_ONLY" != 1 ] && ! process_alive "$WORKER_PID"; then
     BOOTSTRAP_FAILURE_CODE=worker_start_failed
@@ -328,6 +361,7 @@ fetch_artifact() {
   if [ "$USE_HASH_RECEIPTS" = true ]; then
     if run_download --url "$url" --sha256 "$sha256" --output "$output" \
       --status-file "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" \
+      --status-mirror-file "$BOOTSTRAP_STATUS_MIRROR_FILE" \
       --artifact-kind "$kind" --receipt "$RECEIPT_ROOT/$kind.json" \
       "${HOST_ARGS[@]}"; then
       status=0
@@ -337,6 +371,7 @@ fetch_artifact() {
   else
     if run_download --url "$url" --sha256 "$sha256" --output "$output" \
       --status-file "$BOOTSTRAP_STATUS_FILE" --lease-id "$GLIMMER_LEASE_ID" \
+      --status-mirror-file "$BOOTSTRAP_STATUS_MIRROR_FILE" \
       --artifact-kind "$kind" "${HOST_ARGS[@]}"; then
       status=0
     else
@@ -389,6 +424,9 @@ else
   if [ "$REQUIRE_READY_CACHE" = 1 ]; then
     status_update --stage cache_publishing
     if [ "${GLIMMER_REQUIRE_COORDINATOR_CALLBACK:-0}" = 1 ]; then
+      python3 "$COORDINATOR_CALLBACK_TOOL" cache-progress \
+        --status "$BOOTSTRAP_STATUS_MIRROR_FILE" \
+        --cache-key "$GLIMMER_CACHE_KEY" || true
       CACHE_ATTESTATION="$STATE_ROOT/cache-attestation.json"
       CACHE_DOCUMENT="$STATE_ROOT/cache-document.json"
       python3 "$CACHE_MANIFEST_TOOL" prepare "${CACHE_MANIFEST_ARGS[@]}" \

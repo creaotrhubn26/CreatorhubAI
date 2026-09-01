@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from docker.runpod import bootstrap_status
 
@@ -46,6 +47,58 @@ class BootstrapStatusTests(unittest.TestCase):
         self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.path.parent.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(list(self.path.parent.glob(".status.*.tmp")), [])
+
+    def test_public_mirror_is_world_readable_and_contains_only_public_status(self):
+        private_root = self.root / "state"
+        private_root.mkdir(mode=0o700)
+        private_path = private_root / "bootstrap" / LEASE_ID / "status.json"
+        value = bootstrap_status.initialize(private_path, LEASE_ID)
+        mirror_root = self.root / "public-recovery"
+        mirror_root.mkdir(mode=0o755)
+        mirror_path = mirror_root / "bootstrap" / LEASE_ID / "status.json"
+
+        bootstrap_status.write_public_mirror(mirror_path, LEASE_ID, value)
+
+        mirrored = json.loads(mirror_path.read_text(encoding="utf-8"))
+        self.assertEqual(mirrored, bootstrap_status.public_status(value, LEASE_ID))
+        self.assertNotIn("leaseId", mirrored)
+        self.assertNotIn("schemaVersion", mirrored)
+        self.assertEqual(mirror_path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(mirror_path.parent.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(mirror_path.parent.parent.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(list(mirror_path.parent.glob(".status.*.tmp")), [])
+
+    def test_private_status_rejects_a_reporter_running_as_another_uid(self):
+        bootstrap_status.initialize(self.path, LEASE_ID)
+
+        with mock.patch.object(
+            bootstrap_status.os, "geteuid", return_value=os.geteuid() + 1
+        ):
+            with self.assertRaisesRegex(
+                bootstrap_status.BootstrapStatusError, "not private"
+            ):
+                bootstrap_status.transition(
+                    self.path,
+                    LEASE_ID,
+                    "artifact_preparing",
+                    artifact={"kind": "model", "phase": "locking"},
+                )
+
+    def test_public_mirror_rejects_a_symlinked_bootstrap_directory(self):
+        value = bootstrap_status.initialize(self.path, LEASE_ID)
+        public_root = self.root / "public"
+        public_root.mkdir(mode=0o755)
+        victim = self.root / "public-victim"
+        victim.mkdir()
+        (public_root / "bootstrap").symlink_to(victim)
+
+        with self.assertRaises(OSError):
+            bootstrap_status.write_public_mirror(
+                public_root / "bootstrap" / LEASE_ID / "status.json",
+                LEASE_ID,
+                value,
+            )
+        self.assertEqual(list(victim.iterdir()), [])
 
     def test_failure_preserves_last_artifact_without_free_form_detail(self):
         bootstrap_status.initialize(self.path, LEASE_ID)
