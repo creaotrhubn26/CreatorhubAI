@@ -35,6 +35,39 @@ const HOST =
 const TERMINAL_STATES = new Set(["terminated", "failed"]);
 const ACTIVE_PROVIDER_STATES = new Set(["CREATED", "PROVISIONING", "STARTING", "RUNNING"]);
 const TERMINAL_PROVIDER_STATES = new Set(["STOPPED", "EXITED", "ERROR", "TERMINATED"]);
+const CACHE_PROGRESS_STAGES = new Set([
+  "initializing",
+  "worker_starting",
+  "worker_listening",
+  "artifact_preparing",
+  "artifact_downloading",
+  "artifact_verifying",
+  "cache_publishing",
+]);
+const ARTIFACT_KINDS = new Set(["model", "mmproj", "draft"]);
+const ARTIFACT_PHASES = new Set([
+  "locking",
+  "cached",
+  "resuming",
+  "downloading",
+  "verifying",
+  "complete",
+]);
+const MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024;
+const CACHE_FAILURE_CODES = new Map([
+  ["configuration_invalid", "CACHE_BOOTSTRAP_CONFIGURATION_INVALID"],
+  ["status_persistence_failed", "CACHE_BOOTSTRAP_STATUS_PERSISTENCE_FAILED"],
+  ["worker_start_failed", "CACHE_BOOTSTRAP_WORKER_START_FAILED"],
+  ["artifact_download_failed", "CACHE_BOOTSTRAP_ARTIFACT_DOWNLOAD_FAILED"],
+  ["artifact_checksum_failed", "CACHE_BOOTSTRAP_ARTIFACT_CHECKSUM_FAILED"],
+  ["cache_not_ready", "CACHE_BOOTSTRAP_NOT_READY"],
+  ["cache_publish_failed", "CACHE_BOOTSTRAP_PUBLISH_FAILED"],
+  ["coordinator_callback_failed", "CACHE_BOOTSTRAP_CALLBACK_FAILED"],
+  ["model_start_failed", "CACHE_BOOTSTRAP_MODEL_START_FAILED"],
+  ["model_healthcheck_failed", "CACHE_BOOTSTRAP_MODEL_HEALTHCHECK_FAILED"],
+  ["bootstrap_interrupted", "CACHE_BOOTSTRAP_INTERRUPTED"],
+  ["unexpected_failure", "CACHE_BOOTSTRAP_UNEXPECTED_FAILURE"],
+]);
 
 function response(value, status = 200) {
   return Response.json(value, {
@@ -60,6 +93,50 @@ function exactKeys(value, required, optional = []) {
 
 function validTimestamp(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function parseCacheProgress(value) {
+  if (
+    !exactKeys(value, ["stage", "outcome", "stageStartedAt", "updatedAt"], ["artifact"]) ||
+    !CACHE_PROGRESS_STAGES.has(value.stage) ||
+    value.outcome !== "in_progress" ||
+    !validTimestamp(value.stageStartedAt) ||
+    !validTimestamp(value.updatedAt) ||
+    Date.parse(value.updatedAt) < Date.parse(value.stageStartedAt)
+  ) {
+    throw new Error("INVALID_CACHE_PROGRESS");
+  }
+  const progress = {
+    stage: value.stage,
+    outcome: value.outcome,
+    stageStartedAt: value.stageStartedAt,
+    updatedAt: value.updatedAt,
+  };
+  if (value.artifact !== undefined) {
+    const artifact = value.artifact;
+    if (
+      !exactKeys(artifact, ["kind", "phase"], ["bytesCompleted", "bytesTotal"]) ||
+      !ARTIFACT_KINDS.has(artifact.kind) ||
+      !ARTIFACT_PHASES.has(artifact.phase)
+    ) {
+      throw new Error("INVALID_CACHE_PROGRESS");
+    }
+    for (const key of ["bytesCompleted", "bytesTotal"]) {
+      if (
+        artifact[key] !== undefined &&
+        (!Number.isInteger(artifact[key]) ||
+          artifact[key] < 0 ||
+          artifact[key] > MAX_ARTIFACT_BYTES)
+      ) {
+        throw new Error("INVALID_CACHE_PROGRESS");
+      }
+    }
+    if ((artifact.bytesCompleted ?? 0) > (artifact.bytesTotal ?? MAX_ARTIFACT_BYTES)) {
+      throw new Error("INVALID_CACHE_PROGRESS");
+    }
+    progress.artifact = { ...artifact };
+  }
+  return progress;
 }
 
 function bytesToHex(bytes) {
@@ -341,7 +418,12 @@ async function configuration(env) {
   return {
     runpodBaseUrl:
       strictOrigin(
-        env.RUNPOD_API_BASE_URL ?? "https://api.runpod.io",
+        env.RUNPOD_API_BASE_URL ?? "https://rest.runpod.io",
+        "INVALID_COORDINATOR_CONFIG",
+      ) + "/v1",
+    runpodCatalogBaseUrl:
+      strictOrigin(
+        env.RUNPOD_CATALOG_API_BASE_URL ?? "https://api.runpod.io",
         "INVALID_COORDINATOR_CONFIG",
       ) + "/v2",
     watchdogUrl: strictOrigin(env.WATCHDOG_URL, "INVALID_COORDINATOR_CONFIG"),
@@ -581,6 +663,7 @@ function publicJob(job) {
     hardDeadlineAt: job.hardDeadlineAt,
     phaseDeadlineAt: job.currentDeadlineAt,
     ...(job.lastHeartbeatAt ? { lastHeartbeatAt: job.lastHeartbeatAt } : {}),
+    ...(job.cacheProgress ? { cacheProgress: { ...job.cacheProgress } } : {}),
     maxHourlyUsd: job.maxHourlyUsd,
     ...(job.internal.request.maxTotalUsd !== undefined
       ? { maxTotalUsd: job.internal.request.maxTotalUsd }
@@ -599,7 +682,11 @@ function randomToken() {
 }
 
 function runpodClient(env, config) {
-  return new RunPodV2Client({ apiKey: env.RUNPOD_API_KEY, baseUrl: config.runpodBaseUrl });
+  return new RunPodV2Client({
+    apiKey: env.RUNPOD_API_KEY,
+    baseUrl: config.runpodBaseUrl,
+    catalogBaseUrl: config.runpodCatalogBaseUrl,
+  });
 }
 
 async function watchdogRequest(env, config, method, path, body = "") {
@@ -812,7 +899,7 @@ export class ComputeCoordinator {
         error instanceof Error
           ? `${error.name}:${error.message}`
               .replace(/rpa_[A-Za-z0-9_-]+/g, "rpa_[redacted]")
-              .replace(/[A-Za-z0-9_-]{64,}/g, "[redacted]")
+              .replace(/[A-Za-z0-9_-]{43,}/g, "[redacted]")
               .slice(0, 240)
           : "unknown";
       console.warn("[coordinator] watchdog status check failed", code, diagnostic);
@@ -824,7 +911,7 @@ export class ComputeCoordinator {
       schemaVersion: 1,
       ready: watchdogReady,
       checkedAt: new Date().toISOString(),
-      providerApiVersion: "v2",
+      providerApiVersion: "rest-v1+catalog-v2",
       watchdogReady,
       activeJobId,
       cacheSigning: {
@@ -943,6 +1030,50 @@ export class ComputeCoordinator {
       job.internal.workerObservedAt = value.observedAt;
       job.lastHeartbeatAt = value.observedAt;
       if (value.workerState === "ready" || value.workerState === "busy") job.state = "ready";
+      await this.putJob(job);
+      await this.schedule();
+      return response({ accepted: true, job: publicJob(job) });
+    }
+    if (value.type === "cache_progress") {
+      if (
+        !exactKeys(value, ["schemaVersion", "type", "observedAt", "cacheKey", "progress"]) ||
+        value.cacheKey !== job.cacheKey ||
+        job.phase !== "cache_repair"
+      ) {
+        return errorResponse(400, "INVALID_CACHE_PROGRESS");
+      }
+      let progress;
+      try {
+        progress = parseCacheProgress(value.progress);
+      } catch {
+        return errorResponse(400, "INVALID_CACHE_PROGRESS");
+      }
+      if (
+        job.cacheProgress &&
+        Date.parse(value.observedAt) < Date.parse(job.cacheProgress.observedAt)
+      ) {
+        return errorResponse(409, "STALE_CACHE_PROGRESS");
+      }
+      job.cacheProgress = { ...progress, observedAt: value.observedAt };
+      job.lastHeartbeatAt = value.observedAt;
+      await this.putJob(job);
+      return response({ accepted: true, job: publicJob(job) });
+    }
+    if (value.type === "cache_failed") {
+      if (
+        !exactKeys(value, ["schemaVersion", "type", "observedAt", "cacheKey", "failureCode"]) ||
+        value.cacheKey !== job.cacheKey ||
+        job.phase !== "cache_repair" ||
+        !CACHE_FAILURE_CODES.has(value.failureCode)
+      ) {
+        return errorResponse(400, "INVALID_CACHE_FAILURE");
+      }
+      job.cache = { state: "repair_required" };
+      job.failureCode = CACHE_FAILURE_CODES.get(value.failureCode);
+      job.lastHeartbeatAt = value.observedAt;
+      job.internal.terminalTarget = "failed";
+      job.state = "terminating";
+      job.cleanup.requested = true;
       await this.putJob(job);
       await this.schedule();
       return response({ accepted: true, job: publicJob(job) });
@@ -1300,6 +1431,7 @@ export class ComputeCoordinator {
     job.internal.exitObservedAt = null;
     job.internal.workerObservedAt = null;
     job.internal.repairRequested = false;
+    job.cacheProgress = undefined;
     job.state = "cache_ready";
   }
 
@@ -1324,6 +1456,7 @@ export class ComputeCoordinator {
     job.internal.repairAllocation = null;
     job.internal.repairRequested = false;
     job.internal.cacheRepairAttempts += 1;
+    job.cacheProgress = undefined;
     job.state = "awaiting_cache_attestation";
   }
 

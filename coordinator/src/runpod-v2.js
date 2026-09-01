@@ -1,4 +1,5 @@
-const DEFAULT_BASE_URL = "https://api.runpod.io/v2";
+const DEFAULT_BASE_URL = "https://rest.runpod.io/v1";
+const DEFAULT_CATALOG_BASE_URL = "https://api.runpod.io/v2";
 const DEFAULT_TIMEOUT_MS = 15_000;
 const CREATE_TIMEOUT_MS = 60_000;
 const MAX_JSON_BYTES = 1024 * 1024;
@@ -18,24 +19,13 @@ const GPU_ID = /^[A-Za-z0-9][A-Za-z0-9 ._()+/-]{0,127}$/;
 const DATA_CENTER_ID = /^[A-Z0-9][A-Z0-9-]{1,31}$/;
 const IMMUTABLE_IMAGE = /^[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64}$/;
 const ENVIRONMENT_KEY = /^[A-Z][A-Z0-9_]{0,127}$/;
-const POD_STATUSES = new Set([
-  "CREATED",
-  "PROVISIONING",
-  "STARTING",
-  "RUNNING",
-  "STOPPING",
-  "STOPPED",
-  "EXITED",
-  "ERROR",
-  "TERMINATED",
-  "DELETING",
-]);
+const POD_STATUSES = new Set(["RUNNING", "EXITED", "TERMINATED"]);
 const AVAILABILITY_LEVELS = new Set(["NONE", "LOW", "MEDIUM", "HIGH"]);
 const IN_STOCK_AVAILABILITY = new Set(["LOW", "MEDIUM", "HIGH"]);
-const NETWORK_VOLUME_TYPES = new Set(["STANDARD", "HIGH_PERFORMANCE"]);
 const AVAILABILITY_RANK = Object.freeze({ HIGH: 0, MEDIUM: 1, LOW: 2 });
 
 export const RUNPOD_V2_DEFAULT_BASE_URL = DEFAULT_BASE_URL;
+export const RUNPOD_V2_DEFAULT_CATALOG_BASE_URL = DEFAULT_CATALOG_BASE_URL;
 export const RUNPOD_V2_MAX_JSON_BYTES = MAX_JSON_BYTES;
 
 export class RunPodV2Error extends Error {
@@ -155,6 +145,7 @@ function validateBaseUrl(value) {
 export function validateRunPodV2Configuration({
   apiKey,
   baseUrl = DEFAULT_BASE_URL,
+  catalogBaseUrl = DEFAULT_CATALOG_BASE_URL,
   fetchImpl = globalThis.fetch,
 } = {}) {
   if (
@@ -168,7 +159,12 @@ export function validateRunPodV2Configuration({
   if (typeof fetchImpl !== "function") {
     fail("INVALID_RUNPOD_CONFIG", "RunPod fetch implementation is unavailable");
   }
-  return { apiKey, baseUrl: validateBaseUrl(baseUrl), fetchImpl };
+  return {
+    apiKey,
+    baseUrl: validateBaseUrl(baseUrl),
+    catalogBaseUrl: validateBaseUrl(catalogBaseUrl),
+    fetchImpl,
+  };
 }
 
 function validateRegistryId(value) {
@@ -348,10 +344,10 @@ export function validateRunPodV2CreateRequest(value) {
   return buildGpuWorkerPodRequest({ ...input, gpuTypeId: raw.gpu.id });
 }
 
-function parseNetworkMount(value) {
-  const raw = object(value, "INVALID_POD", "Pod network mount");
-  const volumeId = safeId(raw.volumeId, "INVALID_POD", "Pod network volume id");
-  const path = boundedText(raw.path, "INVALID_POD", "Pod network mount path", 512);
+function parseNetworkMount(volume, mountPath) {
+  const raw = object(volume, "INVALID_POD", "Pod network volume");
+  const volumeId = safeId(raw.id, "INVALID_POD", "Pod network volume id");
+  const path = boundedText(mountPath, "INVALID_POD", "Pod network mount path", 512);
   const segments = path.split("/");
   if (!path.startsWith("/") || path.includes("//") || segments.includes("..")) {
     fail("INVALID_POD", "Pod network mount path is invalid");
@@ -359,18 +355,13 @@ function parseNetworkMount(value) {
   return { volumeId, path };
 }
 
-function parseCpu(value) {
-  const raw = object(value, "INVALID_POD", "Pod CPU");
-  const id = boundedText(raw.id, "INVALID_POD", "Pod CPU id", 128);
+function parseCpu(flavorId, vcpuCount) {
+  const id = boundedText(flavorId, "INVALID_POD", "Pod CPU id", 128);
   if (!CPU_ID.test(id)) fail("INVALID_POD", "Pod CPU id is invalid");
-  const cpu = {
+  return {
     id,
-    vcpuCount: integer(raw.vcpuCount, "INVALID_POD", "Pod vCPU count", 1, 1_024),
+    vcpuCount: integer(vcpuCount, "INVALID_POD", "Pod vCPU count", 1, 1_024),
   };
-  if (raw.memory !== undefined) {
-    cpu.memory = finiteNumber(raw.memory, "INVALID_POD", "Pod CPU memory", 0, 100_000_000);
-  }
-  return cpu;
 }
 
 function parseGpu(value) {
@@ -390,48 +381,92 @@ function parseGpu(value) {
 export function parseRunPodV2Pod(value) {
   const raw = object(value, "INVALID_POD", "Pod");
   const id = safeId(raw.id, "INVALID_POD", "Pod id");
-  const name = safeId(raw.name, "INVALID_POD", "Pod name");
-  const status = boundedText(raw.status, "INVALID_POD", "Pod status", 32);
+  const name = boundedText(raw.name, "INVALID_POD", "Pod name", 191);
+  const status = boundedText(raw.desiredStatus, "INVALID_POD", "Pod desired status", 32);
   if (!POD_STATUSES.has(status)) fail("INVALID_POD", "Pod status is invalid");
-  const cloud = boundedText(raw.cloud, "INVALID_POD", "Pod cloud", 16);
-  if (cloud !== "SECURE" && cloud !== "COMMUNITY") {
-    fail("INVALID_POD", "Pod cloud is invalid");
+  const machine = raw.machine === undefined || raw.machine === null ? null : raw.machine;
+  if (machine !== null) object(machine, "INVALID_POD", "Pod machine");
+  if (
+    machine !== null &&
+    machine.secureCloud !== undefined &&
+    typeof machine.secureCloud !== "boolean"
+  ) {
+    fail("INVALID_POD", "Pod machine cloud is invalid");
   }
+  const cloud =
+    machine === null || machine.secureCloud === undefined
+      ? null
+      : machine.secureCloud
+        ? "SECURE"
+        : "COMMUNITY";
 
-  const cpu = raw.cpu === undefined || raw.cpu === null ? null : parseCpu(raw.cpu);
+  const cpu =
+    raw.cpuFlavorId === undefined || raw.cpuFlavorId === null
+      ? null
+      : parseCpu(raw.cpuFlavorId, raw.vcpuCount);
   const gpu = raw.gpu === undefined || raw.gpu === null ? null : parseGpu(raw.gpu);
   if ((cpu === null) === (gpu === null)) {
     fail("INVALID_POD", "Pod must report exactly one CPU or GPU allocation");
   }
 
-  const mounts = object(raw.mounts, "INVALID_POD", "Pod mounts");
-  const network = mounts.network ?? [];
-  if (!Array.isArray(network) || network.length > 4) {
-    fail("INVALID_POD", "Pod network mounts are invalid");
+  const networkVolume =
+    raw.networkVolume === undefined || raw.networkVolume === null ? null : raw.networkVolume;
+  if (networkVolume !== null) object(networkVolume, "INVALID_POD", "Pod network volume");
+  const networkMount =
+    networkVolume === null ? null : parseNetworkMount(networkVolume, raw.volumeMountPath);
+  const volumeDataCenterId =
+    networkVolume === null || networkVolume.dataCenterId === undefined
+      ? null
+      : validateDataCenterId(networkVolume.dataCenterId, "INVALID_POD");
+  const machineDataCenterId =
+    machine === null || machine.dataCenterId === undefined
+      ? null
+      : validateDataCenterId(machine.dataCenterId, "INVALID_POD");
+  if (
+    volumeDataCenterId !== null &&
+    machineDataCenterId !== null &&
+    volumeDataCenterId !== machineDataCenterId
+  ) {
+    fail("INVALID_POD", "Pod and network volume data centers do not match");
   }
-  let dataCenterId = null;
-  if (raw.dataCenterId !== null && raw.dataCenterId !== undefined) {
-    dataCenterId = validateDataCenterId(raw.dataCenterId, "INVALID_POD");
+  const image = boundedText(raw.image, "INVALID_POD", "Pod image", 512);
+  const registryId =
+    raw.containerRegistryAuthId === undefined || raw.containerRegistryAuthId === null
+      ? null
+      : boundedText(raw.containerRegistryAuthId, "INVALID_POD", "Pod registry id", 191);
+  if (registryId !== null && !REGISTRY_ID.test(registryId)) {
+    fail("INVALID_POD", "Pod registry id is invalid");
+  }
+  const disk =
+    raw.containerDiskInGb === undefined || raw.containerDiskInGb === null
+      ? null
+      : integer(raw.containerDiskInGb, "INVALID_POD", "Pod container disk", 1, 1_000_000);
+  const ports = raw.ports ?? [];
+  if (!Array.isArray(ports) || ports.length > 64) {
+    fail("INVALID_POD", "Pod ports are invalid");
   }
   return {
     id,
     name,
     status,
     cloud,
-    cost: finiteNumber(raw.cost, "INVALID_POD", "Pod hourly cost", 0, 100_000),
-    dataCenterId,
+    cost: finiteNumber(raw.costPerHr, "INVALID_POD", "Pod hourly cost", 0, 100_000),
+    dataCenterId: machineDataCenterId ?? volumeDataCenterId,
+    image,
+    registryId,
+    disk,
+    ports: ports.map((port) => boundedText(port, "INVALID_POD", "Pod port", 32)),
     cpu,
     gpu,
-    mounts: { network: network.map(parseNetworkMount) },
+    mounts: { network: networkMount === null ? [] : [networkMount] },
   };
 }
 
 export function parseRunPodV2PodList(value) {
-  const raw = object(value, "INVALID_POD_LIST", "Pod list response");
-  if (!Array.isArray(raw.pods) || raw.pods.length > MAX_PODS) {
+  if (!Array.isArray(value) || value.length > MAX_PODS) {
     fail("INVALID_POD_LIST", "Pod list has an invalid size");
   }
-  const pods = raw.pods.map(parseRunPodV2Pod);
+  const pods = value.map(parseRunPodV2Pod);
   if (new Set(pods.map((pod) => pod.id)).size !== pods.length) {
     fail("INVALID_POD_LIST", "Pod list contains duplicate identities");
   }
@@ -445,15 +480,11 @@ export function parseRunPodV2NetworkVolume(value, expectedId) {
   if (id !== expected) {
     fail("INVALID_NETWORK_VOLUME", "network volume identity does not match the request");
   }
-  const type = boundedText(raw.type, "INVALID_NETWORK_VOLUME", "network volume type", 64);
-  if (!NETWORK_VOLUME_TYPES.has(type)) {
-    fail("INVALID_NETWORK_VOLUME", "network volume type is invalid");
-  }
   return {
     id,
-    dataCenterId: validateDataCenterId(raw.dataCenter, "INVALID_NETWORK_VOLUME"),
+    dataCenterId: validateDataCenterId(raw.dataCenterId, "INVALID_NETWORK_VOLUME"),
     sizeGb: integer(raw.size, "INVALID_NETWORK_VOLUME", "network volume size", 1, 1_000_000),
-    type,
+    name: boundedText(raw.name, "INVALID_NETWORK_VOLUME", "network volume name", 191),
   };
 }
 
@@ -781,7 +812,11 @@ function validatePodAgainstCreateRequest(pod, request, maxHourlyUsd) {
   if (
     pod.name !== request.name ||
     pod.cloud !== request.cloud ||
-    (pod.dataCenterId !== null && pod.dataCenterId !== expectedDataCenterId) ||
+    pod.dataCenterId !== expectedDataCenterId ||
+    pod.image !== request.image ||
+    pod.registryId !== request.registry ||
+    pod.disk !== request.disk ||
+    JSON.stringify(pod.ports) !== JSON.stringify(request.ports) ||
     pod.mounts.network.length !== 1 ||
     pod.mounts.network[0].volumeId !== network[0].volumeId ||
     pod.mounts.network[0].path !== NETWORK_MOUNT_PATH ||
@@ -806,11 +841,50 @@ function validatePodAgainstCreateRequest(pod, request, maxHourlyUsd) {
   return pod;
 }
 
+export function toRunPodRestCreateRequest(value) {
+  const request = validateRunPodV2CreateRequest(value);
+  const common = {
+    name: request.name,
+    imageName: request.image,
+    cloudType: request.cloud,
+    containerDiskInGb: request.disk,
+    containerRegistryAuthId: request.registry,
+    dataCenterIds: request.dataCenterIds,
+    dataCenterPriority: "custom",
+    dockerEntrypoint: [],
+    dockerStartCmd: [],
+    env: request.env,
+    globalNetworking: request.globalNetworking,
+    interruptible: false,
+    locked: false,
+    networkVolumeId: request.mounts.network[0].volumeId,
+    ports: request.ports,
+    volumeMountPath: request.mounts.network[0].path,
+  };
+  if (request.cpu) {
+    return {
+      ...common,
+      computeType: "CPU",
+      cpuFlavorIds: [request.cpu.id],
+      cpuFlavorPriority: "custom",
+      vcpuCount: request.cpu.vcpuCount,
+    };
+  }
+  return {
+    ...common,
+    computeType: "GPU",
+    gpuCount: request.gpu.count,
+    gpuTypeIds: [request.gpu.id],
+    gpuTypePriority: "custom",
+  };
+}
+
 export class RunPodV2Client {
   constructor(configuration) {
     const parsed = validateRunPodV2Configuration(configuration);
     this.apiKey = parsed.apiKey;
     this.baseUrl = parsed.baseUrl;
+    this.catalogBaseUrl = parsed.catalogBaseUrl;
     this.fetchImpl = parsed.fetchImpl;
   }
 
@@ -831,7 +905,8 @@ export class RunPodV2Client {
     try {
       let response;
       try {
-        response = await this.fetchImpl.call(globalThis, `${this.baseUrl}${requestPath}`, {
+        const baseUrl = options.baseUrl ?? this.baseUrl;
+        response = await this.fetchImpl.call(globalThis, `${baseUrl}${requestPath}`, {
           method,
           headers: new Headers({
             Accept: "application/json",
@@ -884,7 +959,7 @@ export class RunPodV2Client {
     return parseRunPodV2NetworkVolume(
       await this.requestJson(
         "network volume lookup",
-        `/network-volumes/${encodeURIComponent(id)}`,
+        `/networkvolumes/${encodeURIComponent(id)}`,
         options,
       ),
       id,
@@ -895,14 +970,22 @@ export class RunPodV2Client {
     const id = boundedText(registryId, "INVALID_REGISTRY", "registry id", 191);
     if (!REGISTRY_ID.test(id)) fail("INVALID_REGISTRY", "registry id is invalid");
     return parseRunPodV2Registry(
-      await this.requestJson("registry lookup", `/registries/${encodeURIComponent(id)}`, options),
+      await this.requestJson(
+        "registry lookup",
+        `/containerregistryauth/${encodeURIComponent(id)}`,
+        options,
+      ),
       id,
     );
   }
 
   async listPods(options = {}) {
     return parseRunPodV2PodList(
-      await this.requestJson("Pod list", "/pods?includeClusterPods=true", options),
+      await this.requestJson(
+        "Pod list",
+        "/pods?includeMachine=true&includeNetworkVolume=true",
+        options,
+      ),
     );
   }
 
@@ -920,7 +1003,7 @@ export class RunPodV2Client {
       await this.requestJson(
         "CPU catalog lookup",
         "/catalog/cpus?include=AVAILABILITY&product=POD&vcpuCount=2",
-        options,
+        { ...options, baseUrl: this.catalogBaseUrl },
       ),
     );
   }
@@ -930,17 +1013,21 @@ export class RunPodV2Client {
       await this.requestJson(
         "GPU catalog lookup",
         "/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=SECURE",
-        options,
+        { ...options, baseUrl: this.catalogBaseUrl },
       ),
     );
   }
 
   async getPod(podId, options = {}) {
     const id = safeId(podId, "INVALID_POD_ID", "Pod id");
-    const response = await this.requestJson("Pod lookup", `/pods/${encodeURIComponent(id)}`, {
-      ...options,
-      nullOn404: true,
-    });
+    const response = await this.requestJson(
+      "Pod lookup",
+      `/pods/${encodeURIComponent(id)}?includeMachine=true&includeNetworkVolume=true`,
+      {
+        ...options,
+        nullOn404: true,
+      },
+    );
     if (response === null) return null;
     const pod = parseRunPodV2Pod(response);
     if (pod.id !== id) {
@@ -961,9 +1048,10 @@ export class RunPodV2Client {
 
   async createPod(request, options = {}) {
     const raw = validateRunPodV2CreateRequest(request);
+    const providerRequest = toRunPodRestCreateRequest(raw);
     const response = await this.requestJson("Pod creation", "/pods", {
       method: "POST",
-      body: raw,
+      body: providerRequest,
       expectedStatuses: [201],
       signal: options.signal,
       timeoutMs: options.timeoutMs,

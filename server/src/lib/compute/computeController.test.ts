@@ -451,6 +451,59 @@ describe("ComputeController cloud coordinator mode", () => {
     expect(coordinatorClient.deleteJob).toHaveBeenCalledWith(coordinatorJob.jobId);
     expect(deletePod).not.toHaveBeenCalled();
   });
+
+  it("shows bounded cloud cache byte progress in the existing status panel detail", async () => {
+    const coordinatorJob = {
+      schemaVersion: 1,
+      jobId: "12345678-1234-4123-8123-123456789abc",
+      kind: "gpu_worker",
+      state: "running",
+      phase: "cache_repair",
+      cacheKey: "e".repeat(64),
+      requestFingerprint: "f".repeat(64),
+      podName: "glimmer-cache-12345678-1234-4123-8123-123456789abc",
+      podId: "pod_cache_1",
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString(),
+      hardDeadlineAt: new Date(NOW.getTime() + 7_200_000).toISOString(),
+      maxHourlyUsd: 1.75,
+      cache: { state: "preparing" },
+      cacheProgress: {
+        stage: "artifact_downloading",
+        outcome: "in_progress",
+        stageStartedAt: NOW.toISOString(),
+        updatedAt: NOW.toISOString(),
+        observedAt: NOW.toISOString(),
+        artifact: {
+          kind: "model",
+          phase: "downloading",
+          bytesCompleted: 1024,
+          bytesTotal: 2048,
+        },
+      },
+      createAttempted: true,
+      cleanup: { requested: false, confirmed: false },
+    };
+    const { controller } = harness({
+      currentConfig: cloudConfig(),
+      currentLease: lease({
+        id: coordinatorJob.jobId,
+        podId: undefined,
+        podName: coordinatorJob.podName,
+        orchestrationMode: "cloud_coordinator",
+        coordinatorJobId: coordinatorJob.jobId,
+      }),
+      coordinatorJob,
+    });
+
+    await expect(controller.getStatus()).resolves.toMatchObject({
+      detail:
+        "The cloud cache repair reports the model artifact as downloading (1,024 of 2,048 bytes).",
+      coordinatorJob: {
+        cacheProgress: { artifact: { bytesCompleted: 1024, bytesTotal: 2048 } },
+      },
+    });
+  });
 });
 
 describe("ComputeController startup recovery", () => {

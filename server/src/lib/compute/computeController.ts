@@ -393,6 +393,22 @@ export class ComputeController {
     return "provisioning";
   }
 
+  private cacheProgressDetail(job: ComputeCoordinatorJobV1): string | null {
+    const progress = job.cacheProgress;
+    if (!progress) return null;
+    const artifact = progress.artifact;
+    if (!artifact) {
+      return `The cloud cache repair is at ${progress.stage.replaceAll("_", " ")}.`;
+    }
+    const bytes =
+      artifact.bytesCompleted !== undefined && artifact.bytesTotal !== undefined
+        ? ` (${artifact.bytesCompleted.toLocaleString("en-US")} of ${artifact.bytesTotal.toLocaleString("en-US")} bytes)`
+        : artifact.bytesCompleted !== undefined
+          ? ` (${artifact.bytesCompleted.toLocaleString("en-US")} bytes)`
+          : "";
+    return `The cloud cache repair reports the ${artifact.kind} artifact as ${artifact.phase}${bytes}.`;
+  }
+
   private async cloudStatus(
     config: ComputeConfigV1,
     lease: ComputeLeaseV1,
@@ -418,7 +434,8 @@ export class ComputeController {
           : job.phase === "cache_repair"
             ? job.cache.state === "ready"
               ? "The signed model cache is ready; the coordinator is handing off to GPU compute."
-              : "The cloud coordinator is preparing and attesting the model cache on bounded repair compute."
+              : (this.cacheProgressDetail(job) ??
+                "The cloud coordinator is preparing and attesting the model cache on bounded repair compute.")
             : job.state === "ready"
               ? "The GPU worker is ready under cloud coordinator supervision."
               : "The cloud coordinator is provisioning or validating the GPU worker."),

@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import type {
+  ComputeCacheProgressV1,
   ComputeCoordinatorJobState,
   ComputeCoordinatorJobV1,
   ComputeCoordinatorTestResult,
@@ -27,6 +28,29 @@ const JOB_STATES = new Set<ComputeCoordinatorJobState>([
   "terminated",
   "failed",
 ]);
+const CACHE_PROGRESS_STAGES = new Set<ComputeCacheProgressV1["stage"]>([
+  "initializing",
+  "worker_starting",
+  "worker_listening",
+  "artifact_preparing",
+  "artifact_downloading",
+  "artifact_verifying",
+  "cache_publishing",
+]);
+const CACHE_PROGRESS_KINDS = new Set<NonNullable<ComputeCacheProgressV1["artifact"]>["kind"]>([
+  "model",
+  "mmproj",
+  "draft",
+]);
+const CACHE_PROGRESS_PHASES = new Set<NonNullable<ComputeCacheProgressV1["artifact"]>["phase"]>([
+  "locking",
+  "cached",
+  "resuming",
+  "downloading",
+  "verifying",
+  "complete",
+]);
+const MAX_ARTIFACT_BYTES = 32 * 1024 * 1024 * 1024;
 
 export interface CoordinatorJobRequestV1 {
   schemaVersion: 1;
@@ -130,6 +154,73 @@ function timestamp(value: unknown, label: string): string {
   return value;
 }
 
+function parseCacheProgress(value: unknown): ComputeCacheProgressV1 {
+  const raw = object(value);
+  exactOptionalKeys(
+    raw,
+    ["stage", "outcome", "stageStartedAt", "updatedAt", "observedAt"],
+    ["artifact"],
+  );
+  if (
+    !CACHE_PROGRESS_STAGES.has(raw.stage as ComputeCacheProgressV1["stage"]) ||
+    raw.outcome !== "in_progress"
+  ) {
+    throw new CoordinatorProtocolError("coordinator cache progress schema is invalid");
+  }
+  const stageStartedAt = timestamp(raw.stageStartedAt, "cache progress stageStartedAt");
+  const updatedAt = timestamp(raw.updatedAt, "cache progress updatedAt");
+  const observedAt = timestamp(raw.observedAt, "cache progress observedAt");
+  if (Date.parse(updatedAt) < Date.parse(stageStartedAt)) {
+    throw new CoordinatorProtocolError("coordinator cache progress timestamps are invalid");
+  }
+  const parsed: ComputeCacheProgressV1 = {
+    stage: raw.stage as ComputeCacheProgressV1["stage"],
+    outcome: "in_progress",
+    stageStartedAt,
+    updatedAt,
+    observedAt,
+  };
+  if (raw.artifact !== undefined) {
+    const artifact = object(raw.artifact);
+    exactOptionalKeys(artifact, ["kind", "phase"], ["bytesCompleted", "bytesTotal"]);
+    if (
+      !CACHE_PROGRESS_KINDS.has(
+        artifact.kind as NonNullable<ComputeCacheProgressV1["artifact"]>["kind"],
+      ) ||
+      !CACHE_PROGRESS_PHASES.has(
+        artifact.phase as NonNullable<ComputeCacheProgressV1["artifact"]>["phase"],
+      )
+    ) {
+      throw new CoordinatorProtocolError("coordinator cache progress artifact is invalid");
+    }
+    for (const key of ["bytesCompleted", "bytesTotal"] as const) {
+      if (
+        artifact[key] !== undefined &&
+        (!Number.isInteger(artifact[key]) ||
+          (artifact[key] as number) < 0 ||
+          (artifact[key] as number) > MAX_ARTIFACT_BYTES)
+      ) {
+        throw new CoordinatorProtocolError("coordinator cache progress bytes are invalid");
+      }
+    }
+    if (
+      ((artifact.bytesCompleted as number | undefined) ?? 0) >
+      ((artifact.bytesTotal as number | undefined) ?? MAX_ARTIFACT_BYTES)
+    ) {
+      throw new CoordinatorProtocolError("coordinator cache progress bytes are inconsistent");
+    }
+    parsed.artifact = {
+      kind: artifact.kind as NonNullable<ComputeCacheProgressV1["artifact"]>["kind"],
+      phase: artifact.phase as NonNullable<ComputeCacheProgressV1["artifact"]>["phase"],
+      ...(typeof artifact.bytesCompleted === "number"
+        ? { bytesCompleted: artifact.bytesCompleted }
+        : {}),
+      ...(typeof artifact.bytesTotal === "number" ? { bytesTotal: artifact.bytesTotal } : {}),
+    };
+  }
+  return parsed;
+}
+
 export function coordinatorRequestSignature(
   ingestToken: string,
   method: string,
@@ -162,7 +253,7 @@ export function parseCoordinatorStatus(value: unknown): ComputeCoordinatorTestRe
     raw.service !== "glimmer-compute-coordinator" ||
     raw.schemaVersion !== 1 ||
     typeof raw.ready !== "boolean" ||
-    raw.providerApiVersion !== "v2" ||
+    (raw.providerApiVersion !== "v2" && raw.providerApiVersion !== "rest-v1+catalog-v2") ||
     typeof raw.watchdogReady !== "boolean" ||
     (raw.activeJobId !== null &&
       (typeof raw.activeJobId !== "string" || !SAFE_JOB_ID.test(raw.activeJobId))) ||
@@ -179,7 +270,7 @@ export function parseCoordinatorStatus(value: unknown): ComputeCoordinatorTestRe
     schemaVersion: 1,
     ready: raw.ready,
     checkedAt: timestamp(raw.checkedAt, "coordinator checkedAt"),
-    providerApiVersion: "v2",
+    providerApiVersion: raw.providerApiVersion,
     watchdogReady: raw.watchdogReady,
     activeJobId: raw.activeJobId as string | null,
     cacheSigning: {
@@ -213,12 +304,15 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     "podId",
     "phaseDeadlineAt",
     "lastHeartbeatAt",
+    "cacheProgress",
     "maxTotalUsd",
     "repairJobId",
     "waitingReason",
     "failureCode",
   ]);
   const cache = object(raw.cache);
+  const cacheProgress =
+    raw.cacheProgress === undefined ? undefined : parseCacheProgress(raw.cacheProgress);
   exactOptionalKeys(cache, ["state"], ["manifestSha256", "verifiedAt", "buildId", "volumeId"]);
   const cleanup = object(raw.cleanup);
   exactKeys(cleanup, ["requested", "confirmed"]);
@@ -284,6 +378,7 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     ...(raw.lastHeartbeatAt !== undefined
       ? { lastHeartbeatAt: timestamp(raw.lastHeartbeatAt, "coordinator job lastHeartbeatAt") }
       : {}),
+    ...(cacheProgress ? { cacheProgress } : {}),
     maxHourlyUsd: raw.maxHourlyUsd,
     ...(typeof raw.maxTotalUsd === "number" ? { maxTotalUsd: raw.maxTotalUsd } : {}),
     cache: {

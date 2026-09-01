@@ -1,4 +1,4 @@
-import { createHmac, webcrypto } from "node:crypto";
+import { createHash, createHmac, webcrypto } from "node:crypto";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { RunPodV2Error, RunPodV2TransportError } from "./runpod-v2.js";
 import { ComputeCoordinator } from "./worker.js";
@@ -6,6 +6,7 @@ import { ComputeCoordinator } from "./worker.js";
 const NOW = Date.parse("2026-08-31T12:00:00.000Z");
 const INGEST_TOKEN = "I".repeat(43);
 const WATCHDOG_TOKEN = "W".repeat(43);
+const CALLBACK_TOKEN = "C".repeat(43);
 const JOB_KEY = Buffer.alloc(32, 7).toString("base64url");
 const BOOTSTRAP_TOKEN = "B".repeat(43);
 const JOB_ID = "12345678-1234-4123-8123-123456789abc";
@@ -49,7 +50,8 @@ beforeAll(async () => {
 function environment(patch = {}) {
   return {
     RUNPOD_API_KEY: `rpa_${"k".repeat(48)}`,
-    RUNPOD_API_BASE_URL: "https://api.runpod.test",
+    RUNPOD_API_BASE_URL: "https://rest.runpod.test",
+    RUNPOD_CATALOG_API_BASE_URL: "https://api.runpod.test",
     INGEST_TOKEN,
     WATCHDOG_URL: "https://watchdog.example",
     WATCHDOG_INGEST_TOKEN: WATCHDOG_TOKEN,
@@ -125,14 +127,27 @@ function responsePod(request, kind) {
   return {
     id: kind === "cpu" ? "cpu-pod-1" : "gpu-pod-1",
     name: request.name,
-    status: "RUNNING",
-    cloud: "SECURE",
-    cost: kind === "cpu" ? 0.02 : 1.2,
-    dataCenterId: "EU-RO-1",
-    mounts: { network: request.mounts.network },
+    desiredStatus: "RUNNING",
+    containerDiskInGb: request.containerDiskInGb,
+    containerRegistryAuthId: request.containerRegistryAuthId,
+    costPerHr: kind === "cpu" ? 0.02 : 1.2,
+    image: request.imageName,
+    machine: { dataCenterId: request.dataCenterIds[0], secureCloud: true },
+    networkVolume: {
+      id: request.networkVolumeId,
+      name: "Glimmer cache",
+      size: 30,
+      dataCenterId: request.dataCenterIds[0],
+    },
+    ports: request.ports,
+    volumeMountPath: request.volumeMountPath,
     ...(kind === "cpu"
-      ? { cpu: { ...request.cpu, memory: 8 }, gpu: null }
-      : { gpu: { ...request.gpu, memory: 80 }, cpu: null }),
+      ? { cpuFlavorId: request.cpuFlavorIds[0], vcpuCount: request.vcpuCount, gpu: null }
+      : {
+          cpuFlavorId: null,
+          vcpuCount: 4,
+          gpu: { id: request.gpuTypeIds[0], count: request.gpuCount, memory: 80 },
+        }),
   };
 }
 
@@ -195,7 +210,7 @@ describe("cloud coordinator ingress", () => {
     expect(status.status).toBe(200);
     expect(await status.json()).toMatchObject({
       ready: true,
-      providerApiVersion: "v2",
+      providerApiVersion: "rest-v1+catalog-v2",
       watchdogReady: true,
       activeJobId: null,
       cacheSigning: { algorithm: "Ed25519", publicKey },
@@ -284,6 +299,100 @@ describe("cloud coordinator ingress", () => {
 });
 
 describe("cache-gated lifecycle", () => {
+  it("records bounded cache progress without extending the hard phase deadline", async () => {
+    const { instance, storage } = coordinator();
+    const path = `/v1/jobs/${JOB_ID}`;
+    await instance.fetch(signedRequest("PUT", path, jobRequest()));
+    const job = await instance.getJob(JOB_ID);
+    const deadline = job.currentDeadlineAt;
+    job.internal.callbackTokenHash = createHash("sha256").update(CALLBACK_TOKEN).digest("hex");
+    await storage.put(`job:${JOB_ID}`, job);
+
+    const progress = await instance.fetch(
+      callbackRequest(CALLBACK_TOKEN, {
+        schemaVersion: 1,
+        type: "cache_progress",
+        observedAt: new Date(NOW).toISOString(),
+        cacheKey: job.cacheKey,
+        progress: {
+          stage: "artifact_downloading",
+          outcome: "in_progress",
+          stageStartedAt: new Date(NOW - 1_000).toISOString(),
+          updatedAt: new Date(NOW).toISOString(),
+          artifact: {
+            kind: "model",
+            phase: "downloading",
+            bytesCompleted: 1024,
+            bytesTotal: 2048,
+          },
+        },
+      }),
+    );
+
+    expect(progress.status).toBe(200);
+    expect(await progress.json()).toMatchObject({
+      accepted: true,
+      job: {
+        phaseDeadlineAt: deadline,
+        lastHeartbeatAt: new Date(NOW).toISOString(),
+        cacheProgress: {
+          stage: "artifact_downloading",
+          artifact: { kind: "model", bytesCompleted: 1024, bytesTotal: 2048 },
+        },
+      },
+    });
+    expect((await instance.getJob(JOB_ID)).currentDeadlineAt).toBe(deadline);
+
+    const injected = await instance.fetch(
+      callbackRequest(CALLBACK_TOKEN, {
+        schemaVersion: 1,
+        type: "cache_progress",
+        observedAt: new Date(NOW).toISOString(),
+        cacheKey: job.cacheKey,
+        progress: {
+          stage: "artifact_downloading",
+          outcome: "in_progress",
+          stageStartedAt: new Date(NOW).toISOString(),
+          updatedAt: new Date(NOW).toISOString(),
+          detail: "provider secret",
+        },
+      }),
+    );
+    expect(injected.status).toBe(400);
+    expect(await injected.json()).toEqual({ error: "INVALID_CACHE_PROGRESS" });
+  });
+
+  it("turns an allowlisted bootstrap failure into immediate bounded cleanup", async () => {
+    const { instance, storage } = coordinator();
+    const path = `/v1/jobs/${JOB_ID}`;
+    await instance.fetch(signedRequest("PUT", path, jobRequest()));
+    const job = await instance.getJob(JOB_ID);
+    job.internal.callbackTokenHash = createHash("sha256").update(CALLBACK_TOKEN).digest("hex");
+    await storage.put(`job:${JOB_ID}`, job);
+
+    const failed = await instance.fetch(
+      callbackRequest(CALLBACK_TOKEN, {
+        schemaVersion: 1,
+        type: "cache_failed",
+        observedAt: new Date(NOW).toISOString(),
+        cacheKey: job.cacheKey,
+        failureCode: "artifact_download_failed",
+      }),
+    );
+
+    expect(failed.status).toBe(200);
+    expect(await failed.json()).toMatchObject({
+      accepted: true,
+      job: {
+        state: "terminating",
+        cache: { state: "repair_required" },
+        cleanup: { requested: true, confirmed: false },
+        failureCode: "CACHE_BOOTSTRAP_ARTIFACT_DOWNLOAD_FAILED",
+      },
+    });
+    expect(storage.alarmAt).toBe(NOW + 1);
+  });
+
   it("starts the GPU phase with its own bounded deadline instead of the outer cache deadline", async () => {
     const { instance } = coordinator();
     const job = {
@@ -330,15 +439,15 @@ describe("cache-gated lifecycle", () => {
                 leaseId: JSON.parse(init.body).leaseId,
               });
         }
-        if (target.endsWith("/network-volumes/volume-1")) {
+        if (target.endsWith("/networkvolumes/volume-1")) {
           return Response.json({
             id: "volume-1",
-            dataCenter: "EU-RO-1",
+            dataCenterId: "EU-RO-1",
+            name: "Glimmer cache",
             size: 30,
-            type: "STANDARD",
           });
         }
-        if (target.endsWith("/registries/registry-1")) {
+        if (target.endsWith("/containerregistryauth/registry-1")) {
           return Response.json({ id: "registry-1", name: "ghcr" });
         }
         if (target.includes("/catalog/cpus")) {
@@ -354,31 +463,33 @@ describe("cache-gated lifecycle", () => {
             ],
           });
         }
-        if (target.endsWith("/v2/pods") && init.method === "POST") {
+        if (target.endsWith("/v1/pods") && init.method === "POST") {
           const request = JSON.parse(init.body);
           creates.push(request);
-          if (request.cpu) cpuPresent = true;
-          if (request.gpu) gpuPresent = true;
-          return Response.json(responsePod(request, request.cpu ? "cpu" : "gpu"), { status: 201 });
+          if (request.computeType === "CPU") cpuPresent = true;
+          if (request.computeType === "GPU") gpuPresent = true;
+          return Response.json(responsePod(request, request.computeType.toLowerCase()), {
+            status: 201,
+          });
         }
-        if (target.endsWith("/v2/pods/cpu-pod-1") && init.method === "DELETE") {
+        if (target.endsWith("/v1/pods/cpu-pod-1") && init.method === "DELETE") {
           cpuPresent = false;
           return new Response(null, { status: 204 });
         }
-        if (target.endsWith("/v2/pods/cpu-pod-1")) {
+        if (target.includes("/v1/pods/cpu-pod-1")) {
           return cpuPresent
             ? Response.json(responsePod(creates[0], "cpu"))
             : Response.json({}, { status: 404 });
         }
-        if (target.endsWith("/v2/pods/gpu-pod-1") && init.method === "DELETE") {
+        if (target.endsWith("/v1/pods/gpu-pod-1") && init.method === "DELETE") {
           gpuPresent = false;
           return new Response(null, { status: 204 });
         }
-        if (target.endsWith("/v2/pods/gpu-pod-1")) {
+        if (target.includes("/v1/pods/gpu-pod-1")) {
           return gpuPresent
             ? Response.json(
                 responsePod(
-                  creates.find((entry) => entry.gpu),
+                  creates.find((entry) => entry.computeType === "GPU"),
                   "gpu",
                 ),
               )
@@ -392,7 +503,11 @@ describe("cache-gated lifecycle", () => {
     await instance.fetch(signedRequest("PUT", path, jobRequest()));
     await instance.alarm();
     expect(creates).toHaveLength(1);
-    expect(creates[0].cpu).toEqual({ id: "cpu3c", vcpuCount: 2 });
+    expect(creates[0]).toMatchObject({
+      computeType: "CPU",
+      cpuFlavorIds: ["cpu3c"],
+      vcpuCount: 2,
+    });
     expect(creates[0].env.GLIMMER_CACHE_SIGNING_PRIVATE_KEY).toBeUndefined();
     expect(creates[0].env.GLIMMER_CACHE_SIGNING_PUBLIC_KEY).toBe(publicKey);
     const callbackToken = creates[0].env.GLIMMER_COORDINATOR_CALLBACK_TOKEN;
@@ -466,7 +581,11 @@ describe("cache-gated lifecycle", () => {
     expect(creates).toHaveLength(1);
     await instance.alarm();
     expect(creates).toHaveLength(2);
-    expect(creates[1].gpu).toEqual({ id: "NVIDIA A100 80GB PCIe", count: 1 });
+    expect(creates[1]).toMatchObject({
+      computeType: "GPU",
+      gpuTypeIds: ["NVIDIA A100 80GB PCIe"],
+      gpuCount: 1,
+    });
     expect(creates[1].env.GLIMMER_CACHE_SIGNING_PRIVATE_KEY).toBeUndefined();
     expect(creates[1].env.GLIMMER_CACHE_SIGNING_PUBLIC_KEY).toBe(publicKey);
     expect(creates[1].env.GLIMMER_CACHE_BUILD_ID).toBe("r2-abcdef012345");
@@ -484,7 +603,11 @@ describe("cache-gated lifecycle", () => {
     await instance.alarm();
     await instance.alarm();
     expect(creates).toHaveLength(3);
-    expect(creates[2].cpu).toEqual({ id: "cpu3c", vcpuCount: 2 });
+    expect(creates[2]).toMatchObject({
+      computeType: "CPU",
+      cpuFlavorIds: ["cpu3c"],
+      vcpuCount: 2,
+    });
   });
 
   it("uses the exact bounded L4 fallback only when automatic CPU repair is unavailable", async () => {
@@ -510,15 +633,15 @@ describe("cache-gated lifecycle", () => {
           leases.push(lease);
           return Response.json({ accepted: true, leaseId: lease.leaseId });
         }
-        if (target.endsWith("/network-volumes/volume-1")) {
+        if (target.endsWith("/networkvolumes/volume-1")) {
           return Response.json({
             id: "volume-1",
-            dataCenter: "EUR-IS-1",
+            dataCenterId: "EUR-IS-1",
+            name: "Glimmer cache",
             size: 30,
-            type: "STANDARD",
           });
         }
-        if (target.endsWith("/registries/registry-1")) {
+        if (target.endsWith("/containerregistryauth/registry-1")) {
           return Response.json({ id: "registry-1", name: "ghcr" });
         }
         if (target.includes("/catalog/cpus")) {
@@ -557,10 +680,13 @@ describe("cache-gated lifecycle", () => {
             ],
           });
         }
-        if (target.endsWith("/v2/pods") && init.method === "POST") {
+        if (target.endsWith("/v1/pods") && init.method === "POST") {
           const request = JSON.parse(init.body);
           creates.push(request);
-          return Response.json({ ...responsePod(request, "gpu"), cost: 0.49 }, { status: 201 });
+          return Response.json(
+            { ...responsePod(request, "gpu"), costPerHr: 0.49 },
+            { status: 201 },
+          );
         }
         throw new Error(`unexpected request ${init.method ?? "GET"} ${target}`);
       }),
@@ -581,11 +707,13 @@ describe("cache-gated lifecycle", () => {
 
     expect(creates).toHaveLength(1);
     expect(creates[0]).toMatchObject({
-      disk: 20,
+      containerDiskInGb: 20,
       ports: [],
-      cloud: "SECURE",
+      cloudType: "SECURE",
+      computeType: "GPU",
       dataCenterIds: ["EUR-IS-1"],
-      gpu: { id: "NVIDIA L4", count: 1 },
+      gpuTypeIds: ["NVIDIA L4"],
+      gpuCount: 1,
     });
     expect(leases.at(-1)).toMatchObject({
       jobKind: "gpu_cache",
@@ -668,17 +796,27 @@ describe("cache-gated lifecycle", () => {
             leaseId: JSON.parse(init.body ?? "{}").leaseId,
           });
         }
-        if (target.endsWith("/v2/pods/gpu-idle")) {
+        if (target.includes("/v1/pods/gpu-idle")) {
           return Response.json({
             id: "gpu-idle",
             name: "glimmer-gpu-idle",
-            status: "RUNNING",
-            cloud: "SECURE",
-            cost: 1.2,
-            dataCenterId: "EU-RO-1",
-            mounts: { network: [{ volumeId: "volume-1", path: "/workspace" }] },
+            desiredStatus: "RUNNING",
+            containerDiskInGb: 50,
+            containerRegistryAuthId: "registry-1",
+            costPerHr: 1.2,
+            image: IMAGE,
+            machine: { dataCenterId: "EU-RO-1", secureCloud: true },
+            networkVolume: {
+              id: "volume-1",
+              name: "Glimmer cache",
+              size: 30,
+              dataCenterId: "EU-RO-1",
+            },
+            ports: ["4318/http"],
+            volumeMountPath: "/workspace",
             gpu: { id: "A100", count: 1, memory: 80 },
-            cpu: null,
+            cpuFlavorId: null,
+            vcpuCount: 4,
           });
         }
         throw new Error(`unexpected request ${target}`);
@@ -706,7 +844,8 @@ describe("cache-gated lifecycle", () => {
       },
     };
     await instance.advance(job, {
-      runpodBaseUrl: "https://api.runpod.test/v2",
+      runpodBaseUrl: "https://rest.runpod.test/v1",
+      runpodCatalogBaseUrl: "https://api.runpod.test/v2",
       watchdogUrl: "https://watchdog.example",
     });
     expect(job.state).toBe("terminating");

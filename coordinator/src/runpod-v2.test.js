@@ -14,12 +14,14 @@ import {
   parseRunPodV2Pod,
   selectCpuOffer,
   selectGpuOffer,
+  toRunPodRestCreateRequest,
   validateRunPodV2Configuration,
   validateRunPodV2CreateRequest,
 } from "./runpod-v2.js";
 
 const API_KEY = `rpa_${"k".repeat(48)}`;
-const BASE_URL = "https://api.runpod.test/v2";
+const BASE_URL = "https://rest.runpod.test/v1";
+const CATALOG_BASE_URL = "https://api.runpod.test/v2";
 const IMAGE = `registry.example/glimmer@sha256:${"a".repeat(64)}`;
 
 function expectCode(callback, code) {
@@ -69,16 +71,26 @@ function providerPod(request, patch = {}) {
   return {
     id: "pod_123",
     name: request.name,
-    status: "RUNNING",
-    cloud: request.cloud,
-    cost: request.cpu ? 0.08 : 2.49,
-    dataCenterId: request.dataCenterIds[0],
-    mounts: {
-      network: request.mounts.network.map((mount) => ({ ...mount })),
+    desiredStatus: "RUNNING",
+    containerDiskInGb: request.disk,
+    containerRegistryAuthId: request.registry,
+    costPerHr: request.cpu ? 0.08 : 2.49,
+    image: request.image,
+    machine: {
+      dataCenterId: request.dataCenterIds[0],
+      secureCloud: request.cloud === "SECURE",
     },
+    networkVolume: {
+      id: request.mounts.network[0].volumeId,
+      name: "Glimmer cache",
+      size: 200,
+      dataCenterId: request.dataCenterIds[0],
+    },
+    ports: [...request.ports],
+    volumeMountPath: request.mounts.network[0].path,
     ...(request.cpu
-      ? { cpu: { ...request.cpu, memory: 8 }, gpu: null }
-      : { gpu: { ...request.gpu, memory: 80 }, cpu: null }),
+      ? { cpuFlavorId: request.cpu.id, vcpuCount: request.cpu.vcpuCount, gpu: null }
+      : { cpuFlavorId: null, vcpuCount: 4, gpu: { ...request.gpu, memory: 80 } }),
     // A real provider response can echo environment data. The parser must not
     // retain it in coordinator state or expose it to callers.
     env: { ...request.env },
@@ -91,9 +103,11 @@ describe("RunPod v2 configuration", () => {
     const parsed = validateRunPodV2Configuration({
       apiKey: API_KEY,
       baseUrl: `${BASE_URL}/`,
+      catalogBaseUrl: `${CATALOG_BASE_URL}/`,
       fetchImpl: async () => new Response(),
     });
     expect(parsed.baseUrl).toBe(BASE_URL);
+    expect(parsed.catalogBaseUrl).toBe(CATALOG_BASE_URL);
 
     for (const baseUrl of [
       "http://api.runpod.test/v2",
@@ -107,6 +121,7 @@ describe("RunPod v2 configuration", () => {
           validateRunPodV2Configuration({
             apiKey: API_KEY,
             baseUrl,
+            catalogBaseUrl: CATALOG_BASE_URL,
             fetchImpl: async () => new Response(),
           }),
         "INVALID_RUNPOD_CONFIG",
@@ -117,6 +132,7 @@ describe("RunPod v2 configuration", () => {
         validateRunPodV2Configuration({
           apiKey: "contains whitespace",
           baseUrl: BASE_URL,
+          catalogBaseUrl: CATALOG_BASE_URL,
           fetchImpl: async () => new Response(),
         }),
       "INVALID_RUNPOD_CONFIG",
@@ -185,6 +201,38 @@ describe("RunPod v2 create request builders", () => {
     expect(validateRunPodV2CreateRequest(gpuCacheRequest())).toEqual(gpuCacheRequest());
   });
 
+  it("maps the internal request to the documented REST Pod create fields", () => {
+    expect(toRunPodRestCreateRequest(cpuRequest())).toEqual({
+      name: "glimmer-cache-job-1",
+      imageName: IMAGE,
+      cloudType: "SECURE",
+      computeType: "CPU",
+      containerDiskInGb: 20,
+      containerRegistryAuthId: "registry_1",
+      cpuFlavorIds: ["cpu3c-2-4"],
+      cpuFlavorPriority: "custom",
+      dataCenterIds: ["EU-RO-1"],
+      dataCenterPriority: "custom",
+      dockerEntrypoint: [],
+      dockerStartCmd: [],
+      env: commonCreateInput().environment,
+      globalNetworking: false,
+      interruptible: false,
+      locked: false,
+      networkVolumeId: "volume_1",
+      ports: [],
+      vcpuCount: 2,
+      volumeMountPath: "/workspace",
+    });
+    expect(toRunPodRestCreateRequest(gpuRequest())).toMatchObject({
+      computeType: "GPU",
+      gpuCount: 1,
+      gpuTypeIds: ["NVIDIA H100 80GB HBM3"],
+      gpuTypePriority: "custom",
+      ports: ["4318/http"],
+    });
+  });
+
   it("rejects mutable images, path-like identities, extra fields, and multi-GPU requests", () => {
     expectCode(
       () =>
@@ -232,28 +280,18 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
     );
   });
 
-  it("accepts only the documented standard and high-performance network volume tiers", () => {
-    for (const type of ["STANDARD", "HIGH_PERFORMANCE"]) {
-      expect(
-        parseRunPodV2NetworkVolume(
-          { id: "volume_1", type, size: 30, dataCenter: "EUR-IS-1" },
-          "volume_1",
-        ),
-      ).toEqual({
-        id: "volume_1",
-        dataCenterId: "EUR-IS-1",
-        sizeGb: 30,
-        type,
-      });
-    }
-    expectCode(
-      () =>
-        parseRunPodV2NetworkVolume(
-          { id: "volume_1", type: "NETWORK", size: 30, dataCenter: "EUR-IS-1" },
-          "volume_1",
-        ),
-      "INVALID_NETWORK_VOLUME",
-    );
+  it("parses the documented network volume identity and data center", () => {
+    expect(
+      parseRunPodV2NetworkVolume(
+        { id: "volume_1", name: "Glimmer cache", size: 30, dataCenterId: "EUR-IS-1" },
+        "volume_1",
+      ),
+    ).toEqual({
+      id: "volume_1",
+      dataCenterId: "EUR-IS-1",
+      sizeGb: 30,
+      name: "Glimmer cache",
+    });
   });
 
   it("returns a secret-free Pod projection and requires exactly one compute type", () => {
@@ -271,13 +309,36 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
     expect("env" in pod).toBe(false);
 
     expectCode(
-      () => parseRunPodV2Pod(providerPod(request, { cpu: { id: "cpu", vcpuCount: 2 } })),
+      () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: "cpu3c" })),
       "INVALID_POD",
     );
     expectCode(
-      () => parseRunPodV2Pod(providerPod(request, { cpu: null, gpu: null })),
+      () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: null, gpu: null })),
       "INVALID_POD",
     );
+  });
+
+  it("can enumerate an unrelated Pod while optional machine and volume fields are absent", () => {
+    const request = cpuRequest();
+    const partial = providerPod(request, {
+      name: "Unrelated notebook Pod",
+      image: "runpod/pytorch:latest",
+      machine: {},
+      networkVolume: null,
+      containerRegistryAuthId: null,
+      ports: undefined,
+    });
+
+    expect(parseRunPodV2Pod(partial)).toMatchObject({
+      id: "pod_123",
+      name: "Unrelated notebook Pod",
+      cloud: null,
+      dataCenterId: null,
+      image: "runpod/pytorch:latest",
+      registryId: null,
+      ports: [],
+      mounts: { network: [] },
+    });
   });
 
   it("chooses deterministically at the volume data center and under the two-vCPU cap", () => {
@@ -423,12 +484,13 @@ describe("RunPod v2 GPU catalog selection", () => {
 });
 
 describe("RunPod v2 HTTP client", () => {
-  it("uses only the pinned v2 routes and proves exact provider identities", async () => {
+  it("separates documented REST resources from the read-only v2 catalogs", async () => {
     const request = cpuRequest();
     const calls = [];
     const client = new RunPodV2Client({
       apiKey: API_KEY,
       baseUrl: BASE_URL,
+      catalogBaseUrl: CATALOG_BASE_URL,
       fetchImpl: async function (url, options) {
         expect(this).toBe(globalThis);
         calls.push({
@@ -437,15 +499,15 @@ describe("RunPod v2 HTTP client", () => {
           authorization: options.headers.get("Authorization"),
           redirect: options.redirect,
         });
-        if (url.endsWith("/network-volumes/volume_1")) {
+        if (url.endsWith("/networkvolumes/volume_1")) {
           return Response.json({
             id: "volume_1",
-            type: "STANDARD",
+            name: "Glimmer cache",
             size: 200,
-            dataCenter: "EU-RO-1",
+            dataCenterId: "EU-RO-1",
           });
         }
-        if (url.endsWith("/registries/registry_1")) {
+        if (url.endsWith("/containerregistryauth/registry_1")) {
           return Response.json({ id: "registry_1", name: "Glimmer registry" });
         }
         if (url.endsWith("/catalog/cpus?include=AVAILABILITY&product=POD&vcpuCount=2")) {
@@ -476,10 +538,13 @@ describe("RunPod v2 HTTP client", () => {
             ],
           });
         }
-        if (url.endsWith("/pods?includeClusterPods=true")) {
-          return Response.json({ pods: [providerPod(request)] });
+        if (url.endsWith("/pods?includeMachine=true&includeNetworkVolume=true")) {
+          return Response.json([providerPod(request)]);
         }
-        if (url.endsWith("/pods/pod_123") && options.method === "GET") {
+        if (
+          url.endsWith("/pods/pod_123?includeMachine=true&includeNetworkVolume=true") &&
+          options.method === "GET"
+        ) {
           return Response.json(providerPod(request));
         }
         if (url.endsWith("/pods/pod_123") && options.method === "DELETE") {
@@ -493,7 +558,7 @@ describe("RunPod v2 HTTP client", () => {
       id: "volume_1",
       dataCenterId: "EU-RO-1",
       sizeGb: 200,
-      type: "STANDARD",
+      name: "Glimmer cache",
     });
     await expect(client.getRegistry("registry_1")).resolves.toEqual({
       id: "registry_1",
@@ -516,6 +581,9 @@ describe("RunPod v2 HTTP client", () => {
     ]);
     expect(calls.every((call) => call.authorization === `Bearer ${API_KEY}`)).toBe(true);
     expect(calls.every((call) => call.redirect === "manual")).toBe(true);
+    expect(calls.slice(0, 2).every((call) => call.url.startsWith(BASE_URL))).toBe(true);
+    expect(calls.slice(2, 4).every((call) => call.url.startsWith(CATALOG_BASE_URL))).toBe(true);
+    expect(calls.slice(4).every((call) => call.url.startsWith(BASE_URL))).toBe(true);
   });
 
   it("sends exactly one POST and returns a parsed, secret-free exact Pod", async () => {
@@ -535,7 +603,7 @@ describe("RunPod v2 HTTP client", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(`${BASE_URL}/pods`);
     expect(calls[0].options.method).toBe("POST");
-    expect(JSON.parse(calls[0].options.body)).toEqual(request);
+    expect(JSON.parse(calls[0].options.body)).toEqual(toRunPodRestCreateRequest(request));
   });
 
   it("marks an unusable successful create response ambiguous without a second POST", async () => {
@@ -580,7 +648,12 @@ describe("RunPod v2 HTTP client", () => {
       apiKey: API_KEY,
       baseUrl: BASE_URL,
       fetchImpl: async () =>
-        Response.json(providerPod(request, { cloud: "COMMUNITY" }), { status: 201 }),
+        Response.json(
+          providerPod(request, {
+            machine: { dataCenterId: request.dataCenterIds[0], secureCloud: false },
+          }),
+          { status: 201 },
+        ),
     });
 
     await expect(client.createPod(request)).rejects.toMatchObject({
@@ -595,9 +668,10 @@ describe("RunPod v2 HTTP client", () => {
       apiKey: API_KEY,
       baseUrl: BASE_URL,
       fetchImpl: async () =>
-        Response.json({
-          pods: [providerPod(request, { id: "pod_1" }), providerPod(request, { id: "pod_2" })],
-        }),
+        Response.json([
+          providerPod(request, { id: "pod_1" }),
+          providerPod(request, { id: "pod_2" }),
+        ]),
     });
     await expect(client.findPodByExactName(request.name)).rejects.toMatchObject({
       code: "DUPLICATE_POD_NAME",
@@ -624,9 +698,9 @@ describe("RunPod v2 HTTP client", () => {
       fetchImpl: async () =>
         Response.json({
           id: "other_volume",
-          type: "STANDARD",
+          name: "Other cache",
           size: 200,
-          dataCenter: "EU-RO-1",
+          dataCenterId: "EU-RO-1",
         }),
     });
     await expect(volumeClient.getNetworkVolume("volume_1")).rejects.toMatchObject({

@@ -2860,7 +2860,7 @@ export interface ComputeCoordinatorTestResult {
   schemaVersion: 1;
   ready: boolean;
   checkedAt: string;
-  providerApiVersion: "v2";
+  providerApiVersion: "v2" | "rest-v1+catalog-v2";
   watchdogReady: boolean;
   activeJobId: string | null;
   cacheSigning: {
@@ -2878,6 +2878,27 @@ export interface ComputeCacheStatusV1 {
   verifiedAt?: string;
   buildId?: string;
   volumeId?: string;
+}
+
+export interface ComputeCacheProgressV1 {
+  stage:
+    | "initializing"
+    | "worker_starting"
+    | "worker_listening"
+    | "artifact_preparing"
+    | "artifact_downloading"
+    | "artifact_verifying"
+    | "cache_publishing";
+  outcome: "in_progress";
+  stageStartedAt: string;
+  updatedAt: string;
+  observedAt: string;
+  artifact?: {
+    kind: "model" | "mmproj" | "draft";
+    phase: "locking" | "cached" | "resuming" | "downloading" | "verifying" | "complete";
+    bytesCompleted?: number;
+    bytesTotal?: number;
+  };
 }
 
 export type ComputeCoordinatorJobState =
@@ -2910,6 +2931,8 @@ export interface ComputeCoordinatorJobV1 {
   /** Phase-local deadline when the coordinator applies a stricter repair/worker cap. */
   phaseDeadlineAt?: string;
   lastHeartbeatAt?: string;
+  /** Secret-free, bounded bootstrap progress from a cloud-owned cache repair. */
+  cacheProgress?: ComputeCacheProgressV1;
   maxHourlyUsd: number;
   /** Optional conservative total ceiling for the GPU phase, including deletion margin. */
   maxTotalUsd?: number;

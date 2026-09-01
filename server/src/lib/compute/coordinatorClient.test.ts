@@ -73,6 +73,13 @@ describe("CoordinatorClient", () => {
     );
   });
 
+  it("accepts the rolling REST migration status while preserving legacy v2 reads", () => {
+    expect(
+      parseCoordinatorStatus({ ...status(), providerApiVersion: "rest-v1+catalog-v2" }),
+    ).toMatchObject({ providerApiVersion: "rest-v1+catalog-v2" });
+    expect(parseCoordinatorStatus(status())).toMatchObject({ providerApiVersion: "v2" });
+  });
+
   it("rejects unsafe origins, malformed keys, and schema drift", () => {
     expect(
       () =>
@@ -161,6 +168,39 @@ describe("CoordinatorClient", () => {
     expect(() => parseCoordinatorJob({ ...job(), callbackToken: "secret" })).toThrow(/unsupported/);
     expect(() =>
       parseCoordinatorJob({ ...job(), cache: { state: "ready", source: "model" } }),
+    ).toThrow(/unsupported/);
+  });
+
+  it("parses bounded cache progress and rejects free-form callback data", () => {
+    const value = {
+      ...job(),
+      lastHeartbeatAt: NOW.toISOString(),
+      cacheProgress: {
+        stage: "artifact_downloading",
+        outcome: "in_progress",
+        stageStartedAt: "2026-08-31T11:59:00.000Z",
+        updatedAt: NOW.toISOString(),
+        observedAt: NOW.toISOString(),
+        artifact: {
+          kind: "model",
+          phase: "downloading",
+          bytesCompleted: 1024,
+          bytesTotal: 2048,
+        },
+      },
+    };
+
+    expect(parseCoordinatorJob(value)).toMatchObject({
+      cacheProgress: {
+        stage: "artifact_downloading",
+        artifact: { kind: "model", bytesCompleted: 1024, bytesTotal: 2048 },
+      },
+    });
+    expect(() =>
+      parseCoordinatorJob({
+        ...value,
+        cacheProgress: { ...value.cacheProgress, detail: "provider secret" },
+      }),
     ).toThrow(/unsupported/);
   });
 });

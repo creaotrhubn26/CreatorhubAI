@@ -25,7 +25,8 @@
     },
   ],
   "vars": {
-    "RUNPOD_API_BASE_URL": "https://api.runpod.io",
+    "RUNPOD_API_BASE_URL": "https://rest.runpod.io",
+    "RUNPOD_CATALOG_API_BASE_URL": "https://api.runpod.io",
     "CPU_CACHE_MAX_HOURLY_USD": "0.0225",
     "CPU_CACHE_TTL_SECONDS": "1680",
     "CACHE_REPAIR_GPU_FALLBACK_ID": "NVIDIA L4",
@@ -33,6 +34,15 @@
     "CACHE_REPAIR_MAX_TOTAL_USD": "0.25",
   },
   "observability": {
-    "enabled": false,
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": false,
+      "persist": true,
+    },
+    "traces": {
+      "enabled": false,
+    },
   },
 }
