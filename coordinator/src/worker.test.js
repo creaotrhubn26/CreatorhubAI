@@ -131,7 +131,7 @@ function responsePod(request, kind) {
     containerDiskInGb: request.containerDiskInGb,
     containerRegistryAuthId: request.containerRegistryAuthId,
     costPerHr: kind === "cpu" ? 0.02 : 1.2,
-    image: request.imageName,
+    imageName: request.imageName,
     machine: { dataCenterId: request.dataCenterIds[0], secureCloud: true },
     networkVolume: {
       id: request.networkVolumeId,

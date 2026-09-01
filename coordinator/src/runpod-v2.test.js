@@ -75,7 +75,7 @@ function providerPod(request, patch = {}) {
     containerDiskInGb: request.disk,
     containerRegistryAuthId: request.registry,
     costPerHr: request.cpu ? 0.08 : 2.49,
-    image: request.image,
+    imageName: request.image,
     machine: {
       dataCenterId: request.dataCenterIds[0],
       secureCloud: request.cloud === "SECURE",
@@ -316,13 +316,22 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
       () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: null, gpu: null })),
       "INVALID_POD",
     );
+
+    const legacy = providerPod(request);
+    legacy.image = legacy.imageName;
+    delete legacy.imageName;
+    expect(parseRunPodV2Pod(legacy).image).toBe(IMAGE);
+    expectCode(
+      () => parseRunPodV2Pod(providerPod(request, { image: "registry.example/conflict:latest" })),
+      "INVALID_POD",
+    );
   });
 
   it("can enumerate an unrelated Pod while optional machine and volume fields are absent", () => {
     const request = cpuRequest();
     const partial = providerPod(request, {
       name: "Unrelated notebook Pod",
-      image: "runpod/pytorch:latest",
+      imageName: "runpod/pytorch:latest",
       machine: {},
       networkVolume: null,
       containerRegistryAuthId: null,

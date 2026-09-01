@@ -429,7 +429,10 @@ export function parseRunPodV2Pod(value) {
   ) {
     fail("INVALID_POD", "Pod and network volume data centers do not match");
   }
-  const image = boundedText(raw.image, "INVALID_POD", "Pod image", 512);
+  if (raw.image !== undefined && raw.imageName !== undefined && raw.image !== raw.imageName) {
+    fail("INVALID_POD", "Pod image fields conflict");
+  }
+  const image = boundedText(raw.imageName ?? raw.image, "INVALID_POD", "Pod image", 512);
   const registryId =
     raw.containerRegistryAuthId === undefined || raw.containerRegistryAuthId === null
       ? null
