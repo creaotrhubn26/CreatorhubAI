@@ -1,10 +1,13 @@
 import {
+  filterRawRunPodPodsByName,
   parseRunPodBillingRecords,
   parseRunPodPod,
+  parseRunPodPodIdentity,
   parseRunPodPodList,
   type RunPodBillingRecord,
   type RunPodCreatePodInput,
   type RunPodPod,
+  type RunPodPodIdentity,
 } from "./runpodSchemas.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -149,6 +152,29 @@ export class RunPodClient {
 
   async listPods(): Promise<RunPodPod[]> {
     return parseRunPodPodList(await this.request("/pods"));
+  }
+
+  // Raw-filters the provider list by exact name before parsing, so recovery
+  // and cleanup cannot be blocked by an unrelated Pod that fails validation.
+  async listPodsByName(podName: string): Promise<RunPodPod[]> {
+    return filterRawRunPodPodsByName(await this.request("/pods"), podName).map(parseRunPodPod);
+  }
+
+  // Identity-only lookup for cleanup paths: confirms presence/absence and the
+  // exact id/name/status without requiring descriptive fields to validate.
+  async getPodIdentity(podId: string): Promise<RunPodPodIdentity | null> {
+    try {
+      const identity = parseRunPodPodIdentity(
+        await this.request(`/pods/${encodeURIComponent(validPodId(podId))}`),
+      );
+      if (identity.id !== podId) {
+        throw new RunPodApiError("RunPod returned a Pod other than the exact requested id");
+      }
+      return identity;
+    } catch (error) {
+      if (error instanceof RunPodApiError && error.status === 404) return null;
+      throw error;
+    }
   }
 
   async getPod(podId: string, options: { timeoutMs?: number } = {}): Promise<RunPodPod | null> {

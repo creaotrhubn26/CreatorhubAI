@@ -1242,16 +1242,16 @@ export class ComputeCoordinator {
       // No provider mutation was attempted, so a Pod cannot exist. Avoid
       // making cleanup depend on a provider that may currently be unreachable.
     } else if (!job.podId) {
-      const matches = (await client.listPods()).filter((pod) => pod.name === job.podName);
+      const matches = await client.listPodsByExactName(job.podName);
       if (matches.length > 1) throw new Error("DUPLICATE_CREATE_OUTCOME");
       if (matches.length === 1) {
         job.podId = matches[0].id;
         await client.deletePod(job.podId).catch(() => undefined);
-        if (await client.getPod(job.podId).catch(() => ({ present: true }))) return false;
+        if (await client.getPodIdentity(job.podId).catch(() => ({ present: true }))) return false;
       }
     } else {
       await client.deletePod(job.podId).catch(() => undefined);
-      if (await client.getPod(job.podId).catch(() => ({ present: true }))) return false;
+      if (await client.getPodIdentity(job.podId).catch(() => ({ present: true }))) return false;
     }
     await watchdogRequest(
       this.env,
@@ -1396,7 +1396,7 @@ export class ComputeCoordinator {
   }
 
   async recoverCreate(job, client, config) {
-    const matches = (await client.listPods()).filter((pod) => pod.name === job.podName);
+    const matches = await client.listPodsByExactName(job.podName);
     if (matches.length > 1) {
       throw new Error("DUPLICATE_CREATE_OUTCOME");
     }

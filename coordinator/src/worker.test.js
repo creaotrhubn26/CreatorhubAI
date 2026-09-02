@@ -767,7 +767,7 @@ describe("cache-gated lifecycle", () => {
   it("uses worker activity for idle expiry and leaves duplicate create outcomes untouched", async () => {
     const { instance } = coordinator();
     const duplicateClient = {
-      listPods: vi.fn(async () => [
+      listPodsByExactName: vi.fn(async () => [
         { id: "duplicate-1", name: "glimmer-gpu-duplicate" },
         { id: "duplicate-2", name: "glimmer-gpu-duplicate" },
       ]),

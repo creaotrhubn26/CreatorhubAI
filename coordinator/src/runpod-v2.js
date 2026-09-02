@@ -345,53 +345,85 @@ export function validateRunPodV2CreateRequest(value) {
 }
 
 function parseNetworkMount(volume, mountPath) {
-  const raw = object(volume, "INVALID_POD", "Pod network volume");
-  const volumeId = safeId(raw.id, "INVALID_POD", "Pod network volume id");
-  const path = boundedText(mountPath, "INVALID_POD", "Pod network mount path", 512);
+  const raw = object(volume, "INVALID_POD_VOLUME_FIELD", "Pod network volume");
+  const volumeId = safeId(raw.id, "INVALID_POD_VOLUME_FIELD", "Pod network volume id");
+  const path = boundedText(mountPath, "INVALID_POD_VOLUME_FIELD", "Pod network mount path", 512);
   const segments = path.split("/");
   if (!path.startsWith("/") || path.includes("//") || segments.includes("..")) {
-    fail("INVALID_POD", "Pod network mount path is invalid");
+    fail("INVALID_POD_VOLUME_FIELD", "Pod network mount path is invalid");
   }
   return { volumeId, path };
 }
 
 function parseCpu(flavorId, vcpuCount) {
-  const id = boundedText(flavorId, "INVALID_POD", "Pod CPU id", 128);
-  if (!CPU_ID.test(id)) fail("INVALID_POD", "Pod CPU id is invalid");
+  const id = boundedText(flavorId, "INVALID_POD_CPU_FIELD", "Pod CPU id", 128);
+  if (!CPU_ID.test(id)) fail("INVALID_POD_CPU_FIELD", "Pod CPU id is invalid");
   return {
     id,
-    vcpuCount: integer(vcpuCount, "INVALID_POD", "Pod vCPU count", 1, 1_024),
+    vcpuCount: integer(vcpuCount, "INVALID_POD_CPU_FIELD", "Pod vCPU count", 1, 1_024),
   };
 }
 
 function parseGpu(value) {
-  const raw = object(value, "INVALID_POD", "Pod GPU");
-  const id = boundedText(raw.id, "INVALID_POD", "Pod GPU id", 128);
-  if (!GPU_ID.test(id)) fail("INVALID_POD", "Pod GPU id is invalid");
+  const raw = object(value, "INVALID_POD_GPU_FIELD", "Pod GPU");
+  const id = boundedText(raw.id, "INVALID_POD_GPU_FIELD", "Pod GPU id", 128);
+  if (!GPU_ID.test(id)) fail("INVALID_POD_GPU_FIELD", "Pod GPU id is invalid");
   const gpu = {
     id,
-    count: integer(raw.count, "INVALID_POD", "Pod GPU count", 1, 64),
+    count: integer(raw.count, "INVALID_POD_GPU_FIELD", "Pod GPU count", 1, 64),
   };
   if (raw.memory !== undefined) {
-    gpu.memory = finiteNumber(raw.memory, "INVALID_POD", "Pod GPU memory", 0, 100_000_000);
+    gpu.memory = finiteNumber(
+      raw.memory,
+      "INVALID_POD_GPU_FIELD",
+      "Pod GPU memory",
+      0,
+      100_000_000,
+    );
   }
   return gpu;
 }
 
+// Minimal identity contract: enough to address a Pod for cleanup (exact id,
+// exact name, lifecycle status) without requiring every descriptive field to
+// validate. A Pod with a malformed cost or GPU record must still be deletable.
+export function parseRunPodV2PodIdentity(value) {
+  const raw = object(value, "INVALID_POD_IDENTITY", "Pod identity");
+  const id = safeId(raw.id, "INVALID_POD_IDENTITY", "Pod id");
+  const name = boundedText(raw.name, "INVALID_POD_IDENTITY", "Pod name", 191);
+  const status = boundedText(raw.desiredStatus, "INVALID_POD_IDENTITY", "Pod desired status", 32);
+  if (!POD_STATUSES.has(status)) fail("INVALID_POD_IDENTITY", "Pod status is invalid");
+  return { id, name, status };
+}
+
+// Filters the raw provider list by exact name BEFORE any full parsing so an
+// unrelated malformed Pod in the account can never block recovery or cleanup
+// of the Pod this deployment owns.
+export function filterRawRunPodV2PodsByExactName(value, podName) {
+  if (!Array.isArray(value) || value.length > MAX_PODS) {
+    fail("INVALID_POD_LIST", "Pod list has an invalid size");
+  }
+  return value.filter(
+    (entry) =>
+      entry !== null &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      entry.name === podName,
+  );
+}
+
 export function parseRunPodV2Pod(value) {
+  const identity = parseRunPodV2PodIdentity(value);
   const raw = object(value, "INVALID_POD", "Pod");
-  const id = safeId(raw.id, "INVALID_POD", "Pod id");
-  const name = boundedText(raw.name, "INVALID_POD", "Pod name", 191);
-  const status = boundedText(raw.desiredStatus, "INVALID_POD", "Pod desired status", 32);
-  if (!POD_STATUSES.has(status)) fail("INVALID_POD", "Pod status is invalid");
+  const { id, name, status } = identity;
   const machine = raw.machine === undefined || raw.machine === null ? null : raw.machine;
-  if (machine !== null) object(machine, "INVALID_POD", "Pod machine");
+  if (machine !== null) object(machine, "INVALID_POD_MACHINE_FIELD", "Pod machine");
   if (
     machine !== null &&
     machine.secureCloud !== undefined &&
     typeof machine.secureCloud !== "boolean"
   ) {
-    fail("INVALID_POD", "Pod machine cloud is invalid");
+    fail("INVALID_POD_MACHINE_FIELD", "Pod machine cloud is invalid");
   }
   const cloud =
     machine === null || machine.secureCloud === undefined
@@ -406,59 +438,76 @@ export function parseRunPodV2Pod(value) {
       : parseCpu(raw.cpuFlavorId, raw.vcpuCount);
   const gpu = raw.gpu === undefined || raw.gpu === null ? null : parseGpu(raw.gpu);
   if ((cpu === null) === (gpu === null)) {
-    fail("INVALID_POD", "Pod must report exactly one CPU or GPU allocation");
+    fail("INVALID_POD_ALLOCATION_FIELD", "Pod must report exactly one CPU or GPU allocation");
   }
 
   const networkVolume =
     raw.networkVolume === undefined || raw.networkVolume === null ? null : raw.networkVolume;
-  if (networkVolume !== null) object(networkVolume, "INVALID_POD", "Pod network volume");
+  if (networkVolume !== null)
+    object(networkVolume, "INVALID_POD_VOLUME_FIELD", "Pod network volume");
   const networkMount =
     networkVolume === null ? null : parseNetworkMount(networkVolume, raw.volumeMountPath);
   const volumeDataCenterId =
     networkVolume === null || networkVolume.dataCenterId === undefined
       ? null
-      : validateDataCenterId(networkVolume.dataCenterId, "INVALID_POD");
+      : validateDataCenterId(networkVolume.dataCenterId, "INVALID_POD_DATACENTER_FIELD");
   const machineDataCenterId =
     machine === null || machine.dataCenterId === undefined
       ? null
-      : validateDataCenterId(machine.dataCenterId, "INVALID_POD");
+      : validateDataCenterId(machine.dataCenterId, "INVALID_POD_DATACENTER_FIELD");
   if (
     volumeDataCenterId !== null &&
     machineDataCenterId !== null &&
     volumeDataCenterId !== machineDataCenterId
   ) {
-    fail("INVALID_POD", "Pod and network volume data centers do not match");
+    fail("INVALID_POD_DATACENTER_FIELD", "Pod and network volume data centers do not match");
   }
   if (raw.image !== undefined && raw.imageName !== undefined && raw.image !== raw.imageName) {
-    fail("INVALID_POD", "Pod image fields conflict");
+    fail("INVALID_POD_IMAGE_FIELD", "Pod image fields conflict");
   }
-  const image = boundedText(raw.imageName ?? raw.image, "INVALID_POD", "Pod image", 512);
+  const image = boundedText(
+    raw.imageName ?? raw.image,
+    "INVALID_POD_IMAGE_FIELD",
+    "Pod image",
+    512,
+  );
   const registryId =
     raw.containerRegistryAuthId === undefined || raw.containerRegistryAuthId === null
       ? null
-      : boundedText(raw.containerRegistryAuthId, "INVALID_POD", "Pod registry id", 191);
+      : boundedText(
+          raw.containerRegistryAuthId,
+          "INVALID_POD_REGISTRY_FIELD",
+          "Pod registry id",
+          191,
+        );
   if (registryId !== null && !REGISTRY_ID.test(registryId)) {
-    fail("INVALID_POD", "Pod registry id is invalid");
+    fail("INVALID_POD_REGISTRY_FIELD", "Pod registry id is invalid");
   }
   const disk =
     raw.containerDiskInGb === undefined || raw.containerDiskInGb === null
       ? null
-      : integer(raw.containerDiskInGb, "INVALID_POD", "Pod container disk", 1, 1_000_000);
+      : integer(
+          raw.containerDiskInGb,
+          "INVALID_POD_DISK_FIELD",
+          "Pod container disk",
+          1,
+          1_000_000,
+        );
   const ports = raw.ports ?? [];
   if (!Array.isArray(ports) || ports.length > 64) {
-    fail("INVALID_POD", "Pod ports are invalid");
+    fail("INVALID_POD_PORTS_FIELD", "Pod ports are invalid");
   }
   return {
     id,
     name,
     status,
     cloud,
-    cost: finiteNumber(raw.costPerHr, "INVALID_POD", "Pod hourly cost", 0, 100_000),
+    cost: finiteNumber(raw.costPerHr, "INVALID_POD_COST_FIELD", "Pod hourly cost", 0, 100_000),
     dataCenterId: machineDataCenterId ?? volumeDataCenterId,
     image,
     registryId,
     disk,
-    ports: ports.map((port) => boundedText(port, "INVALID_POD", "Pod port", 32)),
+    ports: ports.map((port) => boundedText(port, "INVALID_POD_PORTS_FIELD", "Pod port", 32)),
     cpu,
     gpu,
     mounts: { network: networkMount === null ? [] : [networkMount] },
@@ -992,9 +1041,21 @@ export class RunPodV2Client {
     );
   }
 
-  async findPodByExactName(podName, options = {}) {
+  // Raw-filters the provider list by exact name before parsing, so recovery
+  // and cleanup of the owned Pod cannot be blocked by an unrelated Pod that
+  // fails full validation.
+  async listPodsByExactName(podName, options = {}) {
     const name = safeId(podName, "INVALID_POD_NAME", "Pod name");
-    const matches = (await this.listPods(options)).filter((pod) => pod.name === name);
+    const raw = await this.requestJson(
+      "Pod list",
+      "/pods?includeMachine=true&includeNetworkVolume=true",
+      options,
+    );
+    return filterRawRunPodV2PodsByExactName(raw, name).map(parseRunPodV2Pod);
+  }
+
+  async findPodByExactName(podName, options = {}) {
+    const matches = await this.listPodsByExactName(podName, options);
     if (matches.length > 1) {
       fail("DUPLICATE_POD_NAME", "more than one Pod has the exact recovery name");
     }
@@ -1037,6 +1098,22 @@ export class RunPodV2Client {
       fail("POD_IDENTITY_MISMATCH", "RunPod returned a Pod other than the exact requested id");
     }
     return pod;
+  }
+
+  // Identity-only lookup for cleanup paths: confirms presence/absence and the
+  // exact id/name/status without requiring every descriptive field to parse.
+  async getPodIdentity(podId, options = {}) {
+    const id = safeId(podId, "INVALID_POD_ID", "Pod id");
+    const response = await this.requestJson("Pod lookup", `/pods/${encodeURIComponent(id)}`, {
+      ...options,
+      nullOn404: true,
+    });
+    if (response === null) return null;
+    const identity = parseRunPodV2PodIdentity(response);
+    if (identity.id !== id) {
+      fail("POD_IDENTITY_MISMATCH", "RunPod returned a Pod other than the exact requested id");
+    }
+    return identity;
   }
 
   async deletePod(podId, options = {}) {

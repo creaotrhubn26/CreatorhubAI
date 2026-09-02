@@ -607,7 +607,7 @@ export class ComputeController {
       }
       return pod;
     }
-    const matches = (await client.listPods()).filter((pod) => pod.name === lease.podName);
+    const matches = await client.listPodsByName(lease.podName);
     if (matches.length > 1) {
       throw new ComputeControlError(
         "Multiple RunPod Pods match the provisional lease; refusing automatic selection",
@@ -624,7 +624,7 @@ export class ComputeController {
   private async waitForCreateOutcome(client: RunPodClient, podName: string): Promise<RunPodPod[]> {
     for (let attempt = 0; attempt < CREATE_OUTCOME_POLL_ATTEMPTS; attempt += 1) {
       try {
-        const matches = (await client.listPods()).filter((pod) => pod.name === podName);
+        const matches = await client.listPodsByName(podName);
         if (matches.length > 0) return matches;
       } catch {
         // A lost create response plus a transient list failure is ambiguous.
@@ -1291,9 +1291,9 @@ export class ComputeController {
 
   private async waitForTermination(client: RunPodClient, podId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      let pod: RunPodPod | null;
+      let pod: Awaited<ReturnType<RunPodClient["getPodIdentity"]>>;
       try {
-        pod = await client.getPod(podId);
+        pod = await client.getPodIdentity(podId);
       } catch {
         return false;
       }
@@ -1898,7 +1898,7 @@ export class ComputeController {
         const provisionalProfileId = lease.profileId;
         let matches: RunPodPod[];
         try {
-          matches = (await client.listPods()).filter((pod) => pod.name === provisionalPodName);
+          matches = await client.listPodsByName(provisionalPodName);
         } catch (error) {
           this.scheduleCleanupRetry("retry provisional Pod lookup", lease);
           throw new ComputeControlError(
@@ -2075,9 +2075,7 @@ export class ComputeController {
         if (!lease.podId) {
           let matches: RunPodPod[] = [];
           try {
-            matches = (await client.listPods()).filter(
-              (candidate) => candidate.name === lease.podName,
-            );
+            matches = await client.listPodsByName(lease.podName);
           } catch {
             // Keep the durable provisional lease when provider convergence
             // cannot be observed during startup.

@@ -136,6 +136,46 @@ export function parseRunPodPodList(value: unknown): RunPodPod[] {
   return value.map(parseRunPodPod);
 }
 
+export interface RunPodPodIdentity {
+  id: string;
+  name: string;
+  desiredStatus: RunPodDesiredStatus;
+}
+
+// Minimal identity contract: enough to address a Pod for cleanup without
+// requiring every descriptive field (cost, GPU metadata, …) to validate.
+export function parseRunPodPodIdentity(value: unknown): RunPodPodIdentity {
+  const raw = object(value, "RunPod Pod identity");
+  if (typeof raw.id !== "string" || !raw.id.trim()) {
+    throw new RunPodSchemaError("RunPod Pod id is required");
+  }
+  if (typeof raw.name !== "string") {
+    throw new RunPodSchemaError("RunPod Pod name is required");
+  }
+  if (!new Set(["RUNNING", "EXITED", "TERMINATED"]).has(String(raw.desiredStatus))) {
+    throw new RunPodSchemaError("RunPod Pod desiredStatus is unsupported");
+  }
+  return {
+    id: raw.id,
+    name: raw.name,
+    desiredStatus: raw.desiredStatus as RunPodDesiredStatus,
+  };
+}
+
+// Filters the raw provider list by exact name BEFORE full parsing so an
+// unrelated malformed Pod can never block recovery or cleanup of the owned Pod.
+export function filterRawRunPodPodsByName(value: unknown, podName: string): unknown[] {
+  if (!Array.isArray(value)) throw new RunPodSchemaError("RunPod Pod list must be an array");
+  if (value.length > 1_000) throw new RunPodSchemaError("RunPod Pod list exceeds the safe limit");
+  return value.filter(
+    (entry) =>
+      entry !== null &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      (entry as Record<string, unknown>).name === podName,
+  );
+}
+
 export function parseRunPodBillingRecords(value: unknown): RunPodBillingRecord[] {
   if (!Array.isArray(value))
     throw new RunPodSchemaError("RunPod billing response must be an array");

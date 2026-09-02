@@ -310,11 +310,11 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
 
     expectCode(
       () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: "cpu3c" })),
-      "INVALID_POD",
+      "INVALID_POD_ALLOCATION_FIELD",
     );
     expectCode(
       () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: null, gpu: null })),
-      "INVALID_POD",
+      "INVALID_POD_ALLOCATION_FIELD",
     );
 
     const legacy = providerPod(request);
@@ -323,7 +323,7 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
     expect(parseRunPodV2Pod(legacy).image).toBe(IMAGE);
     expectCode(
       () => parseRunPodV2Pod(providerPod(request, { image: "registry.example/conflict:latest" })),
-      "INVALID_POD",
+      "INVALID_POD_IMAGE_FIELD",
     );
   });
 
@@ -627,7 +627,7 @@ describe("RunPod v2 HTTP client", () => {
       },
     });
     await expect(client.createPod(request)).rejects.toMatchObject({
-      code: "INVALID_POD",
+      code: "INVALID_POD_IDENTITY",
       ambiguousCreate: true,
     });
     expect(postCount).toBe(1);
@@ -668,6 +668,61 @@ describe("RunPod v2 HTTP client", () => {
     await expect(client.createPod(request)).rejects.toMatchObject({
       code: "POD_CONTRACT_MISMATCH",
       ambiguousCreate: true,
+    });
+  });
+
+  it("recovers by exact name even when an unrelated Pod fails full validation", async () => {
+    const request = cpuRequest();
+    const client = new RunPodV2Client({
+      apiKey: API_KEY,
+      baseUrl: BASE_URL,
+      fetchImpl: async () =>
+        Response.json([
+          { id: "pod_junk", name: "Unrelated broken Pod", desiredStatus: "RUNNING", costPerHr: -1 },
+          providerPod(request, { id: "pod_owned" }),
+        ]),
+    });
+    await expect(client.findPodByExactName(request.name)).resolves.toMatchObject({
+      id: "pod_owned",
+    });
+  });
+
+  it("confirms Pod identity for cleanup even when descriptive fields are malformed", async () => {
+    const client = new RunPodV2Client({
+      apiKey: API_KEY,
+      baseUrl: BASE_URL,
+      fetchImpl: async () =>
+        Response.json({
+          id: "pod_123",
+          name: "glimmer-cache-1",
+          desiredStatus: "EXITED",
+          costPerHr: "not-a-number",
+          gpu: { id: "???" },
+        }),
+    });
+    await expect(client.getPodIdentity("pod_123")).resolves.toEqual({
+      id: "pod_123",
+      name: "glimmer-cache-1",
+      status: "EXITED",
+    });
+  });
+
+  it("returns null identity for a deleted Pod and rejects a swapped id", async () => {
+    let swapped = false;
+    const client = new RunPodV2Client({
+      apiKey: API_KEY,
+      baseUrl: BASE_URL,
+      fetchImpl: async () => {
+        if (swapped) {
+          return Response.json({ id: "pod_other", name: "x", desiredStatus: "RUNNING" });
+        }
+        return new Response(null, { status: 404 });
+      },
+    });
+    await expect(client.getPodIdentity("pod_123")).resolves.toBeNull();
+    swapped = true;
+    await expect(client.getPodIdentity("pod_123")).rejects.toMatchObject({
+      code: "POD_IDENTITY_MISMATCH",
     });
   });
 

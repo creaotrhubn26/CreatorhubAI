@@ -144,7 +144,26 @@ function harness(options: {
     }),
     deletePod,
     getPodBilling: vi.fn().mockResolvedValue([]),
+  } as {
+    getPod: ReturnType<typeof vi.fn>;
+    listPods: ReturnType<typeof vi.fn>;
+    listPodsByName: ReturnType<typeof vi.fn>;
+    getPodIdentity: ReturnType<typeof vi.fn>;
+    createPod: ReturnType<typeof vi.fn>;
+    deletePod: ReturnType<typeof vi.fn>;
+    getPodBilling: ReturnType<typeof vi.fn>;
   };
+  // Derived views mirror the real client: name-filtered list and identity-only
+  // projection of the same provider state the full mocks report.
+  fakeClient.listPodsByName = vi
+    .fn()
+    .mockImplementation(async (podName: string) =>
+      (await fakeClient.listPods()).filter((pod: { name: string }) => pod.name === podName),
+    );
+  fakeClient.getPodIdentity = vi.fn().mockImplementation(async (podId: string) => {
+    const pod = await fakeClient.getPod(podId);
+    return pod ? { id: pod.id, name: pod.name, desiredStatus: pod.desiredStatus } : null;
+  });
   const initialWorker: ComputeWorkerStatus = options.initialWorker ?? {
     protocolVersion: 1 as const,
     buildId: "r2-aaaaaaaaaaaa",

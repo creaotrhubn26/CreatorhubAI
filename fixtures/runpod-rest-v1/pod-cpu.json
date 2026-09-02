@@ -1,0 +1,26 @@
+{
+  "id": "pod_fixture_cpu1",
+  "name": "glimmer-cache-fixture",
+  "desiredStatus": "RUNNING",
+  "imageName": "registry.example.com/glimmer/worker@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "containerRegistryAuthId": "reg_fixture_1",
+  "containerDiskInGb": 20,
+  "costPerHr": 0.04,
+  "cpuFlavorId": "cpu3c",
+  "vcpuCount": 2,
+  "machine": {
+    "secureCloud": true,
+    "dataCenterId": "EUR-IS-1"
+  },
+  "networkVolume": {
+    "id": "vol_fixture_1",
+    "dataCenterId": "EUR-IS-1",
+    "size": 200,
+    "name": "glimmer-cache"
+  },
+  "volumeMountPath": "/workspace",
+  "ports": [],
+  "env": {
+    "GLIMMER_LEASE_ID": "[redacted]"
+  }
+}

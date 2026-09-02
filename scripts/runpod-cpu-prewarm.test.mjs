@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   PrewarmError,
+  applyCanaryArtifacts,
   ProviderHttpError,
   ProviderTransportError,
   RunPodV2Client,
@@ -204,6 +205,62 @@ test("argument parser separates read-only preflight from paid execution", () => 
   );
 });
 
+test("canary arguments require a paired allowlisted HTTPS artifact and hex digest", () => {
+  const sha = "a".repeat(64);
+  const url = "https://artifacts.example.com/canary/tiny.bin";
+  const canary = parseArguments(
+    [...argumentsFor("--preflight"), "--canary-artifact-url", url, "--canary-artifact-sha256", sha],
+    {},
+  );
+  assert.deepEqual(canary.canary, { url, sha256: sha });
+  assert.equal(parseArguments(argumentsFor("--preflight"), {}).canary, null);
+
+  expectCode(
+    () => parseArguments([...argumentsFor("--preflight"), "--canary-artifact-url", url], {}),
+    "invalid_canary",
+  );
+  expectCode(
+    () =>
+      parseArguments(
+        [
+          ...argumentsFor("--preflight"),
+          "--canary-artifact-url",
+          "http://artifacts.example.com/tiny.bin",
+          "--canary-artifact-sha256",
+          sha,
+        ],
+        {},
+      ),
+    "invalid_canary",
+  );
+  expectCode(
+    () =>
+      parseArguments(
+        [
+          ...argumentsFor("--preflight"),
+          "--canary-artifact-url",
+          url,
+          "--canary-artifact-sha256",
+          "zz",
+        ],
+        {},
+      ),
+    "invalid_canary",
+  );
+
+  const profile = parsedProfile();
+  const substituted = applyCanaryArtifacts(profile, { url, sha256: sha });
+  assert.deepEqual(substituted.artifacts.model, { url, sha256: sha });
+  assert.deepEqual(substituted.artifacts.mmproj, { url, sha256: sha });
+  assert.deepEqual(substituted.artifacts.draftModel, { url, sha256: sha });
+  assert.deepEqual(substituted.artifacts.allowedHosts, profile.artifacts.allowedHosts);
+  assert.equal(substituted.registry, profile.registry);
+  expectCode(
+    () => applyCanaryArtifacts(profile, { url: "https://evil.example.net/tiny.bin", sha256: sha }),
+    "invalid_canary",
+  );
+});
+
 test("state paths are fixed under the state root and ignore config overrides", () => {
   const paths = resolveStatePaths({
     GLIMMER_STATE_ROOT: "/private/state",
@@ -319,6 +376,15 @@ test("Pod proof rejects missing no-port evidence, extra env and EXITED over-pric
   assert.equal(validateOwnedPod(valid, expected, true), valid);
   assert.equal(parseExactPod(providerPod(contract), "pod_123").id, "pod_123");
   expectCode(() => parseExactPod(providerPod(contract), "pod_other"), "pod_identity_mismatch");
+
+  const renamedImageField = providerPod(contract);
+  renamedImageField.imageName = renamedImageField.image;
+  delete renamedImageField.image;
+  assert.equal(parsePod(renamedImageField).image, contract.request.image);
+  expectCode(
+    () => parsePod(providerPod(contract, { imageName: "registry.example/conflict:latest" })),
+    "invalid_pod",
+  );
 
   const missingPorts = providerPod(contract);
   delete missingPorts.ports;

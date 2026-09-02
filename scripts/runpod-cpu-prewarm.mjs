@@ -182,6 +182,12 @@ export function usage() {
     "The command reads only the fixed compute configuration and RunPod key under the state root.",
     "--preflight performs authenticated GETs only; it never sends POST or DELETE.",
     "--execute can create at most one Secure Cloud CPU Pod and always performs exact-id cleanup.",
+    "",
+    "Canary mode (add to either mode):",
+    "  --canary-artifact-url <https URL on an allowlisted artifact host> \\",
+    "  --canary-artifact-sha256 <64 hex>",
+    "Runs the identical lifecycle with one tiny checksum-bound artifact substituted",
+    "for all three model artifacts, so nothing multi-GB is downloaded.",
   ].join("\n");
 }
 
@@ -195,6 +201,8 @@ export function parseArguments(argv, environment = process.env) {
     "--build-id",
     "--max-hourly-usd",
     "--hard-deadline-seconds",
+    "--canary-artifact-url",
+    "--canary-artifact-sha256",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -262,7 +270,32 @@ export function parseArguments(argv, environment = process.env) {
   if (parsed.execute && environment.GLIMMER_RUNPOD_CPU_PREWARM !== CONFIRMATION) {
     fail("authorization_required", "the exact paid-run confirmation environment value is required");
   }
+  const canarySupplied =
+    parsed.canaryArtifactUrl !== undefined || parsed.canaryArtifactSha256 !== undefined;
+  if (canarySupplied) {
+    if (parsed.canaryArtifactUrl === undefined || parsed.canaryArtifactSha256 === undefined) {
+      fail(
+        "invalid_canary",
+        "--canary-artifact-url and --canary-artifact-sha256 must be supplied together",
+      );
+    }
+    let canaryUrl;
+    try {
+      canaryUrl = new URL(parsed.canaryArtifactUrl);
+    } catch {
+      fail("invalid_canary", "--canary-artifact-url must be an absolute URL");
+    }
+    if (canaryUrl.protocol !== "https:" || canaryUrl.username || canaryUrl.password) {
+      fail("invalid_canary", "--canary-artifact-url must be a plain HTTPS URL");
+    }
+    if (!SHA256_PATTERN.test(parsed.canaryArtifactSha256)) {
+      fail("invalid_canary", "--canary-artifact-sha256 must be 64 lowercase hex characters");
+    }
+  }
   return {
+    canary: canarySupplied
+      ? { url: parsed.canaryArtifactUrl, sha256: parsed.canaryArtifactSha256 }
+      : null,
     mode: parsed.execute ? "execute" : "preflight",
     execute: parsed.execute,
     preflight: parsed.preflight,
@@ -389,6 +422,27 @@ export function parseComputeConfig(value, expectedKeyPath) {
       mmproj: normalizeArtifact(artifactsRaw.mmproj, "mmproj", allowedHosts),
       draftModel: normalizeArtifact(artifactsRaw.draftModel, "draft model", allowedHosts),
       allowedHosts,
+    },
+  };
+}
+
+// Canary mode: identical lifecycle (image pull, registry, volume, log proof,
+// exact-id deletion) but with one tiny checksum-bound artifact substituted for
+// all three model artifacts, so the run never downloads the multi-GB cache.
+export function applyCanaryArtifacts(profile, canary) {
+  const url = new URL(canary.url);
+  const host = url.hostname.toLowerCase();
+  if (!profile.artifacts.allowedHosts.includes(host)) {
+    fail("invalid_canary", "canary artifact host is not in the profile artifact host allowlist");
+  }
+  const artifact = { url: canary.url, sha256: canary.sha256 };
+  return {
+    ...profile,
+    artifacts: {
+      model: artifact,
+      mmproj: artifact,
+      draftModel: artifact,
+      allowedHosts: profile.artifacts.allowedHosts,
     },
   };
 }
@@ -530,11 +584,14 @@ export function parsePod(value) {
   if (!Array.isArray(raw.ports) || raw.ports.some((port) => typeof port !== "string")) {
     fail("invalid_pod", "provider returned invalid Pod ports");
   }
+  if (raw.image !== undefined && raw.imageName !== undefined && raw.image !== raw.imageName) {
+    fail("invalid_pod", "provider returned conflicting Pod image fields");
+  }
   return {
     id,
     name,
     status,
-    image: text(raw.image, "Pod image", 512),
+    image: text(raw.image ?? raw.imageName, "Pod image", 512),
     args: typeof raw.args === "string" ? raw.args : fail("invalid_pod", "Pod args are invalid"),
     disk: integer(raw.disk, "Pod disk", 1),
     ports: [...raw.ports],
@@ -1419,6 +1476,7 @@ async function executePrewarm(args, dependencies = {}) {
     releaseLock = await acquireExclusiveLock(paths.lockPath, leaseId);
     timeline.add("prewarm_started", {
       mode: args.mode,
+      canary: Boolean(args.canary),
       leaseId,
       podName,
       buildId: args.buildId,
@@ -1438,6 +1496,12 @@ async function executePrewarm(args, dependencies = {}) {
       fail("invalid_config", "compute configuration is not valid JSON");
     }
     profile = parseComputeConfig(configValue, paths.keyPath);
+    if (args.canary) {
+      profile = applyCanaryArtifacts(profile, args.canary);
+      timeline.add("canary_artifacts_applied", {
+        artifactSha256: args.canary.sha256,
+      });
+    }
     const configHash = sha256(configBytes);
     const keyBytes = await readPrivateRegularFile(paths.keyPath, "RunPod API key", MAX_KEY_BYTES);
     const apiKey = keyBytes.toString("utf8").trim();

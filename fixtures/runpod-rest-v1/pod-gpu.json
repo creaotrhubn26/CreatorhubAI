@@ -1,0 +1,36 @@
+{
+  "id": "pod_fixture_gpu1",
+  "name": "glimmer-gpu-fixture",
+  "desiredStatus": "RUNNING",
+  "imageName": "registry.example.com/glimmer/worker@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "containerRegistryAuthId": "reg_fixture_1",
+  "containerDiskInGb": 50,
+  "costPerHr": 1.39,
+  "adjustedCostPerHr": 1.39,
+  "gpu": {
+    "id": "NVIDIA A100 80GB PCIe",
+    "count": 1,
+    "memory": 81920,
+    "displayName": "A100 80GB PCIe"
+  },
+  "machine": {
+    "secureCloud": true,
+    "dataCenterId": "EUR-IS-1",
+    "gpuTypeId": "NVIDIA A100 80GB PCIe",
+    "gpuDisplayName": "A100 80GB PCIe"
+  },
+  "networkVolume": {
+    "id": "vol_fixture_1",
+    "dataCenterId": "EUR-IS-1",
+    "size": 200,
+    "name": "glimmer-cache"
+  },
+  "volumeMountPath": "/workspace",
+  "ports": ["4318/http"],
+  "publicIp": "203.0.113.10",
+  "lastStartedAt": "2026-09-01T18:00:00Z",
+  "env": {
+    "GLIMMER_LEASE_ID": "[redacted]",
+    "GLIMMER_WORKER_BOOTSTRAP_TOKEN": "[redacted]"
+  }
+}
