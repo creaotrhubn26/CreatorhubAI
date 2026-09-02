@@ -583,13 +583,44 @@ test("Pod polling tolerates one bounded transient GET failure without another cr
     { add: (event, payload) => events.push({ event, ...payload }) },
   );
 
-  assert.equal(result, exited);
+  assert.deepEqual(result, { pod: exited, markerObserved: false });
   assert.equal(getCalls, 2);
   assert.deepEqual(
     events.map(({ event }) => event),
     ["pod_poll_transport_retry", "pod_status"],
   );
   assert.equal(events[0].consecutiveFailure, 1);
+});
+
+test("Pod polling succeeds on the readiness marker while the Pod is still RUNNING", async () => {
+  const contract = expectedContract();
+  const expected = {
+    ...contract,
+    maxHourlyUsd: 0.5,
+    successMarker: `GLIMMER_PREWARM_READY ${contract.leaseId}`,
+  };
+  const running = parsePod(providerPod(expected, { status: "RUNNING" }));
+  const events = [];
+  let markerCalls = 0;
+  const result = await pollUntilExited(
+    {
+      async getPod() {
+        return running;
+      },
+      async hasExactContainerMarker(podId, marker) {
+        markerCalls += 1;
+        assert.equal(marker, expected.successMarker);
+        return markerCalls >= 1;
+      },
+    },
+    running.id,
+    expected,
+    performance.now() + 60_000,
+    new AbortController().signal,
+    { add: (event, payload) => events.push({ event, ...payload }) },
+  );
+  assert.deepEqual(result, { pod: running, markerObserved: true });
+  assert.ok(events.some(({ event }) => event === "prewarm_marker_observed_while_running"));
 });
 
 test("Pod polling fails closed after three consecutive transient GET failures", async () => {

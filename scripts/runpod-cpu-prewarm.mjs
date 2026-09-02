@@ -1210,13 +1210,35 @@ export async function readPrivateRegularFile(file, label, maximumBytes) {
   }
 }
 
-async function acquireExclusiveLock(lockPath, leaseId) {
+function lockOwnerAlive(lockPath) {
+  return fs
+    .readFile(lockPath, "utf8")
+    .then((raw) => {
+      const parsed = JSON.parse(raw);
+      if (!Number.isInteger(parsed?.pid) || parsed.pid <= 0) return true;
+      try {
+        process.kill(parsed.pid, 0);
+        return true;
+      } catch (error) {
+        return error?.code === "EPERM";
+      }
+    })
+    .catch(() => true);
+}
+
+async function acquireExclusiveLock(lockPath, leaseId, retryAfterStale = true) {
   const flags =
     fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | (fsConstants.O_NOFOLLOW ?? 0);
   let handle;
   try {
     handle = await fs.open(lockPath, flags, 0o600);
   } catch {
+    // A crashed prewarm process leaves its lock behind. Take over only when
+    // the recorded owner pid is provably gone; otherwise fail closed.
+    if (retryAfterStale && !(await lockOwnerAlive(lockPath))) {
+      await fs.unlink(lockPath).catch(() => undefined);
+      return acquireExclusiveLock(lockPath, leaseId, false);
+    }
     fail("prewarm_locked", "another CPU prewarm process may already own the local lock");
   }
   let identity;
@@ -1330,13 +1352,45 @@ async function recoverLostCreate(client, podName, deadlineAtMs, signal) {
 }
 
 const LOG_PROBE_INTERVAL_MS = 120_000;
+const MARKER_POLL_INTERVAL_MS = 15_000;
+const MARKER_POLL_TIMEOUT_MS = 12_000;
 
+// RunPod restarts a Pod container that exits, so the Pod may never report
+// EXITED. The lease-bound readiness marker in the container log is therefore
+// the primary success proof; EXITED remains accepted as before.
 export async function pollUntilExited(client, podId, expected, deadlineAtMs, signal, timeline) {
   let previousStatus = null;
   let consecutiveTransportFailures = 0;
   let nextLogProbeAtMs = performance.now() + LOG_PROBE_INTERVAL_MS;
+  // The marker can appear within seconds of container start, so check
+  // immediately and then on the fixed interval.
+  let nextMarkerPollAtMs = performance.now();
+  const marker = expected.successMarker;
   for (;;) {
     if (performance.now() >= deadlineAtMs) fail("hard_deadline", "prewarm hard deadline elapsed");
+    if (
+      marker &&
+      performance.now() >= nextMarkerPollAtMs &&
+      typeof client.hasExactContainerMarker === "function"
+    ) {
+      nextMarkerPollAtMs = performance.now() + MARKER_POLL_INTERVAL_MS;
+      const observed = await client
+        .hasExactContainerMarker(podId, marker, {
+          signal,
+          timeoutMs: Math.min(
+            MARKER_POLL_TIMEOUT_MS,
+            Math.max(1, Math.floor(deadlineAtMs - performance.now())),
+          ),
+        })
+        .catch(() => false);
+      if (observed) {
+        timeline.add("prewarm_marker_observed_while_running", { podId });
+        const pod = await client.getPod(podId, { signal });
+        if (!pod) fail("pod_disappeared", "prewarm Pod disappeared after the readiness marker");
+        validateOwnedPod(pod, expected, false);
+        return { pod, markerObserved: true };
+      }
+    }
     if (
       performance.now() >= nextLogProbeAtMs &&
       typeof client.sampleContainerEvents === "function"
@@ -1381,7 +1435,7 @@ export async function pollUntilExited(client, podId, expected, deadlineAtMs, sig
       timeline.add("pod_status", { podId, status: pod.status, hourlyUsd: pod.cost });
       previousStatus = pod.status;
     }
-    if (pod.status === "EXITED") return pod;
+    if (pod.status === "EXITED") return { pod, markerObserved: false };
     if (pod.status === "ERROR" || pod.status === "TERMINATED") {
       fail("prewarm_failed", `prewarm Pod reached ${pod.status} before success proof`);
     }
@@ -1682,6 +1736,7 @@ async function executePrewarm(args, dependencies = {}) {
       profile,
       volume,
       maxHourlyUsd: args.maxHourlyUsd,
+      successMarker: `GLIMMER_PREWARM_READY ${leaseId}`,
     };
     if (args.mode === "preflight") {
       preflightValidated = true;
@@ -1738,23 +1793,36 @@ async function executePrewarm(args, dependencies = {}) {
         fail("single_pod_invariant_violated", "provider did not contain exactly the captured Pod");
       }
 
-      await pollUntilExited(client, podId, expected, hardDeadlineAtMs, runAbort.signal, timeline);
-      exitedObserved = true;
-      const marker = `GLIMMER_PREWARM_READY ${leaseId}`;
-      markerObserved = await client.hasExactContainerMarker(podId, marker, {
-        signal: runAbort.signal,
-        timeoutMs: Math.min(
-          LOG_REQUEST_TIMEOUT_MS,
-          Math.max(1, Math.floor(hardDeadlineAtMs - performance.now())),
-        ),
-      });
+      const proof = await pollUntilExited(
+        client,
+        podId,
+        expected,
+        hardDeadlineAtMs,
+        runAbort.signal,
+        timeline,
+      );
+      exitedObserved = proof.pod.status === "EXITED";
+      markerObserved = proof.markerObserved;
+      if (!markerObserved) {
+        markerObserved = await client.hasExactContainerMarker(podId, expected.successMarker, {
+          signal: runAbort.signal,
+          timeoutMs: Math.min(
+            LOG_REQUEST_TIMEOUT_MS,
+            Math.max(1, Math.floor(hardDeadlineAtMs - performance.now())),
+          ),
+        });
+      }
       if (!markerObserved) {
         fail(
           "prewarm_marker_missing",
           "EXITED Pod did not emit the exact lease-bound readiness marker",
         );
       }
-      timeline.add("prewarm_proof_observed", { podId, status: "EXITED", markerObserved: true });
+      timeline.add("prewarm_proof_observed", {
+        podId,
+        status: proof.pod.status,
+        markerObserved: true,
+      });
     }
   } catch (error) {
     mainFailure = safeFailure(error);
