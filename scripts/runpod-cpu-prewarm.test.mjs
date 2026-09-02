@@ -212,7 +212,7 @@ test("canary arguments require a paired allowlisted HTTPS artifact and hex diges
     [...argumentsFor("--preflight"), "--canary-artifact-url", url, "--canary-artifact-sha256", sha],
     {},
   );
-  assert.deepEqual(canary.canary, { url, sha256: sha });
+  assert.deepEqual(canary.canary, { url, sha256: sha, skipRegistry: false });
   assert.equal(parseArguments(argumentsFor("--preflight"), {}).canary, null);
 
   expectCode(
@@ -247,6 +247,52 @@ test("canary arguments require a paired allowlisted HTTPS artifact and hex diges
       ),
     "invalid_canary",
   );
+
+  const skipParsed = parseArguments(
+    [
+      ...argumentsFor("--preflight"),
+      "--canary-artifact-url",
+      url,
+      "--canary-artifact-sha256",
+      sha,
+      "--canary-skip-registry",
+    ],
+    {},
+  );
+  assert.equal(skipParsed.canary.skipRegistry, true);
+  expectCode(
+    () => parseArguments([...argumentsFor("--preflight"), "--canary-skip-registry"], {}),
+    "invalid_canary",
+  );
+  const skipProfile = applyCanaryArtifacts(parsedProfile(), {
+    url,
+    sha256: sha,
+    skipRegistry: true,
+  });
+  assert.equal(skipProfile.registry, null);
+  const skipContract = expectedContract();
+  const skipRequest = buildCreatePodRequest({
+    profile: skipProfile,
+    image,
+    buildId,
+    leaseId: skipContract.leaseId,
+    podName: skipContract.podName,
+    cpu: skipContract.cpu,
+    volume: skipContract.volume,
+  });
+  assert.equal("registry" in skipRequest, false);
+  const skipExpected = {
+    ...skipContract,
+    profile: skipProfile,
+    request: { ...skipRequest, env: { ...skipContract.request.env } },
+    maxHourlyUsd: 0.5,
+  };
+  const registryFreePod = providerPod(
+    { ...skipContract, request: skipExpected.request },
+    { registry: undefined, env: { ...skipExpected.request.env } },
+  );
+  delete registryFreePod.registry;
+  assert.equal(parsePod(registryFreePod).registry, null);
 
   const profile = parsedProfile();
   const substituted = applyCanaryArtifacts(profile, { url, sha256: sha });

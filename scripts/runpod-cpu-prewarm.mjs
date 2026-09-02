@@ -216,6 +216,13 @@ export function parseArguments(argv, environment = process.env) {
       parsed.preflight = true;
       continue;
     }
+    if (argument === "--canary-skip-registry") {
+      if (parsed.canarySkipRegistry) {
+        fail("invalid_arguments", "--canary-skip-registry may only be supplied once");
+      }
+      parsed.canarySkipRegistry = true;
+      continue;
+    }
     if (!valueArguments.has(argument)) {
       fail("invalid_arguments", "an unsupported argument was supplied");
     }
@@ -292,9 +299,16 @@ export function parseArguments(argv, environment = process.env) {
       fail("invalid_canary", "--canary-artifact-sha256 must be 64 lowercase hex characters");
     }
   }
+  if (parsed.canarySkipRegistry && !canarySupplied) {
+    fail("invalid_canary", "--canary-skip-registry requires canary mode");
+  }
   return {
     canary: canarySupplied
-      ? { url: parsed.canaryArtifactUrl, sha256: parsed.canaryArtifactSha256 }
+      ? {
+          url: parsed.canaryArtifactUrl,
+          sha256: parsed.canaryArtifactSha256,
+          skipRegistry: parsed.canarySkipRegistry === true,
+        }
       : null,
     mode: parsed.execute ? "execute" : "preflight",
     execute: parsed.execute,
@@ -438,6 +452,9 @@ export function applyCanaryArtifacts(profile, canary) {
   const artifact = { url: canary.url, sha256: canary.sha256 };
   return {
     ...profile,
+    // skipRegistry isolates registry-credential failures: the image is pulled
+    // anonymously (public images only), everything else identical.
+    ...(canary.skipRegistry ? { registry: null } : {}),
     artifacts: {
       model: artifact,
       mmproj: artifact,
@@ -596,7 +613,10 @@ export function parsePod(value) {
     disk: integer(raw.disk, "Pod disk", 1),
     ports: [...raw.ports],
     env: exactStringMap(raw.env, "Pod environment"),
-    registry: raw.registry === null ? null : text(raw.registry, "Pod registry", 191),
+    registry:
+      raw.registry === null || raw.registry === undefined
+        ? null
+        : text(raw.registry, "Pod registry", 191),
     cloud: text(raw.cloud, "Pod cloud", 32),
     dataCenterId: raw.dataCenterId === null ? null : text(raw.dataCenterId, "Pod data center", 32),
     cost: finiteNumber(raw.cost, "Pod hourly cost", 0),
@@ -665,7 +685,7 @@ export function buildCreatePodRequest({ profile, image, buildId, leaseId, podNam
       GLIMMER_DFLASH_SHA256: profile.artifacts.draftModel.sha256,
       GLIMMER_ARTIFACT_HOSTS: profile.artifacts.allowedHosts.join(","),
     },
-    registry: profile.registry,
+    ...(profile.registry === null ? {} : { registry: profile.registry }),
     cloud: "SECURE",
     cpu: { id: cpu.id, vcpuCount: VCPU_COUNT },
     dataCenterIds: [volume.dataCenter],
@@ -686,7 +706,7 @@ export function validateOwnedPod(pod, expected, requireDataCenter = false) {
     pod.image !== expected.request.image ||
     pod.args !== expected.request.args ||
     pod.disk !== expected.request.disk ||
-    pod.registry !== expected.request.registry ||
+    (pod.registry ?? null) !== (expected.request.registry ?? null) ||
     pod.cloud !== "SECURE" ||
     pod.cpu?.id !== expected.request.cpu.id ||
     pod.cpu?.vcpuCount !== VCPU_COUNT ||
@@ -1605,10 +1625,14 @@ async function executePrewarm(args, dependencies = {}) {
     }
     timeline.add("v2_auth_and_empty_provider_confirmed");
 
-    const registry = await client.getRegistry(profile.registry, {
-      signal: runAbort.signal,
-    });
-    timeline.add("container_registry_verified", { registryId: registry.id });
+    if (profile.registry === null) {
+      timeline.add("container_registry_skipped", { reason: "canary_skip_registry" });
+    } else {
+      const registry = await client.getRegistry(profile.registry, {
+        signal: runAbort.signal,
+      });
+      timeline.add("container_registry_verified", { registryId: registry.id });
+    }
 
     volume = await client.getNetworkVolume(profile.networkVolumeId, {
       signal: runAbort.signal,
