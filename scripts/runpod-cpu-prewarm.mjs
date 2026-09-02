@@ -1021,6 +1021,63 @@ export class RunPodV2Client {
       timeout.dispose();
     }
   }
+
+  // Failure diagnostics: samples only structured event lines and Glimmer
+  // markers from the container log so a stuck Pod can be diagnosed without
+  // recording free-form (potentially secret-bearing) log text.
+  async sampleContainerEvents(podId, options = {}) {
+    const timeout = linkedAbortController(
+      options.signal,
+      options.timeoutMs ?? LOG_REQUEST_TIMEOUT_MS,
+    );
+    try {
+      const response = await this.fetchImpl(
+        `${RUNPOD_ORIGIN}/v2/pods/${encodeURIComponent(podId)}/logs?source=container&tail=5000`,
+        {
+          method: "GET",
+          headers: {
+            Accept: "text/event-stream",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          signal: timeout.signal,
+          redirect: "error",
+        },
+      );
+      if (response.status !== 200 || !response.body) {
+        return { available: false, status: response.status, lineCount: 0, events: [] };
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let totalBytes = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_LOG_BYTES) {
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+      }
+      const { events } = extractSseLogEvents(buffer, true);
+      const lines = events.flatMap((event) => event.split("\n"));
+      const structured = lines.filter((line) =>
+        /"event":"[a-z_]+"|GLIMMER_PREWARM_READY|status_update/.test(line),
+      );
+      const sampled = [...structured.slice(0, 3), ...structured.slice(-3)]
+        .filter((line, index, all) => all.indexOf(line) === index)
+        .map((line) => redactText(line, 120));
+      return { available: true, lineCount: lines.length, events: sampled };
+    } catch {
+      return { available: false, lineCount: 0, events: [] };
+    } finally {
+      timeout.dispose();
+    }
+  }
 }
 
 function redactText(value, maximum = 1_024) {
@@ -1650,6 +1707,17 @@ async function executePrewarm(args, dependencies = {}) {
   } catch (error) {
     mainFailure = safeFailure(error);
     timeline.add("prewarm_failed", mainFailure);
+    if (client && podId && args.mode === "execute") {
+      const sample = await client
+        .sampleContainerEvents(podId)
+        .catch(() => ({ available: false, lineCount: 0, events: [] }));
+      timeline.add("failure_logs_sampled", {
+        podId,
+        available: sample.available,
+        lineCount: sample.lineCount,
+        events: sample.events.join(" | "),
+      });
+    }
   } finally {
     clearTimeout(hardTimer);
     if (client) {
