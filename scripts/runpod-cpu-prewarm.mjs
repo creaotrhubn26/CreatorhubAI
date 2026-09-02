@@ -1023,16 +1023,19 @@ export class RunPodV2Client {
   }
 
   // Failure diagnostics: samples only structured event lines and Glimmer
-  // markers from the container log so a stuck Pod can be diagnosed without
-  // recording free-form (potentially secret-bearing) log text.
+  // markers from the log so a stuck Pod can be diagnosed without recording
+  // free-form (potentially secret-bearing) log text. `source` may be
+  // "container" (entrypoint output) or "system" (host events: image pull,
+  // container start/restart).
   async sampleContainerEvents(podId, options = {}) {
+    const source = options.source === "system" ? "system" : "container";
     const timeout = linkedAbortController(
       options.signal,
       options.timeoutMs ?? LOG_REQUEST_TIMEOUT_MS,
     );
     try {
       const response = await this.fetchImpl(
-        `${RUNPOD_ORIGIN}/v2/pods/${encodeURIComponent(podId)}/logs?source=container&tail=5000`,
+        `${RUNPOD_ORIGIN}/v2/pods/${encodeURIComponent(podId)}/logs?source=${source}&tail=5000`,
         {
           method: "GET",
           headers: {
@@ -1044,7 +1047,7 @@ export class RunPodV2Client {
         },
       );
       if (response.status !== 200 || !response.body) {
-        return { available: false, status: response.status, lineCount: 0, events: [] };
+        return { available: false, httpStatus: response.status, lineCount: 0, events: [] };
       }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -1064,11 +1067,14 @@ export class RunPodV2Client {
         buffer += decoder.decode(value, { stream: true });
       }
       const { events } = extractSseLogEvents(buffer, true);
-      const lines = events.flatMap((event) => event.split("\n"));
-      const structured = lines.filter((line) =>
-        /"event":"[a-z_]+"|GLIMMER_PREWARM_READY|status_update/.test(line),
-      );
-      const sampled = [...structured.slice(0, 3), ...structured.slice(-3)]
+      const lines = events.flatMap((event) => event.split("\n")).filter((line) => line.trim());
+      const relevant =
+        source === "system"
+          ? lines
+          : lines.filter((line) =>
+              /"event":"[a-z_]+"|GLIMMER_PREWARM_READY|status_update/.test(line),
+            );
+      const sampled = [...relevant.slice(0, 3), ...relevant.slice(-3)]
         .filter((line, index, all) => all.indexOf(line) === index)
         .map((line) => redactText(line, 120));
       return { available: true, lineCount: lines.length, events: sampled };
@@ -1303,11 +1309,33 @@ async function recoverLostCreate(client, podName, deadlineAtMs, signal) {
   );
 }
 
+const LOG_PROBE_INTERVAL_MS = 120_000;
+
 export async function pollUntilExited(client, podId, expected, deadlineAtMs, signal, timeline) {
   let previousStatus = null;
   let consecutiveTransportFailures = 0;
+  let nextLogProbeAtMs = performance.now() + LOG_PROBE_INTERVAL_MS;
   for (;;) {
     if (performance.now() >= deadlineAtMs) fail("hard_deadline", "prewarm hard deadline elapsed");
+    if (
+      performance.now() >= nextLogProbeAtMs &&
+      typeof client.sampleContainerEvents === "function"
+    ) {
+      nextLogProbeAtMs = performance.now() + LOG_PROBE_INTERVAL_MS;
+      for (const source of ["system", "container"]) {
+        const sample = await client
+          .sampleContainerEvents(podId, { source, signal })
+          .catch(() => ({ available: false, lineCount: 0, events: [] }));
+        timeline.add("pod_log_probe", {
+          podId,
+          source,
+          available: sample.available,
+          httpStatus: sample.httpStatus ?? 200,
+          lineCount: sample.lineCount,
+          events: (sample.events ?? []).join(" | "),
+        });
+      }
+    }
     let pod;
     try {
       pod = await client.getPod(podId, { signal });
@@ -1708,15 +1736,19 @@ async function executePrewarm(args, dependencies = {}) {
     mainFailure = safeFailure(error);
     timeline.add("prewarm_failed", mainFailure);
     if (client && podId && args.mode === "execute") {
-      const sample = await client
-        .sampleContainerEvents(podId)
-        .catch(() => ({ available: false, lineCount: 0, events: [] }));
-      timeline.add("failure_logs_sampled", {
-        podId,
-        available: sample.available,
-        lineCount: sample.lineCount,
-        events: sample.events.join(" | "),
-      });
+      for (const source of ["system", "container"]) {
+        const sample = await client
+          .sampleContainerEvents(podId, { source })
+          .catch(() => ({ available: false, lineCount: 0, events: [] }));
+        timeline.add("failure_logs_sampled", {
+          podId,
+          source,
+          available: sample.available,
+          httpStatus: sample.httpStatus ?? 200,
+          lineCount: sample.lineCount,
+          events: sample.events.join(" | "),
+        });
+      }
     }
   } finally {
     clearTimeout(hardTimer);
