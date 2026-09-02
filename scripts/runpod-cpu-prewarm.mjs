@@ -1881,8 +1881,7 @@ async function executePrewarm(args, dependencies = {}) {
       };
     }
 
-    const proofComplete =
-      args.mode === "preflight" ? preflightValidated : exitedObserved && markerObserved;
+    const proofComplete = args.mode === "preflight" ? preflightValidated : markerObserved;
     const succeeded =
       !mainFailure && proofComplete && cleanup.complete && cleanup.providerPodCount === 0;
     const result = {
@@ -1952,8 +1951,7 @@ async function executePrewarm(args, dependencies = {}) {
     process.removeListener("SIGINT", onSignal);
     process.removeListener("SIGTERM", onSignal);
   }
-  const proofComplete =
-    args.mode === "preflight" ? preflightValidated : exitedObserved && markerObserved;
+  const proofComplete = args.mode === "preflight" ? preflightValidated : markerObserved;
   return mainFailure || !cleanup.complete || cleanup.providerPodCount !== 0 || !proofComplete
     ? 1
     : 0;
