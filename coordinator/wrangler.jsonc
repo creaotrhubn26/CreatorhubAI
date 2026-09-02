@@ -27,7 +27,10 @@
   "vars": {
     "RUNPOD_API_BASE_URL": "https://rest.runpod.io",
     "RUNPOD_CATALOG_API_BASE_URL": "https://api.runpod.io",
-    "CPU_CACHE_MAX_HOURLY_USD": "0.0225",
+    // 2026-09-02: cpu3c (2 vCPU Secure, EUR-IS-1) trades around $0.06/h, so the
+    // previous $0.0225 ceiling made every cpu_cache job fail with CPU_UNAVAILABLE.
+    // Worst case at this ceiling: 0.075 * (1680+120)/3600 = $0.0375 per attempt.
+    "CPU_CACHE_MAX_HOURLY_USD": "0.075",
     "CPU_CACHE_TTL_SECONDS": "1680",
     "CACHE_REPAIR_GPU_FALLBACK_ID": "NVIDIA L4",
     "CACHE_REPAIR_GPU_MAX_HOURLY_USD": "0.49",
