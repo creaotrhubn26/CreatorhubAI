@@ -914,6 +914,10 @@ export class ComputeCoordinator {
       providerApiVersion: "rest-v1+catalog-v2",
       watchdogReady,
       activeJobId,
+      // Hostname only (no path/token): lets an operator confirm which callback
+      // origin live Pods are actually configured with, since a Durable Object
+      // can outlive a secret rotation on an older deployment version.
+      callbackHost: new URL(config.publicUrl).hostname,
       cacheSigning: {
         algorithm: "Ed25519",
         keyId: config.cacheKeyId,
