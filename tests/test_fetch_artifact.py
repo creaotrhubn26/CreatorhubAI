@@ -142,6 +142,23 @@ class FetchArtifactTests(unittest.TestCase):
             },
         )
 
+    def test_foreign_owned_cached_artifact_is_redownloaded_for_sealing(self):
+        # cache_manifest sealing requires euid ownership, so a checksum-valid
+        # artifact owned by another uid must be treated as absent and fetched
+        # again by this run.
+        content = b"already verified"
+        expected = hashlib.sha256(content).hexdigest()
+        self.target.write_bytes(content)
+        with mock.patch.object(
+            fetch_artifact.os, "geteuid", return_value=os.geteuid() + 1
+        ):
+            self.assertIsNone(
+                fetch_artifact._verified_target_receipt(self.target, expected)
+            )
+        self.assertIsNotNone(
+            fetch_artifact._verified_target_receipt(self.target, expected)
+        )
+
     def test_interruption_preserves_checksum_bound_partial_and_resumes(self):
         content = b"hello world"
         expected = hashlib.sha256(content).hexdigest()

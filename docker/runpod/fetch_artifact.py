@@ -159,6 +159,13 @@ def _verified_target_receipt(target: Path, expected_sha256: str) -> Optional[dic
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise ValueError("artifact path must be a private regular file")
+        if before.st_uid != os.geteuid():
+            # A checksum-valid artifact owned by another uid (for example one
+            # written by a standalone prewarm running as a different user)
+            # cannot be sealed by cache_manifest, which requires euid
+            # ownership. Treat it as absent so this run re-downloads and owns
+            # the artifact end to end.
+            return None
         digest = hashlib.sha256()
         total = 0
         while True:
