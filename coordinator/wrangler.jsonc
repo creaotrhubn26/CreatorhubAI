@@ -4,6 +4,15 @@
   "main": "src/worker.js",
   "compatibility_date": "2026-08-30",
   "workers_dev": true,
+  // Pod callbacks to *.workers.dev never reached the worker (edge-filtered
+  // from RunPod data-center IPs), so callbacks go through a dedicated infra
+  // domain instead.
+  "routes": [
+    {
+      "pattern": "coordinator.creatorhubn-infra.com",
+      "custom_domain": true,
+    },
+  ],
   "durable_objects": {
     "bindings": [
       {
