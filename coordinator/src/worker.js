@@ -1103,7 +1103,11 @@ export class ComputeCoordinator {
         job.lastHeartbeatAt = value.observedAt;
         await this.putJob(job);
         return response({ accepted: true, document, job: publicJob(job) });
-      } catch {
+      } catch (error) {
+        console.warn(
+          "[coordinator] cache attestation rejected",
+          error instanceof Error ? error.message.slice(0, 120) : "unknown",
+        );
         job.cache = { state: "repair_required" };
         job.failureCode = "CACHE_ATTESTATION_INVALID";
         await this.putJob(job);
@@ -1141,7 +1145,11 @@ export class ComputeCoordinator {
         await this.putJob(job);
         await this.schedule();
         return response({ accepted: true, job: publicJob(job) });
-      } catch {
+      } catch (error) {
+        console.warn(
+          "[coordinator] cache publication rejected",
+          error instanceof Error ? error.message.slice(0, 120) : "unknown",
+        );
         job.cache = { state: "repair_required" };
         job.failureCode = "CACHE_PUBLICATION_INVALID";
         await this.putJob(job);
