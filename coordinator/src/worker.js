@@ -672,6 +672,7 @@ function publicJob(job) {
     createAttempted: job.createAttempted,
     cleanup: { ...job.cleanup },
     ...(job.repairJobId ? { repairJobId: job.repairJobId } : {}),
+    ...(job.failureDetail ? { failureDetail: [...job.failureDetail] } : {}),
     ...(job.waitingReason ? { waitingReason: job.waitingReason } : {}),
     ...(job.failureCode ? { failureCode: job.failureCode } : {}),
   };
@@ -711,12 +712,16 @@ async function sampleFailedPodLog(env, config, podId) {
     } finally {
       clearTimeout(timer);
     }
-    const events = [...new Set(text.match(/\{"event":[^\n]{0,280}\}/g) ?? [])];
+    const events = [...new Set(text.match(/\{"event":[^\n]{0,280}\}/g) ?? [])].map((event) =>
+      event.slice(0, 300),
+    );
     for (const event of events.slice(-12)) {
-      console.warn("[coordinator] failed pod log", podId, event.slice(0, 300));
+      console.warn("[coordinator] failed pod log", podId, event);
     }
+    return events;
   } catch {
     // Diagnostics only; never block failure handling.
+    return [];
   }
 }
 
@@ -1120,9 +1125,14 @@ export class ComputeCoordinator {
       await this.putJob(job);
       // The Pod is deleted moments after this report, faster than the
       // provider's log ingestion becomes readable elsewhere. Sample its
-      // structured log events now so the persisted worker logs carry the
-      // fatal detail line.
-      if (job.podId) await sampleFailedPodLog(this.env, config, job.podId);
+      // structured log events now and persist them on the job itself.
+      if (job.podId) {
+        const events = await sampleFailedPodLog(this.env, config, job.podId);
+        if (events.length) {
+          job.failureDetail = events.slice(-6);
+          await this.putJob(job);
+        }
+      }
       await this.schedule();
       return response({ accepted: true, job: publicJob(job) });
     }
