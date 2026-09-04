@@ -47,8 +47,23 @@ case "$REQUIRE_READY_CACHE" in
     ;;
 esac
 
+# Directories on the network volume cannot rely on chown: the volume may
+# refuse or remap ownership changes (NFS idmapping/root squash). Create them,
+# set the mode (which the volume honours), and treat ownership as best
+# effort. Local tmpfs paths keep strict install semantics.
+volume_dir() {
+  local owner="$1" mode="$2"
+  shift 2
+  local dir
+  for dir in "$@"; do
+    mkdir -p "$dir"
+    chown "$owner:$owner" "$dir" 2>/dev/null || true
+    chmod "$mode" "$dir"
+  done
+}
+
 install -d -o glimmer -g glimmer -m 0700 "$STATE_ROOT"
-install -d -o glimmer -g glimmer -m 0755 "$RECOVERY_ROOT" "$RECOVERY_ROOT/bootstrap"
+volume_dir glimmer 0755 "$RECOVERY_ROOT" "$RECOVERY_ROOT/bootstrap"
 USE_HASH_RECEIPTS=false
 if [ "$REQUIRE_READY_CACHE" = 1 ]; then
   if [ "$PREWARM_ONLY" = 1 ]; then
@@ -57,14 +72,17 @@ if [ "$REQUIRE_READY_CACHE" = 1 ]; then
     # cross-UID writers by design.
     STATUS_RUNNER=(env)
     install -d -o root -g root -m 0700 "$STATE_ROOT"
-    install -d -o root -g root -m 0700 "$MODEL_ROOT"
+    volume_dir root 0700 "$MODEL_ROOT"
     install -d -o root -g root -m 0700 "$RECEIPT_ROOT"
     USE_HASH_RECEIPTS=true
   else
-    install -d -o root -g root -m 0555 "$MODEL_ROOT"
+    volume_dir root 0555 "$MODEL_ROOT"
   fi
 else
-  install -d -o glimmer -g glimmer -m 0700 "$MODEL_ROOT"
+  # 0755, not 0700: the volume may report the directory as owned by another
+  # uid (see volume_dir), and the glimmer-run model server still needs
+  # traversal. Model weights are not secrets inside this single-tenant Pod.
+  volume_dir glimmer 0755 "$MODEL_ROOT"
 fi
 if ! "${STATUS_RUNNER[@]}" python3 "$BOOTSTRAP_STATUS_TOOL" \
   --path "$BOOTSTRAP_STATUS_FILE" --mirror-path "$BOOTSTRAP_STATUS_MIRROR_FILE" \
