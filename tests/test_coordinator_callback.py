@@ -196,10 +196,12 @@ class CoordinatorCallbackTests(unittest.TestCase):
 
         self.assertEqual(result, 30)
         failure = json.loads(stderr.getvalue())
-        self.assertEqual(
-            failure,
-            {"event": "cache_validation_failed", "reason": "cache_not_ready"},
-        )
+        self.assertEqual(failure["event"], "cache_validation_failed")
+        self.assertEqual(failure["reason"], "cache_not_ready")
+        # The bounded detail names the failing step without echoing input.
+        self.assertTrue(failure["detail"].startswith("JSONDecodeError:"))
+        self.assertLessEqual(len(failure["detail"]), 200)
+        self.assertEqual(set(failure), {"event", "reason", "detail"})
         self.assertNotIn(str(document), stderr.getvalue())
 
 
