@@ -23,7 +23,9 @@ const EXPECTED_CONTEXT = 65_536;
 const MAX_HOURLY_USD = 1.75;
 const MAX_ESTIMATED_GPU_USD = 0.35;
 // Leave two minutes inside the cost envelope for provider-confirmed cleanup.
-const MAX_PAID_RUNTIME_MS = 9 * 60 * 1_000;
+// 10 minutes: the gateway's compute config requires hardSessionLimitSeconds
+// of at least 600, and this cap is sent verbatim as that limit.
+const MAX_PAID_RUNTIME_MS = 10 * 60 * 1_000;
 const MAX_READY_WAIT_MS = 8 * 60 * 1_000;
 const MAX_OVERALL_RUNTIME_MS = 18 * 60 * 1_000;
 const MAX_PROVIDER_CLEANUP_MS = 2 * 60 * 1_000;
