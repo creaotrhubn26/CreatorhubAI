@@ -213,7 +213,9 @@ class CacheManifestTests(unittest.TestCase):
         receipt_root = self.write_receipts()
         receipt = receipt_root / "model.json"
         value = json.loads(receipt.read_text(encoding="utf-8"))
-        value["inode"] += 1
+        # device/inode/ctime are excluded from the cross-process comparison
+        # (network volumes report them unstably), so mtime is the tamper signal.
+        value["mtimeNs"] += 1
         receipt.write_text(json.dumps(value) + "\n")
         receipt.chmod(0o600)
         with self.assertRaisesRegex(cache_manifest.CacheManifestError, "changed"):

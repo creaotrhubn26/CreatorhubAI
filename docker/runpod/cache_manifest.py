@@ -313,12 +313,13 @@ def _seal_receipted_artifact(
         raise CacheManifestError("cache artifact is unavailable") from exc
     try:
         metadata = _safe_artifact_metadata(descriptor, sealed=False)
+        # The receipt was written by the fetch process; sealing happens in a
+        # separate process. Network volumes (FUSE/NFS-style) may report
+        # different device/inode values per process and update ctime lazily,
+        # so only size and mtime are stable cross-process change signals.
         actual = {
             "bytes": metadata.st_size,
-            "device": metadata.st_dev,
-            "inode": metadata.st_ino,
             "mtimeNs": metadata.st_mtime_ns,
-            "ctimeNs": metadata.st_ctime_ns,
         }
         if any(receipt[key] != actual[key] for key in actual):
             raise CacheManifestError("artifact changed after checksum verification")
@@ -727,9 +728,16 @@ def main() -> int:
                 os.environ.get("GLIMMER_CACHE_SIGNING_PUBLIC_KEY", ""),
             )
             print('{"event":"cache_manifest_verified"}')
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, CacheManifestError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, CacheManifestError) as exc:
         event = "cache_publication_failed" if args.command == "publish" else "cache_validation_failed"
-        print(json.dumps({"event": event, "reason": "cache_not_ready"}), file=sys.stderr)
+        # CacheManifestError messages are fixed literals and OSError carries
+        # only errno text for a known path layout; both are safe to surface
+        # and required to diagnose a failing step from container logs alone.
+        detail = f"{type(exc).__name__}:{exc}"[:200]
+        print(
+            json.dumps({"event": event, "reason": "cache_not_ready", "detail": detail}),
+            file=sys.stderr,
+        )
         return 31 if args.command == "publish" else 30
     return 0
 
