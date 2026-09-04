@@ -142,16 +142,23 @@ def _open_cache_root(root: Path, expected_mode: int) -> int:
         raise CacheManifestError("cache root is unavailable") from exc
     try:
         metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != expected_mode
-        ):
+        # Ownership is not checked: network volumes (NFS idmapping/root squash)
+        # can report a different uid than the one chown accepted. Integrity is
+        # carried by artifact checksums and the signed manifest, not by uid.
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != expected_mode:
             raise CacheManifestError("cache root ownership or mode is invalid")
         return descriptor
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _best_effort_own(descriptor: int) -> None:
+    """Try to own a volume-resident file; network volumes may refuse chown."""
+    try:
+        os.fchown(descriptor, os.geteuid(), os.getegid())
+    except OSError:
+        pass
 
 
 def _artifact_flags() -> int:
@@ -165,10 +172,11 @@ def _artifact_flags() -> int:
 
 def _safe_artifact_metadata(descriptor: int, *, sealed: bool) -> os.stat_result:
     metadata = os.fstat(descriptor)
+    # Artifacts live on the network volume, where reported uids are unreliable
+    # (NFS idmapping/root squash); no uid requirement here.
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
-        or metadata.st_uid != os.geteuid()
         or metadata.st_size <= 0
         or metadata.st_size > MAX_ARTIFACT_BYTES
     ):
@@ -211,7 +219,7 @@ def _hash_and_seal_artifact(directory: int, expected: ArtifactExpectation) -> Di
             digest.hexdigest(), expected.sha256
         ):
             raise CacheManifestError("cache artifact checksum does not match")
-        os.fchown(descriptor, os.geteuid(), os.getegid())
+        _best_effort_own(descriptor)
         os.fchmod(descriptor, 0o444)
         os.fsync(descriptor)
         if not _path_still_names_descriptor(directory, expected.name, descriptor):
@@ -325,7 +333,7 @@ def _seal_receipted_artifact(
             raise CacheManifestError("artifact changed after checksum verification")
         if not _path_still_names_descriptor(directory, expected.name, descriptor):
             raise CacheManifestError("cache artifact pathname changed before publication")
-        os.fchown(descriptor, os.geteuid(), os.getegid())
+        _best_effort_own(descriptor)
         os.fchmod(descriptor, 0o444)
         os.fsync(descriptor)
         if not _path_still_names_descriptor(directory, expected.name, descriptor):
@@ -363,7 +371,7 @@ def _atomic_manifest_write(directory: int, payload: Mapping[str, Any]) -> None:
             if written <= 0:
                 raise OSError("cache manifest write made no progress")
             remaining = remaining[written:]
-        os.fchown(descriptor, os.geteuid(), os.getegid())
+        _best_effort_own(descriptor)
         os.fchmod(descriptor, 0o444)
         os.fsync(descriptor)
         os.replace(temporary, MANIFEST_NAME, src_dir_fd=directory, dst_dir_fd=directory)
@@ -456,10 +464,10 @@ def _read_manifest(directory: int) -> Dict[str, Any]:
         raise CacheManifestError("cache manifest is unavailable") from exc
     try:
         metadata = os.fstat(descriptor)
+        # The manifest also lives on the network volume; see the uid note above.
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
-            or metadata.st_uid != os.geteuid()
             or stat.S_IMODE(metadata.st_mode) != 0o444
             or metadata.st_size <= 0
             or metadata.st_size > MAX_MANIFEST_BYTES
