@@ -638,7 +638,11 @@ describe("ComputeController startup recovery", () => {
   });
 
   it("terminates a Pod whose durable idle deadline passed while the gateway was down", async () => {
-    const { controller, deletePod, finishUsage, clearLease } = harness({});
+    // Idle only applies once the worker was serving; a bootstrapping lease is
+    // governed by the hard deadline instead.
+    const { controller, deletePod, finishUsage, clearLease } = harness({
+      currentLease: lease({ state: "ready" }),
+    });
     await expect(controller.reconcileOnStartup()).resolves.toMatchObject({
       recovered: false,
       cleaned: true,
@@ -708,15 +712,10 @@ describe("ComputeController startup recovery", () => {
     });
   });
 
+  // The idle window intentionally does not run during bootstrap/recovery: a
+  // cold GPU start (image pull plus model load) exceeds short idle windows
+  // and stays bounded by the hard deadline and budgets.
   it.each([
-    {
-      label: "idle",
-      leasePatch: {
-        idleDeadlineAt: new Date(NOW.getTime() + 20_000).toISOString(),
-        hardDeadlineAt: new Date(NOW.getTime() + 3_600_000).toISOString(),
-      },
-      detail: "idle deadline elapsed before worker bootstrap",
-    },
     {
       label: "hard session",
       leasePatch: {
@@ -1436,11 +1435,6 @@ describe("ComputeController authenticated worker startup", () => {
 
   it.each([
     {
-      label: "idle",
-      profilePatch: { idleTimeoutSeconds: 20 },
-      error: "idle deadline elapsed before worker bootstrap",
-    },
-    {
       label: "hard session",
       profilePatch: { hardSessionLimitSeconds: 20 },
       error: "hard session deadline elapsed before worker bootstrap",
@@ -1953,8 +1947,8 @@ describe("ComputeController exact-id termination", () => {
         id: "lease-2",
         podId: "pod_456",
         podName: "glimmer-test-second-lease",
-        idleDeadlineAt: new Date(NOW.getTime() + 10_000).toISOString(),
-        hardDeadlineAt: new Date(NOW.getTime() + 60_000).toISOString(),
+        idleDeadlineAt: new Date(NOW.getTime() + 3_600_000).toISOString(),
+        hardDeadlineAt: new Date(NOW.getTime() + 10_000).toISOString(),
       });
       const { controller, readWorkerSecret, workerClient, deletePod, currentLease } = harness({
         currentLease: activeLease,

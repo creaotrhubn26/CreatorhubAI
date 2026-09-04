@@ -221,7 +221,11 @@ function safetyDeadlineMs(
   lease: ComputeLeaseV1,
   nowMs: number,
 ): number {
-  const deadlines = [Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt)];
+  // The idle clock only makes sense once the worker can serve requests. A
+  // cold GPU bootstrap (image pull plus model load) legitimately exceeds a
+  // short idle window and stays bounded by the hard deadline and budgets.
+  const deadlines = [Date.parse(lease.hardDeadlineAt)];
+  if (lease.state !== "bootstrapping") deadlines.push(Date.parse(lease.idleDeadlineAt));
   const hourlyUsd = lease.observedHourlyUsd;
   if (hourlyUsd && hourlyUsd > 0) {
     const daySpent = Math.max(usage.estimatedTodayUsd, usage.reconciledTodayUsd ?? 0);
@@ -1034,6 +1038,10 @@ export class ComputeController {
           workerProtocolVersion: worker.protocolVersion,
           workerBuildId: worker.buildId,
           workerReadyAt: this.dependencies.now().toISOString(),
+          // The idle window starts when the worker can actually serve.
+          idleDeadlineAt: new Date(
+            this.dependencies.now().getTime() + profile.idleTimeoutSeconds * 1_000,
+          ).toISOString(),
           error: undefined,
         });
         this.lastComputeDetail = null;
@@ -1255,9 +1263,9 @@ export class ComputeController {
     if (nowMs >= Date.parse(lease.hardDeadlineAt)) {
       return "RunPod hard session deadline elapsed before worker bootstrap";
     }
-    if (nowMs >= Date.parse(lease.idleDeadlineAt)) {
-      return "RunPod idle deadline elapsed before worker bootstrap";
-    }
+    // No idle check here: the idle window starts at readiness (see the ready
+    // transition), and bootstrap remains bounded by the hard deadline and
+    // the budget checks below.
     const budget = budgetStatus(
       profile,
       await this.dependencies.readUsage(now),
@@ -2267,9 +2275,13 @@ export class ComputeController {
           detail: "Pod termination requested because local safety scheduling failed",
         };
       }
+      // Idle only counts once the worker serves; a recovering bootstrap is
+      // bounded by the hard deadline (mirrors safetyDeadlineMs).
       const deadlinePassed =
         this.dependencies.now().getTime() >=
-        Math.min(Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt));
+        (lease.state === "bootstrapping"
+          ? Date.parse(lease.hardDeadlineAt)
+          : Math.min(Date.parse(lease.idleDeadlineAt), Date.parse(lease.hardDeadlineAt)));
       let allocationError: string | null = null;
       if (!deadlinePassed) {
         try {
