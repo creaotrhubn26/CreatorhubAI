@@ -681,6 +681,45 @@ function randomToken() {
   return bytesToBase64url(crypto.getRandomValues(new Uint8Array(32)));
 }
 
+// Best-effort diagnostic used only when a cache Pod reports a bootstrap
+// failure: reads the container log through the provider API and logs the
+// structured event lines (bounded, secret-free by construction — the
+// entrypoint only prints fixed-shape JSON events) before the Pod is deleted.
+async function sampleFailedPodLog(env, config, podId) {
+  try {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(podId)) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8_000);
+    let text = "";
+    try {
+      const response = await fetch(
+        `${config.runpodCatalogBaseUrl.replace(/\/v2$/, "")}/v2/pods/${encodeURIComponent(podId)}/logs?source=container&tail=2000`,
+        {
+          headers: { Accept: "text/event-stream", Authorization: `Bearer ${env.RUNPOD_API_KEY}` },
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok || !response.body) return;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      while (text.length < 500_000) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+      await reader.cancel().catch(() => undefined);
+    } finally {
+      clearTimeout(timer);
+    }
+    const events = [...new Set(text.match(/\{"event":[^\n]{0,280}\}/g) ?? [])];
+    for (const event of events.slice(-12)) {
+      console.warn("[coordinator] failed pod log", podId, event.slice(0, 300));
+    }
+  } catch {
+    // Diagnostics only; never block failure handling.
+  }
+}
+
 function runpodClient(env, config) {
   return new RunPodV2Client({
     apiKey: env.RUNPOD_API_KEY,
@@ -1079,6 +1118,11 @@ export class ComputeCoordinator {
       job.state = "terminating";
       job.cleanup.requested = true;
       await this.putJob(job);
+      // The Pod is deleted moments after this report, faster than the
+      // provider's log ingestion becomes readable elsewhere. Sample its
+      // structured log events now so the persisted worker logs carry the
+      // fatal detail line.
+      if (job.podId) await sampleFailedPodLog(this.env, config, job.podId);
       await this.schedule();
       return response({ accepted: true, job: publicJob(job) });
     }
