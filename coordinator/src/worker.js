@@ -1128,10 +1128,14 @@ export class ComputeCoordinator {
       // structured log events now and persist them on the job itself.
       if (job.podId) {
         const events = await sampleFailedPodLog(this.env, config, job.podId);
-        if (events.length) {
-          job.failureDetail = events.slice(-6);
-          await this.putJob(job);
-        }
+        // Whether the coordinator ever signed this attempt's attestation
+        // splits a publish failure between the prepare step (before signing)
+        // and the install step (after signing).
+        job.failureDetail = [
+          `attestation_signed:${Boolean(job.internal.pendingManifestSha256)}`,
+          ...events.slice(-5),
+        ];
+        await this.putJob(job);
       }
       await this.schedule();
       return response({ accepted: true, job: publicJob(job) });
