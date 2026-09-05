@@ -204,8 +204,29 @@ describe("watchdog sweep", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("retains a Pod whose provider response omits GPU count metadata entirely", async () => {
+    // Live GPU Pods often carry the GPU only as machine metadata; absence of
+    // a count is not a policy violation (the rate ceiling still applies).
+    const env = environment();
+    await env.LEASES.put("lease:lease-1", JSON.stringify(lease()));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({
+        id: "pod_1",
+        name: "glimmer-instance-1-lease-1",
+        desiredStatus: "RUNNING",
+        adjustedCostPerHr: 1.59,
+      }),
+    );
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
-    ["missing", {}],
     ["fractional", { gpuCount: 1.5 }],
     ["negative", { gpu: { count: -1 } }],
     ["non-numeric string", { gpuCount: "one" }],

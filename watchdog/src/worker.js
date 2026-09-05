@@ -298,6 +298,11 @@ function podRate(pod) {
   return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? rate : null;
 }
 
+// Returns the GPU count when the provider reports one, null when it reports
+// none (live GPU Pods often omit both fields and carry the GPU only as
+// machine metadata), and -1 when the reported fields are malformed or
+// conflict. Only an explicit wrong count or a conflict is a policy signal;
+// absence is not, and the hourly-rate ceiling still bounds cost.
 function podGpuCount(pod) {
   const nestedRaw = pod?.gpu?.count;
   const topLevelRaw = pod?.gpuCount;
@@ -316,8 +321,8 @@ function podGpuCount(pod) {
   };
   const nested = hasNested ? normalize(nestedRaw) : null;
   const topLevel = hasTopLevel ? normalize(topLevelRaw) : null;
-  if ((hasNested && nested === null) || (hasTopLevel && topLevel === null)) return null;
-  if (hasNested && hasTopLevel && nested !== topLevel) return null;
+  if ((hasNested && nested === null) || (hasTopLevel && topLevel === null)) return -1;
+  if (hasNested && hasTopLevel && nested !== topLevel) return -1;
   return hasNested ? nested : topLevel;
 }
 
@@ -380,7 +385,8 @@ function terminationReason(lease, pod, nowMs, staleAfterMs) {
   if (pod?.desiredStatus !== "RUNNING") return "provider-state-not-running";
   if (pod?.name !== lease.podName) return "pod-identity-mismatch";
   if (lease.podId && pod?.id !== lease.podId) return "pod-identity-mismatch";
-  if (podGpuCount(pod) !== 1) return "gpu-count-policy";
+  const gpuCount = podGpuCount(pod);
+  if (gpuCount !== null && gpuCount !== 1) return "gpu-count-policy";
   const rate = podRate(pod);
   if (rate === null) return "provider-rate-unavailable";
   if (rate > lease.maxHourlyUsd) return "provider-rate-ceiling";
