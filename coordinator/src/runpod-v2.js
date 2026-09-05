@@ -432,13 +432,15 @@ export function parseRunPodV2Pod(value) {
         ? "SECURE"
         : "COMMUNITY";
 
+  const gpu = raw.gpu === undefined || raw.gpu === null ? null : parseGpu(raw.gpu);
+  // Live GPU Pods also report their host CPU flavor/vCPUs; the GPU is the
+  // allocation that matters, so CPU metadata is ignored when a GPU exists.
   const cpu =
-    raw.cpuFlavorId === undefined || raw.cpuFlavorId === null
+    gpu !== null || raw.cpuFlavorId === undefined || raw.cpuFlavorId === null
       ? null
       : parseCpu(raw.cpuFlavorId, raw.vcpuCount);
-  const gpu = raw.gpu === undefined || raw.gpu === null ? null : parseGpu(raw.gpu);
-  if ((cpu === null) === (gpu === null)) {
-    fail("INVALID_POD_ALLOCATION_FIELD", "Pod must report exactly one CPU or GPU allocation");
+  if (cpu === null && gpu === null) {
+    fail("INVALID_POD_ALLOCATION_FIELD", "Pod must report a CPU or GPU allocation");
   }
 
   const networkVolume =

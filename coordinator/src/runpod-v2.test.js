@@ -308,10 +308,10 @@ describe("RunPod v2 provider parsing and CPU selection", () => {
     expect(JSON.stringify(pod)).not.toContain("callback-secret");
     expect("env" in pod).toBe(false);
 
-    expectCode(
-      () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: "cpu3c" })),
-      "INVALID_POD_ALLOCATION_FIELD",
-    );
+    // Live GPU Pods also report host CPU metadata; the GPU wins.
+    expect(
+      parseRunPodV2Pod(providerPod(request, { cpuFlavorId: "cpu3c", vcpuCount: 16 })),
+    ).toMatchObject({ gpu: { id: "NVIDIA H100 80GB HBM3" }, cpu: null });
     expectCode(
       () => parseRunPodV2Pod(providerPod(request, { cpuFlavorId: null, gpu: null })),
       "INVALID_POD_ALLOCATION_FIELD",
