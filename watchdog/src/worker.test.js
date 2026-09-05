@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker, { sweep } from "./worker.js";
 
@@ -77,19 +78,25 @@ function leaseV2(patch = {}) {
   };
 }
 
+// Mirrors the RAW RunPod REST v1 Pod shape (fixtures/runpod-rest-v1): the V2
+// sweep consumes provider responses directly, never a parsed adaptation.
 function cpuPodV2(patch = {}) {
   return {
     id: "pod_v2_1",
     name: "glimmer-cache-job-1",
-    status: "RUNNING",
-    cloud: "SECURE",
-    cost: 0.02,
-    cpu: { id: "cpu3c", vcpuCount: 2 },
-    gpu: null,
-    mounts: { network: [{ volumeId: "volume-1", path: "/workspace" }] },
+    desiredStatus: "RUNNING",
+    costPerHr: 0.02,
+    cpuFlavorId: "cpu3c",
+    vcpuCount: 2,
+    machine: { secureCloud: true, dataCenterId: "EUR-IS-1" },
+    networkVolume: { id: "volume-1", dataCenterId: "EUR-IS-1", size: 200, name: "glimmer-cache" },
+    volumeMountPath: "/workspace",
     ...patch,
   };
 }
+
+const rawGpuFixture = () =>
+  JSON.parse(readFileSync(new URL("../../fixtures/runpod-rest-v1/pod-gpu.json", import.meta.url)));
 
 function signedRequest(method, path, body = "", timestamp = NOW) {
   const timestampText = String(timestamp);
@@ -458,7 +465,14 @@ describe("watchdog V2 leases", () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(
-        Response.json(cpuPodV2({ cpu: null, gpu: { id: "NVIDIA L4", count: 1 }, cost: 0.49 })),
+        Response.json(
+          cpuPodV2({
+            cpuFlavorId: undefined,
+            vcpuCount: undefined,
+            gpu: { id: "NVIDIA L4", count: 1 },
+            costPerHr: 0.49,
+          }),
+        ),
       );
 
     await expect(sweep(env, NOW)).resolves.toMatchObject({
@@ -511,6 +525,94 @@ describe("watchdog V2 leases", () => {
     );
   });
 
+  it("retains the sanitized live GPU Pod shape for a coordinator gpu_worker lease", async () => {
+    const env = environment();
+    const lease = leaseV2({
+      jobKind: "gpu_worker",
+      maxHourlyUsd: 1.75,
+      podId: "pod_fixture_gpu1",
+      podName: "glimmer-gpu-fixture",
+      expected: {
+        cloud: "SECURE",
+        gpuCount: 1,
+        gpuTypeId: "NVIDIA A100 80GB PCIe",
+        networkVolumeId: "vol_fixture_1",
+      },
+    });
+    await env.LEASES.put("lease-v2:job-1", JSON.stringify(lease));
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(Response.json(rawGpuFixture()));
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a live GPU Pod whose response omits gpu, cost, and volume metadata", async () => {
+    const env = environment();
+    const lease = leaseV2({
+      jobKind: "gpu_worker",
+      maxHourlyUsd: 1.75,
+      podId: "pod_fixture_gpu1",
+      podName: "glimmer-gpu-fixture",
+      expected: {
+        cloud: "SECURE",
+        gpuCount: 1,
+        gpuTypeId: "NVIDIA A100 80GB PCIe",
+        networkVolumeId: "vol_fixture_1",
+      },
+    });
+    await env.LEASES.put("lease-v2:job-1", JSON.stringify(lease));
+    const raw = rawGpuFixture();
+    delete raw.gpu;
+    delete raw.costPerHr;
+    delete raw.adjustedCostPerHr;
+    delete raw.networkVolume;
+    delete raw.machine;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(raw));
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 0,
+    });
+  });
+
+  it("terminates a live GPU Pod whose machine metadata names the wrong GPU type", async () => {
+    const env = environment();
+    const lease = leaseV2({
+      jobKind: "gpu_worker",
+      maxHourlyUsd: 1.75,
+      podId: "pod_fixture_gpu1",
+      podName: "glimmer-gpu-fixture",
+      expected: {
+        cloud: "SECURE",
+        gpuCount: 1,
+        gpuTypeId: "NVIDIA A100 80GB PCIe",
+        networkVolumeId: "vol_fixture_1",
+      },
+    });
+    await env.LEASES.put("lease-v2:job-1", JSON.stringify(lease));
+    const raw = rawGpuFixture();
+    delete raw.gpu;
+    raw.machine.gpuTypeId = "NVIDIA GeForce RTX 4090";
+    vi.spyOn(globalThis, "fetch").mockImplementation((url, init) =>
+      Promise.resolve(
+        init?.method === "DELETE" ? new Response(null, { status: 200 }) : Response.json(raw),
+      ),
+    );
+
+    await expect(sweep(env, NOW)).resolves.toMatchObject({
+      ok: true,
+      checked: 1,
+      terminationRequests: 1,
+    });
+  });
+
   it("terminates an exact-id V2 GPU Pod after a stale heartbeat", async () => {
     const env = environment();
     await env.LEASES.put(
@@ -527,7 +629,12 @@ describe("watchdog V2 leases", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       if (init?.method === "DELETE") return new Response(null, { status: 204 });
       return Response.json(
-        cpuPodV2({ cpu: null, gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 }, cost: 1.59 }),
+        cpuPodV2({
+          cpuFlavorId: undefined,
+          vcpuCount: undefined,
+          gpu: { id: "NVIDIA A100 80GB PCIe", count: 1 },
+          costPerHr: 1.59,
+        }),
       );
     });
 

@@ -327,30 +327,16 @@ function podGpuCount(pod) {
 }
 
 function podV2GpuCount(pod) {
-  if (pod?.gpu === null || pod?.gpu === undefined) return 0;
-  if (!pod.gpu || typeof pod.gpu !== "object" || Array.isArray(pod.gpu)) return null;
-  const raw = pod.gpu.count;
+  // Raw REST v1 Pods carry the count in gpu.count or top-level gpuCount;
+  // both may be absent, which is "unknown" (null), never a breach.
+  const raw = pod?.gpu?.count ?? pod?.gpuCount;
   const count = typeof raw === "string" && raw.trim() ? Number(raw) : raw;
+  if (count === null || count === undefined) return null;
   return typeof count === "number" &&
     Number.isFinite(count) &&
     Number.isSafeInteger(count) &&
     count >= 0
     ? count
-    : null;
-}
-
-function podV2NetworkMounts(pod) {
-  const mounts = pod?.mounts?.network;
-  if (!Array.isArray(mounts)) return null;
-  return mounts.every(
-    (mount) =>
-      mount &&
-      typeof mount === "object" &&
-      !Array.isArray(mount) &&
-      SAFE_ID.test(mount.volumeId ?? "") &&
-      typeof mount.path === "string",
-  )
-    ? mounts
     : null;
 }
 
@@ -396,37 +382,40 @@ function terminationReason(lease, pod, nowMs, staleAfterMs) {
 }
 
 function terminationReasonV2(lease, pod, nowMs, staleAfterMs) {
+  // The V2 sweep consumes the RAW RunPod REST v1 Pod shape (desiredStatus,
+  // networkVolume, costPerHr, machine.gpuTypeId) exactly as fixtures/
+  // runpod-rest-v1 records it. Live responses intermittently omit optional
+  // metadata, so absence is never proof of a policy breach; the heartbeat
+  // and hard deadline remain the authoritative kill switches.
   if (pod?.name !== lease.podName) return "pod-identity-mismatch";
   if (lease.podId && pod?.id !== lease.podId) return "pod-identity-mismatch";
-  if (!["PROVISIONING", "STARTING", "RUNNING"].includes(pod?.status)) {
+  if (pod?.desiredStatus !== undefined && pod.desiredStatus !== "RUNNING") {
     return "provider-state-not-active";
   }
-  if (pod?.cloud !== lease.expected.cloud) return "cloud-policy";
-  if (podV2GpuCount(pod) !== lease.expected.gpuCount) return "gpu-count-policy";
-  if (lease.jobKind === "cpu_cache" && (!pod?.cpu || typeof pod.cpu !== "object")) {
-    return "cpu-policy";
+  if (pod?.machine && typeof pod.machine === "object" && pod.machine.secureCloud === false) {
+    return "cloud-policy";
   }
+  const gpuCount = podV2GpuCount(pod);
+  if (gpuCount !== null && gpuCount !== 0 && gpuCount !== lease.expected.gpuCount) {
+    return "gpu-count-policy";
+  }
+  const gpuTypeId = pod?.gpu?.id ?? pod?.machine?.gpuTypeId;
   if (
-    (lease.jobKind === "gpu_cache" || lease.jobKind === "gpu_worker") &&
-    (!pod?.gpu || typeof pod.gpu !== "object")
+    lease.expected.gpuTypeId &&
+    typeof gpuTypeId === "string" &&
+    gpuTypeId !== lease.expected.gpuTypeId
   ) {
-    return "gpu-policy";
-  }
-  if (lease.expected.gpuTypeId && pod.gpu.id !== lease.expected.gpuTypeId) {
     return "gpu-type-policy";
   }
-  const mounts = podV2NetworkMounts(pod);
-  if (
-    !mounts ||
-    mounts.length !== 1 ||
-    mounts[0].volumeId !== lease.expected.networkVolumeId ||
-    mounts[0].path !== "/workspace"
-  ) {
+  const volumeId = pod?.networkVolume?.id;
+  if (typeof volumeId === "string" && volumeId !== lease.expected.networkVolumeId) {
     return "network-volume-policy";
   }
-  const rate = podRate({ costPerHr: pod?.cost });
-  if (rate === null) return "provider-rate-unavailable";
-  if (rate > lease.maxHourlyUsd) return "provider-rate-ceiling";
+  if (typeof pod?.volumeMountPath === "string" && pod.volumeMountPath !== "/workspace") {
+    return "network-volume-policy";
+  }
+  const rate = podRate(pod);
+  if (rate !== null && rate > lease.maxHourlyUsd) return "provider-rate-ceiling";
   if (nowMs >= Date.parse(lease.hardDeadlineAt)) return "hard-deadline";
   if (nowMs - Date.parse(lease.lastHeartbeatAt) >= staleAfterMs) return "heartbeat-stale";
   return null;
@@ -525,12 +514,13 @@ export async function sweep(env, nowMs = Date.now()) {
           throw new Error("RUNPOD_EXACT_NAME_AMBIGUOUS");
         }
         const pod = pods[0];
-        if (["TERMINATED", "EXITED"].includes(pod?.status)) {
+        if (["TERMINATED", "EXITED"].includes(pod?.desiredStatus)) {
           await env.LEASES.delete(key);
           continue;
         }
         const reason = terminationReasonV2(lease, pod, nowMs, staleAfterMs);
         if (!reason) continue;
+        console.warn("[watchdog] terminating V2 pod", pod?.id ?? lease.podId ?? "?", reason);
         const podId = lease.podId ?? pod.id;
         if (!SAFE_ID.test(podId ?? "")) throw new Error("RUNPOD_POD_ID_INVALID");
         result.terminationRequests += 1;
