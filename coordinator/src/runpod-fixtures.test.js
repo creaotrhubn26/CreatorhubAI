@@ -26,6 +26,14 @@ describe("RunPod REST v1 fixture contract", () => {
     expect("env" in pod).toBe(false);
   });
 
+  it("derives the GPU from machine metadata when the nested gpu object is absent", () => {
+    const raw = fixture("pod-gpu.json");
+    delete raw.gpu;
+    const pod = parseRunPodV2Pod(raw);
+    expect(pod.gpu).toEqual({ id: "NVIDIA A100 80GB PCIe", count: 1 });
+    expect(pod.cpu).toBeNull();
+  });
+
   it("parses the sanitized live CPU Pod shape", () => {
     const pod = parseRunPodV2Pod(fixture("pod-cpu.json"));
     expect(pod).toMatchObject({

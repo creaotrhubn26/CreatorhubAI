@@ -432,7 +432,20 @@ export function parseRunPodV2Pod(value) {
         ? "SECURE"
         : "COMMUNITY";
 
-  const gpu = raw.gpu === undefined || raw.gpu === null ? null : parseGpu(raw.gpu);
+  let gpu = raw.gpu === undefined || raw.gpu === null ? null : parseGpu(raw.gpu);
+  if (gpu === null && machine !== null && typeof machine.gpuTypeId === "string") {
+    // Live responses (create bodies in particular) often carry the GPU only
+    // as machine metadata rather than a nested gpu object.
+    const id = boundedText(machine.gpuTypeId, "INVALID_POD_GPU_FIELD", "Pod GPU id", 128);
+    if (!GPU_ID.test(id)) fail("INVALID_POD_GPU_FIELD", "Pod GPU id is invalid");
+    gpu = {
+      id,
+      count:
+        raw.gpuCount === undefined || raw.gpuCount === null
+          ? 1
+          : integer(raw.gpuCount, "INVALID_POD_GPU_FIELD", "Pod GPU count", 1, 64),
+    };
+  }
   // Live GPU Pods also report their host CPU flavor/vCPUs; the GPU is the
   // allocation that matters, so CPU metadata is ignored when a GPU exists.
   const cpu =
