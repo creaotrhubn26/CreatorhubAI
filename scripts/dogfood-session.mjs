@@ -15,10 +15,19 @@ const timeoutMs = Number(options.timeout ?? 15 * 60_000);
 const cancelAfterMs = options["cancel-after"] ? Number(options["cancel-after"]) : null;
 const origin = "http://127.0.0.1:5183";
 
+const capabilityToken = process.env.GLIMMER_CAPABILITY_TOKEN ?? "";
+
 async function api(path, init = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", Origin: origin, ...(init.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      Origin: origin,
+      // A controlled gateway (spawned with GLIMMER_CAPABILITY_TOKEN) rejects
+      // state-changing requests without its capability header.
+      ...(capabilityToken ? { "X-Glimmer-Capability": capabilityToken } : {}),
+      ...(init.headers ?? {}),
+    },
   });
   const body = await response.json().catch(() => null);
   if (!response.ok)
