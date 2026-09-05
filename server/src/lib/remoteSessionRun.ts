@@ -277,7 +277,20 @@ export async function resumeRemoteSession(
   jobId: string,
   cancelled: () => boolean,
 ): Promise<RemoteSessionOutcome> {
-  const status = await deps.worker.jobStatus(jobId, deps.capability);
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  // The Pod proxy routinely 502s for a few seconds around a gateway restart,
+  // and a job created moments before the crash may still be registering; a
+  // first-read failure must not end the session as unrecovered.
+  let status;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      status = await deps.worker.jobStatus(jobId, deps.capability);
+      break;
+    } catch (error) {
+      if (attempt >= 6) throw error;
+      await sleep(5_000);
+    }
+  }
   return superviseRemoteSession(deps, status, cancelled, {
     deadlineMs: deps.deadlineMs ?? 2 * 3_600_000,
   });
