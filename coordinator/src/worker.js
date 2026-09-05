@@ -1362,6 +1362,9 @@ export class ComputeCoordinator {
     const callbackToken = randomToken();
     const callbackTokenHash = await sha256Text(callbackToken);
     const commonEnvironment = {
+      // Native crashes (SIGSEGV) in the orchestrator are otherwise
+      // untraceable; faulthandler writes the stack to the job log.
+      PYTHONFAULTHANDLER: "1",
       GLIMMER_LEASE_ID: job.currentLeaseId,
       GLIMMER_CONTEXT_TOKENS: String(request.contextTokens),
       GLIMMER_MODEL_SHA256: request.modelArtifacts.model.sha256,
