@@ -463,6 +463,21 @@ describe("cache-gated lifecycle", () => {
             ],
           });
         }
+        if (target.includes("/catalog/gpus")) {
+          return Response.json({
+            gpus: [
+              {
+                id: "NVIDIA A100 80GB PCIe",
+                name: "A100 PCIe",
+                memory: 80,
+                secure: true,
+                price: { secure: 1.39, community: 1.19 },
+                availability: "HIGH",
+                dataCenters: [{ id: "EU-RO-1", name: "EU-RO-1", availability: "HIGH" }],
+              },
+            ],
+          });
+        }
         if (target.endsWith("/v1/pods") && init.method === "POST") {
           const request = JSON.parse(init.body);
           creates.push(request);

@@ -1556,6 +1556,7 @@ export class ComputeController {
       hardDeadlineAt,
       idleTimeoutSeconds: profile.idleTimeoutSeconds,
       gpuTypeId: profile.gpuTypeIds[0],
+      gpuTypeIds: [...profile.gpuTypeIds],
       bootstrapToken: secret.bootstrapToken,
     };
     try {

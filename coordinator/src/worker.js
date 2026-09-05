@@ -484,6 +484,7 @@ function parseJobRequest(value, jobId, nowMs) {
   if (
     !exactKeys(value, required, [
       "gpuTypeId",
+      "gpuTypeIds",
       "bootstrapToken",
       "idleTimeoutSeconds",
       "gpuMaxRuntimeSeconds",
@@ -530,6 +531,16 @@ function parseJobRequest(value, jobId, nowMs) {
       typeof value.gpuTypeId !== "string" ||
       value.gpuTypeId.length > 128 ||
       !TOKEN.test(value.bootstrapToken ?? "")
+    ) {
+      throw new Error("INVALID_GPU_JOB");
+    }
+    if (
+      value.gpuTypeIds !== undefined &&
+      (!Array.isArray(value.gpuTypeIds) ||
+        value.gpuTypeIds.length < 1 ||
+        value.gpuTypeIds.length > 4 ||
+        value.gpuTypeIds.some((id) => typeof id !== "string" || !id || id.length > 128) ||
+        new Set(value.gpuTypeIds).size !== value.gpuTypeIds.length)
     ) {
       throw new Error("INVALID_GPU_JOB");
     }
@@ -586,6 +597,7 @@ function parseJobRequest(value, jobId, nowMs) {
     hardDeadlineAt: new Date(deadline).toISOString(),
     idleTimeoutSeconds,
     ...(value.gpuTypeId ? { gpuTypeId: value.gpuTypeId } : {}),
+    ...(value.gpuTypeIds ? { gpuTypeIds: [...value.gpuTypeIds] } : {}),
     ...(value.bootstrapToken ? { bootstrapToken: value.bootstrapToken } : {}),
     ...(value.gpuMaxRuntimeSeconds !== undefined
       ? { gpuMaxRuntimeSeconds: value.gpuMaxRuntimeSeconds }
@@ -1424,13 +1436,42 @@ export class ComputeCoordinator {
         this.env,
         job.jobId,
       );
+      // Choose among the allowed GPU types by live catalog capacity at the
+      // volume's data center; availability differs per variant and flaps.
+      const gpuCandidates = request.gpuTypeIds ?? [request.gpuTypeId];
+      const gpuCatalog = await client.listGpuTypes();
+      let chosenGpu = null;
+      for (const candidate of gpuCandidates) {
+        try {
+          const offer = selectRunPodV2GpuOffer(gpuCatalog, {
+            gpuTypeId: candidate,
+            dataCenterId: volume.dataCenterId,
+            maxHourlyUsd: job.maxHourlyUsd,
+          });
+          if (
+            chosenGpu === null ||
+            offer.hourlyUsd < chosenGpu.hourlyUsd ||
+            (offer.hourlyUsd === chosenGpu.hourlyUsd && offer.id < chosenGpu.id)
+          ) {
+            chosenGpu = offer;
+          }
+        } catch (error) {
+          if (!(error instanceof RunPodV2Error) || error.code !== "GPU_UNAVAILABLE") throw error;
+        }
+      }
+      if (chosenGpu === null) {
+        throw new RunPodV2Error(
+          "GPU_UNAVAILABLE",
+          "no allowed Secure GPU type is available at the volume data center within the ceiling",
+        );
+      }
       createRequest = buildGpuWorkerPodRequest({
         podName: job.podName,
         image: request.image,
         registryId: request.containerRegistryAuthId,
         networkVolumeId: request.networkVolumeId,
         dataCenterId: volume.dataCenterId,
-        gpuTypeId: request.gpuTypeId,
+        gpuTypeId: chosenGpu.id,
         environment: {
           ...commonEnvironment,
           GLIMMER_PREWARM_ONLY: "0",
@@ -1661,7 +1702,7 @@ export class ComputeCoordinator {
         error instanceof RunPodV2Error &&
         (error.code === "GPU_UNAVAILABLE" || error.code === "RUNPOD_TRANSPORT_ERROR") &&
         job.kind === "gpu_worker" &&
-        job.phase === "cache_repair" &&
+        (job.phase === "cache_repair" || job.phase === "gpu_worker") &&
         job.createAttempted === false &&
         !job.internal.terminalTarget &&
         Date.now() < Date.parse(job.currentDeadlineAt);

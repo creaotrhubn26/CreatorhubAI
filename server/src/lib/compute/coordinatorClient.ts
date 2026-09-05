@@ -74,6 +74,9 @@ export interface CoordinatorJobRequestV1 {
   maxTotalUsd?: number;
   idleTimeoutSeconds: number;
   gpuTypeId: string;
+  // Every allowed GPU variant; the coordinator picks the one with live
+  // capacity at the volume's data center.
+  gpuTypeIds?: string[];
   bootstrapToken: string;
 }
 
