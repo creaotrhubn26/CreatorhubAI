@@ -210,10 +210,10 @@ class ProcessJobRunner:
     ) -> RunningProcess:
         workspace = self._prepare_workspace(job_dir, manifest)
         session_dir = job_dir / "sessions" / manifest.session_id
-        # The log lives inside session_dir so the result checkpoint carries it
-        # home; a crash on the Pod is otherwise undiagnosable from the Mac.
-        session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        log_path = session_dir / "orchestrator.log"
+        # The orchestrator creates session_dir itself (and refuses a
+        # pre-existing one), so the log lives in job_dir and is archived
+        # into the checkpoint under session/ explicitly.
+        log_path = job_dir / "orchestrator.log"
         log_handle = open(log_path, "ab", buffering=0)
         orchestrator = self.orchestrator_root / "glimmer-v2.py"
         if not orchestrator.is_file():
@@ -708,6 +708,9 @@ class WorkerService:
         archive = job_dir / "result.tar"
         with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as output:
             output.add(metadata_path, arcname="result.json", recursive=False)
+            log_path = job_dir / "orchestrator.log"
+            if log_path.is_file() and log_path.stat().st_size <= 64 * 1024 * 1024:
+                output.add(log_path, arcname="session/orchestrator.log", recursive=False)
             if session_dir.is_dir():
                 for path in sorted(session_dir.rglob("*")):
                     if path.is_symlink() or not path.is_file():
