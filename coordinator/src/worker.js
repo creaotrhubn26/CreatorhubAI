@@ -1460,6 +1460,13 @@ export class ComputeCoordinator {
     } catch (error) {
       if (error?.ambiguousCreate) {
         job.state = "recovering_create";
+      } else if (error instanceof RunPodV2HttpError && error.status === 500) {
+        // The provider returns HTTP 500 for "no instances currently
+        // available". A 500 does not prove the create failed, so recover by
+        // exact name first; if no Pod appears, recoverCreate waits for
+        // capacity instead of failing terminally.
+        job.internal.capacityRetry = true;
+        job.state = "recovering_create";
       } else {
         throw error;
       }
@@ -1478,6 +1485,16 @@ export class ComputeCoordinator {
       return;
     }
     if (Date.now() - Date.parse(job.internal.createIntentAt) >= CREATE_RECOVERY_MS) {
+      if (job.internal.capacityRetry && Date.now() < Date.parse(job.currentDeadlineAt)) {
+        // The provider rejected the create for lack of capacity and no Pod
+        // materialized: safe to retry on the normal cadence, bounded by the
+        // phase deadline. Never widen the GPU type, data center, or ceiling.
+        job.internal.capacityRetry = null;
+        job.createAttempted = false;
+        job.waitingReason = "PROVIDER_NO_CAPACITY";
+        job.state = "waiting_for_capacity";
+        return;
+      }
       throw new Error("CREATE_OUTCOME_UNRESOLVED");
     }
   }
