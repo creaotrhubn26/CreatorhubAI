@@ -1432,6 +1432,15 @@ export class ComputeController {
     };
   }
 
+  /** Shutdown-path read only; never mutates and never throws. */
+  async readLeaseForShutdown(): Promise<ComputeLeaseV1 | null> {
+    try {
+      return await this.dependencies.readLease();
+    } catch {
+      return null;
+    }
+  }
+
   async getStatus(): Promise<ComputeStatus> {
     const config = await this.dependencies.readConfig();
     const lease = await this.dependencies.readLease();

@@ -14,9 +14,20 @@ async function shutdownWithComputeCleanup(reason: string, exitCode = 0) {
     process.exit(1);
   }, 12_000);
   try {
-    const result = await getComputeController().stop(reason);
-    if (result.terminated)
-      console.log("[gateway] active RunPod compute terminated during shutdown");
+    // A coordinator-supervised lease survives gateway death by design: the
+    // cloud coordinator and independent watchdog own its lifecycle (idle
+    // timeout, hard deadline, budgets), and tearing it down here would kill
+    // remote sessions that startup recovery can otherwise reattach to.
+    const lease = await getComputeController().readLeaseForShutdown();
+    if (lease?.orchestrationMode === "cloud_coordinator") {
+      console.log(
+        "[gateway] leaving coordinator-supervised compute running for restart recovery",
+      );
+    } else {
+      const result = await getComputeController().stop(reason);
+      if (result.terminated)
+        console.log("[gateway] active RunPod compute terminated during shutdown");
+    }
   } catch (error) {
     console.error(
       `[gateway] compute cleanup failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
