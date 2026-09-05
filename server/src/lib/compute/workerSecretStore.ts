@@ -67,7 +67,9 @@ export async function createWorkerSecret(leaseId: string): Promise<WorkerSecretV
     version: 1,
     leaseId,
     bootstrapToken: generatedSecret(),
-    handshakeIdempotencyKey: generatedSecret(),
+    // The worker's idempotency-key grammar requires a leading alphanumeric;
+    // base64url can start with "-"/"_" and would flake ~6% of handshakes.
+    handshakeIdempotencyKey: randomUUID(),
     controllerNonce: generatedSecret(),
     createdAt: new Date().toISOString(),
   };
