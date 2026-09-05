@@ -516,6 +516,10 @@ for _ in $(seq 1 180); do
   if ! process_alive "$LLAMA_PID"; then
     BOOTSTRAP_FAILURE_CODE=model_start_failed
     echo '{"event":"startup_failed","reason":"llama_exited"}' >&2
+    # The log lives on tmpfs and dies with the Pod; surface the tail in the
+    # container log so the crash cause is diagnosable. llama-server does not
+    # print the API key, and the model paths are not secrets.
+    tail -n 40 "$STATE_ROOT/llama.log" 2>/dev/null | sed 's/^/llama: /' >&2 || true
     exit 3
   fi
   if python3 /opt/glimmer/docker/runpod/healthcheck.py >/dev/null 2>&1; then
