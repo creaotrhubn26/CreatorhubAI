@@ -488,6 +488,9 @@ export async function sweep(env, nowMs = Date.now()) {
         }
         const reason = terminationReason(lease, pod, nowMs, staleAfterMs);
         if (!reason) continue;
+        // Terminations are silent otherwise; the reason is essential when a
+        // healthy-looking worker vanishes mid-bootstrap.
+        console.warn("[watchdog] terminating pod", pod?.id ?? lease.podId ?? "?", reason);
         const podId = lease.podId ?? pod.id;
         if (!SAFE_ID.test(podId ?? "")) throw new Error("RUNPOD_POD_ID_INVALID");
         result.terminationRequests += 1;
