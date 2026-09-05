@@ -1346,6 +1346,92 @@ export class ComputeController {
     });
   }
 
+  /**
+   * Session access to a coordinator-supervised worker (milestone R3). The
+   * coordinator bootstraps the Pod but never holds the controller-side
+   * handshake material, so the first session on a lease performs the
+   * idempotent worker handshake here and later sessions reuse the stored
+   * capability.
+   */
+  async cloudWorkerSession(): Promise<{
+    leaseId: string;
+    podId: string;
+    capability: string;
+    checkpointKey: string;
+    contextTokens: 65_536 | 131_072;
+    /** Manifests must carry the instance id the worker handshake stored. */
+    controllerInstanceId: string;
+  }> {
+    const lease = await this.dependencies.readLease();
+    if (!lease || lease.orchestrationMode !== "cloud_coordinator" || !lease.coordinatorJobId) {
+      throw new ComputeControlError("Cloud compute is not active for remote sessions", 409);
+    }
+    const config = await this.dependencies.readConfig();
+    const profile = config.profiles.find((candidate) => candidate.id === lease.profileId);
+    if (!profile) {
+      throw new ComputeControlError("Compute profile for the active lease is missing", 409);
+    }
+    const job = await (await this.coordinator()).getJob(lease.coordinatorJobId);
+    if (job.state !== "ready") {
+      throw new ComputeControlError(`Cloud worker is not ready (job state: ${job.state})`, 409);
+    }
+    const podId = job.podId ?? lease.podId;
+    if (!podId) {
+      throw new ComputeControlError("Cloud coordinator has not reported the worker Pod id", 409);
+    }
+    if (lease.podId !== podId) {
+      await this.dependencies.updateLease((current) =>
+        current.id === lease.id ? { ...current, podId } : current,
+      );
+    }
+    const secret = await this.dependencies.readWorkerSecret(lease.id);
+    if (!secret) {
+      throw new ComputeControlError("Worker bootstrap state is missing for the active lease", 409);
+    }
+    if (secret.capability && secret.checkpointKey) {
+      return {
+        leaseId: lease.id,
+        podId,
+        capability: secret.capability,
+        checkpointKey: secret.checkpointKey,
+        contextTokens: profile.contextTokens,
+        controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+      };
+    }
+    if (!secret.bootstrapToken) {
+      throw new ComputeControlError("Worker bootstrap token was already consumed", 409);
+    }
+    const worker = this.dependencies.workerFactory(podId);
+    const handshake = await worker.handshake({
+      bootstrapToken: secret.bootstrapToken,
+      controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+      nonce: secret.controllerNonce,
+      idempotencyKey: secret.handshakeIdempotencyKey,
+    });
+    const rotated = await this.exclusive(async () => {
+      const current = await this.dependencies.readLease();
+      if (!current || current.id !== lease.id) {
+        throw new ComputeControlError("Compute lease changed during the worker handshake", 409);
+      }
+      return this.dependencies.storeWorkerHandshake(
+        lease.id,
+        handshake.capability,
+        handshake.checkpointKey,
+      );
+    });
+    if (!rotated.capability || !rotated.checkpointKey) {
+      throw new ComputeControlError("Worker handshake did not persist a capability", 500);
+    }
+    return {
+      leaseId: lease.id,
+      podId,
+      capability: rotated.capability,
+      checkpointKey: rotated.checkpointKey,
+      contextTokens: profile.contextTokens,
+      controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+    };
+  }
+
   async getStatus(): Promise<ComputeStatus> {
     const config = await this.dependencies.readConfig();
     const lease = await this.dependencies.readLease();

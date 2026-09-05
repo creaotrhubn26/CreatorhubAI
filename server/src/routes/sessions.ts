@@ -49,6 +49,13 @@ import {
   writeDesignContractInput,
 } from "../lib/runner.js";
 import { validateDesignContract } from "../lib/designContract.js";
+import { getComputeController } from "../lib/compute/computeController.js";
+import { WorkerClient, workerBaseUrlForPod } from "../lib/compute/workerClient.js";
+import {
+  packWorkspaceBundle,
+  buildRemoteManifest,
+  runRemoteSession,
+} from "../lib/remoteSessionRun.js";
 import { validateDesignFeedbackUpdate } from "../lib/designFeedback.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
@@ -482,6 +489,76 @@ sessionsRouter.post("/sessions", async (req, res) => {
   res.status(201).json(session);
 });
 
+/**
+ * Milestone R3: run the session on the coordinator-supervised GPU worker.
+ * Returns null when cloud compute is off or not ready, which keeps the local
+ * path authoritative. Throwing here would fail a session that can still run
+ * locally, so unavailability is a routing decision, not an error.
+ */
+async function tryStartRemoteRun(
+  id: string,
+  record: { workspace: string; contract: Parameters<typeof buildArgs>[0] },
+  workspaceStatus: { branch: string; headSha: string },
+  logDir: string,
+): Promise<{ cancel(): void } | null> {
+  let access: Awaited<ReturnType<ReturnType<typeof getComputeController>["cloudWorkerSession"]>>;
+  try {
+    access = await getComputeController().cloudWorkerSession();
+  } catch {
+    return null;
+  }
+  const bundle = await packWorkspaceBundle(record.workspace);
+  const manifest = buildRemoteManifest({
+    instanceId: access.controllerInstanceId,
+    sessionId: id,
+    baselineSha: workspaceStatus.headSha,
+    branch: workspaceStatus.branch,
+    contract: record.contract,
+    contextTokens: access.contextTokens,
+    bundle,
+  });
+  let cancelRequested = false;
+  void runRemoteSession(
+    {
+      worker: new WorkerClient({ baseUrl: workerBaseUrlForPod(access.podId) }),
+      capability: access.capability,
+      checkpointKey: access.checkpointKey,
+      sessionDir: path.join(sessionsDir(), id),
+      logDir,
+    },
+    manifest,
+    bundle.parts,
+    () => cancelRequested,
+  )
+    .then(async (outcome) => {
+      activeRuns.delete(id);
+      await releaseWorkspaceLease(record.workspace, id);
+      await updateGatewayRun(id, (current) => ({
+        ...current,
+        state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+        exitCode: outcome.exitCode,
+        ...(outcome.detail ? { error: outcome.detail } : {}),
+        completedAt: new Date().toISOString(),
+      }));
+    })
+    .catch(async (error) => {
+      activeRuns.delete(id);
+      await releaseWorkspaceLease(record.workspace, id);
+      await updateGatewayRun(id, (current) => ({
+        ...current,
+        state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+        exitCode: null,
+        error: `remote session failed: ${error instanceof Error ? error.message : String(error)}`,
+        completedAt: new Date().toISOString(),
+      }));
+    });
+  return {
+    cancel: () => {
+      cancelRequested = true;
+    },
+  };
+}
+
 sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   if (!isValidSessionId(req.params.id)) return res.status(404).json({ error: "not found" });
   if (activeRuns.has(req.params.id)) return res.status(409).json({ error: "already running" });
@@ -556,6 +633,22 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
       error: "Could not persist the validated design contract; the workspace lease was released.",
     });
   }
+  // Milestone R3: when the coordinator-supervised GPU worker is ready, the
+  // session executes remotely; otherwise the local orchestrator runs as
+  // before. The remote decision is made per run, never persisted.
+  const remoteHandle = await tryStartRemoteRun(req.params.id, record, workspaceStatus, logDir);
+  if (remoteHandle) {
+    activeRuns.set(req.params.id, remoteHandle);
+    await updateGatewayRun(req.params.id, (current) =>
+      current.state === "starting" ? { ...current, state: "running" } : current,
+    );
+    await updateWorkspaceLease(record.workspace, req.params.id, {
+      state: "running",
+      detail: "The remote GPU worker is running this session. Artifacts sync on completion.",
+    });
+    return res.json({ started: true, backend: "runpod_pod" });
+  }
+
   const args = buildArgs(record.contract, record.workspace, req.params.id, designContractPath);
   const handle = runGlimmer(
     logDir,
