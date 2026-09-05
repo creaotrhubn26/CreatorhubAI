@@ -53,3 +53,64 @@ class RemoteContractParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkspacePatchTest(unittest.TestCase):
+    def test_uncommitted_changes_become_a_checkpoint_patch(self):
+        import subprocess
+        import tempfile
+
+        from runpod_worker import WorkerService
+
+        with tempfile.TemporaryDirectory() as scratch:
+            workspace = Path(scratch) / "ws"
+            session = Path(scratch) / "session"
+            workspace.mkdir()
+            session.mkdir()
+            git = lambda *args: subprocess.run(  # noqa: E731
+                ["git", "-C", str(workspace), *args], check=True, capture_output=True
+            )
+            git("init", "-q", "-b", "glimmer/patch-test")
+            (workspace / "a.txt").write_text("one\n")
+            git("add", "-A")
+            git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base")
+            (workspace / "a.txt").write_text("two\n")
+            (workspace / "new.txt").write_text("created\n")
+
+            WorkerService._workspace_patch(object(), workspace, session)
+
+            patch = (session / "workspace-changes.patch").read_bytes().decode()
+            self.assertIn("new.txt", patch)
+            self.assertIn("+two", patch)
+
+    def test_clean_workspace_writes_no_patch(self):
+        import subprocess
+        import tempfile
+
+        from runpod_worker import WorkerService
+
+        with tempfile.TemporaryDirectory() as scratch:
+            workspace = Path(scratch) / "ws"
+            session = Path(scratch) / "session"
+            workspace.mkdir()
+            session.mkdir()
+            subprocess.run(
+                ["git", "-C", str(workspace), "init", "-q"], check=True, capture_output=True
+            )
+            (workspace / "a.txt").write_text("one\n")
+            subprocess.run(
+                ["git", "-C", str(workspace), "add", "-A"], check=True, capture_output=True
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(workspace),
+                    "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "-m", "base",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            WorkerService._workspace_patch(object(), workspace, session)
+
+            self.assertFalse((session / "workspace-changes.patch").exists())

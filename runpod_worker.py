@@ -680,10 +680,41 @@ class WorkerService:
         self._notify_activity("busy")
         return result
 
+    def _workspace_patch(self, workspace: Path, session_dir: Path) -> None:
+        """Persist the run's uncommitted workspace changes as one binary-safe
+        patch inside session_dir so the checkpoint carries the actual work
+        home. The orchestrator restores HEAD to the baseline and leaves the
+        result uncommitted, so `add -A` + diff against HEAD captures edits,
+        new files, and deletions alike. Best effort: a broken git state must
+        not lose the rest of the checkpoint."""
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                timeout=60,
+            )
+            diff = subprocess.run(
+                ["git", "diff", "--binary", "--cached", "HEAD"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                timeout=120,
+            ).stdout
+            if diff.strip():
+                patch_path = session_dir / "workspace-changes.patch"
+                patch_path.write_bytes(diff)
+                patch_path.chmod(0o600)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     def _result_archive(
         self, job_id: str, workspace: Path, session_dir: Path, exit_code: int
     ) -> Path:
         job_dir = self._job_dir(job_id)
+        if session_dir.is_dir() and workspace.is_dir():
+            self._workspace_patch(workspace, session_dir)
         metadata_path = job_dir / "result.json"
         result: Dict[str, Any] = {
             "schemaVersion": 1,

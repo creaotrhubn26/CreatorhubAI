@@ -51,6 +51,21 @@ RUN find /etc/apt/sources.list.d -maxdepth 1 -type f -delete \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git gosu libgomp1 python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
+# Node for remote verification commands (npm test/typecheck). The jammy
+# snapshot only carries Node 12, so the official checksum-pinned binary is
+# installed instead; xz-utils is needed to unpack it.
+ARG NODE_VERSION=22.23.2
+ARG NODE_SHA256=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl xz-utils \
+    && curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+    && rm /tmp/node.tar.xz \
+    && apt-get purge -y curl xz-utils \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
 COPY requirements-runpod.txt /tmp/requirements-runpod.txt
 RUN python3 -m pip install --no-cache-dir --only-binary=:all: --require-hashes \
       -r /tmp/requirements-runpod.txt \
