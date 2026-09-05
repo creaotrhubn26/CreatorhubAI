@@ -417,3 +417,74 @@ describe("resumeRemoteSession", () => {
     await expect(fs.readFile(path.join(sessionDir, "manifest.json"), "utf8")).resolves.toBe("{}");
   });
 });
+
+describe("remote workspace patch apply", () => {
+  const checkpointKey2 = randomBytes(32).toString("base64url");
+
+  async function runWithPatch(patch: Buffer, workspaceMutator?: (ws: string) => Promise<void>) {
+    const workspace = await createWorkspace();
+    const bundle = await packWorkspaceBundle(workspace);
+    const { stdout } = await execFileAsync("git", ["-C", workspace, "rev-parse", "HEAD"]);
+    const baselineSha = stdout.trim();
+    const manifest = buildRemoteManifest({
+      instanceId: "gateway-test",
+      sessionId: "20260905-190000-abcdefabcdef",
+      baselineSha,
+      branch: "glimmer/remote-fixture",
+      contract: CONTRACT,
+      contextTokens: 65_536,
+      bundle,
+    });
+    if (workspaceMutator) await workspaceMutator(workspace);
+    const archive = ustarArchive([
+      { name: "result.json", content: Buffer.from(JSON.stringify({ exitCode: 0 })) },
+      { name: "session/workspace-changes.patch", content: patch },
+    ]);
+    const fake = fakeWorker(archive, checkpointKey2);
+    const outcome = await runRemoteSession(
+      {
+        worker: fake.worker,
+        capability: "C".repeat(43),
+        checkpointKey: checkpointKey2,
+        sessionDir: path.join(scratch, "patch-session"),
+        logDir: path.join(scratch, "patch-logs"),
+        workspace,
+        baselineSha,
+        sleep: async () => {},
+      },
+      manifest,
+      bundle.parts,
+      () => false,
+    );
+    return { outcome, workspace };
+  }
+
+  const PATCH = Buffer.from(
+    [
+      "diff --git a/remote.txt b/remote.txt",
+      "new file mode 100644",
+      "index 0000000..180cf83",
+      "--- /dev/null",
+      "+++ b/remote.txt",
+      "@@ -0,0 +1 @@",
+      "+remote work",
+      "",
+    ].join("\n"),
+  );
+
+  it("applies the remote patch to a clean worktree on the baseline", async () => {
+    const { outcome, workspace } = await runWithPatch(PATCH);
+    expect(outcome.detail).toBeUndefined();
+    await expect(fs.readFile(path.join(workspace, "remote.txt"), "utf8")).resolves.toBe(
+      "remote work\n",
+    );
+  });
+
+  it("keeps the patch unapplied when the worktree has local edits", async () => {
+    const { outcome, workspace } = await runWithPatch(PATCH, async (ws) => {
+      await fs.writeFile(path.join(ws, "README.md"), "# drifted\n");
+    });
+    expect(outcome.detail).toMatch(/local edits/);
+    await expect(fs.access(path.join(workspace, "remote.txt"))).rejects.toThrow();
+  });
+});

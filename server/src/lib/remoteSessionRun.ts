@@ -246,6 +246,10 @@ export interface RemoteSessionDeps {
   checkpointKey: string;
   sessionDir: string;
   logDir: string;
+  /** Local worktree the remote job was packaged from; enables patch apply. */
+  workspace?: string;
+  /** The baseline the patch was produced against. */
+  baselineSha?: string;
   sleep?: (ms: number) => Promise<void>;
   deadlineMs?: number;
 }
@@ -343,5 +347,46 @@ async function superviseRemoteSession(
   } catch {
     // The worker-reported exit code stands when result.json is unavailable.
   }
-  return { state: status.state, exitCode, detail: status.detail };
+  const patchDetail = await applyRemoteWorkspacePatch(deps).catch(
+    (error) => `remote changes were not applied: ${error instanceof Error ? error.message : String(error)}`,
+  );
+  return {
+    state: status.state,
+    exitCode,
+    detail: patchDetail ?? status.detail,
+  };
+}
+
+/**
+ * Lands the remote run's uncommitted work in the local worktree, mirroring a
+ * local run's end state (uncommitted, ready for Diff Review). Refuses to
+ * touch a worktree that moved off the packaged baseline or is dirty — the
+ * patch stays in the session directory for manual application, reported via
+ * the returned detail.
+ */
+async function applyRemoteWorkspacePatch(deps: RemoteSessionDeps): Promise<string | undefined> {
+  const patchPath = path.join(deps.sessionDir, "workspace-changes.patch");
+  try {
+    await fs.access(patchPath);
+  } catch {
+    return undefined;
+  }
+  if (!deps.workspace || !deps.baselineSha) {
+    return "remote changes arrived, but no local worktree was configured to receive them";
+  }
+  const git = (...args: string[]) =>
+    execFileAsync("git", ["-C", deps.workspace as string, ...args], {
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  const head = (await git("rev-parse", "HEAD")).stdout.trim();
+  if (head !== deps.baselineSha) {
+    return `remote changes were not applied: the worktree moved off baseline ${deps.baselineSha.slice(0, 12)} (patch kept at ${patchPath})`;
+  }
+  const dirty = (await git("status", "--porcelain")).stdout.trim();
+  if (dirty) {
+    return `remote changes were not applied: the worktree has local edits (patch kept at ${patchPath})`;
+  }
+  await git("apply", "--check", patchPath);
+  await git("apply", patchPath);
+  return undefined;
 }

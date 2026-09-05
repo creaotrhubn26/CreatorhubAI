@@ -527,6 +527,8 @@ async function tryStartRemoteRun(
       checkpointKey: access.checkpointKey,
       sessionDir: path.join(sessionsDir(), id),
       logDir,
+      workspace: record.workspace,
+      baselineSha: workspaceStatus.headSha,
     },
     manifest,
     bundle.parts,
@@ -571,6 +573,7 @@ async function tryStartRemoteRun(
 async function resumeRemoteRunOnStartup(record: {
   id: string;
   workspace: string;
+  baselineSha?: string;
   remote: NonNullable<Awaited<ReturnType<typeof readGatewayRun>>>["remote"] & object;
 }): Promise<boolean> {
   const remote = record.remote as { jobId: string; podId: string; leaseId: string };
@@ -603,6 +606,8 @@ async function resumeRemoteRunOnStartup(record: {
       checkpointKey: secret.checkpointKey,
       sessionDir: path.join(sessionsDir(), record.id),
       logDir: path.join(gatewayRunLogsDir(), record.id),
+      workspace: record.workspace,
+      ...(record.baselineSha ? { baselineSha: record.baselineSha } : {}),
     },
     remote.jobId,
     () => cancelRequested,

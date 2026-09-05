@@ -404,6 +404,11 @@ export function ActiveSessionScreen() {
         </div>
       )}
       <h1>{session.task}</h1>
+      {session.backend === "runpod_pod" && (
+        <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          Running on cloud GPU compute — artifacts and changes sync home when the run finishes.
+        </p>
+      )}
       <LivenessLine isRunning={isRunning} startedAt={startedAtBase} lastEventAt={lastEventAt} />
       {session.pendingApproval && id && (
         <ApprovalCard
