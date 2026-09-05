@@ -1326,6 +1326,8 @@ export class ComputeCoordinator {
   }
 
   async cleanupCurrent(job, client, config) {
+    // Cleanup deletions must be attributable when diagnosing vanished Pods.
+    console.warn("[coordinator] cleanup deleting pod", job.jobId, job.podId ?? job.podName);
     job.cleanup.requested = true;
     if (!job.podId && job.createAttempted === false) {
       // No provider mutation was attempted, so a Pod cannot exist. Avoid
@@ -1639,6 +1641,7 @@ export class ComputeCoordinator {
     }
     if (!job.podId) throw new Error("POD_ID_MISSING");
     const pod = await client.getPod(job.podId);
+    console.warn("[coordinator] poll", job.jobId, job.podId, pod ? pod.status : "ABSENT");
     if (pod) {
       job.internal.absentPolls = 0;
     }
