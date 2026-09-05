@@ -1639,7 +1639,19 @@ export class ComputeCoordinator {
     }
     if (!job.podId) throw new Error("POD_ID_MISSING");
     const pod = await client.getPod(job.podId);
+    if (pod) {
+      job.internal.absentPolls = 0;
+    }
     if (!pod) {
+      // A single provider 404 can be an API hiccup; only consecutive absent
+      // polls prove the Pod is gone (deletion is confirmed elsewhere).
+      job.internal.absentPolls = (job.internal.absentPolls ?? 0) + 1;
+      if (
+        job.internal.absentPolls < 3 &&
+        !(job.phase === "cache_repair" && job.cache.state === "ready")
+      ) {
+        return;
+      }
       if (job.phase === "cache_repair" && job.cache.state === "ready") {
         await watchdogRequest(
           this.env,
