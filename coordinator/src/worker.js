@@ -777,7 +777,7 @@ async function watchdogRequest(env, config, method, path, body = "") {
     : readBoundedJsonResponse(result, MAX_WATCHDOG_RESPONSE_BYTES);
 }
 
-function watchdogLease(job, now) {
+export function watchdogLease(job, now) {
   const repair = job.phase === "cache_repair";
   const gpuRepair = repair && job.internal.repairAllocation?.kind === "gpu";
   return {
@@ -800,7 +800,7 @@ function watchdogLease(job, now) {
         ? { gpuTypeId: job.internal.repairAllocation.resourceId }
         : repair
           ? {}
-          : { gpuTypeId: job.internal.request.gpuTypeId }),
+          : { gpuTypeId: job.internal.selectedGpuTypeId ?? job.internal.request.gpuTypeId }),
     },
   };
 }
@@ -1467,6 +1467,7 @@ export class ComputeCoordinator {
           if (!(error instanceof RunPodV2Error) || error.code !== "GPU_UNAVAILABLE") throw error;
         }
       }
+      if (chosenGpu !== null) job.internal.selectedGpuTypeId = chosenGpu.id;
       if (chosenGpu === null) {
         throw new RunPodV2Error(
           "GPU_UNAVAILABLE",

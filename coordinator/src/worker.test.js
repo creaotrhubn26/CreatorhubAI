@@ -1,7 +1,7 @@
 import { createHash, createHmac, webcrypto } from "node:crypto";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { RunPodV2Error, RunPodV2TransportError } from "./runpod-v2.js";
-import { ComputeCoordinator } from "./worker.js";
+import { watchdogLease, ComputeCoordinator } from "./worker.js";
 
 const NOW = Date.parse("2026-08-31T12:00:00.000Z");
 const INGEST_TOKEN = "I".repeat(43);
@@ -897,5 +897,28 @@ describe("cache-gated lifecycle", () => {
     });
     expect(posts).toEqual([]);
     expect(await storage.get("active-job")).toBeUndefined();
+  });
+});
+
+describe("watchdog lease GPU expectations", () => {
+  it("carries the actually selected GPU type, not the request's first candidate", () => {
+    const job = {
+      phase: "gpu_worker",
+      currentLeaseId: "lease-1",
+      podName: "glimmer-gpu-job-1",
+      podId: "pod1",
+      currentDeadlineAt: "2026-01-01T01:00:00.000Z",
+      maxHourlyUsd: 1.75,
+      internal: {
+        selectedGpuTypeId: "NVIDIA A100-SXM4-80GB",
+        request: {
+          gpuTypeId: "NVIDIA A100 80GB PCIe",
+          gpuTypeIds: ["NVIDIA A100 80GB PCIe", "NVIDIA A100-SXM4-80GB"],
+          networkVolumeId: "vol1",
+        },
+      },
+    };
+    const lease = watchdogLease(job, "2026-01-01T00:00:00.000Z");
+    expect(lease.expected.gpuTypeId).toBe("NVIDIA A100-SXM4-80GB");
   });
 });
