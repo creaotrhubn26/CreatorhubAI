@@ -4,7 +4,24 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { RemoteJobManifestV1, RemoteJobStatusV1, TaskContract } from "@glimmer/shared";
+import type {
+  RemoteJobManifestV1,
+  RemoteJobStatusV1,
+  RemoteTaskContractV1,
+  TaskContract,
+} from "@glimmer/shared";
+import {
+  CUSTOMER_READINESS_VALUES,
+  MAX_CHANGED_FILES_RANGE,
+  MAX_TURNS_RANGE,
+  MODES,
+  SCOPE_PACKAGES,
+  TIMEOUT_RANGE,
+  TOOLCHAIN_MODES,
+  VERIFICATION_COMMANDS,
+  VISUAL_VERIFICATION,
+  isInRange,
+} from "./runner.js";
 import { RemoteWorkerRunBackend, type RemoteBundlePart } from "./runBackend.js";
 import {
   WorkerClient,
@@ -52,6 +69,67 @@ export async function packWorkspaceBundle(workspace: string): Promise<RemoteBund
   }
 }
 
+/**
+ * Projects the TaskContract onto the closed remote-contract schema with the
+ * same drop-invalid posture as buildArgs: an out-of-set value is omitted,
+ * never forwarded. Verification travels as NAMES; the Pod owns the
+ * name-to-command map, so no command string crosses the wire. The visual
+ * verification name is dropped — it needs a loopback design target that
+ * cannot exist inside the Pod.
+ */
+export function buildRemoteTaskContract(contract: TaskContract): RemoteTaskContractV1 {
+  const remote: RemoteTaskContractV1 = {};
+  if (MODES.has(contract.mode)) remote.mode = contract.mode;
+  const verification = contract.verification.filter(
+    (name) => name !== VISUAL_VERIFICATION && name in VERIFICATION_COMMANDS,
+  );
+  if (verification.length > 0) remote.verification = verification;
+  if (contract.maxTurns !== undefined && isInRange(contract.maxTurns, MAX_TURNS_RANGE)) {
+    remote.maxTurns = contract.maxTurns;
+  }
+  const maxChangedFiles = contract.budgets?.maxChangedFiles;
+  if (maxChangedFiles !== undefined && isInRange(maxChangedFiles, MAX_CHANGED_FILES_RANGE)) {
+    remote.maxChangedFiles = maxChangedFiles;
+  }
+  if (SCOPE_PACKAGES.has(contract.scope.package)) remote.scopePackage = contract.scope.package;
+  const area = contract.scope.area?.trim();
+  if (area && !area.startsWith("-")) remote.scopeArea = area;
+  const paths = (contract.scope.paths ?? [])
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim())
+    .filter((value) => value && !value.startsWith("-"));
+  if (paths.length > 0) remote.scopePaths = paths;
+  if (contract.intent?.kind === "improvement-assessment" || contract.intent?.kind === "direct") {
+    remote.intent = contract.intent.kind;
+    if (
+      contract.intent.source === "explicit" ||
+      contract.intent.source === "deterministic-inference"
+    ) {
+      remote.intentSource = contract.intent.source;
+    }
+  }
+  const toolchainMode = contract.advanced?.toolchainMode;
+  if (toolchainMode !== undefined && TOOLCHAIN_MODES.has(toolchainMode)) {
+    remote.toolchainMode = toolchainMode;
+  }
+  const qualityGates = contract.qualityGates;
+  if (qualityGates) {
+    const gates: NonNullable<RemoteTaskContractV1["qualityGates"]> = {};
+    if (qualityGates.customerReadinessRequired === true) gates.customerReadinessRequired = true;
+    if (
+      qualityGates.minimumCustomerReadiness !== undefined &&
+      CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)
+    ) {
+      gates.minimumCustomerReadiness =
+        qualityGates.minimumCustomerReadiness as NonNullable<
+          RemoteTaskContractV1["qualityGates"]
+        >["minimumCustomerReadiness"];
+    }
+    if (Object.keys(gates).length > 0) remote.qualityGates = gates;
+  }
+  return remote;
+}
+
 export function buildRemoteManifest(input: {
   instanceId: string;
   sessionId: string;
@@ -76,7 +154,11 @@ export function buildRemoteManifest(input: {
     objective: input.contract.objective,
     contextTokens: input.contextTokens,
     maxRepairs: input.contract.repairBudget ?? 0,
-    timeoutSeconds: 3_600,
+    timeoutSeconds:
+      input.contract.advanced?.timeoutSeconds !== undefined &&
+      isInRange(input.contract.advanced.timeoutSeconds, TIMEOUT_RANGE)
+        ? input.contract.advanced.timeoutSeconds
+        : 3_600,
     createdAt: (input.now ?? new Date()).toISOString(),
     input: {
       format: "git_bundle",
@@ -84,6 +166,7 @@ export function buildRemoteManifest(input: {
       bytes: input.bundle.bytes,
       sha256: input.bundle.sha256,
     },
+    contract: buildRemoteTaskContract(input.contract),
   };
 }
 

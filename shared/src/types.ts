@@ -3094,6 +3094,36 @@ export interface RemoteInputV1 {
   sha256: string;
 }
 
+/**
+ * Closed, validated projection of TaskContract for remote execution. The Pod
+ * maps these fields to orchestrator flags with the same drop-invalid posture
+ * as the local buildArgs; unknown keys or out-of-set values are rejected at
+ * the worker boundary. Loopback-bound fields (design/visual URLs) are
+ * deliberately absent — they cannot mean anything inside the Pod.
+ */
+export interface RemoteTaskContractV1 {
+  mode?: "inspect" | "plan" | "implement" | "debug" | "test" | "review" | "refactor";
+  /** Verification NAMES from the gateway's closed set; the Pod owns the name→command map. */
+  verification?: string[];
+  maxTurns?: number;
+  maxChangedFiles?: number;
+  scopePackage?: "repository" | "frontend" | "backend" | "directory" | "files";
+  scopeArea?: string;
+  scopePaths?: string[];
+  intent?: "improvement-assessment" | "direct";
+  intentSource?: "explicit" | "deterministic-inference";
+  toolchainMode?: "path" | "linked" | "none";
+  qualityGates?: {
+    customerReadinessRequired?: boolean;
+    minimumCustomerReadiness?:
+      | "ready_to_ship"
+      | "ready_with_known_limitations"
+      | "needs_polish"
+      | "needs_rework"
+      | "not_customer_ready";
+  };
+}
+
 export interface RemoteJobManifestV1 {
   schemaVersion: 1;
   instanceId: string;
@@ -3108,6 +3138,7 @@ export interface RemoteJobManifestV1 {
   timeoutSeconds: number;
   createdAt: string;
   input: RemoteInputV1;
+  contract?: RemoteTaskContractV1;
 }
 
 export type RemoteJobState =

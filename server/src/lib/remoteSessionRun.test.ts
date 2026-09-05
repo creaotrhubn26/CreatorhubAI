@@ -331,3 +331,45 @@ describe("runRemoteSession", () => {
     expect(fake.calls).toContain("cancel");
   });
 });
+
+describe("buildRemoteTaskContract parity fixture", () => {
+  it("projects every fixture TaskContract onto the recorded wire contract", async () => {
+    const { buildRemoteTaskContract } = await import("./remoteSessionRun.js");
+    const fixture = JSON.parse(
+      await fs.readFile(
+        path.join(__dirname, "..", "..", "..", "fixtures", "task-contract-remote", "cases.json"),
+        "utf8",
+      ),
+    );
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(3);
+    for (const testCase of fixture.cases) {
+      expect(
+        buildRemoteTaskContract(testCase.taskContract as TaskContract),
+        testCase.name,
+      ).toEqual(testCase.contract);
+    }
+  });
+
+  it("embeds the wire contract and bounded timeout in the manifest", async () => {
+    const workspace = await createWorkspace();
+    const bundle = await packWorkspaceBundle(workspace);
+    const manifest = buildRemoteManifest({
+      instanceId: "gateway-test",
+      sessionId: "20260905-190000-abcdefabcdef",
+      baselineSha: "a".repeat(40),
+      branch: "glimmer/remote-fixture",
+      contract: {
+        ...CONTRACT,
+        advanced: { toolchainMode: "none", timeoutSeconds: 900 },
+      } as TaskContract,
+      contextTokens: 65_536,
+      bundle,
+    });
+    expect(manifest.timeoutSeconds).toBe(900);
+    expect(manifest.contract).toEqual({
+      mode: "inspect",
+      scopePackage: "repository",
+      toolchainMode: "none",
+    });
+  });
+});

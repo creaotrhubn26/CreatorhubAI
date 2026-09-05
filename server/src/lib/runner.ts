@@ -9,23 +9,23 @@ import { CONFIG } from "../config.js";
 // (`shlex.split` -> subprocess) with no allowlist on that side, so a free-form
 // pass-through would be an arbitrary-command channel for any network client.
 // Symbolic names come from the composer; only these map to a real command.
-const VERIFICATION_COMMANDS: Record<string, string> = {
+export const VERIFICATION_COMMANDS: Record<string, string> = {
   "frontend-typecheck": "npm --prefix frontend run typecheck",
   "targeted-test": "npm --prefix frontend run test:unit",
 };
-const VISUAL_VERIFICATION = "visual";
+export const VISUAL_VERIFICATION = "visual";
 
 // §7 Advanced controls. Closed enum for toolchainMode — same discipline as
 // VERIFICATION_COMMANDS above: a value outside this set is dropped, never
 // forwarded. Ranges match the route-level 400 boundary in validateAdvanced.
-const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
+export const TOOLCHAIN_MODES = new Set(["path", "linked", "none"] as const);
 // Review round 1 fix: TaskContract.mode was never forwarded to glimmer-v2.py
 // at all (buildArgs had no --mode push), so every gateway-launched run got
 // v2.1's own "implement" default regardless of what the composer/client
 // contract said. Closed set, same defense-in-depth posture as
 // TOOLCHAIN_MODES -- an out-of-range string from a raw API client is
 // dropped, never forwarded.
-const MODES = new Set([
+export const MODES = new Set([
   "inspect",
   "plan",
   "implement",
@@ -44,22 +44,22 @@ const MODES = new Set([
 // the user picked are never named in its prompt. Same closed-set posture as
 // MODES/TOOLCHAIN_MODES -- mirrors glimmer-v2.py's own --scope-package
 // choices, and a value outside it is dropped rather than forwarded.
-const SCOPE_PACKAGES = new Set([
+export const SCOPE_PACKAGES = new Set([
   "repository",
   "frontend",
   "backend",
   "directory",
   "files",
 ] as const);
-const MAX_TURNS_RANGE = { min: 1, max: 64 };
-const TIMEOUT_RANGE = { min: 60, max: 3600 };
+export const MAX_TURNS_RANGE = { min: 1, max: 64 };
+export const TIMEOUT_RANGE = { min: 60, max: 3600 };
 // Task 1.4 (V7 §6): TaskContract.budgets.maxChangedFiles closed range.
-const MAX_CHANGED_FILES_RANGE = { min: 1, max: 500 };
+export const MAX_CHANGED_FILES_RANGE = { min: 1, max: 500 };
 // Task 8.1 (V7 §23.10): closed set for qualityGates.minimumCustomerReadiness,
 // mirroring @glimmer/shared's DeliveryReviewCustomerReadiness union and
 // glimmer-v2.py's CUSTOMER_READINESS_ORDER -- a membership check only, the
 // ORDER itself lives in glimmer-v2.py's own compare_customer_readiness.
-const CUSTOMER_READINESS_VALUES = new Set([
+export const CUSTOMER_READINESS_VALUES = new Set([
   "ready_to_ship",
   "ready_with_known_limitations",
   "needs_polish",
@@ -93,7 +93,7 @@ function isValidLoopbackUrl(value: string): boolean {
   }
 }
 
-function isInRange(n: unknown, range: { min: number; max: number }): n is number {
+export function isInRange(n: unknown, range: { min: number; max: number }): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= range.min && n <= range.max;
 }
 

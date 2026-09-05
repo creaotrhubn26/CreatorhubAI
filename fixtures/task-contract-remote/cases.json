@@ -1,0 +1,150 @@
+{
+  "comment": "Parity fixture for remote contract execution. The gateway asserts taskContract -> contract (wire); the Pod (glimmer-orchestrator-main copy) asserts contract -> expectedArgs. Keep both copies identical.",
+  "cases": [
+    {
+      "name": "inspect-minimal",
+      "taskContract": {
+        "objective": "Inspect the repository.",
+        "scope": { "package": "repository" },
+        "mode": "inspect",
+        "constraints": {
+          "minimalChange": true,
+          "noCommit": true,
+          "noPush": true,
+          "noDeploy": true,
+          "noDependencyInstall": true
+        },
+        "verification": [],
+        "repairBudget": 0,
+        "advanced": { "toolchainMode": "none" }
+      },
+      "contract": {
+        "mode": "inspect",
+        "scopePackage": "repository",
+        "toolchainMode": "none"
+      },
+      "expectedArgs": [
+        "--verification-level",
+        "minimal",
+        "--mode",
+        "inspect",
+        "--scope-package",
+        "repository",
+        "--toolchain-mode",
+        "none"
+      ]
+    },
+    {
+      "name": "implement-full",
+      "taskContract": {
+        "objective": "Implement the fix.",
+        "scope": {
+          "package": "frontend",
+          "area": "src/components",
+          "paths": ["src/components/App.tsx", " src/lib/util.ts "]
+        },
+        "mode": "implement",
+        "intent": { "kind": "direct", "source": "explicit" },
+        "constraints": {
+          "minimalChange": true,
+          "noCommit": true,
+          "noPush": true,
+          "noDeploy": true,
+          "noDependencyInstall": true
+        },
+        "verification": ["frontend-typecheck", "targeted-test", "visual", "unknown-check"],
+        "repairBudget": 2,
+        "maxTurns": 24,
+        "budgets": { "maxChangedFiles": 12 },
+        "advanced": { "toolchainMode": "path", "timeoutSeconds": 900 },
+        "qualityGates": {
+          "customerReadinessRequired": true,
+          "minimumCustomerReadiness": "needs_polish"
+        }
+      },
+      "contract": {
+        "mode": "implement",
+        "verification": ["frontend-typecheck", "targeted-test"],
+        "maxTurns": 24,
+        "maxChangedFiles": 12,
+        "scopePackage": "frontend",
+        "scopeArea": "src/components",
+        "scopePaths": ["src/components/App.tsx", "src/lib/util.ts"],
+        "intent": "direct",
+        "intentSource": "explicit",
+        "toolchainMode": "path",
+        "qualityGates": {
+          "customerReadinessRequired": true,
+          "minimumCustomerReadiness": "needs_polish"
+        }
+      },
+      "expectedArgs": [
+        "--verification-level",
+        "standard",
+        "--verify",
+        "npm --prefix frontend run typecheck",
+        "--verify",
+        "npm --prefix frontend run test:unit",
+        "--max-turns",
+        "24",
+        "--max-changed-files",
+        "12",
+        "--mode",
+        "implement",
+        "--intent",
+        "direct",
+        "--intent-source",
+        "explicit",
+        "--scope-package",
+        "frontend",
+        "--scope-area",
+        "src/components",
+        "--scope-paths",
+        "src/components/App.tsx",
+        "--scope-paths",
+        "src/lib/util.ts",
+        "--toolchain-mode",
+        "path",
+        "--customer-readiness-required",
+        "--minimum-customer-readiness",
+        "needs_polish"
+      ]
+    },
+    {
+      "name": "review-improvement-intent",
+      "taskContract": {
+        "objective": "What can be improved?",
+        "scope": { "package": "backend", "area": "-bad", "paths": ["-x", ""] },
+        "mode": "review",
+        "intent": { "kind": "improvement-assessment", "source": "deterministic-inference" },
+        "constraints": {
+          "minimalChange": true,
+          "noCommit": true,
+          "noPush": true,
+          "noDeploy": true,
+          "noDependencyInstall": true
+        },
+        "verification": [],
+        "repairBudget": 0
+      },
+      "contract": {
+        "mode": "review",
+        "scopePackage": "backend",
+        "intent": "improvement-assessment",
+        "intentSource": "deterministic-inference"
+      },
+      "expectedArgs": [
+        "--verification-level",
+        "minimal",
+        "--mode",
+        "review",
+        "--intent",
+        "improvement-assessment",
+        "--intent-source",
+        "deterministic-inference",
+        "--scope-package",
+        "backend"
+      ]
+    }
+  ]
+}
