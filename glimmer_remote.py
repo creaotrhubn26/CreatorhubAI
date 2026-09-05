@@ -137,6 +137,7 @@ class RemoteJobManifestV1:
     timeout_seconds: int
     created_at: str
     input: RemoteInputV1
+    contract: Optional["RemoteTaskContractV1"] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -153,7 +154,233 @@ class RemoteJobManifestV1:
             "timeoutSeconds": self.timeout_seconds,
             "createdAt": self.created_at,
             "input": self.input.as_dict(),
+            **({"contract": self.contract.as_dict()} if self.contract is not None else {}),
         }
+
+
+
+CONTRACT_MODES = ("inspect", "plan", "implement", "debug", "test", "review", "refactor")
+CONTRACT_SCOPE_PACKAGES = ("repository", "frontend", "backend", "directory", "files")
+CONTRACT_TOOLCHAIN_MODES = ("path", "linked", "none")
+CONTRACT_INTENTS = ("improvement-assessment", "direct")
+CONTRACT_INTENT_SOURCES = ("explicit", "deterministic-inference")
+CONTRACT_READINESS = (
+    "ready_to_ship",
+    "ready_with_known_limitations",
+    "needs_polish",
+    "needs_rework",
+    "not_customer_ready",
+)
+# Mirrors the gateway's closed verification map; NAMES travel in the
+# manifest and the command strings never cross the wire.
+CONTRACT_VERIFICATION_COMMANDS = {
+    "frontend-typecheck": "npm --prefix frontend run typecheck",
+    "targeted-test": "npm --prefix frontend run test:unit",
+}
+
+
+@dataclass(frozen=True)
+class RemoteTaskContractV1:
+    mode: Optional[str] = None
+    verification: tuple = ()
+    max_turns: Optional[int] = None
+    max_changed_files: Optional[int] = None
+    scope_package: Optional[str] = None
+    scope_area: Optional[str] = None
+    scope_paths: tuple = ()
+    intent: Optional[str] = None
+    intent_source: Optional[str] = None
+    toolchain_mode: Optional[str] = None
+    customer_readiness_required: bool = False
+    minimum_customer_readiness: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        if self.mode is not None:
+            result["mode"] = self.mode
+        if self.verification:
+            result["verification"] = list(self.verification)
+        if self.max_turns is not None:
+            result["maxTurns"] = self.max_turns
+        if self.max_changed_files is not None:
+            result["maxChangedFiles"] = self.max_changed_files
+        if self.scope_package is not None:
+            result["scopePackage"] = self.scope_package
+        if self.scope_area is not None:
+            result["scopeArea"] = self.scope_area
+        if self.scope_paths:
+            result["scopePaths"] = list(self.scope_paths)
+        if self.intent is not None:
+            result["intent"] = self.intent
+        if self.intent_source is not None:
+            result["intentSource"] = self.intent_source
+        if self.toolchain_mode is not None:
+            result["toolchainMode"] = self.toolchain_mode
+        gates: Dict[str, Any] = {}
+        if self.customer_readiness_required:
+            gates["customerReadinessRequired"] = True
+        if self.minimum_customer_readiness is not None:
+            gates["minimumCustomerReadiness"] = self.minimum_customer_readiness
+        if gates:
+            result["qualityGates"] = gates
+        return result
+
+
+def _enum(value: Any, allowed: tuple, label: str) -> str:
+    if value not in allowed:
+        raise RemoteContractError(f"{label} is invalid")
+    return value
+
+
+def parse_remote_task_contract(value: Any) -> RemoteTaskContractV1:
+    raw = _require_dict(value, "manifest.contract")
+    _closed_keys(
+        raw,
+        (
+            "mode",
+            "verification",
+            "maxTurns",
+            "maxChangedFiles",
+            "scopePackage",
+            "scopeArea",
+            "scopePaths",
+            "intent",
+            "intentSource",
+            "toolchainMode",
+            "qualityGates",
+        ),
+        "manifest.contract",
+    )
+    verification = raw.get("verification", [])
+    if not isinstance(verification, list) or len(verification) > 16:
+        raise RemoteContractError("manifest.contract.verification is invalid")
+    for name in verification:
+        if name not in CONTRACT_VERIFICATION_COMMANDS:
+            raise RemoteContractError("manifest.contract.verification names an unknown check")
+    scope_paths = raw.get("scopePaths", [])
+    if not isinstance(scope_paths, list) or len(scope_paths) > 64:
+        raise RemoteContractError("manifest.contract.scopePaths is invalid")
+    parsed_paths = []
+    for item in scope_paths:
+        text = _bounded_text(item, "manifest.contract.scopePaths entry", 1024)
+        if text.startswith("-") or ".." in text.split("/"):
+            raise RemoteContractError("manifest.contract.scopePaths entry is invalid")
+        parsed_paths.append(text)
+    scope_area = None
+    if raw.get("scopeArea") is not None:
+        scope_area = _bounded_text(raw.get("scopeArea"), "manifest.contract.scopeArea", 1024)
+        if scope_area.startswith("-"):
+            raise RemoteContractError("manifest.contract.scopeArea is invalid")
+    gates = raw.get("qualityGates")
+    readiness_required = False
+    minimum_readiness = None
+    if gates is not None:
+        gates = _require_dict(gates, "manifest.contract.qualityGates")
+        _closed_keys(
+            gates,
+            ("customerReadinessRequired", "minimumCustomerReadiness"),
+            "manifest.contract.qualityGates",
+        )
+        if "customerReadinessRequired" in gates:
+            if gates["customerReadinessRequired"] is not True:
+                raise RemoteContractError(
+                    "manifest.contract.qualityGates.customerReadinessRequired is invalid"
+                )
+            readiness_required = True
+        if "minimumCustomerReadiness" in gates:
+            minimum_readiness = _enum(
+                gates["minimumCustomerReadiness"],
+                CONTRACT_READINESS,
+                "manifest.contract.qualityGates.minimumCustomerReadiness",
+            )
+    return RemoteTaskContractV1(
+        mode=(
+            _enum(raw["mode"], CONTRACT_MODES, "manifest.contract.mode")
+            if "mode" in raw
+            else None
+        ),
+        verification=tuple(verification),
+        max_turns=(
+            _positive_int(raw["maxTurns"], "manifest.contract.maxTurns", 64, 1)
+            if "maxTurns" in raw
+            else None
+        ),
+        max_changed_files=(
+            _positive_int(raw["maxChangedFiles"], "manifest.contract.maxChangedFiles", 500, 1)
+            if "maxChangedFiles" in raw
+            else None
+        ),
+        scope_package=(
+            _enum(raw["scopePackage"], CONTRACT_SCOPE_PACKAGES, "manifest.contract.scopePackage")
+            if "scopePackage" in raw
+            else None
+        ),
+        scope_area=scope_area,
+        scope_paths=tuple(parsed_paths),
+        intent=(
+            _enum(raw["intent"], CONTRACT_INTENTS, "manifest.contract.intent")
+            if "intent" in raw
+            else None
+        ),
+        intent_source=(
+            _enum(
+                raw["intentSource"],
+                CONTRACT_INTENT_SOURCES,
+                "manifest.contract.intentSource",
+            )
+            if "intentSource" in raw
+            else None
+        ),
+        toolchain_mode=(
+            _enum(
+                raw["toolchainMode"],
+                CONTRACT_TOOLCHAIN_MODES,
+                "manifest.contract.toolchainMode",
+            )
+            if "toolchainMode" in raw
+            else None
+        ),
+        customer_readiness_required=readiness_required,
+        minimum_customer_readiness=minimum_readiness,
+    )
+
+
+def build_contract_args(contract: Optional[RemoteTaskContractV1]) -> list:
+    """Argv fragment for the parsed contract; mirrors the gateway's buildArgs
+    order so fixture parity locks both sides. None keeps today's behavior for
+    manifests from older clients (standard verification, no extra flags)."""
+    if contract is None:
+        return ["--verification-level", "standard"]
+    args = []
+    if not contract.verification:
+        args.extend(["--verification-level", "minimal"])
+    else:
+        args.extend(["--verification-level", "standard"])
+        for name in contract.verification:
+            args.extend(["--verify", CONTRACT_VERIFICATION_COMMANDS[name]])
+    if contract.max_turns is not None:
+        args.extend(["--max-turns", str(contract.max_turns)])
+    if contract.max_changed_files is not None:
+        args.extend(["--max-changed-files", str(contract.max_changed_files)])
+    if contract.mode is not None:
+        args.extend(["--mode", contract.mode])
+    if contract.intent is not None:
+        args.extend(["--intent", contract.intent])
+        if contract.intent_source is not None:
+            args.extend(["--intent-source", contract.intent_source])
+    if contract.scope_package is not None:
+        args.extend(["--scope-package", contract.scope_package])
+    if contract.scope_area is not None:
+        args.extend(["--scope-area", contract.scope_area])
+    for scope_path in contract.scope_paths:
+        args.extend(["--scope-paths", scope_path])
+    if contract.toolchain_mode is not None:
+        args.extend(["--toolchain-mode", contract.toolchain_mode])
+    if contract.customer_readiness_required:
+        args.append("--customer-readiness-required")
+    if contract.minimum_customer_readiness is not None:
+        args.extend(["--minimum-customer-readiness", contract.minimum_customer_readiness])
+    return args
 
 
 def parse_remote_job_manifest(value: Any) -> RemoteJobManifestV1:
@@ -174,6 +401,7 @@ def parse_remote_job_manifest(value: Any) -> RemoteJobManifestV1:
             "timeoutSeconds",
             "createdAt",
             "input",
+            "contract",
         ),
         "manifest",
     )
@@ -227,6 +455,9 @@ def parse_remote_job_manifest(value: Any) -> RemoteJobManifestV1:
         ),
         created_at=_iso8601(raw.get("createdAt"), "manifest.createdAt"),
         input=RemoteInputV1("git_bundle", parts, byte_length, digest),
+        contract=(
+            parse_remote_task_contract(raw["contract"]) if "contract" in raw else None
+        ),
     )
 
 

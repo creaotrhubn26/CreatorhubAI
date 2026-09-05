@@ -26,6 +26,7 @@ PYTHON_FILES := \
 
 RUNPOD_TESTS := \
 	tests.test_glimmer_remote \
+	tests.test_remote_contract \
 	tests.test_bootstrap_status \
 	tests.test_cache_manifest \
 	tests.test_coordinator_callback \
