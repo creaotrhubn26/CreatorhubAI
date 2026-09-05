@@ -256,25 +256,55 @@ export async function runRemoteSession(
   parts: readonly RemoteBundlePart[],
   cancelled: () => boolean,
 ): Promise<RemoteSessionOutcome> {
-  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const backend = new RemoteWorkerRunBackend(deps.worker, deps.capability);
   const handle = await backend.start({ manifest, parts });
-  const deadline = Date.now() + (deps.deadlineMs ?? (manifest.timeoutSeconds + 600) * 1_000);
-  let status = handle.accepted;
+  return superviseRemoteSession(deps, handle.accepted, cancelled, {
+    deadlineMs: deps.deadlineMs ?? (manifest.timeoutSeconds + 600) * 1_000,
+  });
+}
+
+/**
+ * Reattach to a job started before a gateway restart: the Pod kept running,
+ * so supervision resumes from the worker's current status. Used by startup
+ * recovery; the job id equals the session id.
+ */
+export async function resumeRemoteSession(
+  deps: RemoteSessionDeps,
+  jobId: string,
+  cancelled: () => boolean,
+): Promise<RemoteSessionOutcome> {
+  const status = await deps.worker.jobStatus(jobId, deps.capability);
+  return superviseRemoteSession(deps, status, cancelled, {
+    deadlineMs: deps.deadlineMs ?? 2 * 3_600_000,
+  });
+}
+
+async function superviseRemoteSession(
+  deps: RemoteSessionDeps,
+  initial: RemoteJobStatusV1,
+  cancelled: () => boolean,
+  options: { deadlineMs: number },
+): Promise<RemoteSessionOutcome> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const jobId = initial.jobId;
+  const deadline = Date.now() + options.deadlineMs;
+  let status = initial;
   let cancelRequested = false;
+  const requestCancel = () =>
+    deps.worker.cancelJob(jobId, deps.capability, `${jobId}:cancel`).catch(() => undefined);
   for (;;) {
     if (TERMINAL_STATES.has(status.state)) break;
     if (Date.now() > deadline) {
-      await handle.cancel().catch(() => undefined);
+      await requestCancel();
       return { state: "interrupted", exitCode: null, detail: "remote job deadline elapsed" };
     }
     if (!cancelRequested && cancelled()) {
       cancelRequested = true;
-      await handle.cancel().catch(() => undefined);
+      await requestCancel();
     }
     await sleep(POLL_INTERVAL_MS);
     try {
-      status = await handle.status();
+      status = await deps.worker.jobStatus(jobId, deps.capability);
     } catch {
       // Transient proxy failures must not kill a running remote job.
     }

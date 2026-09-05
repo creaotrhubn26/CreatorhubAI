@@ -55,7 +55,9 @@ import {
   packWorkspaceBundle,
   buildRemoteManifest,
   runRemoteSession,
+  resumeRemoteSession,
 } from "../lib/remoteSessionRun.js";
+import { readWorkerSecret } from "../lib/compute/workerSecretStore.js";
 import { validateDesignFeedbackUpdate } from "../lib/designFeedback.js";
 import { computeRiskScore, computeScopeGuard } from "../lib/repoAnalysis.js";
 import { findRepoMap } from "./repository.js";
@@ -500,7 +502,7 @@ async function tryStartRemoteRun(
   record: { workspace: string; contract: Parameters<typeof buildArgs>[0] },
   workspaceStatus: { branch: string; headSha: string },
   logDir: string,
-): Promise<{ cancel(): void } | null> {
+): Promise<{ cancel(): void; remote: { jobId: string; podId: string; leaseId: string } } | null> {
   let access: Awaited<ReturnType<ReturnType<typeof getComputeController>["cloudWorkerSession"]>>;
   try {
     access = await getComputeController().cloudWorkerSession();
@@ -556,7 +558,68 @@ async function tryStartRemoteRun(
     cancel: () => {
       cancelRequested = true;
     },
+    remote: { jobId: id, podId: access.podId, leaseId: access.leaseId },
   };
+}
+
+/**
+ * Startup recovery for remote runs: the Pod and worker outlive a gateway
+ * restart, so supervision reattaches through the stored capability instead of
+ * declaring the session interrupted. Missing worker state (lease already
+ * cleaned) ends the record honestly instead of leaving it running forever.
+ */
+async function resumeRemoteRunOnStartup(record: {
+  id: string;
+  workspace: string;
+  remote: NonNullable<Awaited<ReturnType<typeof readGatewayRun>>>["remote"] & object;
+}): Promise<boolean> {
+  const remote = record.remote as { jobId: string; podId: string; leaseId: string };
+  const secret = await readWorkerSecret(remote.leaseId).catch(() => null);
+  const finalizeFailure = async (error: unknown) => {
+    activeRuns.delete(record.id);
+    await releaseWorkspaceLease(record.workspace, record.id);
+    await updateGatewayRun(record.id, (current) => ({
+      ...current,
+      state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+      exitCode: null,
+      error: `remote session was not recovered: ${error instanceof Error ? error.message : String(error)}`,
+      completedAt: new Date().toISOString(),
+    }));
+  };
+  if (!secret?.capability || !secret.checkpointKey) {
+    await finalizeFailure(new Error("worker authentication state is gone"));
+    return false;
+  }
+  let cancelRequested = false;
+  activeRuns.set(record.id, {
+    cancel: () => {
+      cancelRequested = true;
+    },
+  });
+  void resumeRemoteSession(
+    {
+      worker: new WorkerClient({ baseUrl: workerBaseUrlForPod(remote.podId) }),
+      capability: secret.capability,
+      checkpointKey: secret.checkpointKey,
+      sessionDir: path.join(sessionsDir(), record.id),
+      logDir: path.join(gatewayRunLogsDir(), record.id),
+    },
+    remote.jobId,
+    () => cancelRequested,
+  )
+    .then(async (outcome) => {
+      activeRuns.delete(record.id);
+      await releaseWorkspaceLease(record.workspace, record.id);
+      await updateGatewayRun(record.id, (current) => ({
+        ...current,
+        state: current.state === "cancel_requested" ? "cancel_requested" : "exited",
+        exitCode: outcome.exitCode,
+        ...(outcome.detail ? { error: outcome.detail } : {}),
+        completedAt: new Date().toISOString(),
+      }));
+    })
+    .catch(finalizeFailure);
+  return true;
 }
 
 sessionsRouter.post("/sessions/:id/run", async (req, res) => {
@@ -640,7 +703,9 @@ sessionsRouter.post("/sessions/:id/run", async (req, res) => {
   if (remoteHandle) {
     activeRuns.set(req.params.id, remoteHandle);
     await updateGatewayRun(req.params.id, (current) =>
-      current.state === "starting" ? { ...current, state: "running" } : current,
+      current.state === "starting"
+        ? { ...current, state: "running", remote: remoteHandle.remote }
+        : current,
     );
     await updateWorkspaceLease(record.workspace, req.params.id, {
       state: "running",
@@ -753,6 +818,22 @@ export async function reconcileActiveRunsOnStartup(): Promise<{
   for (const id of await listGatewayRunIds()) {
     const record = await readGatewayRun(id);
     if (!record || (record.state !== "running" && record.state !== "starting")) continue;
+
+    if (record.remote) {
+      await acquireWorkspaceLease(record.workspace, record.id).catch((error) => {
+        if (!(error instanceof WorkspaceLeaseConflictError)) throw error;
+      });
+      if (await resumeRemoteRunOnStartup(record as never)) {
+        await updateWorkspaceLease(record.workspace, record.id, {
+          state: "running",
+          detail: "Re-attached after the gateway restarted; the remote worker kept running.",
+        });
+        result.reattached += 1;
+      } else {
+        result.completed += 1;
+      }
+      continue;
+    }
 
     if (await isRecordedProcessAlive(record)) {
       await acquireWorkspaceLease(record.workspace, record.id).catch((error) => {

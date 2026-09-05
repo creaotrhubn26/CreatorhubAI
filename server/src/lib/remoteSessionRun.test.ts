@@ -7,7 +7,12 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RemoteJobStatusV1, TaskContract } from "@glimmer/shared";
 import { canonicalJsonBytes } from "./compute/workerClient.js";
-import { buildRemoteManifest, packWorkspaceBundle, runRemoteSession } from "./remoteSessionRun.js";
+import {
+  buildRemoteManifest,
+  packWorkspaceBundle,
+  resumeRemoteSession,
+  runRemoteSession,
+} from "./remoteSessionRun.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -371,5 +376,44 @@ describe("buildRemoteTaskContract parity fixture", () => {
       scopePackage: "repository",
       toolchainMode: "none",
     });
+  });
+});
+
+describe("resumeRemoteSession", () => {
+  it("reattaches to a finished job and lands the same artifacts", async () => {
+    const checkpointKey = randomBytes(32).toString("base64url");
+    const workspace = await createWorkspace();
+    const bundle = await packWorkspaceBundle(workspace);
+    const manifest = buildRemoteManifest({
+      instanceId: "gateway-test",
+      sessionId: "20260905-190000-abcdefabcdef",
+      baselineSha: "a".repeat(40),
+      branch: "glimmer/remote-fixture",
+      contract: CONTRACT,
+      contextTokens: 65_536,
+      bundle,
+    });
+    const archive = ustarArchive([
+      { name: "result.json", content: Buffer.from(JSON.stringify({ exitCode: 0 })) },
+      { name: "session/manifest.json", content: Buffer.from("{}") },
+    ]);
+    const fake = fakeWorker(archive, checkpointKey);
+    await fake.worker.createJob(manifest);
+    const sessionDir = path.join(scratch, "resumed-session");
+    const outcome = await resumeRemoteSession(
+      {
+        worker: fake.worker,
+        capability: "C".repeat(43),
+        checkpointKey,
+        sessionDir,
+        logDir: path.join(scratch, "resumed-logs"),
+        sleep: async () => {},
+      },
+      manifest.jobId,
+      () => false,
+    );
+    expect(outcome.state).toBe("succeeded");
+    expect(outcome.exitCode).toBe(0);
+    await expect(fs.readFile(path.join(sessionDir, "manifest.json"), "utf8")).resolves.toBe("{}");
   });
 });

@@ -915,6 +915,7 @@ export async function readSession(
   const taskContract = await readGatewayContract(real);
   if (!session.taskContract && taskContract) session = { ...session, taskContract };
   const gatewayRun = await readGatewayRun(real);
+  if (gatewayRun?.remote) session = { ...session, backend: "runpod_pod" };
   // The gateway-owned interruption record is newer than an in-flight
   // manifest left behind by a killed orchestrator. Merge it instead of
   // returning the stale pre-crash status with no recovery controls.

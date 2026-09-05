@@ -547,6 +547,8 @@ export interface GlimmerSession {
   task: string;
   taskContract?: TaskContract;
   status: GlimmerSessionStatus;
+  /** Where the run executes; absent means the historical local default. */
+  backend?: "local_process" | "runpod_pod";
   workspace: string;
   branch: string;
   baselineSha: string;

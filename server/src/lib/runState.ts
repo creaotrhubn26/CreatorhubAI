@@ -35,6 +35,8 @@ export interface GatewayRunRecord {
   updatedAt?: string;
   heartbeatAt?: string;
   recovery?: NonNullable<GlimmerSession["recovery"]>;
+  /** Present when the run executes on the coordinator-supervised GPU worker. */
+  remote?: { jobId: string; podId: string; leaseId: string };
 }
 
 const updateQueues = new Map<string, Promise<unknown>>();
@@ -273,6 +275,7 @@ export function gatewayRunToSession(record: GatewayRunRecord): GlimmerSession {
     task: record.contract.objective,
     taskContract: record.contract,
     status,
+    ...(record.remote ? { backend: "runpod_pod" as const } : {}),
     workspace: record.workspace,
     branch: record.branch ?? "Unavailable",
     baselineSha: record.baselineSha ?? "Unavailable",
