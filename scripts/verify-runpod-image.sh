@@ -33,7 +33,7 @@ expected_packages = {
     "cffi": "2.1.1",
     "pycparser": "3.0",
     "typing-extensions": "4.16.0",
-    "tree-sitter": "0.26.0",
+    "tree-sitter": "0.25.2",
     "tree-sitter-python": "0.25.0",
     "tree-sitter-javascript": "0.25.0",
     "tree-sitter-typescript": "0.23.2",
@@ -79,5 +79,5 @@ if [ -n "$EXPECTED_BUILD_ID" ]; then
   test "$BUILD_ID" = "$EXPECTED_BUILD_ID"
 fi
 docker run --rm --platform linux/amd64 --entrypoint python3 "$IMAGE" \
-  -c 'from importlib.metadata import version; from tree_sitter import Language, Parser; import cryptography, glimmer_remote, runpod_worker, tree_sitter_javascript, tree_sitter_python, tree_sitter_rust, tree_sitter_typescript; from docker.runpod import bootstrap_status, cache_manifest, coordinator_callback; assert bootstrap_status.STATUS_SCHEMA_VERSION == 1; assert cache_manifest.CACHE_SCHEMA_VERSION == 1; assert coordinator_callback.MAX_MANIFEST_BYTES == 16384; assert cryptography.__version__ == "49.0.0"; assert {name: version(name) for name in ("typing-extensions", "tree-sitter", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-rust")} == {"typing-extensions":"4.16.0", "tree-sitter":"0.26.0", "tree-sitter-python":"0.25.0", "tree-sitter-javascript":"0.25.0", "tree-sitter-typescript":"0.23.2", "tree-sitter-rust":"0.24.2"}; samples=((tree_sitter_python.language,b"x = 1\n"),(tree_sitter_javascript.language,b"const x = 1;"),(tree_sitter_typescript.language_typescript,b"const x: number = 1;"),(tree_sitter_typescript.language_tsx,b"const x = <div />;"),(tree_sitter_rust.language,b"fn main() {}")); assert all(not Parser(Language(grammar())).parse(source).root_node.has_error for grammar, source in samples)'
+  -c 'from importlib.metadata import version; from tree_sitter import Language, Parser; import cryptography, glimmer_remote, runpod_worker, tree_sitter_javascript, tree_sitter_python, tree_sitter_rust, tree_sitter_typescript; from docker.runpod import bootstrap_status, cache_manifest, coordinator_callback; assert bootstrap_status.STATUS_SCHEMA_VERSION == 1; assert cache_manifest.CACHE_SCHEMA_VERSION == 1; assert coordinator_callback.MAX_MANIFEST_BYTES == 16384; assert cryptography.__version__ == "49.0.0"; assert {name: version(name) for name in ("typing-extensions", "tree-sitter", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript", "tree-sitter-rust")} == {"typing-extensions":"4.16.0", "tree-sitter":"0.25.2", "tree-sitter-python":"0.25.0", "tree-sitter-javascript":"0.25.0", "tree-sitter-typescript":"0.23.2", "tree-sitter-rust":"0.24.2"}; samples=((tree_sitter_python.language,b"x = 1\n"),(tree_sitter_javascript.language,b"const x = 1;"),(tree_sitter_typescript.language_typescript,b"const x: number = 1;"),(tree_sitter_typescript.language_tsx,b"const x = <div />;"),(tree_sitter_rust.language,b"fn main() {}")); assert all(not Parser(Language(grammar())).parse(source).root_node.has_error for grammar, source in samples)'
 echo "RunPod image runtime check: PASS"
