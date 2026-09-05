@@ -1,6 +1,7 @@
 import {
   RunPodV2Client,
   RunPodV2Error,
+  RunPodV2HttpError,
   buildCpuCachePodRequest,
   buildGpuCachePodRequest,
   buildGpuWorkerPodRequest,
@@ -1662,6 +1663,11 @@ export class ComputeCoordinator {
             : error instanceof Error
               ? error.message
               : "COORDINATOR_FAILURE";
+        // Name the failing provider operation and HTTP status; the generic
+        // code alone (for example RUNPOD_HTTP_ERROR) is undiagnosable.
+        if (error instanceof RunPodV2HttpError) {
+          job.failureDetail = [`${error.operation}:HTTP_${error.status}`];
+        }
         job.internal.terminalTarget = "failed";
         job.state = "terminating";
       }
