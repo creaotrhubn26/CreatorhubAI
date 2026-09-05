@@ -11,6 +11,7 @@ import {
 
 const PRIMARY_COORDINATOR = "primary";
 const ACTIVE_JOB_KEY = "active-job";
+const LAST_JOB_KEY = "last-job";
 const JOB_PREFIX = "job:";
 const CACHE_PREFIX = "cache:";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -963,6 +964,7 @@ export class ComputeCoordinator {
       watchdogReady = false;
     }
     const activeJobId = (await this.storage.get(ACTIVE_JOB_KEY)) ?? null;
+    const lastJobId = (await this.storage.get(LAST_JOB_KEY)) ?? null;
     return {
       service: "glimmer-compute-coordinator",
       schemaVersion: 1,
@@ -971,6 +973,9 @@ export class ComputeCoordinator {
       providerApiVersion: "rest-v1+catalog-v2",
       watchdogReady,
       activeJobId,
+      // Most recently created job, terminal ones included, so an operator can
+      // fetch its failure diagnostics after the gateway clears its lease.
+      lastJobId,
       // Hostname only (no path/token): lets an operator confirm which callback
       // origin live Pods are actually configured with, since a Durable Object
       // can outlive a secret rotation on an older deployment version.
@@ -1053,6 +1058,7 @@ export class ComputeCoordinator {
       },
     };
     await this.storage.put(ACTIVE_JOB_KEY, jobId);
+    await this.storage.put(LAST_JOB_KEY, jobId);
     await this.putJob(job);
     await this.schedule();
     return response(publicJob(job), 202);

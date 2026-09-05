@@ -254,7 +254,7 @@ export function parseCoordinatorStatus(value: unknown): ComputeCoordinatorTestRe
     ],
     // Operator diagnostic added 2026-09-04: the callback hostname live Pods
     // are configured with.
-    ["callbackHost"],
+    ["callbackHost", "lastJobId"],
   );
   const signing = object(raw.cacheSigning);
   exactKeys(signing, ["algorithm", "keyId", "publicKey"]);
