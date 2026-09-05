@@ -26,6 +26,7 @@ RUN cd /src/llama.cpp \
     && git apply /tmp/mcp-permissions.patch \
     && cmake -S . -B build -G Ninja \
         -DGGML_CUDA=ON \
+        -DGGML_NATIVE=OFF \
         -DLLAMA_CURL=OFF \
         -DLLAMA_BUILD_SERVER=ON \
         -DLLAMA_BUILD_TESTS=OFF \
