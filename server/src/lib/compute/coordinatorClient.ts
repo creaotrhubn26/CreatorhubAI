@@ -237,16 +237,22 @@ export function coordinatorRequestSignature(
 
 export function parseCoordinatorStatus(value: unknown): ComputeCoordinatorTestResult {
   const raw = object(value);
-  exactKeys(raw, [
-    "service",
-    "schemaVersion",
-    "ready",
-    "checkedAt",
-    "providerApiVersion",
-    "watchdogReady",
-    "activeJobId",
-    "cacheSigning",
-  ]);
+  exactOptionalKeys(
+    raw,
+    [
+      "service",
+      "schemaVersion",
+      "ready",
+      "checkedAt",
+      "providerApiVersion",
+      "watchdogReady",
+      "activeJobId",
+      "cacheSigning",
+    ],
+    // Operator diagnostic added 2026-09-04: the callback hostname live Pods
+    // are configured with.
+    ["callbackHost"],
+  );
   const signing = object(raw.cacheSigning);
   exactKeys(signing, ["algorithm", "keyId", "publicKey"]);
   if (
@@ -309,6 +315,8 @@ export function parseCoordinatorJob(value: unknown): ComputeCoordinatorJobV1 {
     "repairJobId",
     "waitingReason",
     "failureCode",
+    // Bounded diagnostic event lines sampled from a failed cache Pod.
+    "failureDetail",
   ]);
   const cache = object(raw.cache);
   const cacheProgress =
