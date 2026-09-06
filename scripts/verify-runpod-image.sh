@@ -20,7 +20,7 @@ requirements = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 digest = re.compile(r"^[^\s]+@sha256:[a-f0-9]{64}$")
 assert lock["schemaVersion"] == 1
 assert lock["platform"] == "linux/amd64"
-assert lock["ubuntuSnapshot"] == "20260828T000000Z"
+assert lock["ubuntuSnapshot"] == "20260905T000000Z"
 assert digest.fullmatch(lock["buildBase"])
 assert digest.fullmatch(lock["runtimeBase"])
 assert re.fullmatch(r"[a-f0-9]{40}", lock["llamaCppCommit"])
@@ -46,7 +46,7 @@ for package, version in expected_packages.items():
 assert "COPY ." not in dockerfile
 assert "GLIMMER_WORKER_BOOTSTRAP_TOKEN" not in dockerfile
 snapshot = pathlib.Path("docker/runpod/jammy-snapshot.sources.list").read_text(encoding="utf-8")
-assert snapshot.count("20260828T000000Z") == 3
+assert snapshot.count("20260905T000000Z") == 3
 assert "jammy-security" in snapshot
 print("RunPod image contract: PASS")
 PY

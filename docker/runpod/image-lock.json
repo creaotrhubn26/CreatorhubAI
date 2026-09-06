@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "platform": "linux/amd64",
   "cuda": "12.4.1",
-  "ubuntuSnapshot": "20260828T000000Z",
+  "ubuntuSnapshot": "20260905T000000Z",
   "buildBase": "nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749",
   "runtimeBase": "nvidia/cuda:12.4.1-runtime-ubuntu22.04@sha256:cff3a0d82d2c2b47bab252d67fa9b34a20ef4c50781d98501b5c7367ea9afd10",
   "llamaCppRepository": "https://github.com/ggml-org/llama.cpp.git",
