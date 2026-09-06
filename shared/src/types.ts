@@ -2772,6 +2772,7 @@ export type RunPodGpuTypeId =
   | "NVIDIA A100-SXM4-80GB"
   | "NVIDIA H100 PCIe"
   | "NVIDIA H100 80GB HBM3"
+  | "NVIDIA L40S"
   | "NVIDIA RTX PRO 6000 Blackwell Server Edition";
 
 export interface ComputeArtifactV1 {

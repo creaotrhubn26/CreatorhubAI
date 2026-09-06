@@ -37,10 +37,13 @@ export const RUNPOD_H100_GPU_IDS: RunPodGpuTypeId[] = ["NVIDIA H100 PCIe", "NVID
 export const RUNPOD_RTX_PRO_GPU_IDS: RunPodGpuTypeId[] = [
   "NVIDIA RTX PRO 6000 Blackwell Server Edition",
 ];
+/** 48GB Ada economy option; fits the 65k-context model stack when tested. */
+export const RUNPOD_L40S_GPU_IDS: RunPodGpuTypeId[] = ["NVIDIA L40S"];
 const RUNPOD_GPU_IDS = new Set<RunPodGpuTypeId>([
   ...RUNPOD_A100_GPU_IDS,
   ...RUNPOD_H100_GPU_IDS,
   ...RUNPOD_RTX_PRO_GPU_IDS,
+  ...RUNPOD_L40S_GPU_IDS,
 ]);
 
 type StoredComputeProfile = ComputeProfileUpdateV1;
@@ -261,7 +264,15 @@ async function readStoredConfig(): Promise<{
 }> {
   try {
     const parsed = JSON.parse(await fs.readFile(CONFIG.computeConfigPath, "utf8"));
-    if (isStoredConfig(parsed)) {
+    const accepted = isStoredConfig(parsed);
+    if (!accepted) {
+      // A malformed saved config silently degrading to defaults loses the
+      // coordinator credentials and GPU list with no trace; say so loudly.
+      console.error(
+        `[compute] stored config at ${CONFIG.computeConfigPath} failed validation; using defaults`,
+      );
+    }
+    if (accepted) {
       return {
         config: {
           ...parsed,
