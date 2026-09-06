@@ -72,7 +72,11 @@ describe("compute diagnostic store", () => {
     await expect(readLastComputeDiagnostic(file)).rejects.toThrow(/unsafe/);
     await fs.unlink(file);
 
-    await fs.writeFile(file, JSON.stringify(diagnostic), { mode: 0o644 });
+    // chmod, not writeFile's mode option: the latter is masked by the
+    // process umask (a hardened 077 umask silently turns 0644 into 0600 and
+    // the "broad permissions" case never exists — seen on the GPU worker).
+    await fs.writeFile(file, JSON.stringify(diagnostic));
+    await fs.chmod(file, 0o644);
     await expect(readLastComputeDiagnostic(file)).rejects.toThrow(/unsafe/);
     await fs.chmod(file, 0o600);
     await fs.writeFile(file, "x".repeat(64 * 1024 + 1), "utf8");
