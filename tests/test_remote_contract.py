@@ -114,3 +114,70 @@ class WorkspacePatchTest(unittest.TestCase):
             WorkerService._workspace_patch(object(), workspace, session)
 
             self.assertFalse((session / "workspace-changes.patch").exists())
+
+
+class VerificationDependencyInstallTest(unittest.TestCase):
+    def _runner(self):
+        from runpod_worker import ProcessJobRunner
+
+        return ProcessJobRunner.__new__(ProcessJobRunner)
+
+    def _manifest(self, verification):
+        contract = parse_remote_task_contract(
+            {"verification": verification} if verification else {}
+        )
+
+        class Manifest:
+            pass
+
+        manifest = Manifest()
+        manifest.contract = contract
+        return manifest
+
+    def test_installs_from_each_committed_lockfile_with_fake_npm(self):
+        import os
+        import stat
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            workspace = Path(scratch) / "ws"
+            (workspace / "frontend").mkdir(parents=True)
+            (workspace / "package-lock.json").write_text("{}")
+            (workspace / "frontend" / "package-lock.json").write_text("{}")
+            fake_bin = Path(scratch) / "bin"
+            fake_bin.mkdir()
+            marker = Path(scratch) / "calls.log"
+            npm = fake_bin / "npm"
+            npm.write_text(f'#!/bin/sh\necho "$PWD $@" >> {marker}\n')
+            npm.chmod(npm.stat().st_mode | stat.S_IEXEC)
+            log = open(Path(scratch) / "log", "ab", buffering=0)
+            previous = os.environ["PATH"]
+            os.environ["PATH"] = f"{fake_bin}:{previous}"
+            try:
+                self._runner()._install_verification_dependencies(
+                    workspace, self._manifest(["frontend-typecheck"]), log
+                )
+            finally:
+                os.environ["PATH"] = previous
+                log.close()
+            calls = marker.read_text().strip().splitlines()
+            self.assertEqual(len(calls), 2)
+            self.assertIn("ci --no-audit --no-fund", calls[0])
+            self.assertTrue(calls[1].split(" ")[0].endswith("/frontend"))
+
+    def test_skips_install_without_verification(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            workspace = Path(scratch) / "ws"
+            workspace.mkdir()
+            (workspace / "package-lock.json").write_text("{}")
+            log = open(Path(scratch) / "log", "ab", buffering=0)
+            try:
+                # No npm on PATH needed: the guard returns before any spawn.
+                self._runner()._install_verification_dependencies(
+                    workspace, self._manifest([]), log
+                )
+            finally:
+                log.close()
+            self.assertEqual((Path(scratch) / "log").read_bytes(), b"")

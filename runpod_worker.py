@@ -203,6 +203,56 @@ class ProcessJobRunner:
         )
         return workspace
 
+    def _install_verification_dependencies(
+        self, workspace: Path, manifest: RemoteJobManifestV1, log_handle
+    ) -> None:
+        """Contract verification runs npm scripts, which need node_modules in
+        the Pod's disposable workspace. Install from the committed lockfiles
+        (closed set: repo root and frontend/) with the npm cache on the
+        network volume so repeat runs cost seconds. Best effort by design: a
+        failed install must not kill the run — verification then reports the
+        infrastructure gap honestly instead of the job dying here.
+        The contract's noDependencyInstall protects the user's machine; this
+        workspace is a Pod-local clone that never leaves the job directory."""
+        contract = manifest.contract
+        if contract is None or not contract.verification:
+            return
+        cache_dir = Path("/workspace/npm-cache")
+        try:
+            cache_dir.mkdir(mode=0o770, exist_ok=True)
+        except OSError:
+            cache_dir = workspace / ".npm-cache"
+            cache_dir.mkdir(mode=0o700, exist_ok=True)
+        for prefix in (workspace, workspace / "frontend"):
+            if not (prefix / "package-lock.json").is_file():
+                continue
+            log_handle.write(
+                f"[worker] npm ci in {prefix.name or 'workspace root'}\n".encode()
+            )
+            try:
+                subprocess.run(
+                    ["npm", "ci", "--no-audit", "--no-fund"],
+                    cwd=prefix,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env={
+                        **os.environ,
+                        "npm_config_cache": str(cache_dir),
+                        "HOME": str(workspace),
+                    },
+                    timeout=600,
+                    check=True,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                log_handle.write(
+                    f"[worker] npm ci failed in {prefix}: {exc}\n".encode()
+                )
+                print(
+                    json.dumps({"event": "deps_install_failed", "prefix": prefix.name}),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
     def start(
         self,
         job_dir: Path,
@@ -216,6 +266,7 @@ class ProcessJobRunner:
         # into the checkpoint under session/ explicitly.
         log_path = job_dir / "orchestrator.log"
         log_handle = open(log_path, "ab", buffering=0)
+        self._install_verification_dependencies(workspace, manifest, log_handle)
         orchestrator = self.orchestrator_root / "glimmer-v2.py"
         if not orchestrator.is_file():
             log_handle.close()
