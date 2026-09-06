@@ -249,6 +249,23 @@ export function NewTaskScreen() {
     retry: false,
   });
 
+  // Where the run will execute: when the coordinator-supervised GPU worker
+  // is ready (or coming up), the gateway routes this session remotely; the
+  // composer says so up front instead of the user discovering it mid-run.
+  const computeStatus = useQuery({
+    queryKey: ["compute-status"],
+    queryFn: () => glimmerApi.getComputeStatus(),
+    retry: false,
+    refetchInterval: 15_000,
+  });
+  const computeState = computeStatus.data?.state;
+  const remoteExecutionLine =
+    computeState === "ready"
+      ? "Cloud GPU worker is ready — this task will run remotely."
+      : computeState === "provisioning" || computeState === "bootstrapping"
+        ? "Cloud GPU worker is starting — the task runs remotely once it is ready, locally otherwise."
+        : null;
+
   // §27/§4.1 — "New worktree" affordance: cuts a fresh git worktree+branch
   // off the source repo and adopts it as the workspace path above, the same
   // field POST /sessions already reads. Fetch can take ~10s+ (git fetch
@@ -653,6 +670,11 @@ export function NewTaskScreen() {
 
       <div className="composer__runbar">
         <p className="composer__summary">{buildSummaryLine(form)}</p>
+        {remoteExecutionLine && (
+          <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            {remoteExecutionLine}
+          </p>
+        )}
         {buildArchitectRiskLine(form) && (
           <p className="composer__architect-risk">{buildArchitectRiskLine(form)}</p>
         )}
