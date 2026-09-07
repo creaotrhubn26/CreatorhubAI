@@ -76,15 +76,38 @@ function computeUpdate(enabled) {
   };
 }
 
-let app = spawn(APP, [], {
-  stdio: ["ignore", "pipe", "pipe"],
-  env: { ...process.env, GLIMMER_INSTANCE_ID: instanceId, GLIMMER_CAPABILITY_TOKEN: capability },
-});
+// Attach to an already-running app instead of racing it for the gateway
+// port: a user's open app and a driver-spawned one collide (one gateway
+// shuts the other's session down mid-run). Attach reuses the live gateway;
+// spawn happens only when nothing is listening.
+async function gatewayAlive() {
+  try {
+    const response = await fetch(`${BASE}/api/ready`, { headers: { Origin: ORIGIN } });
+    return response.ok || response.status === 503;
+  } catch {
+    return false;
+  }
+}
+
+let app = null;
 let appOut = "";
-app.stdout.on("data", (d) => (appOut += d));
-app.stderr.on("data", (d) => (appOut += d));
 let exitCode = 1;
+let originalEnabled = false;
 try {
+  const attached = await gatewayAlive();
+  if (attached && KILL_MID_RUN) {
+    throw new Error(
+      "--kill-mid-run needs to own the app process; quit the running app first",
+    );
+  }
+  if (!attached) {
+    app = spawn(APP, [], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GLIMMER_INSTANCE_ID: instanceId, GLIMMER_CAPABILITY_TOKEN: capability },
+    });
+    app.stdout.on("data", (d) => (appOut += d));
+    app.stderr.on("data", (d) => (appOut += d));
+  }
   for (let i = 0; i < 60; i += 1) {
     try {
       await api("/api/ready");
@@ -93,7 +116,10 @@ try {
       await delay(2000);
     }
   }
-  log("gateway_ready");
+  log("gateway_ready", { attached });
+  originalEnabled = JSON.parse(
+    readFileSync(path.join(stateRoot, "compute.json"), "utf8"),
+  ).enabled === true;
   await api("/api/compute/config", { method: "PUT", body: JSON.stringify(computeUpdate(true)) });
   await api("/api/compute/start", { method: "POST", body: JSON.stringify({}) });
   log("compute_start_accepted");
@@ -245,7 +271,7 @@ try {
     if (status && ["offline", "failed"].includes(status.state)) break;
     await delay(5000);
   }
-  await api("/api/compute/config", { method: "PUT", body: JSON.stringify(computeUpdate(false)) })
+  await api("/api/compute/config", { method: "PUT", body: JSON.stringify(computeUpdate(originalEnabled)) })
     .then(() => log("config_restored"))
     .catch((error) => log("config_restore_error", { message: String(error) }));
   const runpodKey = readFileSync(path.join(stateRoot, "compute-keys", "runpod.key"), "utf8").trim();
@@ -255,7 +281,7 @@ try {
     .then((r) => r.json())
     .catch(() => null);
   log("provider_final", { podCount: Array.isArray(pods) ? pods.length : -1 });
-  app.kill("SIGTERM");
+  if (app) app.kill("SIGTERM");
   if (exitCode !== 0) {
     console.error("--- gateway log tail ---");
     console.error(appOut.slice(-4000));

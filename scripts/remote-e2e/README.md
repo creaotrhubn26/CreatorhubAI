@@ -31,6 +31,14 @@ node scripts/remote-e2e/remote-session-e2e.mjs --worktree <path> \
   script for the contract check to pass.
 - `--kill-mid-run`: SIGKILLs the whole app 45s into the run and relaunches
   it, proving startup reconciliation reattaches and finishes the session.
+  Requires owning the app process, so it refuses to run against an
+  already-open app.
+
+The driver ATTACHES to an already-running app when one is listening on the
+gateway port (and restores the compute enabled/disabled setting to what it
+was); it only spawns its own instance when nothing is running. Opening or
+closing the app mid-test is therefore safe in attach mode — never quit the
+app while a spawned-mode test is running.
 
 ## watch-coordinator-pod.mjs
 
