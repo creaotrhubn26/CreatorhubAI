@@ -345,6 +345,23 @@ async function superviseRemoteSession(
   await execFileAsync("tar", ["-xf", archivePath, "-C", deps.logDir, "result.json"]).catch(
     () => undefined,
   );
+  // The workspace patch applies BEFORE the session artifacts become
+  // visible: readSession serves the manifest the moment it exists, and a
+  // watcher reacting to the terminal status must find the workspace
+  // already updated — extracting session/ first is a race (observed live:
+  // the E2E driver read an empty worktree milliseconds before apply).
+  await execFileAsync("tar", [
+    "-xf",
+    archivePath,
+    "-C",
+    deps.logDir,
+    "--strip-components=1",
+    "session/workspace-changes.patch",
+  ]).catch(() => undefined);
+  const patchDetail = await applyRemoteWorkspacePatch(deps).catch(
+    (error) =>
+      `remote changes were not applied: ${error instanceof Error ? error.message : String(error)}`,
+  );
   await execFileAsync("tar", [
     "-xf",
     archivePath,
@@ -360,9 +377,6 @@ async function superviseRemoteSession(
   } catch {
     // The worker-reported exit code stands when result.json is unavailable.
   }
-  const patchDetail = await applyRemoteWorkspacePatch(deps).catch(
-    (error) => `remote changes were not applied: ${error instanceof Error ? error.message : String(error)}`,
-  );
   return {
     state: status.state,
     exitCode,
@@ -378,7 +392,7 @@ async function superviseRemoteSession(
  * the returned detail.
  */
 async function applyRemoteWorkspacePatch(deps: RemoteSessionDeps): Promise<string | undefined> {
-  const patchPath = path.join(deps.sessionDir, "workspace-changes.patch");
+  const patchPath = path.join(deps.logDir, "workspace-changes.patch");
   try {
     await fs.access(patchPath);
   } catch {
