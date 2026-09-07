@@ -236,6 +236,18 @@ async function streamAssistant(
   return full;
 }
 
+export interface WorkspaceMemoryEntry {
+  kind: string;
+  key: string;
+  count: number;
+  firstSeen?: string;
+  lastSeen?: string;
+  payload?: unknown;
+  ageDays: number | null;
+  score: number;
+  belowFloor: boolean;
+}
+
 export const glimmerApi = {
   getHealth: () => request<GatewayHealth>("/api/health"),
   getReadiness: () => request<GatewayReadiness>("/api/ready"),
@@ -357,6 +369,15 @@ export const glimmerApi = {
       body: JSON.stringify({ podId }),
     }),
   getQualityMetrics: () => request<LocalQualityMetrics>("/api/quality/metrics"),
+  getWorkspaceMemory: (workspace: string) =>
+    request<{ entries: WorkspaceMemoryEntry[] }>(
+      `/api/workspaces/memory?workspace=${encodeURIComponent(workspace)}`,
+    ),
+  deleteWorkspaceMemoryEntry: (workspace: string, kind: string, key: string) =>
+    request<{ removed: true }>(
+      `/api/workspaces/memory?workspace=${encodeURIComponent(workspace)}&kind=${encodeURIComponent(kind)}&key=${encodeURIComponent(key)}`,
+      { method: "DELETE" },
+    ),
   listSessionPage: (cursor?: string, limit = 100) => {
     const query = new URLSearchParams({ limit: String(limit) });
     if (cursor) query.set("cursor", cursor);

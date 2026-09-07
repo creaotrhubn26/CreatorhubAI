@@ -268,6 +268,55 @@ function ClarificationCard({ sessionId }: { sessionId: string }) {
   );
 }
 
+
+// Context indicator: which files the agent has actually read this session —
+// the map-is-not-the-territory point made transparent. Sourced from the
+// evidence index (read-kind entries carry the path), fetched lazily when
+// opened so it costs nothing while collapsed.
+function FilesReadIndicator({
+  sessionId,
+  events,
+}: {
+  sessionId: string;
+  events: { type: string }[];
+}) {
+  const [open, setOpen] = useState(false);
+  const evidenceQuery = useQuery({
+    queryKey: ["evidence-index", sessionId, events.length > 0],
+    queryFn: () => glimmerApi.getEvidenceIndex(sessionId),
+    enabled: open,
+    retry: false,
+  });
+  const paths = [
+    ...new Set(
+      (evidenceQuery.data?.entries ?? [])
+        .filter((entry) => entry.path)
+        .map((entry) => entry.path as string),
+    ),
+  ].sort();
+  return (
+    <details onToggle={(event) => setOpen((event.target as HTMLDetailsElement).open)}>
+      <summary style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        Files the agent has read{open && paths.length ? ` (${paths.length})` : ""}
+      </summary>
+      {open &&
+        (paths.length ? (
+          <ul style={{ fontSize: 12 }}>
+            {paths.map((filePath) => (
+              <li key={filePath}>
+                <code>{filePath}</code>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            No evidence entries yet — nothing has been read (or the session predates evidence).
+          </p>
+        ))}
+    </details>
+  );
+}
+
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -457,6 +506,16 @@ export function ActiveSessionScreen() {
         <dt>Changed files</dt>
         <dd>{session.changedFiles.length}</dd>
       </dl>
+      {/* Budget meter, not a spinner: a number that stands still while the
+          clock runs is an honest hang signal a spinner would hide. */}
+      <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
+        {events.filter((event) => event.type === "tool_completed").length} tool calls ·
+        repairs {session.repairsUsed}/{session.repairBudget}
+        {events.some((event) => event.type === "loop_detected") && (
+          <span style={{ color: "var(--amber)" }}> · loop nudge issued</span>
+        )}
+      </p>
+      <FilesReadIndicator sessionId={id!} events={events} />
       {!readOnlyMode && (
         <p style={{ fontSize: 12, color: "var(--text-muted)" }}>
           Human review:{" "}

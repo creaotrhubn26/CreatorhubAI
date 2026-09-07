@@ -220,6 +220,32 @@ async function resolveContained(rawRoot: string, rawPath: string): Promise<Resol
   }
 }
 
+// Project memory made visible and user-owned: what the orchestrator's
+// verified-repository-memory currently takes for granted about this
+// workspace, with age (stale knowledge fades) — and DELETE as first-class
+// curation. Workspace must be a KNOWN root, same boundary as every other
+// workspace-scoped read here.
+workspacesRouter.get("/workspaces/memory", async (req, res) => {
+  const workspace = String(req.query.workspace ?? "");
+  const known = (await knownWorkspaceRoots()).find((root) => root === workspace);
+  if (!known) return res.status(403).json({ error: "unknown workspace" });
+  const { readWorkspaceMemory } = await import("../lib/workspaceMemory.js");
+  res.json({ entries: await readWorkspaceMemory(known) });
+});
+
+workspacesRouter.delete("/workspaces/memory", async (req, res) => {
+  const workspace = String(req.query.workspace ?? "");
+  const kind = String(req.query.kind ?? "");
+  const key = String(req.query.key ?? "");
+  const known = (await knownWorkspaceRoots()).find((root) => root === workspace);
+  if (!known) return res.status(403).json({ error: "unknown workspace" });
+  if (!kind || !key) return res.status(400).json({ error: "kind and key are required" });
+  const { deleteWorkspaceMemoryEntry } = await import("../lib/workspaceMemory.js");
+  const removed = await deleteWorkspaceMemoryEntry(known, kind, key);
+  if (!removed) return res.status(404).json({ error: "no such memory entry" });
+  res.json({ removed: true });
+});
+
 workspacesRouter.get("/fs/dirs", async (req, res) => {
   const rawRoot =
     typeof req.query.root === "string" && req.query.root.trim()

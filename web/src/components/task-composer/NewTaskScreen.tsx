@@ -274,6 +274,39 @@ export function NewTaskScreen() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  // "This is what I take for granted about this project" — the
+  // orchestrator's verified repository memory, visible and user-owned:
+  // stale entries fade, and deleting one is first-class curation.
+  const memoryQuery = useQuery({
+    queryKey: ["workspace-memory", workspace],
+    queryFn: () => glimmerApi.getWorkspaceMemory(workspace),
+    enabled: !!workspace,
+    retry: false,
+  });
+  const forgetMutation = useMutation({
+    mutationFn: ({ kind, key }: { kind: string; key: string }) =>
+      glimmerApi.deleteWorkspaceMemoryEntry(workspace, kind, key),
+    onSuccess: () => memoryQuery.refetch(),
+  });
+
+  // Warm start: the most recent session in this workspace, with its
+  // forward plan — continuity as one click instead of re-explaining.
+  const recentSessions = useQuery({
+    queryKey: ["sessions-warmstart"],
+    queryFn: () => glimmerApi.listSessions(),
+    enabled: !!workspace,
+    retry: false,
+  });
+  const lastSession = (recentSessions.data ?? []).find(
+    (candidate) => candidate.workspace === workspace,
+  );
+  const lastPacket = useQuery({
+    queryKey: ["delivery-packet", lastSession?.id],
+    queryFn: () => glimmerApi.getDeliveryPacket(lastSession!.id),
+    enabled: !!lastSession,
+    retry: false,
+  });
+
   const computeStatus = useQuery({
     queryKey: ["compute-status"],
     queryFn: () => glimmerApi.getComputeStatus(),
@@ -369,6 +402,72 @@ export function NewTaskScreen() {
                   </button>
                 ))}
               </div>
+            )}
+
+            {lastSession && (
+              <div
+                style={{
+                  border: "1px solid var(--border, #444)",
+                  borderRadius: 8,
+                  padding: 10,
+                  margin: "8px 0",
+                  fontSize: 13,
+                }}
+              >
+                <strong>Warm start</strong> — last session here:{" "}
+                <span style={{ color: "var(--text-muted)" }}>
+                  {lastSession.task.slice(0, 120)} ({lastSession.status})
+                </span>
+                {(lastPacket.data?.forwardPlan?.nextSteps ?? []).slice(0, 2).map((step, index) => (
+                  <div key={index} style={{ marginTop: 4 }}>
+                    ↳ {step.action.slice(0, 140)}{" "}
+                    <button
+                      type="button"
+                      onClick={() => setForm({ ...form, objective: step.action })}
+                    >
+                      Continue with this
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {workspace && (memoryQuery.data?.entries.length ?? 0) > 0 && (
+              <details style={{ margin: "8px 0", fontSize: 13 }}>
+                <summary>
+                  What Glimmer takes for granted here (
+                  {memoryQuery.data!.entries.filter((entry) => !entry.belowFloor).length})
+                </summary>
+                <ul style={{ margin: "6px 0" }}>
+                  {memoryQuery.data!.entries.map((entry) => {
+                    const faded = (entry.ageDays ?? 0) > 45 || entry.belowFloor;
+                    return (
+                      <li
+                        key={`${entry.kind}:${entry.key}`}
+                        style={{ opacity: faded ? 0.55 : 1 }}
+                      >
+                        <span className="mono">
+                          [{entry.kind}] {entry.key}
+                        </span>{" "}
+                        <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                          ×{entry.count}
+                          {entry.ageDays !== null && ` · ${Math.round(entry.ageDays)}d old`}
+                          {entry.belowFloor && " · below observation floor"}
+                        </span>{" "}
+                        <button
+                          type="button"
+                          title="Forget this — it only comes back through fresh verified observations"
+                          onClick={() =>
+                            forgetMutation.mutate({ kind: entry.kind, key: entry.key })
+                          }
+                        >
+                          Forget
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </details>
             )}
 
             <fieldset>

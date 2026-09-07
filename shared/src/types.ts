@@ -1958,6 +1958,19 @@ export interface RepairStartedEvent extends GlimmerEventBase {
   type: "repair_started";
   iteration: number;
 }
+export interface RetrievalQueryEvent extends GlimmerEventBase {
+  type: "retrieval_query";
+  tool: string;
+  query: string;
+  hits: string[];
+}
+
+export interface LoopDetectedEvent extends GlimmerEventBase {
+  type: "loop_detected";
+  tool: string;
+  repeats: number;
+}
+
 export interface ParserRecoveryEvent extends GlimmerEventBase {
   type: "parser_recovery";
   attempt: number;
@@ -2231,6 +2244,8 @@ export type GlimmerEvent =
   | ScopeExpandedEvent
   | RepairStartedEvent
   | ParserRecoveryEvent
+  | RetrievalQueryEvent
+  | LoopDetectedEvent
   | SessionCompletedEvent
   | SessionCreatedEvent
   | SkillLoadedEvent
@@ -2279,6 +2294,8 @@ const EVENT_TYPES: ReadonlySet<GlimmerEvent["type"]> = new Set([
   "repair_started",
   "parser_recovery",
   "session_completed",
+  "retrieval_query",
+  "loop_detected",
   "session_created",
   "skill_loaded",
   "model_retry",
