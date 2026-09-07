@@ -3822,10 +3822,25 @@ def load_task_report(session_dir):
     return data if isinstance(data, dict) else None
 
 
-def request_clarification(plan, session, events_path, sid, manifest, save_manifest):
-    """Pause once for the first unresolved high-impact architecture decision."""
+def request_clarification(plan, session, events_path, sid, manifest, save_manifest,
+                          plan_review=False):
+    """Pause once for the first unresolved high-impact architecture decision.
+    With plan_review=True (--plan-review) the pause ALWAYS happens: the plan
+    itself becomes the checkpoint — one explicit proceed/stop moment before
+    any implementation step, the error-accumulation antidote as UX."""
     points = plan.get("decisionPoints") if isinstance(plan, dict) else None
     high_impact = next((point for point in points or [] if point.get("impact") == "high"), None)
+    if not high_impact and plan_review:
+        risk = plan.get("risk") if isinstance(plan, dict) else None
+        step_count = len((plan or {}).get("implementationPlan") or [])
+        high_impact = {
+            "question": (
+                f"Architecture plan ready ({step_count} steps, risk: {risk or 'unknown'}). "
+                "Review it in the Architecture Plan panel — proceed with implementation?"
+            ),
+            "options": ["Proceed with this plan", "Stop — I want to revise the task"],
+            "_stopOptionIndex": 1,
+        }
     if not high_impact:
         return True
     options = [
@@ -3890,6 +3905,12 @@ def request_clarification(plan, session, events_path, sid, manifest, save_manife
                                clarificationId=clarification_id, optionId=selected)
                     emit_event(events_path, "agent_state_changed", sid, state=manifest["state"])
                     save_manifest()
+                    stop_index = high_impact.get("_stopOptionIndex")
+                    if stop_index is not None and selected == f"option-{stop_index + 1}":
+                        # Plan review answered with "stop": end honestly
+                        # before any implementation step, same exit as an
+                        # unanswered high-impact clarification.
+                        return False
                     return True
         time.sleep(0.5)
 
@@ -7042,6 +7063,10 @@ def main():
     # C1 (glimmer-v7): manual force-on, default False. Independent of the
     # Task 2.1 risk-based auto-trigger below (§5.5) -- passing this always
     # runs architect mode regardless of score.
+    ap.add_argument("--plan-review", action="store_true",
+                    help="Pause after the architecture plan for an explicit human "
+                         "proceed/stop decision (uses the clarification mechanism), "
+                         "regardless of whether the plan has high-impact decision points.")
     ap.add_argument("--architect-first", action="store_true",
                     help="Run glimmer-engineer.py --mode architect before iteration 0 and feed its "
                          "ArchitecturePlan into the engineering prompt. Manual force-on, independent "
@@ -7558,6 +7583,7 @@ def main():
             candidate_evidence = read_candidate_evidence(architecture_plan, ws, rank_by_path=rank_by_path)
             if architecture_plan is not None and not request_clarification(
                 architecture_plan, session, events_path, sid, manifest, save,
+                plan_review=bool(getattr(args, "plan_review", False)),
             ):
                 final_label = "AMBIGUOUS TASK — NEEDS REVIEW"
                 return 2
