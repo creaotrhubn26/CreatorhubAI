@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -572,3 +573,79 @@ def _selfcheck() -> None:
 
 if __name__ == "__main__":
     _selfcheck()
+
+# --- Lexical retrieval helpers (shared by docs_search and retrieval evals) ---
+#
+# Deliberately deterministic and dependency-free: identifier-aware
+# tokenization plus BM25 ranking covers the "synonym-ish" gap (camelCase /
+# snake_case sub-words, partial-phrase queries) that exact-token matching
+# misses, without embeddings. Retrieval evals in tests/test_retrieval_eval.py
+# gate any future move to semantic embeddings with measured recall.
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def split_identifier(text: str) -> list[str]:
+    """camelCase/PascalCase/snake_case/kebab-case -> lowercase sub-words."""
+    parts = []
+    for raw in re.split(r"[^A-Za-z0-9]+", str(text or "")):
+        if not raw:
+            continue
+        for piece in _CAMEL_BOUNDARY.split(raw):
+            if piece:
+                parts.append(piece.lower())
+    return parts
+
+
+def tokenize_for_search(text: str) -> list[str]:
+    """Whole lowered words plus identifier sub-words, order-preserving."""
+    tokens = []
+    for raw in re.split(r"[^A-Za-z0-9]+", str(text or "")):
+        if not raw:
+            continue
+        lowered = raw.lower()
+        tokens.append(lowered)
+        for piece in _CAMEL_BOUNDARY.split(raw):
+            piece = piece.lower()
+            if piece and piece != lowered:
+                tokens.append(piece)
+    return tokens
+
+
+def bm25_rank(
+    query: str,
+    documents: list[tuple[str, str]],
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> list[tuple[str, float]]:
+    """Ranks (doc_id, text) pairs for the query; returns (doc_id, score)
+    sorted by descending score then doc_id, zero-score documents dropped."""
+    query_tokens = set(tokenize_for_search(query))
+    if not query_tokens or not documents:
+        return []
+    doc_tokens = [(doc_id, tokenize_for_search(text)) for doc_id, text in documents]
+    total = len(doc_tokens)
+    average_length = sum(len(tokens) for _, tokens in doc_tokens) / max(1, total)
+    containing: dict[str, int] = {}
+    for _, tokens in doc_tokens:
+        for token in set(tokens):
+            if token in query_tokens:
+                containing[token] = containing.get(token, 0) + 1
+    scored = []
+    for doc_id, tokens in doc_tokens:
+        if not tokens:
+            continue
+        counts: dict[str, int] = {}
+        for token in tokens:
+            if token in query_tokens:
+                counts[token] = counts.get(token, 0) + 1
+        score = 0.0
+        for token, frequency in counts.items():
+            document_frequency = containing.get(token, 0)
+            idf = math.log(1.0 + (total - document_frequency + 0.5) / (document_frequency + 0.5))
+            denominator = frequency + k1 * (1 - b + b * len(tokens) / average_length)
+            score += idf * (frequency * (k1 + 1)) / denominator
+        if score > 0.0:
+            scored.append((doc_id, round(score, 6)))
+    return sorted(scored, key=lambda item: (-item[1], item[0]))
+

@@ -34,6 +34,7 @@ from glimmer_quality import (
     parse_critic_response,
     validate_task_report_v2,
 )
+from glimmer_semantic import bm25_rank
 from glimmer_semantic import (
     impact_paths as semantic_impact_paths,
 )
@@ -4362,36 +4363,35 @@ def _load_adr_titles_for_engineer(workspace):
 
 
 def _docs_search(query, graph, workspace):
-    """docs_search(query): exact-token search (split on non-alnum, case-
-    insensitive -- same boundary rule as this codebase's other
-    deterministic matchers) over graph node id/type/path/title AND ADR
-    id/title. Capped to DOC_TOOLS_SEARCH_CAP results."""
-    tokens = {t for t in re.split(r"[^a-z0-9]+", str(query or "").lower()) if t}
-    if not tokens:
+    """docs_search(query): identifier-aware BM25 ranking (camelCase and
+    snake_case sub-words match, best hits first) over graph node
+    id/type/path/title AND ADR id/title. Deterministic -- same tokenizer the
+    retrieval evals measure. Capped to DOC_TOOLS_SEARCH_CAP results."""
+    if not str(query or "").strip():
         return "docs_search: empty query."
 
-    results = []
+    lines = {}
+    documents = []
     for node in graph.get("nodes") or []:
         if not isinstance(node, dict):
             continue
-        haystack = " ".join(str(node.get(k, "")) for k in ("id", "type", "path", "title"))
-        node_tokens = {t for t in re.split(r"[^a-z0-9]+", haystack.lower()) if t}
-        if tokens & node_tokens:
-            results.append(
-                f"node {node.get('id')} ({node.get('type')}, {node.get('status')}): "
-                f"{node.get('path')} -- {node.get('title')}"
-            )
-
+        doc_id = f"node:{node.get('id')}"
+        documents.append(
+            (doc_id, " ".join(str(node.get(k, "")) for k in ("id", "type", "path", "title")))
+        )
+        lines[doc_id] = (
+            f"node {node.get('id')} ({node.get('type')}, {node.get('status')}): "
+            f"{node.get('path')} -- {node.get('title')}"
+        )
     for adr in _load_adr_titles_for_engineer(workspace):
-        haystack = f"{adr['id']} {adr['title']}"
-        adr_tokens = {t for t in re.split(r"[^a-z0-9]+", haystack.lower()) if t}
-        if tokens & adr_tokens:
-            results.append(f"adr {adr['id']}: {adr['title']} ({adr['path']})")
+        doc_id = f"adr:{adr['id']}"
+        documents.append((doc_id, f"{adr['id']} {adr['title']}"))
+        lines[doc_id] = f"adr {adr['id']}: {adr['title']} ({adr['path']})"
 
-    if not results:
+    ranked = bm25_rank(str(query), documents)
+    if not ranked:
         return f"docs_search: no matches for {query!r}."
-    return "\n".join(results[:DOC_TOOLS_SEARCH_CAP])
-
+    return "\n".join(lines[doc_id] for doc_id, _ in ranked[:DOC_TOOLS_SEARCH_CAP])
 
 def _docs_get_node(node_id, graph):
     """docs_get_node(id): one node plus its edges (either endpoint),
