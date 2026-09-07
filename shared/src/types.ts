@@ -417,6 +417,9 @@ export interface TaskContract {
     toolchainMode?: "path" | "linked" | "none";
     modelReadinessUrl?: string;
     architectFirst?: boolean;
+    /** Pause after the architecture plan for an explicit proceed/stop
+     * decision (plan-as-checklist before execution). Implies architectFirst. */
+    planReview?: boolean;
   };
   // Task 8.1 (V7 §23.10): "would I send this to a customer?" quality gate.
   // Omitted entirely (or customerReadinessRequired omitted/false) means the
@@ -934,6 +937,15 @@ export interface DeliveryPacket {
     reason: string;
     provenance: DataProvenance;
     reviewFailed?: true;
+    /** Measured hit rate of this stated level on this installation. */
+    calibratedRate?: number;
+    calibratedSampleSize?: number;
+  } | null;
+  /** Deterministic clarity verdict on the objective (intent layer). */
+  objectiveAssessment?: {
+    clarity: "clear" | "underspecified";
+    signals: string[];
+    provenance: "deterministic";
   } | null;
   humanReviewStatus: string;
   // Round-8 re-review NEW-MN2/NEW-MN1: written by glimmer-v2.py since

@@ -154,6 +154,7 @@ function parseDraft(value: unknown): TaskComposerDraft | null {
     (form.toolchainMode !== undefined && !TOOLCHAINS.has(String(form.toolchainMode))) ||
     !boundedString(form.modelReadinessUrl, 2_048) ||
     (form.architectFirst !== undefined && typeof form.architectFirst !== "boolean") ||
+    (form.planReview !== undefined && typeof form.planReview !== "boolean") ||
     typeof form.designEnabled !== "boolean" ||
     !DESIGN_KINDS.has(String(form.designKind)) ||
     !boundedString(form.designTargetUrl, 2_048) ||

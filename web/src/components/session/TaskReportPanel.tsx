@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
@@ -6,9 +7,11 @@ import type { TaskReportV2 } from "@glimmer/shared";
 export function TaskReportPanel({
   sessionId,
   ready = true,
+  workspace,
 }: {
   sessionId: string;
   ready?: boolean;
+  workspace?: string;
 }) {
   const { data: report } = useQuery({
     queryKey: ["task-report", sessionId],
@@ -54,10 +57,22 @@ export function TaskReportPanel({
                   <ul>
                     {finding.evidence.map((evidence, evidenceIndex) => (
                       <li key={`${evidence.path}-${evidence.line ?? 0}-${evidenceIndex}`}>
-                        <span className="mono">
-                          {evidence.path}
-                          {evidence.line ? `:${evidence.line}` : ""}
-                        </span>
+                        {/* Inline clickable source: the claim links straight
+                            to the file and line it rests on. */}
+                        {workspace ? (
+                          <Link
+                            className="mono"
+                            to={`/files?path=${encodeURIComponent(`${workspace.replace(/\/+$/, "")}/${evidence.path}`)}${evidence.line ? `&line=${evidence.line}` : ""}`}
+                          >
+                            {evidence.path}
+                            {evidence.line ? `:${evidence.line}` : ""}
+                          </Link>
+                        ) : (
+                          <span className="mono">
+                            {evidence.path}
+                            {evidence.line ? `:${evidence.line}` : ""}
+                          </span>
+                        )}
                         {` — ${evidence.detail}`}
                       </li>
                     ))}

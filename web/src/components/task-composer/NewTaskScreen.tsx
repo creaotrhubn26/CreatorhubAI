@@ -44,6 +44,7 @@ const DEFAULT_FORM: TaskComposerFormState = {
   toolchainMode: "path",
   modelReadinessUrl: "",
   architectFirst: false,
+  planReview: false,
 };
 
 const PATH_SCOPED_PACKAGES = new Set(["directory", "files"]);
@@ -252,6 +253,27 @@ export function NewTaskScreen() {
   // Where the run will execute: when the coordinator-supervised GPU worker
   // is ready (or coming up), the gateway routes this session remotely; the
   // composer says so up front instead of the user discovering it mid-run.
+  // Keyboard-first: Cmd/Ctrl+Enter runs from anywhere in the composer —
+  // daily users live on the keyboard, and the primary action must not
+  // require a mouse trip. Same guard set as the button's disabled state.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
+      if (
+        !form.objective ||
+        !workspace ||
+        scopePathMissing ||
+        !!designError ||
+        runMutation.isPending
+      )
+        return;
+      event.preventDefault();
+      runMutation.mutate();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   const computeStatus = useQuery({
     queryKey: ["compute-status"],
     queryFn: () => glimmerApi.getComputeStatus(),
@@ -663,6 +685,24 @@ export function NewTaskScreen() {
                 Architect first
               </label>
               <p>Runs a read-only planning pass first.</p>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={form.planReview ?? false}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      planReview: e.target.checked,
+                      architectFirst: e.target.checked ? true : form.architectFirst,
+                    })
+                  }
+                />
+                Review plan before execution
+              </label>
+              <p>
+                Pauses after the architecture plan for your explicit proceed/stop decision
+                (implies architect first).
+              </p>
             </details>
           </div>
         </div>
@@ -693,6 +733,7 @@ export function NewTaskScreen() {
             !!designError ||
             runMutation.isPending
           }
+          title="⌘/Ctrl+Enter"
         >
           RUN GLIMMER
         </button>

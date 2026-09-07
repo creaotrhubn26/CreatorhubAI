@@ -143,6 +143,9 @@ export function validateAdvanced(contract: TaskContract): string | null {
   if (advanced.architectFirst !== undefined && typeof advanced.architectFirst !== "boolean") {
     return "architectFirst must be a boolean";
   }
+  if (advanced.planReview !== undefined && typeof advanced.planReview !== "boolean") {
+    return "planReview must be a boolean";
+  }
   return null;
 }
 
@@ -233,8 +236,11 @@ export function buildArgs(
   ) {
     args.push("--model-readiness-url", advanced.modelReadinessUrl);
   }
-  if (advanced?.architectFirst === true || contract.design) {
+  if (advanced?.architectFirst === true || advanced?.planReview === true || contract.design) {
     args.push("--architect-first");
+  }
+  if (advanced?.planReview === true) {
+    args.push("--plan-review");
   }
   if (contract.design?.targetUrl && isValidLoopbackUrl(contract.design.targetUrl)) {
     args.push("--visual-url", contract.design.targetUrl);

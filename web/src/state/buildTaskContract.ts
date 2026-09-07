@@ -24,6 +24,7 @@ export interface TaskComposerFormState extends DesignComposerFields {
   toolchainMode?: ToolchainMode;
   modelReadinessUrl?: string;
   architectFirst?: boolean;
+  planReview?: boolean;
 }
 
 // Task 4c(3): "files" scope is a LIST — the picker can select several, and the
@@ -51,6 +52,7 @@ export function buildTaskContract(form: TaskComposerFormState): TaskContract {
   }
   if (form.modelReadinessUrl?.trim()) advanced.modelReadinessUrl = form.modelReadinessUrl.trim();
   if (form.architectFirst || design) advanced.architectFirst = true;
+  if (form.planReview) advanced.planReview = true;
 
   const verification = [...form.verification];
   if (design?.targetUrl && !verification.includes("visual")) verification.push("visual");

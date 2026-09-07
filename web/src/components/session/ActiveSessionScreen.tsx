@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useParams, Link, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { GlimmerSession } from "@glimmer/shared";
 import { glimmerApi } from "../../api/client";
@@ -270,6 +270,7 @@ function ClarificationCard({ sessionId }: { sessionId: string }) {
 
 export function ActiveSessionScreen() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const cancelMutation = useMutation({
     mutationFn: () => glimmerApi.cancelSession(id!),
@@ -429,6 +430,22 @@ export function ActiveSessionScreen() {
             {cancelMutation.isPending || cancelMutation.isSuccess ? "Cancelling…" : "Cancel"}
           </button>
         )}
+        {isRunning && (
+          // Mid-run steering: "wrong direction" = stop THIS run and land in
+          // the composer with the same objective and workspace ready to
+          // rephrase — intervention as a two-second loop, not an autopsy.
+          <button
+            onClick={() => {
+              cancelMutation.mutate();
+              navigate("/tasks/new", {
+                state: { objective: session.task, workspace: session.workspace },
+              });
+            }}
+            disabled={cancelMutation.isPending || cancelMutation.isSuccess}
+          >
+            Stop &amp; revise
+          </button>
+        )}
       </div>
       {isRunning && cancelMutation.isError && (
         <div>
@@ -478,7 +495,7 @@ export function ActiveSessionScreen() {
       <GatesRow gates={session.gates} />
       <StatusesRow statuses={session.statuses} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
-      {id && readOnlyMode && <TaskReportPanel sessionId={id} ready={!isRunning} />}
+      {id && readOnlyMode && <TaskReportPanel sessionId={id} ready={!isRunning} workspace={session.workspace} />}
       {id && !readOnlyMode && <ArchitecturePlanPanel sessionId={id} />}
       {id && !readOnlyMode && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
       {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} workspace={session.workspace} />}

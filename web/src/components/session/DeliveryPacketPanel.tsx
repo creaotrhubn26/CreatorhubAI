@@ -10,6 +10,30 @@ import { CollapsibleSection } from "../common/CollapsibleSection";
 // have their own panels (ArchitecturePlanPanel, DeliveryReviewPanel,
 // VisualVerificationPanel). Model-derived sections are labeled the same way
 // DeliveryReviewPanel already labels its own content.
+
+// "Checked vs. assumed" made visual: deterministic/verified facts get a
+// green CHECKED badge, model-stated values an amber STATED badge — the
+// reviewer sees at a glance which parts of the delivery reality graded and
+// which parts the model asserted.
+function ProvenanceBadge({ kind }: { kind: "checked" | "stated" }) {
+  const checked = kind === "checked";
+  return (
+    <span
+      className="mono"
+      style={{
+        fontSize: 10,
+        padding: "1px 6px",
+        marginLeft: 6,
+        borderRadius: 6,
+        border: `1px solid ${checked ? "var(--green, #3a5)" : "var(--amber, #b90)"}`,
+        color: checked ? "var(--green, #3a5)" : "var(--amber, #b90)",
+      }}
+    >
+      {checked ? "CHECKED" : "STATED"}
+    </span>
+  );
+}
+
 export function DeliveryPacketPanel({
   sessionId,
   workspace,
@@ -43,7 +67,10 @@ export function DeliveryPacketPanel({
         </div>
         <div>
           <dt>Verification</dt>
-          <dd>{packet.verification.status}</dd>
+          <dd>
+            {packet.verification.status}
+            {packet.verification.status === "VERIFIED" && <ProvenanceBadge kind="checked" />}
+          </dd>
         </div>
         <div>
           <dt>Visual</dt>
@@ -53,19 +80,41 @@ export function DeliveryPacketPanel({
           <dt>Customer readiness</dt>
           <dd>
             {readiness ?? "Unavailable"}
-            {packet.customerReadiness && (
-              <span style={{ fontSize: 11, color: "var(--text-muted)" }}> (model-generated)</span>
-            )}
+            {packet.customerReadiness && <ProvenanceBadge kind="stated" />}
           </dd>
         </div>
         <div>
           <dt>Confidence</dt>
           <dd>
-            {packet.confidence
-              ? `${packet.confidence.level} — ${packet.confidence.reason}`
-              : "Unavailable"}
+            {packet.confidence ? (
+              <>
+                {packet.confidence.level} — {packet.confidence.reason}
+                <ProvenanceBadge kind="stated" />
+                {packet.confidence.calibratedRate !== undefined && (
+                  <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                    {" "}
+                    (measured: "{packet.confidence.level}" verified{" "}
+                    {Math.round(packet.confidence.calibratedRate * 100)}% of n=
+                    {packet.confidence.calibratedSampleSize})
+                  </span>
+                )}
+              </>
+            ) : (
+              "Unavailable"
+            )}
           </dd>
         </div>
+        {packet.objectiveAssessment && (
+          <div>
+            <dt>Objective clarity</dt>
+            <dd>
+              {packet.objectiveAssessment.clarity}
+              {packet.objectiveAssessment.signals.length > 0 &&
+                ` (${packet.objectiveAssessment.signals.join(", ")})`}
+              <ProvenanceBadge kind="checked" />
+            </dd>
+          </div>
+        )}
         <div>
           <dt>Human review status</dt>
           <dd>{packet.humanReviewStatus}</dd>
