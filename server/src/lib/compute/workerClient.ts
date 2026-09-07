@@ -5,6 +5,8 @@ import type {
   ComputeBootstrapStage,
   ComputeBootstrapStatus,
   ComputeWorkerStatus,
+  ArchitecturePlan,
+  ClarificationRequest,
   RemoteJobManifestV1,
   RemoteJobStatusV1,
 } from "@glimmer/shared";
@@ -488,6 +490,59 @@ function parseCheckpoint(value: unknown) {
   } as const;
 }
 
+const CLARIFICATION_STATUSES = new Set(["pending", "answered", "expired"]);
+
+/** The pod's session artifact crosses a trust boundary here: it gets
+ * mirrored into the local session dir and rendered by the app, so the
+ * shape is enforced strictly and everything else is rejected. */
+function parseStatusClarification(value: unknown): ClarificationRequest {
+  const raw = object(value, "remote clarification");
+  if (raw.schemaVersion !== 1 || !CLARIFICATION_STATUSES.has(String(raw.status))) {
+    throw new WorkerProtocolError("remote clarification schema is invalid");
+  }
+  if (!Array.isArray(raw.options) || raw.options.length < 2 || raw.options.length > 3) {
+    throw new WorkerProtocolError("remote clarification options are invalid");
+  }
+  const options = raw.options.map((option) => {
+    const entry = object(option, "remote clarification option");
+    return {
+      id: text(entry.id, "remote clarification option id", 64),
+      label: text(entry.label, "remote clarification option label", 300),
+    };
+  });
+  const parsed: ClarificationRequest = {
+    schemaVersion: 1,
+    id: text(raw.id, "remote clarification id", 128),
+    sessionId: text(raw.sessionId, "remote clarification session id", 128),
+    status: raw.status as ClarificationRequest["status"],
+    createdAt: timestamp(raw.createdAt, "remote clarification createdAt"),
+    expiresAt: timestamp(raw.expiresAt, "remote clarification expiresAt"),
+    question: text(raw.question, "remote clarification question", 2_000),
+    impact: "high",
+    options,
+    allowFreeform: true,
+  };
+  if (raw.answer !== undefined) {
+    const answer = object(raw.answer, "remote clarification answer");
+    parsed.answer = {
+      optionId: answer.optionId == null ? null : text(answer.optionId, "answer option", 64),
+      text: answer.text == null ? null : text(answer.text, "answer text", 2_000),
+      ...(answer.answeredAt === undefined
+        ? {}
+        : { answeredAt: timestamp(answer.answeredAt, "answer answeredAt") }),
+    };
+  }
+  return parsed;
+}
+
+function parseStatusArchitecturePlan(value: unknown): ArchitecturePlan {
+  const raw = object(value, "remote architecture plan");
+  if (JSON.stringify(raw).length > 256 * 1024) {
+    throw new WorkerProtocolError("remote architecture plan is too large");
+  }
+  return raw as unknown as ArchitecturePlan;
+}
+
 export function parseRemoteJobStatus(value: unknown): RemoteJobStatusV1 {
   const raw = object(value, "remote job status");
   const allowed = [
@@ -504,6 +559,8 @@ export function parseRemoteJobStatus(value: unknown): RemoteJobStatusV1 {
     "checkpoints",
     ...(raw.exitCode === undefined ? [] : ["exitCode"]),
     ...(raw.detail === undefined ? [] : ["detail"]),
+    ...(raw.clarification === undefined ? [] : ["clarification"]),
+    ...(raw.architecturePlan === undefined ? [] : ["architecturePlan"]),
   ];
   exactKeys(raw, allowed, "remote job status");
   const states = [
@@ -538,6 +595,12 @@ export function parseRemoteJobStatus(value: unknown): RemoteJobStatusV1 {
       ? {}
       : { exitCode: signedInteger(raw.exitCode, "remote exit code", 255) }),
     ...(raw.detail === undefined ? {} : { detail: text(raw.detail, "remote job detail", 2_000) }),
+    ...(raw.clarification === undefined
+      ? {}
+      : { clarification: parseStatusClarification(raw.clarification) }),
+    ...(raw.architecturePlan === undefined
+      ? {}
+      : { architecturePlan: parseStatusArchitecturePlan(raw.architecturePlan) }),
   };
 }
 
@@ -834,6 +897,26 @@ export class WorkerClient {
     const matches = timingSafeEqual(Buffer.from(actual, "ascii"), Buffer.from(digest, "ascii"));
     if (!matches) throw new WorkerProtocolError("checkpoint digest does not match");
     return { bytes, sha256: digest };
+  }
+
+  answerClarification(
+    jobId: string,
+    payload: { clarificationId: string; optionId?: string | null; text?: string | null },
+    capability: string,
+    idempotencyKey: string,
+  ) {
+    return this.mutateJson(
+      `/v1/jobs/${validJobId(jobId)}/clarification`,
+      "POST",
+      {
+        clarificationId: payload.clarificationId,
+        ...(payload.optionId == null ? {} : { optionId: payload.optionId }),
+        ...(payload.text == null ? {} : { text: payload.text }),
+      },
+      capability,
+      idempotencyKey,
+      [200],
+    );
   }
 
   acknowledgeCheckpoint(

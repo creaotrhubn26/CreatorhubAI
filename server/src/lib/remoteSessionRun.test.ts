@@ -307,6 +307,81 @@ describe("runRemoteSession", () => {
     ).rejects.toThrow(/unsafe entry/);
   });
 
+  it("mirrors a pending remote clarification locally and forwards the answer", async () => {
+    const { bundle, manifest } = await makeManifest();
+    const archive = ustarArchive([
+      { name: "result.json", content: Buffer.from(JSON.stringify({ exitCode: 0 })) },
+      { name: "session/manifest.json", content: Buffer.from("{}") },
+    ]);
+    const fake = fakeWorker(archive, checkpointKey);
+    const sessionDir = path.join(scratch, "clarify-session");
+    const logDir = path.join(scratch, "clarify-logs");
+    const pending = {
+      schemaVersion: 1,
+      id: "clarify-1",
+      sessionId: manifest.sessionId,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 300_000).toISOString(),
+      question: "Proceed with the plan?",
+      impact: "high",
+      options: [
+        { id: "option-1", label: "Proceed" },
+        { id: "option-2", label: "Stop" },
+      ],
+      allowFreeform: true,
+    };
+    const answers: unknown[] = [];
+    const baseStatus = fake.worker.jobStatus;
+    let polls = 0;
+    fake.worker.answerClarification = async (_jobId: string, payload: unknown) => {
+      answers.push(payload);
+    };
+    fake.worker.jobStatus = async (...args: unknown[]) => {
+      const status = await baseStatus(...args);
+      polls += 1;
+      if (polls === 1) {
+        return {
+          ...status,
+          state: "running",
+          clarification: pending,
+          architecturePlan: { risk: "low" },
+        };
+      }
+      if (polls === 2) {
+        // The app answered through the existing local route between polls.
+        const localPath = path.join(sessionDir, "clarification.json");
+        const local = JSON.parse(await fs.readFile(localPath, "utf8"));
+        local.status = "answered";
+        local.answer = { optionId: "option-1", text: null, answeredAt: new Date().toISOString() };
+        await fs.writeFile(localPath, JSON.stringify(local));
+        return { ...status, state: "running", clarification: pending };
+      }
+      return status;
+    };
+    const outcome = await runRemoteSession(
+      {
+        worker: fake.worker,
+        capability: "C".repeat(43),
+        checkpointKey,
+        sessionDir,
+        logDir,
+        sleep: async () => {},
+      },
+      manifest,
+      bundle.parts,
+      () => false,
+    );
+    expect(outcome.state).toBe("succeeded");
+    const mirrored = JSON.parse(
+      await fs.readFile(path.join(sessionDir, "architecture-plan.json"), "utf8"),
+    );
+    expect(mirrored).toEqual({ risk: "low" });
+    expect(answers).toEqual([
+      { clarificationId: "clarify-1", optionId: "option-1", text: null },
+    ]);
+  });
+
   it("cancels the remote job when the session is cancelled", async () => {
     const { bundle, manifest } = await makeManifest();
     const archive = ustarArchive([

@@ -127,6 +127,8 @@ export function buildRemoteTaskContract(contract: TaskContract): RemoteTaskContr
     }
     if (Object.keys(gates).length > 0) remote.qualityGates = gates;
   }
+  if (contract.advanced?.architectFirst === true) remote.architectFirst = true;
+  if (contract.advanced?.planReview === true) remote.planReview = true;
   return remote;
 }
 
@@ -307,6 +309,7 @@ async function superviseRemoteSession(
   const deadline = Date.now() + options.deadlineMs;
   let status = initial;
   let cancelRequested = false;
+  const forwardedClarifications = new Set<string>();
   const requestCancel = () =>
     deps.worker.cancelJob(jobId, deps.capability, `${jobId}:cancel`).catch(() => undefined);
   for (;;) {
@@ -324,6 +327,11 @@ async function superviseRemoteSession(
       status = await deps.worker.jobStatus(jobId, deps.capability);
     } catch {
       // Transient proxy failures must not kill a running remote job.
+    }
+    try {
+      await relayClarification(deps, jobId, status, forwardedClarifications);
+    } catch {
+      // The relay retries on the next poll; a hiccup must not kill the job.
     }
   }
   if (status.state === "cancelled") {
@@ -382,6 +390,62 @@ async function superviseRemoteSession(
     exitCode,
     detail: patchDetail ?? status.detail,
   };
+}
+
+/**
+ * Plan-review parity for remote runs: the pod-side orchestrator pauses on a
+ * clarification exactly like a local run, and the worker surfaces the pending
+ * artifact (plus the plan it gates on) in job status. This mirrors both into
+ * the local session dir so the existing app UI works unchanged, then forwards
+ * the locally answered artifact back to the worker so the pod resumes.
+ */
+async function relayClarification(
+  deps: RemoteSessionDeps,
+  jobId: string,
+  status: RemoteJobStatusV1,
+  forwarded: Set<string>,
+): Promise<void> {
+  const remote = status.clarification;
+  if (!remote || remote.status !== "pending") return;
+  await fs.mkdir(deps.sessionDir, { recursive: true });
+  const clarificationPath = path.join(deps.sessionDir, "clarification.json");
+  let local: {
+    id?: string;
+    status?: string;
+    answer?: { optionId?: string | null; text?: string | null };
+  } | null;
+  try {
+    local = JSON.parse(await fs.readFile(clarificationPath, "utf8"));
+  } catch {
+    local = null;
+  }
+  if (!local || local.id !== remote.id) {
+    if (status.architecturePlan) {
+      await fs.writeFile(
+        path.join(deps.sessionDir, "architecture-plan.json"),
+        JSON.stringify(status.architecturePlan),
+        { encoding: "utf8", mode: 0o600 },
+      );
+    }
+    await fs.writeFile(clarificationPath, JSON.stringify(remote), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    return;
+  }
+  if (local.status === "answered" && local.answer && !forwarded.has(remote.id)) {
+    await deps.worker.answerClarification(
+      jobId,
+      {
+        clarificationId: remote.id,
+        optionId: local.answer.optionId ?? null,
+        text: local.answer.text ?? null,
+      },
+      deps.capability,
+      `${jobId}:clarification:${remote.id}`,
+    );
+    forwarded.add(remote.id);
+  }
 }
 
 /**

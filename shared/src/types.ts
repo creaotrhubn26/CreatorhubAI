@@ -3154,6 +3154,8 @@ export interface RemoteTaskContractV1 {
       | "needs_rework"
       | "not_customer_ready";
   };
+  architectFirst?: boolean;
+  planReview?: boolean;
 }
 
 export interface RemoteJobManifestV1 {
@@ -3207,6 +3209,10 @@ export interface RemoteJobStatusV1 {
   checkpoints: RemoteCheckpointV1[];
   exitCode?: number;
   detail?: string;
+  /** Plan-review parity: a paused remote orchestrator's pending question. */
+  clarification?: ClarificationRequest;
+  /** The plan the pending clarification gates on, mirrored for the panel. */
+  architecturePlan?: ArchitecturePlan;
 }
 
 export interface RemoteJobResultV1 {
