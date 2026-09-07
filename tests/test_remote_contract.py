@@ -181,3 +181,90 @@ class VerificationDependencyInstallTest(unittest.TestCase):
             finally:
                 log.close()
             self.assertEqual((Path(scratch) / "log").read_bytes(), b"")
+
+
+class ClarificationRelayTest(unittest.TestCase):
+    """Plan-review parity: the worker surfaces a pod-side pending
+    clarification in job status and lets the gateway answer it."""
+
+    def _service(self, tmp):
+        from runpod_worker import WorkerService
+
+        service = WorkerService(
+            state_root=Path(tmp) / "state",
+            recovery_root=Path(tmp) / "recovery",
+            bootstrap_token="token",
+            build_id="test",
+            context_tokens=65_536,
+            model_ready=lambda: True,
+        )
+        session_dir = service._job_dir("job-1") / "sessions" / "session-1"
+        session_dir.mkdir(parents=True)
+        service.jobs["job-1"] = {
+            "schemaVersion": 1,
+            "jobId": "job-1",
+            "state": "running",
+            "createdAt": "2026-09-07T00:00:00Z",
+            "updatedAt": "2026-09-07T00:00:00Z",
+            "manifest": {"sessionId": "session-1", "input": {"parts": 1, "bytes": 1}},
+        }
+        return service, session_dir
+
+    def _pending(self):
+        return {
+            "schemaVersion": 1,
+            "id": "session-1-clarification-1",
+            "sessionId": "session-1",
+            "status": "pending",
+            "createdAt": "2026-09-07T00:00:00Z",
+            "expiresAt": "2026-09-07T00:05:00Z",
+            "question": "Proceed with the plan?",
+            "impact": "high",
+            "options": [
+                {"id": "option-1", "label": "Proceed"},
+                {"id": "option-2", "label": "Stop"},
+            ],
+            "allowFreeform": True,
+        }
+
+    def test_status_surfaces_pending_clarification_and_plan(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service, session_dir = self._service(tmp)
+            self.assertNotIn("clarification", service.job_status("job-1"))
+            (session_dir / "clarification.json").write_text(json.dumps(self._pending()))
+            (session_dir / "architecture-plan.json").write_text('{"risk": "low"}')
+            status = service.job_status("job-1")
+            self.assertEqual(status["clarification"]["status"], "pending")
+            self.assertEqual(status["architecturePlan"], {"risk": "low"})
+
+    def test_answer_writes_answered_artifact_for_the_orchestrator(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service, session_dir = self._service(tmp)
+            (session_dir / "clarification.json").write_text(json.dumps(self._pending()))
+            service.answer_clarification(
+                "job-1",
+                {"clarificationId": "session-1-clarification-1", "optionId": "option-1"},
+            )
+            saved = json.loads((session_dir / "clarification.json").read_text())
+            self.assertEqual(saved["status"], "answered")
+            self.assertEqual(saved["answer"]["optionId"], "option-1")
+            # answered clarifications no longer ship a plan in status
+            self.assertNotIn("architecturePlan", service.job_status("job-1"))
+
+    def test_answer_rejects_unlisted_option_without_text(self):
+        import tempfile
+
+        from runpod_worker import WorkerError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service, session_dir = self._service(tmp)
+            (session_dir / "clarification.json").write_text(json.dumps(self._pending()))
+            with self.assertRaises(WorkerError):
+                service.answer_clarification(
+                    "job-1",
+                    {"clarificationId": "session-1-clarification-1", "optionId": "nope"},
+                )

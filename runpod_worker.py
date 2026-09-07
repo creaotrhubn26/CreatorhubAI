@@ -68,6 +68,9 @@ START_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/start$")
 CANCEL_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/cancel$")
 CHECKPOINT_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/checkpoints/([0-9]{1,6})$")
 ACK_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/checkpoints/([0-9]{1,6})/ack$")
+CLARIFICATION_ROUTE = re.compile(r"^/v1/jobs/([A-Za-z0-9._-]+)/clarification$")
+MAX_CLARIFICATION_BYTES = 64 * 1024
+MAX_PLAN_BYTES = 256 * 1024
 
 
 class WorkerError(RuntimeError):
@@ -581,7 +584,7 @@ class WorkerService:
                     "acknowledged": item.get("acknowledged", False),
                 }
             )
-        return {
+        public = {
             "schemaVersion": 1,
             "jobId": state["jobId"],
             "sessionId": manifest["sessionId"],
@@ -596,6 +599,84 @@ class WorkerService:
             **({"exitCode": state["exitCode"]} if "exitCode" in state else {}),
             **({"detail": state["detail"]} if "detail" in state else {}),
         }
+        # Plan-review parity: a paused orchestrator writes clarification.json
+        # in the pod-local session dir; surface it (and the plan it gates on)
+        # so the gateway can mirror the pause into the local session.
+        if state.get("state") == "running":
+            clarification = self._read_session_artifact(
+                state, "clarification.json", MAX_CLARIFICATION_BYTES
+            )
+            if clarification is not None:
+                public["clarification"] = clarification
+                if clarification.get("status") == "pending":
+                    plan = self._read_session_artifact(
+                        state, "architecture-plan.json", MAX_PLAN_BYTES
+                    )
+                    if plan is not None:
+                        public["architecturePlan"] = plan
+        return public
+
+    def _session_artifact_path(self, state: Mapping[str, Any], name: str) -> Path:
+        session_id = state["manifest"]["sessionId"]
+        return self._job_dir(state["jobId"]) / "sessions" / session_id / name
+
+    def _read_session_artifact(
+        self, state: Mapping[str, Any], name: str, limit: int
+    ) -> Optional[Dict[str, Any]]:
+        path = self._session_artifact_path(state, name)
+        try:
+            if path.stat().st_size > limit:
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def answer_clarification(self, job_id: str, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict) or not (
+            set(payload) <= {"clarificationId", "optionId", "text"}
+        ):
+            raise WorkerError("clarification answer body is invalid")
+        clarification_id = payload.get("clarificationId")
+        if not isinstance(clarification_id, str) or not clarification_id:
+            raise WorkerError("clarification answer body is invalid")
+        option_id = payload.get("optionId")
+        text = payload.get("text")
+        if option_id is not None and not isinstance(option_id, str):
+            raise WorkerError("clarification answer body is invalid")
+        if text is not None and not isinstance(text, str):
+            raise WorkerError("clarification answer body is invalid")
+        text = (text or "").strip()[:2000] or None
+        with self.lock:
+            state = self.jobs.get(job_id)
+            if not state:
+                raise WorkerError("remote job was not found", HTTPStatus.NOT_FOUND)
+            if state.get("state") != "running":
+                raise WorkerError("remote job is not running", HTTPStatus.CONFLICT)
+            current = self._read_session_artifact(
+                state, "clarification.json", MAX_CLARIFICATION_BYTES
+            )
+            if not current or current.get("id") != clarification_id:
+                raise WorkerError("remote clarification was not found", HTTPStatus.NOT_FOUND)
+            if current.get("status") != "pending":
+                return self._public_job(state)
+            valid_option = option_id is not None and any(
+                isinstance(option, dict) and option.get("id") == option_id
+                for option in current.get("options") or []
+            )
+            if not valid_option and not text:
+                raise WorkerError("answer must select a listed option or include text")
+            current["status"] = "answered"
+            current["answer"] = {
+                "optionId": option_id if valid_option else None,
+                "text": text,
+                "answeredAt": utc_now(),
+            }
+            _atomic_write(
+                self._session_artifact_path(state, "clarification.json"),
+                canonical_json_bytes(current),
+            )
+            return self._public_job(state)
 
     def create_job(self, manifest_value: Any) -> Dict[str, Any]:
         manifest = parse_remote_job_manifest(manifest_value)
@@ -1073,6 +1154,13 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                 if parse_json_body(body, MAX_JSON_BODY) != {}:
                     raise WorkerError("cancel body must be an empty object")
                 self._send_json(HTTPStatus.ACCEPTED, self.service.cancel_job(cancel_match.group(1)))
+                return
+            clarification_match = CLARIFICATION_ROUTE.fullmatch(self.path)
+            if clarification_match:
+                response = self.service.answer_clarification(
+                    clarification_match.group(1), parse_json_body(body, MAX_JSON_BODY)
+                )
+                self._send_json(HTTPStatus.OK, response)
                 return
             ack_match = ACK_ROUTE.fullmatch(self.path)
             if ack_match:

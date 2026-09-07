@@ -193,6 +193,8 @@ class RemoteTaskContractV1:
     toolchain_mode: Optional[str] = None
     customer_readiness_required: bool = False
     minimum_customer_readiness: Optional[str] = None
+    architect_first: bool = False
+    plan_review: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -221,6 +223,10 @@ class RemoteTaskContractV1:
             gates["customerReadinessRequired"] = True
         if self.minimum_customer_readiness is not None:
             gates["minimumCustomerReadiness"] = self.minimum_customer_readiness
+        if self.architect_first:
+            result["architectFirst"] = True
+        if self.plan_review:
+            result["planReview"] = True
         if gates:
             result["qualityGates"] = gates
         return result
@@ -248,6 +254,8 @@ def parse_remote_task_contract(value: Any) -> RemoteTaskContractV1:
             "intentSource",
             "toolchainMode",
             "qualityGates",
+            "architectFirst",
+            "planReview",
         ),
         "manifest.contract",
     )
@@ -293,6 +301,9 @@ def parse_remote_task_contract(value: Any) -> RemoteTaskContractV1:
                 CONTRACT_READINESS,
                 "manifest.contract.qualityGates.minimumCustomerReadiness",
             )
+    for flag in ("architectFirst", "planReview"):
+        if flag in raw and raw[flag] is not True:
+            raise RemoteContractError(f"manifest.contract.{flag} is invalid")
     return RemoteTaskContractV1(
         mode=(
             _enum(raw["mode"], CONTRACT_MODES, "manifest.contract.mode")
@@ -342,6 +353,8 @@ def parse_remote_task_contract(value: Any) -> RemoteTaskContractV1:
         ),
         customer_readiness_required=readiness_required,
         minimum_customer_readiness=minimum_readiness,
+        architect_first=raw.get("architectFirst") is True,
+        plan_review=raw.get("planReview") is True,
     )
 
 
@@ -380,6 +393,10 @@ def build_contract_args(contract: Optional[RemoteTaskContractV1]) -> list:
         args.append("--customer-readiness-required")
     if contract.minimum_customer_readiness is not None:
         args.extend(["--minimum-customer-readiness", contract.minimum_customer_readiness])
+    if contract.architect_first or contract.plan_review:
+        args.append("--architect-first")
+    if contract.plan_review:
+        args.append("--plan-review")
     return args
 
 
