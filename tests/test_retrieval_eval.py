@@ -212,3 +212,67 @@ class ObjectiveClarityEval(unittest.TestCase):
         total = len(self.UNDERSPECIFIED) + len(self.CLEAR)
         print(f"[retrieval-eval] clarity accuracy: {(total - len(wrong))}/{total}")
         self.assertEqual(wrong, [])
+
+
+class ConfidenceCalibrationLoopTest(unittest.TestCase):
+    """The calibration loop's orchestrator side: the gateway-computed report
+    anchors the prompt and annotates the packet's confidence."""
+
+    REPORT = {
+        "schemaVersion": 1,
+        "generatedAt": "2026-09-07T00:00:00Z",
+        "gradedSessions": 12,
+        "excludedSessions": 3,
+        "buckets": [
+            {"level": "high", "sessions": 8, "hits": 7, "rate": 0.875},
+            {"level": "medium", "sessions": 4, "hits": 2, "rate": 0.5},
+            {"level": "low", "sessions": 0, "hits": 0, "rate": None},
+        ],
+        "brierScore": 0.11,
+    }
+
+    def _load_v2(self):
+        spec = importlib.util.spec_from_file_location("gv2_eval", ROOT / "glimmer-v2.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["gv2_eval"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_prompt_line_reflects_measured_rates(self):
+        v2 = self._load_v2()
+        line = v2.calibration_prompt_line(self.REPORT)
+        self.assertIn("'high' verified 88%", line)
+        self.assertIn("n=8", line)
+        self.assertNotIn("'low'", line)
+
+    def test_no_history_anchors_nothing(self):
+        v2 = self._load_v2()
+        self.assertEqual(v2.calibration_prompt_line(None), "")
+        self.assertEqual(
+            v2.calibration_prompt_line({**self.REPORT, "gradedSessions": 2}), ""
+        )
+
+    def test_packet_confidence_carries_calibrated_rate(self):
+        import os
+        import tempfile
+
+        v2 = self._load_v2()
+        with tempfile.TemporaryDirectory() as scratch:
+            (Path(scratch) / "confidence-calibration.json").write_text(json.dumps(self.REPORT))
+            previous = os.environ.get("GLIMMER_STATE_ROOT")
+            os.environ["GLIMMER_STATE_ROOT"] = scratch
+            try:
+                packet = v2.compute_delivery_packet(
+                    {"statuses": {}, "gates": {}, "attempts": []},
+                    {"confidence": {"level": "high", "reason": "r"},
+                     "customerReadiness": "ready_to_ship"},
+                )
+            finally:
+                if previous is None:
+                    os.environ.pop("GLIMMER_STATE_ROOT", None)
+                else:
+                    os.environ["GLIMMER_STATE_ROOT"] = previous
+        confidence = packet["confidence"]
+        print(f"[retrieval-eval] calibrated confidence: {confidence}")
+        self.assertEqual(confidence["calibratedRate"], 0.875)
+        self.assertEqual(confidence["calibratedSampleSize"], 8)

@@ -3233,7 +3233,7 @@ def _first_focus_task(tasks, in_repair: bool = False):
 
 
 def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None, plan=None, evidence=None,
-                 repair_contract=None, tasks=None, objective_assessment=None):
+                 repair_contract=None, tasks=None, objective_assessment=None, calibration=None):
     # R2: the contract dict (same shape as manifest["contract"]) is the sole
     # source of truth for scope/mode/constraints — derive the human-readable
     # OPERATING CONTRACT lines below FROM it rather than maintaining separate
@@ -3269,6 +3269,9 @@ def make_prompt(contract, summary, iteration, failure=None, checkpoint_sha=None,
             "you make in the delivery review (unresolvedItems), so the human "
             "reviewer sees exactly what was guessed."
         )
+    calibration_line = calibration_prompt_line(calibration)
+    if calibration_line:
+        constraint_lines.append(calibration_line)
     if constraints.get("minimalChange"):
         constraint_lines.append("Make the smallest complete implementation; do not modify unrelated files.")
     banned = []
@@ -3774,6 +3777,40 @@ def run_architect_first(engineer, ws, contract, summary, session, events_path, s
         print("[V2] Architect produced no usable plan (missing/invalid/failed); proceeding without it.")
 
     return plan
+
+
+def load_confidence_calibration():
+    """Reads the gateway-computed calibration report (stated confidence vs.
+    graded outcomes across past sessions) from the state root. None when the
+    file is absent (fresh installs, Pod workspaces) — the loop simply hasn't
+    closed yet, and nothing downstream may fabricate rates."""
+    root = Path(os.environ.get("GLIMMER_STATE_ROOT") or (Path.home() / ".muse-glimmer"))
+    try:
+        data = json.loads((root / "confidence-calibration.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schemaVersion") != 1:
+        return None
+    return data
+
+
+def calibration_prompt_line(calibration) -> str:
+    """One compact line telling the model its own measured track record so
+    stated confidence is anchored to reality, not vibes. Empty when there is
+    no graded history worth anchoring to."""
+    if not isinstance(calibration, dict) or (calibration.get("gradedSessions") or 0) < 3:
+        return ""
+    parts = []
+    for bucket in calibration.get("buckets") or []:
+        if isinstance(bucket, dict) and bucket.get("rate") is not None and bucket.get("sessions"):
+            parts.append(f"'{bucket['level']}' verified {bucket['rate']:.0%} (n={bucket['sessions']})")
+    if not parts:
+        return ""
+    return (
+        "CONFIDENCE CALIBRATION (measured on this installation's past "
+        "sessions): " + "; ".join(parts) + ". State confidence consistent "
+        "with this track record — overstating erodes the reviewer's trust."
+    )
 
 
 def load_task_report(session_dir):
@@ -6177,6 +6214,17 @@ def compute_delivery_packet(manifest: dict, delivery_review, escalation=None) ->
         }
         confidence = dict(delivery_review.get("confidence") or {})
         confidence["provenance"] = "model-output"
+        calibration = load_confidence_calibration()
+        stated = confidence.get("value") or confidence.get("level")
+        if isinstance(calibration, dict) and stated:
+            bucket = next(
+                (b for b in calibration.get("buckets") or []
+                 if isinstance(b, dict) and b.get("level") == stated and b.get("rate") is not None),
+                None,
+            )
+            if bucket:
+                confidence["calibratedRate"] = bucket["rate"]
+                confidence["calibratedSampleSize"] = bucket["sessions"]
         if review_failed:
             # _fallback_delivery_review's degrade path -- still a REAL file
             # on disk, just not a real review. Labeled rather than passed
@@ -7129,6 +7177,7 @@ def main():
             if segment:
                 repo_vocabulary.add(segment.lower())
     objective_assessment = assess_objective_clarity(task, repo_vocabulary)
+    confidence_calibration = load_confidence_calibration()
     if objective_assessment["clarity"] == "underspecified":
         print(f"[V2] Objective assessed as underspecified ({', '.join(objective_assessment['signals'])}); "
               "the engineer must state its interpretation assumptions explicitly.")
@@ -7560,6 +7609,7 @@ def main():
                 emit_event(events_path, "repair_started", sid, iteration=iteration)
             prompt = make_prompt(contract, summary, iteration, failure, checkpoint_sha,
                                  objective_assessment=objective_assessment,
+                                 calibration=confidence_calibration,
                                  plan=architecture_plan, evidence=candidate_evidence,
                                  repair_contract=repair_contract, tasks=tasks)
             atomic_write_bytes(
