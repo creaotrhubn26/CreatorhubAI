@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CodeViewer } from "./CodeViewer";
 import * as client from "../../api/client";
@@ -7,7 +8,12 @@ import { SessionEventsContext } from "../../api/useSessionEvents";
 
 function withQuery(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return <QueryClientProvider client={qc}>{ui}</QueryClientProvider>;
+  // MemoryRouter: the selection popover's "Start as task" uses useNavigate.
+  return (
+    <MemoryRouter>
+      <QueryClientProvider client={qc}>{ui}</QueryClientProvider>
+    </MemoryRouter>
+  );
 }
 
 const textFile = {
@@ -185,30 +191,36 @@ describe("CodeViewer", () => {
       lastEventAt: Date.now(),
     };
     const { rerender } = render(
-      <QueryClientProvider client={qc}>
-        <SessionEventsContext.Provider value={empty}>
-          <CodeViewer path="/w/src/a.ts" workspace="/w" />
-        </SessionEventsContext.Provider>
-      </QueryClientProvider>,
+      <MemoryRouter>
+        <QueryClientProvider client={qc}>
+          <SessionEventsContext.Provider value={empty}>
+            <CodeViewer path="/w/src/a.ts" workspace="/w" />
+          </SessionEventsContext.Provider>
+        </QueryClientProvider>
+      </MemoryRouter>,
     );
     await waitFor(() => expect(readFile).toHaveBeenCalledTimes(1));
 
     rerender(
-      <QueryClientProvider client={qc}>
-        <SessionEventsContext.Provider value={changed}>
-          <CodeViewer path="/w/src/a.ts" workspace="/w" />
-        </SessionEventsContext.Provider>
-      </QueryClientProvider>,
+      <MemoryRouter>
+        <QueryClientProvider client={qc}>
+          <SessionEventsContext.Provider value={changed}>
+            <CodeViewer path="/w/src/a.ts" workspace="/w" />
+          </SessionEventsContext.Provider>
+        </QueryClientProvider>
+      </MemoryRouter>,
     );
     await waitFor(() => expect(readFile).toHaveBeenCalledTimes(2));
 
     // Replaying the same event id is not another edit.
     rerender(
-      <QueryClientProvider client={qc}>
-        <SessionEventsContext.Provider value={changed}>
-          <CodeViewer path="/w/src/a.ts" workspace="/w" />
-        </SessionEventsContext.Provider>
-      </QueryClientProvider>,
+      <MemoryRouter>
+        <QueryClientProvider client={qc}>
+          <SessionEventsContext.Provider value={changed}>
+            <CodeViewer path="/w/src/a.ts" workspace="/w" />
+          </SessionEventsContext.Provider>
+        </QueryClientProvider>
+      </MemoryRouter>,
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(readFile).toHaveBeenCalledTimes(2);

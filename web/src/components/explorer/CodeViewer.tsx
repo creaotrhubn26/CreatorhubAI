@@ -1,4 +1,5 @@
-import { useEffect, useRef, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { useSharedSessionEvents } from "../../api/useSessionEvents";
@@ -93,15 +94,49 @@ export function CodeViewer({
   }, [events, path, workspace, refetch]);
 
   const name = path.split("/").pop() || path;
+  const navigate = useNavigate();
+  const [popover, setPopover] = useState<{
+    x: number;
+    y: number;
+    text: string;
+    startLine: number;
+    endLine: number;
+  } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!popover) return;
+    const dismiss = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPopover(null);
+    };
+    window.addEventListener("keydown", dismiss);
+    return () => window.removeEventListener("keydown", dismiss);
+  }, [popover]);
 
   function captureSelection(event: MouseEvent<HTMLDivElement>) {
     if (!onSelectionChange) return;
     const selection = window.getSelection();
-    if (!selection || selection.isCollapsed) return;
+    if (!selection || selection.isCollapsed) {
+      setPopover(null);
+      return;
+    }
     const start = lineNumberForNode(selection.anchorNode, event.currentTarget);
     const end = lineNumberForNode(selection.focusNode, event.currentTarget);
     if (start === null || end === null) return;
     onSelectionChange(Math.min(start, end), Math.max(start, end));
+    // Selection popover (contextual quick actions): cheap, reversible
+    // actions happen right where the selection was made — the ask-vs-assume
+    // rule in UI form. Anchored to the container so scrolling keeps it near
+    // the text; Escape or any collapse dismisses it.
+    const bounds = event.currentTarget.getBoundingClientRect();
+    setPopover({
+      x: event.clientX - bounds.left,
+      y: event.clientY - bounds.top + 12,
+      text: selection.toString(),
+      startLine: Math.min(start, end),
+      endLine: Math.max(start, end),
+    });
+    setCopied(false);
   }
 
   if (isPending) return <div className="code-view__status">Loading {name}…</div>;
@@ -167,7 +202,63 @@ export function CodeViewer({
               lines.
             </p>
           )}
-          <div className="code-view__body" onMouseUp={captureSelection}>
+          <div
+            className="code-view__body"
+            onMouseUp={captureSelection}
+            style={{ position: "relative" }}
+          >
+            {popover && (
+              <div
+                role="menu"
+                aria-label="Selection actions"
+                style={{
+                  position: "absolute",
+                  left: Math.max(8, popover.x - 40),
+                  top: popover.y,
+                  zIndex: 10,
+                  display: "flex",
+                  gap: 4,
+                  padding: 4,
+                  borderRadius: 8,
+                  border: "1px solid var(--border, #444)",
+                  background: "var(--bg-elevated, #222)",
+                  boxShadow: "0 4px 16px rgba(0,0,0,0.35)",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(popover.text);
+                    setCopied(true);
+                  }}
+                >
+                  {copied ? "Copied ✓" : "Copy"}
+                </button>
+                {workspace && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      navigate("/tasks/new", {
+                        state: {
+                          selectionDraft: {
+                            objective: "",
+                            workspace,
+                            path,
+                            startLine: popover.startLine,
+                            endLine: popover.endLine,
+                          },
+                        },
+                      })
+                    }
+                  >
+                    Start as task
+                  </button>
+                )}
+                <button type="button" onClick={() => setPopover(null)} aria-label="Dismiss">
+                  ✕
+                </button>
+              </div>
+            )}
             {lines.map((text, i) => {
               const no = i + 1;
               const isCurrent = line === no;
