@@ -66,6 +66,12 @@ Add `--kill-mid-run` to also prove restart recovery.
   capacity). Prove it with a `--mode verify` run before adding it.
 - The snapshot mirror (snapshot.ubuntu.com) has multi-minute 5xx
   outages; image builds that fail there succeed on retrigger.
+- One unreproduced compute.test flake was observed during an on-Pod
+  verification run (2026-09-07); 5 isolated + 2 full-suite runs in the
+  exact image could not reproduce it. Working hypothesis: CPU contention
+  with llama-server during live runs. If it recurs, the session's
+  orchestrator.log carries the failure output — investigate then, not
+  preemptively.
 - Never build llama.cpp without `-DGGML_NATIVE=OFF` — CI runners leak
   AMX/AVX-512 into the binary and Pods on older hosts die with
   "Illegal instruction".
