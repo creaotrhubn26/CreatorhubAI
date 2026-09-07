@@ -4,8 +4,16 @@ import path from "node:path";
 import type { LocalQualityMetrics, TaskReportV2 } from "@glimmer/shared";
 import { CONFIG, sessionsDir } from "../config.js";
 import { isValidSessionId, listSessionIds } from "../lib/sessions.js";
+import { refreshCalibrationReport } from "../lib/confidenceCalibration.js";
 
 export const qualityRouter = Router();
+
+// Confidence calibration: stated confidence vs. graded outcomes across all
+// sessions. Refreshing also persists <stateRoot>/confidence-calibration.json,
+// which the local orchestrator feeds back into the next run (the loop).
+qualityRouter.get("/quality/confidence-calibration", async (_req, res) => {
+  res.json(await refreshCalibrationReport());
+});
 
 async function readJson(file: string): Promise<unknown | null> {
   try {
