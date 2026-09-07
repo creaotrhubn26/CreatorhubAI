@@ -301,3 +301,13 @@ describe("gitRevertFile", () => {
     }
   });
 });
+
+describe("isVolatileWorktreeRoot", () => {
+  it("flags tmp-based roots and accepts the home directory", async () => {
+    const { isVolatileWorktreeRoot } = await import("./git.js");
+    expect(isVolatileWorktreeRoot("/private/tmp")).toBe(true);
+    expect(isVolatileWorktreeRoot("/tmp/worktrees")).toBe(true);
+    expect(isVolatileWorktreeRoot(os.tmpdir())).toBe(true);
+    expect(isVolatileWorktreeRoot(os.homedir())).toBe(false);
+  });
+});

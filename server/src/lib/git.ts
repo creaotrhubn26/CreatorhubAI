@@ -429,6 +429,19 @@ export function resolvesWithinRoot(root: string, candidate: string): boolean {
   return path.resolve(candidate).startsWith(resolvedRoot);
 }
 
+
+// A session ends with UNCOMMITTED changes awaiting Diff Review; a worktree
+// under a volatile root (macOS wipes /private/tmp on boot) silently loses
+// that work on the next reboot, so a misconfigured GLIMMER_WORKTREE_ROOT
+// fails loudly at creation instead.
+export function isVolatileWorktreeRoot(root: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  return [os.tmpdir(), "/tmp", "/private/tmp", "/private/var/folders"].some((volatile) => {
+    const volatileRoot = path.resolve(volatile);
+    return resolvedRoot === volatileRoot || resolvesWithinRoot(volatileRoot, resolvedRoot);
+  });
+}
+
 async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
@@ -515,6 +528,12 @@ async function doCreateWorkspace(slug: string): Promise<CreateWorkspaceResult> {
   if (!resolvesWithinRoot(CONFIG.worktreeRoot, workspace)) {
     throw new WorkspaceCreateError(
       `refusing to create a worktree outside worktreeRoot: ${workspace}`,
+      500,
+    );
+  }
+  if (isVolatileWorktreeRoot(CONFIG.worktreeRoot)) {
+    throw new WorkspaceCreateError(
+      `refusing a worktree under the volatile root ${path.resolve(CONFIG.worktreeRoot)}: it would not survive a reboot`,
       500,
     );
   }
