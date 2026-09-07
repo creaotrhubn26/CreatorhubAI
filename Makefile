@@ -29,6 +29,7 @@ RUNPOD_TESTS := \
 	tests.test_remote_contract \
 	tests.test_retrieval_eval \
 	tests.test_injection_canaries \
+	tests.test_loop_sentinel \
 	tests.test_bootstrap_status \
 	tests.test_cache_manifest \
 	tests.test_coordinator_callback \

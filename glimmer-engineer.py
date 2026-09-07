@@ -34,7 +34,7 @@ from glimmer_quality import (
     parse_critic_response,
     validate_task_report_v2,
 )
-from glimmer_semantic import bm25_rank
+from glimmer_semantic import bm25_rank, tokenize_for_search
 from glimmer_semantic import (
     impact_paths as semantic_impact_paths,
 )
@@ -4782,6 +4782,86 @@ def _persist_tool_envelope(envelope):
         print(f"[glimmer-engineer] failed to persist tool envelope: {exc}", flush=True)
 
 
+
+
+# ============================================================
+# Insight-based loop detection (metacognition layer). Budget caps bound HOW
+# LONG an engineer can dig; this detects THAT it is digging: near-identical
+# tool calls producing near-identical failing results. The intervention is a
+# visible nudge appended to the tool result — the model reads it exactly
+# where it is looping — plus a loop_detected event for the session record.
+# Deterministic (token Jaccard), warns once per pattern, never blocks.
+# ============================================================
+
+LOOP_WINDOW = 10
+LOOP_MIN_REPEATS = 3
+LOOP_ARGS_SIMILARITY = 0.65
+LOOP_RESULT_SIMILARITY = 0.7
+_LOOP_FAILURE_RE = re.compile(
+    r"error|failed|failure|exception|traceback|cannot|not found|denied|refused",
+    re.IGNORECASE,
+)
+
+LOOP_NUDGE = (
+    "\n\n[LOOP DETECTED] You have now tried a near-identical {tool} call "
+    "{count} times and received a near-identical failing result each time. "
+    "Small variations of this approach are not converging. Step back: "
+    "re-read the actual error, question the assumption that led here, try a "
+    "genuinely different approach, or honestly report the blocker instead "
+    "of retrying."
+)
+
+
+def _jaccard(left: set, right: set) -> float:
+    if not left and not right:
+        return 1.0
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+class LoopSentinel:
+    """Watches the tool-call stream for same-approach-small-variation loops."""
+
+    def __init__(self):
+        self._history = []
+        self._warned = set()
+
+    def observe(self, tool_name: str, arguments, content: str):
+        """Records one completed call; returns a nudge string when this call
+        completes a loop pattern (once per pattern), else None."""
+        argument_tokens = frozenset(tokenize_for_search(json.dumps(arguments, sort_keys=True, default=str)))
+        result_tokens = frozenset(tokenize_for_search(str(content)[:2000]))
+        failing = bool(_LOOP_FAILURE_RE.search(str(content)[:2000]))
+        entry = (tool_name, argument_tokens, result_tokens, failing)
+        self._history.append(entry)
+        del self._history[:-LOOP_WINDOW]
+        if not failing:
+            return None
+        repeats = 1
+        for previous_tool, previous_args, previous_result, previous_failing in self._history[:-1]:
+            if (
+                previous_tool == tool_name
+                and previous_failing
+                and _jaccard(set(previous_args), set(argument_tokens)) >= LOOP_ARGS_SIMILARITY
+                and _jaccard(set(previous_result), set(result_tokens)) >= LOOP_RESULT_SIMILARITY
+            ):
+                repeats += 1
+        if repeats < LOOP_MIN_REPEATS:
+            return None
+        # One nudge per PATTERN: keyed on the failing result, not the
+        # arguments — small argument variations are exactly what a loop
+        # looks like, so they must not re-arm the warning.
+        signature = (tool_name, tuple(sorted(result_tokens))[:32])
+        if signature in self._warned:
+            return None
+        self._warned.add(signature)
+        _emit("loop_detected", tool=tool_name, repeats=repeats)
+        return LOOP_NUDGE.format(tool=tool_name, count=repeats)
+
+
+_LOOP_SENTINEL = LoopSentinel()
+
+
 def execute_tool(
     tool_name,
     arguments,
@@ -5278,6 +5358,11 @@ def execute_tool(
         )
 
     content = result_text(result)
+
+    loop_nudge = _LOOP_SENTINEL.observe(tool_name, arguments, content)
+    if loop_nudge:
+        content += loop_nudge
+        print(loop_nudge.strip())
 
     result_summary = content[:1800]
 

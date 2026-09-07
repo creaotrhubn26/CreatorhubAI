@@ -25,7 +25,7 @@ EVENT_TYPES = {
     "tool_started", "tool_completed", "tool_blocked", "file_changed",
     "verification_started", "verification_completed", "agent_state_changed",
     "candidate_selected", "scope_expanded", "repair_started",
-    "parser_recovery", "session_completed", "retrieval_query",
+    "parser_recovery", "session_completed", "retrieval_query", "loop_detected",
     # V7 event vocabulary expansion (Task 1.2 — §5.14, §22.15, task events,
     # §23.13). "architect_replan_started" is emitted by glimmer-v2.py's
     # review loop (Task 2.2, V7 §5.12) right before re-invoking the
