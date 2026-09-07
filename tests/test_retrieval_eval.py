@@ -174,3 +174,41 @@ class MemoryScoringEval(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObjectiveClarityEval(unittest.TestCase):
+    """Precision/recall of the deterministic clarity assessor. Cases mirror
+    real composer inputs in both languages; every verdict is asserted so a
+    tokenizer or stopword change fails loudly."""
+
+    VOCAB = {"computecontroller", "auth", "billing", "readme"}
+    UNDERSPECIFIED = [
+        "fiks dette",
+        "fix it",
+        "fix this",
+        "gjør det bedre",
+        "make it better",
+    ]
+    CLEAR = [
+        "Fix the race in computeController.ts",
+        "Les README eller package.json og skriv en kort oppsummering",
+        "Improve error handling in the auth module",
+        "Rydd opp i billing-koden og fjern død kode",
+        "Add retry logic to the RunPod client",
+    ]
+
+    def test_clarity_verdicts(self):
+        from glimmer_semantic import assess_objective_clarity
+
+        wrong = []
+        for objective in self.UNDERSPECIFIED:
+            verdict = assess_objective_clarity(objective, self.VOCAB)
+            if verdict["clarity"] != "underspecified":
+                wrong.append((objective, verdict))
+        for objective in self.CLEAR:
+            verdict = assess_objective_clarity(objective, self.VOCAB)
+            if verdict["clarity"] != "clear":
+                wrong.append((objective, verdict))
+        total = len(self.UNDERSPECIFIED) + len(self.CLEAR)
+        print(f"[retrieval-eval] clarity accuracy: {(total - len(wrong))}/{total}")
+        self.assertEqual(wrong, [])

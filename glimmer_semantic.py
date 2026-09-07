@@ -649,3 +649,42 @@ def bm25_rank(
             scored.append((doc_id, round(score, 6)))
     return sorted(scored, key=lambda item: (-item[1], item[0]))
 
+# Deterministic objective-clarity assessment (intent-clarification layer).
+# Runs before any model call: a vague objective yields vague retrieval and
+# silent guessing, so the orchestrator records the assessment in the
+# manifest/delivery packet and instructs the engineer to surface its
+# interpretation assumptions explicitly. Never blocks a run.
+
+_DEMONSTRATIVES = {
+    "this", "that", "it", "these", "those",
+    "dette", "det", "den", "denne", "disse", "her", "der",
+}
+_CLARITY_STOPWORDS = _DEMONSTRATIVES | {
+    "the", "a", "an", "and", "or", "please", "now",
+    "og", "en", "et", "ei", "å", "i", "på", "til", "med", "som",
+}
+
+
+def assess_objective_clarity(objective: str, known_tokens=None) -> dict:
+    """Classifies an objective as "clear" or "underspecified" with the
+    signals that drove the verdict. known_tokens: lowercase repository
+    vocabulary (file path segments, symbol names) used to resolve
+    demonstrative references — "fix this" is underspecified in general but
+    clear when another token names something real in the repo."""
+    known = {str(token).lower() for token in (known_tokens or set())}
+    text = str(objective or "")
+    tokens = tokenize_for_search(text)
+    content = [token for token in tokens if token not in _CLARITY_STOPWORDS]
+    signals = []
+    if len(content) < 2:
+        signals.append("too-short")
+    has_demonstrative = any(token in _DEMONSTRATIVES for token in tokens)
+    has_path = bool(re.search(r"[\w-]+\.[A-Za-z0-9]{1,8}\b|/", text))
+    has_known_referent = has_path or any(token in known for token in content)
+    if has_demonstrative and not has_known_referent and len(content) < 4:
+        signals.append("unresolved-referent")
+    return {
+        "clarity": "underspecified" if signals else "clear",
+        "signals": signals,
+    }
+
