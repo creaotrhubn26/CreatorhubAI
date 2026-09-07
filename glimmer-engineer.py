@@ -4389,6 +4389,15 @@ def _docs_search(query, graph, workspace):
         lines[doc_id] = f"adr {adr['id']}: {adr['title']} ({adr['path']})"
 
     ranked = bm25_rank(str(query), documents)
+    # Golden-set harvesting: every real query (and whether it hit) lands in
+    # the session event stream, so misses become retrieval-eval cases
+    # instead of anecdotes. See docs/retrieval-decision.md.
+    _emit(
+        "retrieval_query",
+        tool="docs_search",
+        query=str(query)[:200],
+        hits=[doc_id for doc_id, _ in ranked[:3]],
+    )
     if not ranked:
         return f"docs_search: no matches for {query!r}."
     return "\n".join(lines[doc_id] for doc_id, _ in ranked[:DOC_TOOLS_SEARCH_CAP])
