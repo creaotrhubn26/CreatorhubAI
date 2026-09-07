@@ -1,3 +1,4 @@
+import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { CollapsibleSection } from "../common/CollapsibleSection";
@@ -9,7 +10,14 @@ import { CollapsibleSection } from "../common/CollapsibleSection";
 // have their own panels (ArchitecturePlanPanel, DeliveryReviewPanel,
 // VisualVerificationPanel). Model-derived sections are labeled the same way
 // DeliveryReviewPanel already labels its own content.
-export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
+export function DeliveryPacketPanel({
+  sessionId,
+  workspace,
+}: {
+  sessionId: string;
+  workspace?: string;
+}) {
+  const navigate = useNavigate();
   // Written once at session close-out — fetch once, not a poll target,
   // same convention as DeliveryReviewPanel/ArchitecturePlanPanel.
   const { data: packet } = useQuery({
@@ -112,7 +120,17 @@ export function DeliveryPacketPanel({ sessionId }: { sessionId: string }) {
           <h3>Plan forward</h3>
           <ul>
             {packet.forwardPlan.nextSteps.map((s, i) => (
-              <li key={i}>{s.action}</li>
+              <li key={i}>
+                {s.action}{" "}
+                <button
+                  type="button"
+                  onClick={() =>
+                    navigate("/tasks/new", { state: { objective: s.action, workspace } })
+                  }
+                >
+                  Start as task
+                </button>
+              </li>
             ))}
           </ul>
         </>

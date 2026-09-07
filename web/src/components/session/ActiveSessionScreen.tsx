@@ -481,8 +481,8 @@ export function ActiveSessionScreen() {
       {id && readOnlyMode && <TaskReportPanel sessionId={id} ready={!isRunning} />}
       {id && !readOnlyMode && <ArchitecturePlanPanel sessionId={id} />}
       {id && !readOnlyMode && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
-      {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} />}
-      {id && !readOnlyMode && <DeliveryPacketPanel sessionId={id} />}
+      {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} workspace={session.workspace} />}
+      {id && !readOnlyMode && <DeliveryPacketPanel sessionId={id} workspace={session.workspace} />}
       {id && !readOnlyMode && (
         <VisualVerificationPanel
           sessionId={id}

@@ -26,7 +26,13 @@ const PRIORITY_LABEL: Record<NextStepPriority, string> = {
   future_opportunity: "Future opportunity",
 };
 
-export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
+export function DeliveryReviewPanel({
+  sessionId,
+  workspace,
+}: {
+  sessionId: string;
+  workspace?: string;
+}) {
   const navigate = useNavigate();
   // Written once at session close-out — fetch once, not a poll target.
   const { data: review } = useQuery({
@@ -144,7 +150,7 @@ export function DeliveryReviewPanel({ sessionId }: { sessionId: string }) {
                           type="button"
                           style={{ fontSize: 12 }}
                           title="Convert this next step into a new task (opens the composer, prefilled — nothing runs automatically)"
-                          onClick={() => navigate("/tasks/new", { state: { objective: s.action } })}
+                          onClick={() => navigate("/tasks/new", { state: { objective: s.action, workspace } })}
                         >
                           Convert to task
                         </button>

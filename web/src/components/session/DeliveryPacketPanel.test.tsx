@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DeliveryPacketPanel } from "./DeliveryPacketPanel";
 import * as client from "../../api/client";
@@ -44,7 +45,7 @@ const FULL_PACKET = {
 describe("DeliveryPacketPanel", () => {
   it("renders task, verification, visual, customer readiness, confidence, changed files, limitations, and plan forward", async () => {
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockResolvedValue(FULL_PACKET as any);
-    render(withQuery(<DeliveryPacketPanel sessionId="s1" />));
+    render(withQuery(<MemoryRouter><DeliveryPacketPanel sessionId="s1" /></MemoryRouter>));
 
     await waitFor(() => expect(screen.getByText("add widget")).toBeInTheDocument());
     expect(screen.getByText("VERIFIED")).toBeInTheDocument();
@@ -74,7 +75,7 @@ describe("DeliveryPacketPanel", () => {
       humanReviewStatus: "pending",
     };
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockResolvedValue(bare as any);
-    render(withQuery(<DeliveryPacketPanel sessionId="s1" />));
+    render(withQuery(<MemoryRouter><DeliveryPacketPanel sessionId="s1" /></MemoryRouter>));
 
     await waitFor(() => expect(screen.getByText("t")).toBeInTheDocument());
     // customerReadiness dd and confidence dd both honestly render the bare
@@ -89,7 +90,7 @@ describe("DeliveryPacketPanel", () => {
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockRejectedValue(
       new Error("GET .../delivery-packet failed: 404"),
     );
-    const { container } = render(withQuery(<DeliveryPacketPanel sessionId="s1" />));
+    const { container } = render(withQuery(<MemoryRouter><DeliveryPacketPanel sessionId="s1" /></MemoryRouter>));
 
     await waitFor(() => expect(client.glimmerApi.getDeliveryPacket).toHaveBeenCalled());
     expect(container).toBeEmptyDOMElement();
