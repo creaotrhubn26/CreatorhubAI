@@ -1,3 +1,5 @@
+import { promises as fs, unlinkSync } from "node:fs";
+import path from "node:path";
 import { createApp } from "./app.js";
 import { CONFIG } from "./config.js";
 import { reconcileActiveRunsOnStartup } from "./routes/sessions.js";
@@ -75,6 +77,33 @@ if (
 }
 // Loopback only: this API can spawn processes, so it must never be reachable
 // from other hosts on the network.
+// Local tooling (the remote-e2e drivers) attaches to a running app instead
+// of racing it for the port; state-changing requests need this instance's
+// capability token, so it is exposed to the SAME user only via a 0600 file
+// in the state root — the trust domain that already holds the compute keys.
+const capabilityTokenPath = path.join(CONFIG.stateRoot, "gateway-capability.token");
+if (CONFIG.capabilityToken) {
+  try {
+    await fs.mkdir(CONFIG.stateRoot, { recursive: true });
+    await fs.writeFile(capabilityTokenPath, CONFIG.capabilityToken, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    process.once("exit", () => {
+      try {
+        unlinkSync(capabilityTokenPath);
+      } catch {
+        // Best effort; a stale file is harmless (it is only readable by the
+        // same user and stops matching once a new instance rewrites it).
+      }
+    });
+  } catch (error) {
+    console.error(
+      `[gateway] could not expose the capability token for local tooling: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 app.listen(CONFIG.port, "127.0.0.1", () => {
   console.log(`Glimmer Local API listening on http://127.0.0.1:${CONFIG.port}`);
   // The PATH this process inherited is the PATH glimmer-v2.py and every

@@ -35,7 +35,7 @@ const MODE = options.mode ?? "inspect";
 const KILL_MID_RUN = options["kill-mid-run"] === "true";
 
 const instanceId = randomBytes(16).toString("hex");
-const capability = randomBytes(32).toString("hex");
+let capability = randomBytes(32).toString("hex");
 const stateRoot = path.join(os.homedir(), ".muse-glimmer");
 
 const log = (event, extra = {}) =>
@@ -95,6 +95,17 @@ let exitCode = 1;
 let originalEnabled = false;
 try {
   const attached = await gatewayAlive();
+  if (attached) {
+    // The running instance enforces its own capability token; the gateway
+    // exposes it to the same user via a 0600 file in the state root.
+    try {
+      capability = readFileSync(path.join(stateRoot, "gateway-capability.token"), "utf8").trim();
+    } catch {
+      throw new Error(
+        "an app is running but its capability token file is missing — update the app (the gateway writes ~/.muse-glimmer/gateway-capability.token) or quit it first",
+      );
+    }
+  }
   if (attached && KILL_MID_RUN) {
     throw new Error(
       "--kill-mid-run needs to own the app process; quit the running app first",
