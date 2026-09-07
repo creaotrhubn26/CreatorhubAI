@@ -31,27 +31,23 @@ const startTime = Date.now();
 const SUPPORT_LOG_BYTES = 16 * 1024;
 const SUPPORT_LOG_SESSIONS = 3;
 export const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
-  "glimmer-v2.py": "ecd0952e83bc9fd658230e4aa2707d92e90151e994529e78aacbd011b067ee4a",
-  "glimmer-engineer.py": "16be8ca1c4ec368e3247a1f034a0db5b8418235129cf964962d12ee9bda3f7db",
-  "glimmer_events.py": "2fd4aa0afbe32b58150be442c0e2b4cbb70f1c5ab65f2a9d2e857b239cd34454",
+  "glimmer-v2.py": "23f4195a04db230d378bcdfcaa407af59c8b6269ec2fe813dc527283e23e2b0a",
+  "glimmer-engineer.py": "1d94fbfc892918d378d57ac4c5b2f258641251499a14ff485664ebde6565096f",
+  "glimmer_events.py": "7bbf8ace8c591704a152297c2978520a8ec59dd1e3c19b75ddd54a2453fc42e4",
   "glimmer_journal.py": "67a28a2c480ca65ff49133968bda89a0c4f9e670aa02e28cd5fcb3e269464cf5",
   "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",
   "glimmer_memory.py": "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920",
   "glimmer_quality.py": "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188",
-  "glimmer_semantic.py": "e1d3ce00c33f6db5d4183b1e8c237bbea50532ee051018b64b577163f864f167",
+  "glimmer_semantic.py": "a9720efab5f7c1201d2af9e454dcacef32e576b682aa33fbcd5e4e62e7cbf6dd",
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
   "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
-  "glimmer_remote.py": "5771ff5870bfc74b35cdad90c7011da5f23ca88bf2d54eb2f9a8a59188926bfd",
-  "runpod_worker.py": "b06de735ab48659456f59e188ea173cc839513d918235be4000f9651f6b5e979",
+  "glimmer_remote.py": "0fcd9cd18bab8e548b713e9f96f1205e7916dde8552cdef9a11556c0d2842ffc",
+  "runpod_worker.py": "dab472be76ba836a7ac8ec62e8f0dd8b5b2feddee6488a28d2e7d3803cc6b41e",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
-  "eval-baselines/baseline-stub.json":
-    "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
-  "eval-baselines/latest-stub.json":
-    "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
-  "eval-baselines/baseline-live.json":
-    "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
-  "eval-baselines/latest-live.json":
-    "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
+  "eval-baselines/baseline-stub.json": "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
+  "eval-baselines/latest-stub.json": "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
+  "eval-baselines/baseline-live.json": "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
+  "eval-baselines/latest-live.json": "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
 };
 const BUNDLED_PYTHON_SHA256: Record<string, string> = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",

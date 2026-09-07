@@ -86,6 +86,23 @@ for index in "${!FILES[@]}"; do
   printf '%s  %s\n' "${SHAS[$index]}" "$STAGING/${FILES[$index]}" | shasum -a 256 -c -
 done
 
+
+# Pin-drift guard: the gateway's own integrity table
+# (server/src/lib/diagnostics.ts BUNDLED_ORCHESTRATOR_SHA256) must agree
+# with the pins above — a third copy of these hashes once drifted silently
+# and the shipped app refused its own orchestrator. Fail the build loudly
+# instead.
+DIAGNOSTICS_TS="server/../server/src/lib/diagnostics.ts"
+DIAGNOSTICS_TS="$(cd .. && pwd)/server/src/lib/diagnostics.ts"
+for index in "${!FILES[@]}"; do
+  file="${FILES[$index]}"
+  case "$file" in eval-baselines/*) continue;; esac
+  if ! grep -q "\"${SHAS[$index]}\"" "$DIAGNOSTICS_TS"; then
+    echo "pin drift: diagnostics.ts BUNDLED_ORCHESTRATOR_SHA256 disagrees for $file" >&2
+    exit 1
+  fi
+done
+
 test "$OUT" = "binaries/runtime/orchestrator"
 rm -rf "$OUT"
 mkdir -p "$OUT"
