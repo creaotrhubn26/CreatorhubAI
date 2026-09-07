@@ -7,7 +7,7 @@
 # network; each final file must match its release SHA-256 before output.
 set -euo pipefail
 
-ORCHESTRATOR_REF="0a3004be30723e0dc92d98d695dada624e0ff439"
+ORCHESTRATOR_REF="6e51df569a29e95d87e6c7186b3bb66e51b7a25c"
 SNAPSHOT_ID="glimmer-runpod-r2"
 RUNPOD_WORKFLOW_SHA="c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952"
 
@@ -50,7 +50,7 @@ FILES=(
   "eval-baselines/latest-live.json"
 )
 SHAS=(
-  "9a2a5512e43a8a8bf459050332598f7b30e86f40dec1eeb956863c8299d99bba"
+  "23f4195a04db230d378bcdfcaa407af59c8b6269ec2fe813dc527283e23e2b0a"
   "1d94fbfc892918d378d57ac4c5b2f258641251499a14ff485664ebde6565096f"
   "7bbf8ace8c591704a152297c2978520a8ec59dd1e3c19b75ddd54a2453fc42e4"
   "67a28a2c480ca65ff49133968bda89a0c4f9e670aa02e28cd5fcb3e269464cf5"
