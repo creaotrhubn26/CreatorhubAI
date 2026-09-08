@@ -323,6 +323,15 @@ export function runGlimmer(
       ...process.env,
       GLIMMER_API_KEY_FILE: CONFIG.modelApiKeyFile,
       GLIMMER_MODEL_CONFIG: CONFIG.modelConfigPath,
+      // Browser-bridge opt-in for glimmer-visual.py: point it at this
+      // gateway so visual verification can also capture the user's REAL
+      // browser (logged-in state, console errors) via the Chrome extension.
+      // Harmless when the extension is not connected — the bridge reports
+      // "not connected" and headless capture stands alone.
+      GLIMMER_BROWSER_BRIDGE_URL: `http://127.0.0.1:${CONFIG.port}`,
+      ...(CONFIG.capabilityToken
+        ? { GLIMMER_BROWSER_BRIDGE_TOKEN: CONFIG.capabilityToken }
+        : {}),
     },
   });
 

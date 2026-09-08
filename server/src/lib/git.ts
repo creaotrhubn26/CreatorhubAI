@@ -435,6 +435,9 @@ export function resolvesWithinRoot(root: string, candidate: string): boolean {
 // that work on the next reboot, so a misconfigured GLIMMER_WORKTREE_ROOT
 // fails loudly at creation instead.
 export function isVolatileWorktreeRoot(root: string): boolean {
+  // Tests exercise real worktrees under mkdtemp roots; the explicit opt-out
+  // keeps the production default loud without forbidding that.
+  if (process.env.GLIMMER_ALLOW_VOLATILE_WORKTREE_ROOT === "1") return false;
   const resolvedRoot = path.resolve(root);
   return [os.tmpdir(), "/tmp", "/private/tmp", "/private/var/folders"].some((volatile) => {
     const volatileRoot = path.resolve(volatile);

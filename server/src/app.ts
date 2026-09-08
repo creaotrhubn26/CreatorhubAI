@@ -14,6 +14,7 @@ import { designBridgeRouter } from "./routes/designBridge.js";
 import { designWorkflowRouter } from "./routes/designWorkflow.js";
 import { designCatalogRouter } from "./routes/designCatalog.js";
 import { computeRouter } from "./routes/compute.js";
+import { browserRouter } from "./routes/browser.js";
 import { CONFIG } from "./config.js";
 
 // The only origins allowed to reach this API: the local web dev server
@@ -96,7 +97,12 @@ export function localOnlyGuard(req: Request, res: Response, next: NextFunction) 
   }
   if (SAFE_METHODS.has(req.method)) return next();
   const origin = req.headers.origin;
-  if (!origin || !ALLOWED_ORIGINS.has(origin)) {
+  // A chrome-extension:// origin can only be set by an installed extension —
+  // no web page can forge it — so CSRF does not apply; the capability check
+  // below is still the gate that authorizes the write. This admits the
+  // Glimmer browser-bridge extension without pinning its install-dependent id.
+  const fromExtension = typeof origin === "string" && origin.startsWith("chrome-extension://");
+  if (!origin || (!ALLOWED_ORIGINS.has(origin) && !fromExtension)) {
     return res.status(403).json({
       error: origin
         ? `request rejected: origin "${origin}" may not make state-changing requests`
@@ -127,7 +133,12 @@ export function createApp(): Express {
       exposedHeaders: ["Content-Disposition"],
     }),
   );
+  // Screenshot results from the browser bridge exceed the default 100kb
+  // json cap; scoping the raised limit to that router keeps every other
+  // route on the strict default.
+  app.use("/api/browser", express.json({ limit: "10mb" }));
   app.use(express.json());
+  app.use("/api", browserRouter);
   app.use("/api", statusRouter);
   app.use("/api", sessionsRouter);
   app.use("/api", workspacesRouter);

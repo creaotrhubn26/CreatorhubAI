@@ -44,6 +44,7 @@ beforeAll(async () => {
 
   process.env.GLIMMER_SOURCE_REPO = sourceRepo;
   process.env.GLIMMER_WORKTREE_ROOT = worktreeRoot;
+  process.env.GLIMMER_ALLOW_VOLATILE_WORKTREE_ROOT = "1";
   process.env.GLIMMER_WORKTREE_BASE = "origin/main";
 
   const mod = await import("./git.js");

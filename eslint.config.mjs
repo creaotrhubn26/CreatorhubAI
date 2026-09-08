@@ -14,6 +14,10 @@ export default tseslint.config(
       "src-tauri/resources/**",
     ],
   },
+  {
+    files: ["chrome-extension/**/*.js"],
+    languageOptions: { globals: { ...globals.browser, chrome: "readonly" } },
+  },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
