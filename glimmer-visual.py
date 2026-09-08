@@ -928,6 +928,58 @@ def build_findings(captures, findings=None, reports=None):
     }
 
 
+
+
+def _bridge_live_capture(url, output_dir):
+    """Glimmer Browser Bridge (opt-in): one screenshot plus a console dump
+    from the USER'S real browser, through the local gateway's /api/browser
+    relay and its Chrome extension. Activated only when
+    GLIMMER_BROWSER_BRIDGE_URL is set; GLIMMER_BROWSER_BRIDGE_TOKEN carries
+    the gateway capability. Read-only like the rest of this script, and a
+    failure is reported in the returned entry -- never raised -- because
+    live-browser evidence is a bonus on top of headless capture, not a
+    gate. Returns None when the bridge is not configured."""
+    base = os.environ.get("GLIMMER_BROWSER_BRIDGE_URL", "").rstrip("/")
+    token = os.environ.get("GLIMMER_BROWSER_BRIDGE_TOKEN", "")
+    if not base:
+        return None
+    import urllib.request
+
+    def call(kind):
+        request = urllib.request.Request(
+            base + "/api/browser/execute",
+            data=json.dumps({"kind": kind, "url": url}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "tauri://localhost",
+                **({"X-Glimmer-Capability": token} if token else {}),
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    entry = {"status": "failed", "screenshot": None, "consoleEntries": None, "error": None}
+    try:
+        shot = call("screenshot")
+        data = shot.get("data") or {}
+        if shot.get("ok") and data.get("pngBase64"):
+            (output_dir / "live-browser.png").write_bytes(base64.b64decode(data["pngBase64"]))
+            entry["screenshot"] = "live-browser.png"
+            entry["status"] = "captured"
+        else:
+            entry["error"] = shot.get("error") or "bridge screenshot unavailable"
+        console = call("console")
+        if console.get("ok"):
+            entries = (console.get("data") or {}).get("entries") or []
+            (output_dir / "browser-console.json").write_text(
+                json.dumps(entries, indent=2), encoding="utf-8"
+            )
+            entry["consoleEntries"] = len(entries)
+    except Exception as exc:  # noqa: BLE001 -- bridge evidence must never crash capture
+        entry["error"] = f"{type(exc).__name__}: {exc}"
+    return entry
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Glimmer C4 visual capture + review (capture always runs; --vision opts in a real multimodal model review)"
@@ -1008,6 +1060,9 @@ def main(argv=None):
     manifest = build_manifest(
         args.url, captures, states=state_names, checks=checks, references=references
     )
+    live_browser = _bridge_live_capture(args.url, output_dir)
+    if live_browser is not None:
+        manifest["liveBrowser"] = live_browser
     (output_dir / "visual-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     if args.vision:
@@ -1473,6 +1528,9 @@ def _selfcheck() -> None:
         assert {r["state"] for r in reports_multi} == {"initial", "dialog-opened", "loading"}
         assert "dialog-opened" in next(f["description"] for f in findings_multi if f["state"] == "dialog-opened")
 
+    assert _bridge_live_capture("http://127.0.0.1:1/x", Path(".")) is None, (
+        "bridge capture must be inert without GLIMMER_BROWSER_BRIDGE_URL"
+    )
     print("glimmer-visual.py self-check: PASS")
 
 
