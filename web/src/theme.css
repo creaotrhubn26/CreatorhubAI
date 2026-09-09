@@ -3795,6 +3795,19 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.diff-view__preview-toggle {
+  font-size: 0.8em;
+  padding: 2px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-1, transparent);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.diff-view__preview-toggle[aria-pressed="true"] {
+  color: var(--accent-strong);
+  border-color: var(--accent);
+}
 .diff-view.wrap .diff-view__line {
   white-space: pre-wrap;
 }

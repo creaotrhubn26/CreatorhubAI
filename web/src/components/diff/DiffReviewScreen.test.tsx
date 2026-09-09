@@ -246,4 +246,38 @@ describe("DiffReviewScreen", () => {
     await waitFor(() => expect(rejectHunk).toHaveBeenCalledWith("s1", hunkId, "a.ts"));
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session-analysis", "s1"] });
   });
+
+  it("previews an added markdown file as rendered prose, defaulting to the diff", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
+      diff:
+        "diff --git a/docs/spec.md b/docs/spec.md\n--- /dev/null\n+++ b/docs/spec.md\n" +
+        "@@ -0,0 +1,3 @@\n+# Spec Title\n+\n+Some **bold** prose.\n",
+      hunks: [],
+    });
+    const { container } = renderScreen();
+    // Diff first: the raw added line is shown, no rendered heading yet.
+    await waitFor(() => expect(container.querySelector(".diff-view")).toBeInTheDocument());
+    expect(screen.queryByRole("heading", { name: "Spec Title" })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Preview" }));
+    const heading = await screen.findByRole("heading", { name: "Spec Title" });
+    expect(heading.tagName).toBe("H1");
+
+    // Back to the diff.
+    fireEvent.click(screen.getByRole("button", { name: "Diff" }));
+    expect(screen.queryByRole("heading", { name: "Spec Title" })).toBeNull();
+  });
+
+  it("labels a modified markdown preview as partial", async () => {
+    vi.spyOn(client.glimmerApi, "getSessionDiff").mockResolvedValue({
+      diff:
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n" +
+        "@@ -1,2 +1,2 @@\n-# Old\n+# New Heading\n unchanged tail\n",
+      hunks: [],
+    });
+    renderScreen();
+    fireEvent.click(await screen.findByRole("button", { name: "Preview" }));
+    expect(await screen.findByText(/Partial preview/i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "New Heading" })).toBeInTheDocument();
+  });
 });

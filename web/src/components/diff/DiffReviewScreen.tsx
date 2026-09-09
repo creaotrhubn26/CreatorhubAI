@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { glimmerApi } from "../../api/client";
 import { langFromPath, type Lang } from "../../state/highlight";
 import { HighlightedText } from "../common/HighlightedText";
+import { MarkdownView } from "../common/MarkdownView";
 import { absolutePath, fileHref } from "../../state/fileLink";
 import type { DiffReviewHunk } from "@glimmer/shared";
 
@@ -278,69 +279,136 @@ function DiffView({
   const className = `diff-view${mode === "split" ? " diff-view--split" : ""}${wrap ? " wrap" : ""}`;
   return (
     <div className={className}>
-      {groups.map((g, gi) => {
-        // ponytail: skip highlighting entirely for a giant generated/lockfile
-        // dump — tokenizing 2000+ lines just to render them all in the same
-        // muted color is wasted work, so treat the whole file group as plain.
-        const lang = g.lines.length > 2000 ? "plain" : langFromPath(g.path);
-        return (
-          <div className="diff-view__filegroup" key={gi}>
-            <div className="diff-view__file-header">
-              {/* Opens the working-tree file in the read-only viewer. Only
-                  when the session's workspace is known — without it there is
-                  no absolute path to open, and guessing one would be a lie. */}
-              {workspace ? (
-                <Link
-                  className="mono"
-                  to={fileHref(
-                    absolutePath(workspace, g.path),
-                    firstChangedLine(g.lines),
-                    sessionId,
-                  )}
-                >
-                  {g.path}
-                </Link>
-              ) : (
-                <span className="mono">{g.path}</span>
-              )}
-              <span className="diff-view__stat-add">+{g.added}</span>
-              <span className="diff-view__stat-del">-{g.removed}</span>
+      {groups.map((g, gi) => (
+        <DiffFileGroupView
+          key={gi}
+          group={g}
+          mode={mode}
+          workspace={workspace}
+          sessionId={sessionId}
+          hunks={hunks}
+          hunkBusy={hunkBusy}
+          onAcceptHunk={onAcceptHunk}
+          onRejectHunk={onRejectHunk}
+        />
+      ))}
+    </div>
+  );
+}
+
+// The new-file content a markdown preview needs, reconstructed from the diff
+// itself (added + context lines, in order) — zero extra fetch. For an added
+// file that is the whole document, which is the primary case for a doc
+// deliverable; for a modified file it is the changed regions plus context,
+// honestly labeled as a partial preview.
+function reconstructNewContent(lines: DiffLine[]): string {
+  return lines
+    .filter((l) => l.kind === "add" || l.kind === "context")
+    .map((l) => l.text)
+    .join("\n");
+}
+
+const MARKDOWN_PATH = /\.(md|markdown|mdx)$/i;
+
+function DiffFileGroupView({
+  group: g,
+  mode,
+  workspace,
+  sessionId,
+  hunks,
+  hunkBusy,
+  onAcceptHunk,
+  onRejectHunk,
+}: {
+  group: DiffFileGroup;
+  mode: "unified" | "split";
+  workspace?: string;
+  sessionId?: string;
+  hunks: DiffReviewHunk[];
+  hunkBusy: boolean;
+  onAcceptHunk: (hunk: DiffReviewHunk) => void;
+  onRejectHunk: (hunk: DiffReviewHunk) => void;
+}) {
+  // ponytail: skip highlighting entirely for a giant generated/lockfile
+  // dump — tokenizing 2000+ lines just to render them all in the same
+  // muted color is wasted work, so treat the whole file group as plain.
+  const lang = g.lines.length > 2000 ? "plain" : langFromPath(g.path);
+  const isMarkdown = MARKDOWN_PATH.test(g.path);
+  // Diff Review is about changes, so the diff stays the default; the rendered
+  // deliverable is one opt-in click away per markdown file.
+  const [showPreview, setShowPreview] = useState(false);
+  const partialPreview = isMarkdown && showPreview && g.removed > 0;
+  return (
+    <div className="diff-view__filegroup">
+      <div className="diff-view__file-header">
+        {/* Opens the working-tree file in the read-only viewer. Only
+            when the session's workspace is known — without it there is
+            no absolute path to open, and guessing one would be a lie. */}
+        {workspace ? (
+          <Link
+            className="mono"
+            to={fileHref(absolutePath(workspace, g.path), firstChangedLine(g.lines), sessionId)}
+          >
+            {g.path}
+          </Link>
+        ) : (
+          <span className="mono">{g.path}</span>
+        )}
+        <span className="diff-view__stat-add">+{g.added}</span>
+        <span className="diff-view__stat-del">-{g.removed}</span>
+        {isMarkdown && (
+          <button
+            type="button"
+            className="diff-view__preview-toggle"
+            onClick={() => setShowPreview((value) => !value)}
+            aria-pressed={showPreview}
+          >
+            {showPreview ? "Diff" : "Preview"}
+          </button>
+        )}
+      </div>
+      {isMarkdown && showPreview ? (
+        <>
+          {partialPreview && (
+            <p className="code-view__notice" role="status">
+              Partial preview — the added and unchanged text of a modified file, not the whole
+              document. Open the file to render it in full.
+            </p>
+          )}
+          <MarkdownView content={reconstructNewContent(g.lines)} />
+        </>
+      ) : mode === "unified" ? (
+        g.lines.map((l, i) => (
+          <UnifiedLine
+            l={l}
+            lang={lang}
+            hunk={l.reviewIndex === undefined ? undefined : hunks[l.reviewIndex]}
+            busy={hunkBusy}
+            onAccept={onAcceptHunk}
+            onReject={onRejectHunk}
+            key={i}
+          />
+        ))
+      ) : (
+        buildSplitRows(g.lines).map((r, i) =>
+          r.type === "full" ? (
+            <UnifiedLine
+              l={r.line}
+              lang={lang}
+              hunk={r.line.reviewIndex === undefined ? undefined : hunks[r.line.reviewIndex]}
+              busy={hunkBusy}
+              onAccept={onAcceptHunk}
+              onReject={onRejectHunk}
+              key={i}
+            />
+          ) : (
+            <div className="diff-view__split-row" key={i}>
+              <SplitCell line={r.left} side="del" lang={lang} />
+              <SplitCell line={r.right} side="add" lang={lang} />
             </div>
-            {mode === "unified"
-              ? g.lines.map((l, i) => (
-                  <UnifiedLine
-                    l={l}
-                    lang={lang}
-                    hunk={l.reviewIndex === undefined ? undefined : hunks[l.reviewIndex]}
-                    busy={hunkBusy}
-                    onAccept={onAcceptHunk}
-                    onReject={onRejectHunk}
-                    key={i}
-                  />
-                ))
-              : buildSplitRows(g.lines).map((r, i) =>
-                  r.type === "full" ? (
-                    <UnifiedLine
-                      l={r.line}
-                      lang={lang}
-                      hunk={
-                        r.line.reviewIndex === undefined ? undefined : hunks[r.line.reviewIndex]
-                      }
-                      busy={hunkBusy}
-                      onAccept={onAcceptHunk}
-                      onReject={onRejectHunk}
-                      key={i}
-                    />
-                  ) : (
-                    <div className="diff-view__split-row" key={i}>
-                      <SplitCell line={r.left} side="del" lang={lang} />
-                      <SplitCell line={r.right} side="add" lang={lang} />
-                    </div>
-                  ),
-                )}
-          </div>
-        );
-      })}
+          ),
+        )
+      )}
     </div>
   );
 }
