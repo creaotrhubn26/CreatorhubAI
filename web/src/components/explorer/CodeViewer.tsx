@@ -6,6 +6,7 @@ import { useSharedSessionEvents } from "../../api/useSessionEvents";
 import { langFromPath } from "../../state/highlight";
 import { HighlightedText } from "../common/HighlightedText";
 import { MarkdownView } from "../common/MarkdownView";
+import { exportMarkdownArtifact } from "../../state/exportArtifact";
 import { EmptyState } from "../common/EmptyState";
 
 // Task A3: read-only file viewer. Line numbers + the SAME tokenizer the diff
@@ -175,13 +176,18 @@ export function CodeViewer({
           {data.size.toLocaleString()} bytes · read {new Date(dataUpdatedAt).toLocaleTimeString()}
         </span>
         {isMarkdown && !data.binary && data.content && (
-          <button
-            type="button"
-            onClick={() => setShowSource((value) => !value)}
-            aria-pressed={showSource}
-          >
-            {showSource ? "Preview" : "Source"}
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => setShowSource((value) => !value)}
+              aria-pressed={showSource}
+            >
+              {showSource ? "Preview" : "Source"}
+            </button>
+            <button type="button" onClick={() => exportMarkdownArtifact(path, data.content!)}>
+              Export HTML
+            </button>
+          </>
         )}
         <button type="button" onClick={() => refetch()} disabled={isFetching}>
           {isFetching ? "Reloading…" : "Reload"}

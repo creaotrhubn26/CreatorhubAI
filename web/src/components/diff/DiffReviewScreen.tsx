@@ -5,6 +5,7 @@ import { glimmerApi } from "../../api/client";
 import { langFromPath, type Lang } from "../../state/highlight";
 import { HighlightedText } from "../common/HighlightedText";
 import { MarkdownView } from "../common/MarkdownView";
+import { exportMarkdownArtifact } from "../../state/exportArtifact";
 import { absolutePath, fileHref } from "../../state/fileLink";
 import type { DiffReviewHunk } from "@glimmer/shared";
 
@@ -364,6 +365,15 @@ function DiffFileGroupView({
             aria-pressed={showPreview}
           >
             {showPreview ? "Diff" : "Preview"}
+          </button>
+        )}
+        {isMarkdown && showPreview && (
+          <button
+            type="button"
+            className="diff-view__preview-toggle"
+            onClick={() => exportMarkdownArtifact(g.path, reconstructNewContent(g.lines))}
+          >
+            Export HTML
           </button>
         )}
       </div>
