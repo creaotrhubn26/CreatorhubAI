@@ -457,6 +457,10 @@ sessionsRouter.post("/sessions", async (req, res) => {
     !contract ||
     typeof contract.objective !== "string" ||
     !contract.objective ||
+    // scope is required by the TaskContract type and read unguarded by
+    // buildArgs — a contract without it once crashed the whole gateway at
+    // /run time instead of failing this request with a 400.
+    typeof contract.scope?.package !== "string" ||
     !TASK_MODES.has(contract.mode) ||
     !Array.isArray(contract.verification) ||
     typeof contract.repairBudget !== "number" ||

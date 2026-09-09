@@ -740,6 +740,18 @@ describe("POST /api/sessions — §7 advanced controls validation", () => {
     repairBudget: 1,
   };
 
+  it("rejects a contract without scope with 400 instead of crashing at /run", async () => {
+    const { scope: _scope, ...withoutScope } = validBase as Record<string, unknown> & {
+      scope: unknown;
+    };
+    const res = await request(app)
+      .post("/api/sessions")
+      .set("Origin", UI_ORIGIN)
+      .send({ taskContract: withoutScope, workspace: "/tmp/ws" });
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+  });
+
   it("rejects maxTurns out of 1..64 range with 400", async () => {
     const res = await request(app)
       .post("/api/sessions")

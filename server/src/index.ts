@@ -5,6 +5,16 @@ import { CONFIG } from "./config.js";
 import { reconcileActiveRunsOnStartup } from "./routes/sessions.js";
 import { getComputeController } from "./lib/compute/computeController.js";
 
+// Last line of defense (observed live: a route handler's async throw is
+// invisible to Express 4's error middleware, and the default behavior kills
+// the gateway — orphaning running orchestrators and marking their sessions
+// interrupted). Log loudly and keep serving; the failing request itself
+// times out client-side, which is strictly better than losing every run.
+process.on("unhandledRejection", (reason) => {
+  console.error("[gateway] unhandled rejection:", reason);
+});
+
+
 const app = createApp();
 
 let shutdownStarted = false;
