@@ -1693,7 +1693,24 @@ export class ComputeController {
           412,
         );
       }
-      const existing = await this.dependencies.readLease();
+      let existing = await this.dependencies.readLease();
+      if (existing?.orchestrationMode === "cloud_coordinator" && existing.coordinatorJobId) {
+        // A coordinator lease can be terminal server-side while the local
+        // file lingers: stop() while the job was still "terminating" keeps
+        // the lease, and only startup reconciliation would ever clear it —
+        // observed live as start() refusing silently for hours. Re-check
+        // the coordinator here and self-heal before giving up.
+        try {
+          const job = await (await this.coordinator()).getJob(existing.coordinatorJobId);
+          if ((job.state === "terminated" || job.state === "failed") && job.cleanup.confirmed) {
+            await this.dependencies.clearLease(existing.id);
+            await this.dependencies.deleteWorkerSecret(existing.id);
+            existing = null;
+          }
+        } catch {
+          // Coordinator unreachable: keep the lease and refuse below.
+        }
+      }
       if (existing) {
         const status = await this.getStatus();
         return { started: false, status };

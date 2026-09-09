@@ -427,6 +427,43 @@ describe("ComputeController cloud coordinator mode", () => {
     });
   });
 
+  it("self-heals a stale lease whose coordinator job is already cleaned up, then starts", async () => {
+    const coordinatorJob = {
+      schemaVersion: 1,
+      jobId: "12345678-1234-4123-8123-123456789abc",
+      kind: "gpu_worker",
+      state: "terminated",
+      phase: "gpu_worker",
+      cacheKey: "e".repeat(64),
+      requestFingerprint: "f".repeat(64),
+      podName: "glimmer-gpu-12345678-1234-4123-8123-123456789abc",
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString(),
+      hardDeadlineAt: new Date(NOW.getTime() + 7_200_000).toISOString(),
+      maxHourlyUsd: 1.75,
+      cache: { state: "ready", buildId: "r2-aaaaaaaaaaaa", volumeId: "volume_1" },
+      createAttempted: true,
+      cleanup: { requested: true, confirmed: true },
+    };
+    const { controller, coordinatorClient, clearLease } = harness({
+      currentConfig: cloudConfig(),
+      currentLease: lease({
+        id: coordinatorJob.jobId,
+        podId: undefined,
+        podName: coordinatorJob.podName,
+        orchestrationMode: "cloud_coordinator",
+        coordinatorJobId: coordinatorJob.jobId,
+      }),
+      coordinatorJob,
+    });
+
+    const result = await controller.start();
+
+    expect(clearLease).toHaveBeenCalledWith(coordinatorJob.jobId);
+    expect(result.started).toBe(true);
+    expect(coordinatorClient.putJob).toHaveBeenCalledTimes(1);
+  });
+
   it("reads and stops through the coordinator without direct provider mutation", async () => {
     const coordinatorJob = {
       schemaVersion: 1,

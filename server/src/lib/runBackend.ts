@@ -89,17 +89,27 @@ export class RemoteWorkerRunBackend implements RunBackend<RemoteRunRequest, Remo
     validateParts(request);
     const jobId = request.manifest.jobId;
     await this.worker.createJob(request.manifest, this.capability, `${jobId}:create`);
-    for (const part of request.parts) {
-      await this.worker.uploadPart({
-        jobId,
-        part: part.index,
-        bytes: part.bytes,
-        sha256: part.sha256,
-        capability: this.capability,
-        idempotencyKey: `${jobId}:part:${part.index}`,
-      });
+    let accepted;
+    try {
+      for (const part of request.parts) {
+        await this.worker.uploadPart({
+          jobId,
+          part: part.index,
+          bytes: part.bytes,
+          sha256: part.sha256,
+          capability: this.capability,
+          idempotencyKey: `${jobId}:part:${part.index}`,
+        });
+      }
+      accepted = await this.worker.startJob(jobId, this.capability, `${jobId}:start`);
+    } catch (error) {
+      // The job was already created worker-side; leaving it behind blocks
+      // every later job with a 409 (the worker allows one active job).
+      // Observed live: a cold-proxy fetch failure right after pod-ready
+      // stranded a "created" job and the retried session got 409'd.
+      await this.worker.cancelJob(jobId, this.capability, `${jobId}:cancel`).catch(() => undefined);
+      throw error;
     }
-    const accepted = await this.worker.startJob(jobId, this.capability, `${jobId}:start`);
     return {
       jobId,
       accepted,
