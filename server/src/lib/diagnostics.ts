@@ -38,7 +38,7 @@ export const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
   "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",
   "glimmer_memory.py": "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920",
   "glimmer_quality.py": "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188",
-  "glimmer_semantic.py": "a9720efab5f7c1201d2af9e454dcacef32e576b682aa33fbcd5e4e62e7cbf6dd",
+  "glimmer_semantic.py": "998bcc8b0cf49a5e729c842a0be08344ec397ff8d216f92a61c3fb22bf7d02cb",
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
   "glimmer-visual.py": "e67d2448adbdb34f00a523acee93de8fc25bbde8c26fbe4120f88f60ad19f1d6",
   "glimmer_remote.py": "b2f7e2dab8478d95dd09787dc0cd3cbacd3a6f7e482a865f9f179f4c2089083d",

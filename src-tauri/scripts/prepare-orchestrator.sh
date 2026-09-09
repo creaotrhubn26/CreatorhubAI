@@ -7,8 +7,8 @@
 # network; each final file must match its release SHA-256 before output.
 set -euo pipefail
 
-ORCHESTRATOR_REF="a9b4210ea51ebbdbcb89756fbee7995051736794"
-SNAPSHOT_ID="glimmer-runpod-r4"
+ORCHESTRATOR_REF="1a84a9a1171cf2a37437e84a6a1a3dd019b13e1f"
+SNAPSHOT_ID="glimmer-runpod-r5"
 RUNPOD_WORKFLOW_SHA="c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952"
 
 cd "$(dirname "$0")/.."
@@ -57,7 +57,7 @@ SHAS=(
   "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c"
   "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920"
   "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188"
-  "a9720efab5f7c1201d2af9e454dcacef32e576b682aa33fbcd5e4e62e7cbf6dd"
+  "998bcc8b0cf49a5e729c842a0be08344ec397ff8d216f92a61c3fb22bf7d02cb"
   "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711"
   "e67d2448adbdb34f00a523acee93de8fc25bbde8c26fbe4120f88f60ad19f1d6"
   "b2f7e2dab8478d95dd09787dc0cd3cbacd3a6f7e482a865f9f179f4c2089083d"
