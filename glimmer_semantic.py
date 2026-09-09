@@ -8,6 +8,7 @@ coverage object reports unsupported and failed languages explicitly.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -175,12 +176,23 @@ def _symbol_from_node(source: bytes, node: object) -> tuple[str, str] | None:
     return (name, kind) if name else None
 
 
+def _line_of_byte(newline_offsets: list, offset: int) -> int:
+    """1-based line for a byte offset, from a precomputed newline index.
+    Exists because node.start_point segfaults in the bundled tree-sitter
+    0.26.0 binding on some real trees (observed live on a monorepo file;
+    start_byte/children/child_by_field_name are unaffected) — so line
+    numbers are derived from start_byte, never from the native point
+    struct."""
+    return bisect.bisect_right(newline_offsets, offset - 1) + 1
+
+
 def _parse_semantics(path: str, source: bytes, parser: object | None, language: str) -> dict:
     symbols = []
     identifiers = []
     provenance = "tree-sitter" if parser is not None else "lexical"
     parse_status = "parsed" if parser is not None else "fallback"
     if parser is not None:
+        newline_offsets = [i for i, b in enumerate(source) if b == 0x0A]
         try:
             tree = getattr(parser, "parse")(source)
             root = tree.root_node
@@ -189,18 +201,19 @@ def _parse_semantics(path: str, source: bytes, parser: object | None, language: 
                 symbol = _symbol_from_node(source, node)
                 if symbol:
                     name, kind = symbol
+                    line = _line_of_byte(newline_offsets, node.start_byte)
                     symbols.append({
-                        "id": f"symbol:{path}:{node.start_point.row + 1}:{name}",
+                        "id": f"symbol:{path}:{line}:{name}",
                         "name": name,
                         "kind": kind,
                         "path": path,
-                        "line": node.start_point.row + 1,
+                        "line": line,
                         "provenance": "tree-sitter",
                     })
                 if getattr(node, "type", "") in {"identifier", "type_identifier"}:
                     name = _node_text(source, node).strip()
                     if name:
-                        identifiers.append((name, node.start_point.row + 1))
+                        identifiers.append((name, _line_of_byte(newline_offsets, node.start_byte)))
         except Exception as exc:
             provenance = "lexical"
             parse_status = f"parser-error:{type(exc).__name__}"

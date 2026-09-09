@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "tag": "glimmer-runpod-worker:r2-3548a35307ad",
+  "imageId": "sha256:d63b80b139b7d707d04fc8d47a6917a4ff18e8895c98084dcff56ce75b395a81",
+  "sourceCommit": "3548a35307ad5abeecd8d9bac6b5157b7bfc7c42",
+  "buildId": "r2-3548a35307ad",
+  "imageLockSha256": "9a1a46be1b5e2c18455b5d0862699482203f734f2f2c7996ba38d445f4331c22"
+}
