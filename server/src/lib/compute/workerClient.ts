@@ -636,19 +636,26 @@ export class WorkerClient {
       requestedTimeoutMs === undefined
         ? this.timeoutMs
         : Math.max(1, Math.min(this.timeoutMs, Math.floor(requestedTimeoutMs)));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // Network-level failures (no HTTP response at all) get two quick
+    // retries, each with a fresh full timeout budget: the RunPod proxy
+    // takes a few seconds to become routable after the pod reports ready,
+    // and that cold window failed a live remote session. Every mutating
+    // route is idempotency-keyed, so a repeated send is safe; HTTP error
+    // statuses are never retried here.
+    let response: Response | undefined;
+    let controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), timeoutMs);
     timer.unref?.();
     try {
-      // Network-level failures (no HTTP response at all) get two quick
-      // retries: the RunPod proxy takes a few seconds to become routable
-      // after the pod reports ready, and that cold window failed a live
-      // remote session. Every mutating route is idempotency-keyed, so a
-      // repeated send is safe; HTTP error statuses are never retried here.
-      let response: Response | undefined;
       let lastNetworkError: unknown;
       for (const delayMs of [0, 2_000, 5_000]) {
-        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          clearTimeout(timer);
+          controller = new AbortController();
+          timer = setTimeout(() => controller.abort(), timeoutMs);
+          timer.unref?.();
+        }
         try {
           response = await this.fetchImpl(`${this.baseUrl}${requestPath}`, {
             ...init,

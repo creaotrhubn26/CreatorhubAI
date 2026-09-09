@@ -526,7 +526,12 @@ async function tryStartRemoteRun(
   let cancelRequested = false;
   void runRemoteSession(
     {
-      worker: new WorkerClient({ baseUrl: workerBaseUrlForPod(access.podId) }),
+      worker: new WorkerClient({
+        baseUrl: workerBaseUrlForPod(access.podId),
+        // A real monorepo bundle is hundreds of MB in 4 MiB parts; the 10 s
+        // default starved uploads through the RunPod proxy (observed live).
+        timeoutMs: 180_000,
+      }),
       capability: access.capability,
       checkpointKey: access.checkpointKey,
       sessionDir: path.join(sessionsDir(), id),
@@ -605,7 +610,10 @@ async function resumeRemoteRunOnStartup(record: {
   });
   void resumeRemoteSession(
     {
-      worker: new WorkerClient({ baseUrl: workerBaseUrlForPod(remote.podId) }),
+      worker: new WorkerClient({
+        baseUrl: workerBaseUrlForPod(remote.podId),
+        timeoutMs: 180_000,
+      }),
       capability: secret.capability,
       checkpointKey: secret.checkpointKey,
       sessionDir: path.join(sessionsDir(), record.id),
