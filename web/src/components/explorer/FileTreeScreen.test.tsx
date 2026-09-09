@@ -195,6 +195,9 @@ describe("FileTreeScreen", () => {
     const { container } = render(
       withProviders(<FileTreeScreen />, "/files?path=%2Fw%2FREADME.md&session=s1"),
     );
+    // A .md file now previews as prose by default; line-range selection is a
+    // source-view action, so switch to Source first.
+    fireEvent.click(await screen.findByRole("button", { name: "Source" }));
     await waitFor(() => expect(container.querySelector(".code-view__text")).not.toBeNull());
     const text = container.querySelector<HTMLElement>(".code-view__text")!;
     const range = document.createRange();

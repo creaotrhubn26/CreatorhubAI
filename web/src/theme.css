@@ -4634,3 +4634,70 @@ pre {
     display: none;
   }
 }
+
+/* Glimmer artifact preview: rendered markdown deliverables in the file viewer. */
+.markdown-view {
+  padding: 1.25rem 1.5rem;
+  max-width: 46rem;
+  color: var(--text);
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+.markdown-view h1,
+.markdown-view h2,
+.markdown-view h3 {
+  color: var(--text-primary);
+  line-height: 1.25;
+  margin: 1.4em 0 0.5em;
+}
+.markdown-view h1 {
+  font-size: 1.6rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+.markdown-view h2 {
+  font-size: 1.3rem;
+}
+.markdown-view h3 {
+  font-size: 1.1rem;
+}
+.markdown-view p,
+.markdown-view ul,
+.markdown-view ol {
+  margin: 0.6em 0;
+}
+.markdown-view a {
+  color: var(--accent-strong);
+}
+.markdown-view code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+  background: var(--border);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.markdown-view pre {
+  background: var(--border);
+  padding: 0.9rem 1rem;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.markdown-view pre code {
+  background: none;
+  padding: 0;
+}
+.markdown-view blockquote {
+  margin: 0.8em 0;
+  padding-left: 1rem;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+.markdown-view table {
+  border-collapse: collapse;
+  margin: 0.8em 0;
+}
+.markdown-view th,
+.markdown-view td {
+  border: 1px solid var(--border);
+  padding: 0.4em 0.7em;
+}

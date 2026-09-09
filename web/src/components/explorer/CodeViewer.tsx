@@ -5,6 +5,7 @@ import { glimmerApi } from "../../api/client";
 import { useSharedSessionEvents } from "../../api/useSessionEvents";
 import { langFromPath } from "../../state/highlight";
 import { HighlightedText } from "../common/HighlightedText";
+import { MarkdownView } from "../common/MarkdownView";
 import { EmptyState } from "../common/EmptyState";
 
 // Task A3: read-only file viewer. Line numbers + the SAME tokenizer the diff
@@ -103,6 +104,11 @@ export function CodeViewer({
     endLine: number;
   } | null>(null);
   const [copied, setCopied] = useState(false);
+  // "Glimmer artifact" preview: a documentation/proposal deliverable renders
+  // as prose by default instead of raw diff text. Source stays one click away
+  // (line numbers + the selection popover live only in the source view).
+  const isMarkdown = /\.(md|markdown|mdx)$/i.test(path);
+  const [showSource, setShowSource] = useState(false);
 
   useEffect(() => {
     if (!popover) return;
@@ -168,6 +174,15 @@ export function CodeViewer({
         <span className="code-view__meta">
           {data.size.toLocaleString()} bytes · read {new Date(dataUpdatedAt).toLocaleTimeString()}
         </span>
+        {isMarkdown && !data.binary && data.content && (
+          <button
+            type="button"
+            onClick={() => setShowSource((value) => !value)}
+            aria-pressed={showSource}
+          >
+            {showSource ? "Preview" : "Source"}
+          </button>
+        )}
         <button type="button" onClick={() => refetch()} disabled={isFetching}>
           {isFetching ? "Reloading…" : "Reload"}
         </button>
@@ -187,6 +202,10 @@ export function CodeViewer({
             </p>
           )}
           {data.size === 0 && <p className="code-view__notice">This file is empty (0 bytes).</p>}
+          {isMarkdown && !showSource && data.content ? (
+            <MarkdownView content={data.content} />
+          ) : (
+            <>
           {/* A requested line the excerpt doesn't reach is said out loud —
               silently landing at the top would read as "line N is line 1". */}
           {line !== undefined && line > lines.length && (
@@ -286,6 +305,8 @@ export function CodeViewer({
             <p className="code-view__notice" role="status">
               — end of the truncated excerpt, not the end of the file —
             </p>
+          )}
+            </>
           )}
         </>
       )}

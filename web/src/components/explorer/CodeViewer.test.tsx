@@ -225,4 +225,38 @@ describe("CodeViewer", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(readFile).toHaveBeenCalledTimes(2);
   });
+
+  const markdownFile = {
+    path: "/w/docs/spec.md",
+    size: 40,
+    bytesReturned: 40,
+    truncated: false,
+    binary: false,
+    content: "# Title\n\nSome **bold** prose and a [link](https://example.com).\n",
+  };
+
+  it("renders a markdown file as prose by default, with a heading element", async () => {
+    vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(markdownFile);
+    render(withQuery(<CodeViewer path="/w/docs/spec.md" />));
+
+    const heading = await screen.findByRole("heading", { name: "Title" });
+    expect(heading.tagName).toBe("H1");
+    // Preview mode has no numbered source lines.
+    expect(document.querySelector(".code-view__lineno")).toBeNull();
+    // Links open safely in a new tab.
+    expect(screen.getByRole("link", { name: "link" })).toHaveAttribute("rel", "noreferrer noopener");
+  });
+
+  it("toggles to raw source and back", async () => {
+    vi.spyOn(client.glimmerApi, "readFile").mockResolvedValue(markdownFile);
+    render(withQuery(<CodeViewer path="/w/docs/spec.md" />));
+
+    const toggle = await screen.findByRole("button", { name: "Source" });
+    fireEvent.click(toggle);
+    // Source view shows the literal markdown with line numbers.
+    expect(screen.getByText("# Title", { selector: ".code-view__text, .code-view__text *" }))
+      .toBeTruthy();
+    expect(document.querySelector(".code-view__lineno")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Preview" })).toBeTruthy();
+  });
 });
