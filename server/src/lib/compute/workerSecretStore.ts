@@ -12,6 +12,10 @@ export interface WorkerSecretV1 {
   bootstrapToken?: string;
   capability?: string;
   checkpointKey?: string;
+  /** The controller instance id the worker bound to at handshake. Persisted
+   * so an app restart (which mints a fresh process instance id) still
+   * addresses the same worker instead of being rejected as a new owner. */
+  controllerInstanceId?: string;
   handshakeIdempotencyKey: string;
   controllerNonce: string;
   createdAt: string;
@@ -38,6 +42,7 @@ function isWorkerSecret(value: unknown, leaseId: string): value is WorkerSecretV
     (raw.bootstrapToken === undefined || SAFE_SECRET.test(raw.bootstrapToken)) &&
     (raw.capability === undefined || SAFE_SECRET.test(raw.capability)) &&
     (raw.checkpointKey === undefined || SAFE_SECRET.test(raw.checkpointKey)) &&
+    (raw.controllerInstanceId === undefined || typeof raw.controllerInstanceId === "string") &&
     (raw.rotatedAt === undefined || Number.isFinite(Date.parse(raw.rotatedAt)))
   );
 }
@@ -92,6 +97,7 @@ export async function storeWorkerHandshake(
   leaseId: string,
   capability: string,
   checkpointKey: string,
+  controllerInstanceId?: string,
 ): Promise<WorkerSecretV1> {
   if (!SAFE_SECRET.test(capability) || !SAFE_SECRET.test(checkpointKey)) {
     throw new Error("worker handshake returned an invalid secret");
@@ -103,6 +109,7 @@ export async function storeWorkerHandshake(
     bootstrapToken: undefined,
     capability,
     checkpointKey,
+    ...(controllerInstanceId ? { controllerInstanceId } : {}),
     rotatedAt: new Date().toISOString(),
   };
   await writeAtomic(updated);

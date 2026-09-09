@@ -1395,16 +1395,20 @@ export class ComputeController {
         capability: secret.capability,
         checkpointKey: secret.checkpointKey,
         contextTokens: profile.contextTokens,
-        controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+        // The worker bound to the instance id from the launch that
+        // handshaked; a later app restart mints a new process instance id,
+        // so use the persisted one or the worker rejects our manifests (403).
+        controllerInstanceId: secret.controllerInstanceId ?? safeInstanceId(CONFIG.instanceId),
       };
     }
     if (!secret.bootstrapToken) {
       throw new ComputeControlError("Worker bootstrap token was already consumed", 409);
     }
     const worker = this.dependencies.workerFactory(podId);
+    const handshakeInstanceId = safeInstanceId(CONFIG.instanceId);
     const handshake = await worker.handshake({
       bootstrapToken: secret.bootstrapToken,
-      controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+      controllerInstanceId: handshakeInstanceId,
       nonce: secret.controllerNonce,
       idempotencyKey: secret.handshakeIdempotencyKey,
     });
@@ -1417,6 +1421,7 @@ export class ComputeController {
         lease.id,
         handshake.capability,
         handshake.checkpointKey,
+        handshakeInstanceId,
       );
     });
     if (!rotated.capability || !rotated.checkpointKey) {
@@ -1428,7 +1433,8 @@ export class ComputeController {
       capability: rotated.capability,
       checkpointKey: rotated.checkpointKey,
       contextTokens: profile.contextTokens,
-      controllerInstanceId: safeInstanceId(CONFIG.instanceId),
+      // Persisted so a later app restart still owns this worker.
+      controllerInstanceId: rotated.controllerInstanceId ?? handshakeInstanceId,
     };
   }
 

@@ -267,16 +267,19 @@ function harness(options: {
       cleanup: { requested: true, confirmed: false },
     }),
   };
-  const storeWorkerHandshake = vi.fn().mockImplementation(async (id: string) => ({
-    version: 1,
-    leaseId: id,
-    capability: "C".repeat(43),
-    checkpointKey: "K".repeat(43),
-    handshakeIdempotencyKey: "I".repeat(43),
-    controllerNonce: "N".repeat(43),
-    createdAt: NOW.toISOString(),
-    rotatedAt: NOW.toISOString(),
-  }));
+  const storeWorkerHandshake = vi.fn().mockImplementation(
+    async (id: string, _cap: string, _ck: string, controllerInstanceId?: string) => ({
+      version: 1,
+      leaseId: id,
+      capability: "C".repeat(43),
+      checkpointKey: "K".repeat(43),
+      ...(controllerInstanceId ? { controllerInstanceId } : {}),
+      handshakeIdempotencyKey: "I".repeat(43),
+      controllerNonce: "N".repeat(43),
+      createdAt: NOW.toISOString(),
+      rotatedAt: NOW.toISOString(),
+    }),
+  );
   let saveLeaseCalls = 0;
   const saveLease = vi.fn().mockImplementation(async (next: ComputeLeaseV1) => {
     saveLeaseCalls += 1;
@@ -2303,7 +2306,12 @@ describe("ComputeController cloudWorkerSession (R3)", () => {
       nonce: "N".repeat(43),
       idempotencyKey: "I".repeat(43),
     });
-    expect(storeWorkerHandshake).toHaveBeenCalledWith(job.jobId, "C".repeat(43), "K".repeat(43));
+    expect(storeWorkerHandshake).toHaveBeenCalledWith(
+      job.jobId,
+      "C".repeat(43),
+      "K".repeat(43),
+      expect.any(String),
+    );
     expect(currentLease()).toMatchObject({ podId: "pod_cloud_1" });
   });
 
@@ -2334,6 +2342,35 @@ describe("ComputeController cloudWorkerSession (R3)", () => {
       capability: "C".repeat(43),
     });
     expect(workerClient.handshake).not.toHaveBeenCalled();
+  });
+
+  it("returns the persisted controller instance id so a restart still owns the worker", async () => {
+    const job = readyJob();
+    const { controller, readWorkerSecret } = harness({
+      currentConfig: cloudConfig(),
+      currentLease: lease({
+        id: job.jobId,
+        podId: "pod_cloud_1",
+        podName: job.podName,
+        orchestrationMode: "cloud_coordinator",
+        coordinatorJobId: job.jobId,
+      }),
+      coordinatorJob: job,
+    });
+    readWorkerSecret.mockResolvedValue({
+      version: 1,
+      leaseId: job.jobId,
+      capability: "C".repeat(43),
+      checkpointKey: "K".repeat(43),
+      controllerInstanceId: "handshake-era-instance",
+      handshakeIdempotencyKey: "I".repeat(43),
+      controllerNonce: "N".repeat(43),
+      createdAt: NOW.toISOString(),
+    });
+
+    await expect(controller.cloudWorkerSession()).resolves.toMatchObject({
+      controllerInstanceId: "handshake-era-instance",
+    });
   });
 
   it("refuses while the coordinator job is not ready", async () => {
