@@ -1,0 +1,20 @@
+#!/bin/sh
+# Fast pre-push gate for CreatorhubAI: catches the two classes that have failed
+# release builds this project — unformatted code and drifted orchestrator pins
+# — plus version incoherence, without the full test/build (too slow per push).
+# Install with `npm run hooks:install` (sets core.hooksPath to .githooks).
+# The heavy gate is `npm run release:preflight`; run that before tagging.
+set -e
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+echo "[pre-push] prettier format check…"
+npm run --silent format:check
+
+echo "[pre-push] orchestrator pin coherence…"
+npm run --silent pins:check
+
+echo "[pre-push] release version coherence…"
+npm run --silent release:check
+
+echo "[pre-push] ok"

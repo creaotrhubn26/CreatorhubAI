@@ -16,7 +16,7 @@
     "rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
     "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "rust:check": "npm run rust:fmt && npm run rust:clippy",
-    "quality": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run rust:check",
+    "quality": "npm run pins:check && npm run format:check && npm run lint && npm run typecheck && npm test && npm run rust:check",
     "release:check": "node scripts/check-release-version.mjs",
     "release:verify": "node scripts/verify-updater-artifact.mjs",
     "runtime:prepare": "src-tauri/scripts/prepare-python.sh && src-tauri/scripts/prepare-orchestrator.sh",
@@ -40,7 +40,12 @@
     "coordinator:deploy": "wrangler deploy --config coordinator/wrangler.jsonc",
     "runpod:live-smoke": "npm run build --workspace @glimmer/shared && npm run build --workspace server && node scripts/runpod-live-smoke.mjs",
     "runpod:cpu-prewarm": "node scripts/runpod-cpu-prewarm.mjs",
-    "runpod:cpu-prewarm:test": "node --test scripts/runpod-cpu-prewarm.test.mjs"
+    "runpod:cpu-prewarm:test": "node --test scripts/runpod-cpu-prewarm.test.mjs",
+    "pins:sync": "node scripts/orchestrator-pins.mjs --sync",
+    "pins:check": "node scripts/orchestrator-pins.mjs --check",
+    "release:bump": "node scripts/bump-version.mjs",
+    "release:preflight": "npm run pins:check && npm run release:check && npm run quality && npm run runtime:verify",
+    "hooks:install": "git config core.hooksPath .githooks"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

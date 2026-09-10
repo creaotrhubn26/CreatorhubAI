@@ -86,46 +86,6 @@ for index in "${!FILES[@]}"; do
   printf '%s  %s\n' "${SHAS[$index]}" "$STAGING/${FILES[$index]}" | shasum -a 256 -c -
 done
 
-
-# Pin-drift guard: the gateway's own integrity table
-# (server/src/lib/diagnostics.ts BUNDLED_ORCHESTRATOR_SHA256) must agree
-# with the pins above — a third copy of these hashes once drifted silently
-# and the shipped app refused its own orchestrator. Fail the build loudly
-# instead.
-DIAGNOSTICS_TS="server/../server/src/lib/diagnostics.ts"
-DIAGNOSTICS_TS="$(cd .. && pwd)/server/src/lib/diagnostics.ts"
-for index in "${!FILES[@]}"; do
-  file="${FILES[$index]}"
-  case "$file" in eval-baselines/*) continue;; esac
-  if ! grep -q "\"${SHAS[$index]}\"" "$DIAGNOSTICS_TS"; then
-    echo "pin drift: diagnostics.ts BUNDLED_ORCHESTRATOR_SHA256 disagrees for $file" >&2
-    exit 1
-  fi
-done
-
-# Pin-drift guard, part 2: the release/CI runtime verifier
-# (scripts/verify-bundled-runtime.mjs) hardcodes the expected orchestrator
-# commit and snapshot. A fourth pin site that once shipped stale and failed
-# the release build after the snapshot was rolled — fail the prepare step
-# loudly instead of the release.
-VERIFY_MJS="$(cd .. && pwd)/scripts/verify-bundled-runtime.mjs"
-if ! grep -q "\"${ORCHESTRATOR_REF}\"" "$VERIFY_MJS"; then
-  echo "pin drift: verify-bundled-runtime.mjs EXPECTED_ORCHESTRATOR_COMMIT is not ${ORCHESTRATOR_REF}" >&2
-  exit 1
-fi
-if ! grep -q "\"${SNAPSHOT_ID}\"" "$VERIFY_MJS"; then
-  echo "pin drift: verify-bundled-runtime.mjs EXPECTED_ORCHESTRATOR_SNAPSHOT is not ${SNAPSHOT_ID}" >&2
-  exit 1
-fi
-# ...and its per-file EXPECTED_ORCHESTRATOR_FILES table (every file, including
-# eval-baselines and run-github-mcp.sh, unlike the gateway's table above).
-for index in "${!FILES[@]}"; do
-  if ! grep -q "\"${SHAS[$index]}\"" "$VERIFY_MJS"; then
-    echo "pin drift: verify-bundled-runtime.mjs EXPECTED_ORCHESTRATOR_FILES disagrees for ${FILES[$index]}" >&2
-    exit 1
-  fi
-done
-
 test "$OUT" = "binaries/runtime/orchestrator"
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -144,6 +104,14 @@ chmod +x "$OUT/glimmer-v2.py" "$OUT/glimmer-engineer.py" \
   done
   printf '  }\n}\n'
 } > "$OUT/ORIGIN.json"
+
+# Single source of truth for the pins: write these same hashes/commit/snapshot
+# into every independent copy (diagnostics.ts, its test, verify-bundled-
+# runtime.mjs) from the manifest just produced, so a roll can never leave one
+# copy stale — the failure that broke both the shipped app and the release
+# build this session. `npm run pins:check` in CI/preflight is the safety net
+# for a hand edit that skipped this step.
+node "$(cd .. && pwd)/scripts/orchestrator-pins.mjs" --sync
 
 printf 'orchestrator ready: src-tauri/%s (%s) at %s (checksums verified)\n' \
   "$OUT" "$(du -sh "$OUT" | cut -f1)" "$ORCHESTRATOR_REF"
