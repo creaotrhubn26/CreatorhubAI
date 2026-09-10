@@ -45,7 +45,13 @@ const FULL_PACKET = {
 describe("DeliveryPacketPanel", () => {
   it("renders task, verification, visual, customer readiness, confidence, changed files, limitations, and plan forward", async () => {
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockResolvedValue(FULL_PACKET as any);
-    render(withQuery(<MemoryRouter><DeliveryPacketPanel sessionId="s1" /></MemoryRouter>));
+    render(
+      withQuery(
+        <MemoryRouter>
+          <DeliveryPacketPanel sessionId="s1" />
+        </MemoryRouter>,
+      ),
+    );
 
     await waitFor(() => expect(screen.getByText("add widget")).toBeInTheDocument());
     expect(screen.getByText("VERIFIED")).toBeInTheDocument();
@@ -75,7 +81,13 @@ describe("DeliveryPacketPanel", () => {
       humanReviewStatus: "pending",
     };
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockResolvedValue(bare as any);
-    render(withQuery(<MemoryRouter><DeliveryPacketPanel sessionId="s1" /></MemoryRouter>));
+    render(
+      withQuery(
+        <MemoryRouter>
+          <DeliveryPacketPanel sessionId="s1" />
+        </MemoryRouter>,
+      ),
+    );
 
     await waitFor(() => expect(screen.getByText("t")).toBeInTheDocument());
     // customerReadiness dd and confidence dd both honestly render the bare
@@ -90,7 +102,13 @@ describe("DeliveryPacketPanel", () => {
     vi.spyOn(client.glimmerApi, "getDeliveryPacket").mockRejectedValue(
       new Error("GET .../delivery-packet failed: 404"),
     );
-    const { container } = render(withQuery(<MemoryRouter><DeliveryPacketPanel sessionId="s1" /></MemoryRouter>));
+    const { container } = render(
+      withQuery(
+        <MemoryRouter>
+          <DeliveryPacketPanel sessionId="s1" />
+        </MemoryRouter>,
+      ),
+    );
 
     await waitFor(() => expect(client.glimmerApi.getDeliveryPacket).toHaveBeenCalled());
     expect(container).toBeEmptyDOMElement();

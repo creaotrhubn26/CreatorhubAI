@@ -267,19 +267,21 @@ function harness(options: {
       cleanup: { requested: true, confirmed: false },
     }),
   };
-  const storeWorkerHandshake = vi.fn().mockImplementation(
-    async (id: string, _cap: string, _ck: string, controllerInstanceId?: string) => ({
-      version: 1,
-      leaseId: id,
-      capability: "C".repeat(43),
-      checkpointKey: "K".repeat(43),
-      ...(controllerInstanceId ? { controllerInstanceId } : {}),
-      handshakeIdempotencyKey: "I".repeat(43),
-      controllerNonce: "N".repeat(43),
-      createdAt: NOW.toISOString(),
-      rotatedAt: NOW.toISOString(),
-    }),
-  );
+  const storeWorkerHandshake = vi
+    .fn()
+    .mockImplementation(
+      async (id: string, _cap: string, _ck: string, controllerInstanceId?: string) => ({
+        version: 1,
+        leaseId: id,
+        capability: "C".repeat(43),
+        checkpointKey: "K".repeat(43),
+        ...(controllerInstanceId ? { controllerInstanceId } : {}),
+        handshakeIdempotencyKey: "I".repeat(43),
+        controllerNonce: "N".repeat(43),
+        createdAt: NOW.toISOString(),
+        rotatedAt: NOW.toISOString(),
+      }),
+    );
   let saveLeaseCalls = 0;
   const saveLease = vi.fn().mockImplementation(async (next: ComputeLeaseV1) => {
     saveLeaseCalls += 1;

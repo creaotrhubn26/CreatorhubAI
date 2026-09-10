@@ -74,8 +74,7 @@ export async function readWorkspaceMemory(workspace: string): Promise<WorkspaceM
         ? Math.max(0, (now - lastSeenMs) / 86_400_000)
         : null;
       const count = Math.max(0, Number(entry.count) || 0);
-      const score =
-        ageDays === null ? 0 : count * Math.pow(0.5, ageDays / HALF_LIFE_DAYS);
+      const score = ageDays === null ? 0 : count * Math.pow(0.5, ageDays / HALF_LIFE_DAYS);
       return {
         kind: String(entry.kind ?? "unknown"),
         key: entry.key,
@@ -109,9 +108,7 @@ export async function deleteWorkspaceMemoryEntry(
   }
   if (data?.schemaVersion !== 2 || !Array.isArray(data.entries)) return false;
   const before = data.entries.length;
-  data.entries = data.entries.filter(
-    (entry: any) => !(entry?.kind === kind && entry?.key === key),
-  );
+  data.entries = data.entries.filter((entry: any) => !(entry?.kind === kind && entry?.key === key));
   if (data.entries.length === before) return false;
   data.updatedAt = new Date().toISOString();
   const temporary = `${file}.tmp`;

@@ -44,10 +44,14 @@ export const BUNDLED_ORCHESTRATOR_SHA256: Record<string, string> = {
   "glimmer_remote.py": "b2f7e2dab8478d95dd09787dc0cd3cbacd3a6f7e482a865f9f179f4c2089083d",
   "runpod_worker.py": "1e004bb6dfcaf26a4d92468015b4770f00754ee1ae62e6b079d7834ff97390a8",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
-  "eval-baselines/baseline-stub.json": "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
-  "eval-baselines/latest-stub.json": "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
-  "eval-baselines/baseline-live.json": "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
-  "eval-baselines/latest-live.json": "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
+  "eval-baselines/baseline-stub.json":
+    "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
+  "eval-baselines/latest-stub.json":
+    "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
+  "eval-baselines/baseline-live.json":
+    "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
+  "eval-baselines/latest-live.json":
+    "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
 };
 const BUNDLED_PYTHON_SHA256: Record<string, string> = {
   "lib/python3.13/os.py": "18560b0a37dfb90b4712fba97668d44a1328c5566b10deffaee292ba12cc21ff",

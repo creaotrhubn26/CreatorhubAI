@@ -46,7 +46,17 @@ async function createWorkspace(): Promise<string> {
   await fs.writeFile(path.join(workspace, "README.md"), "# fixture\n");
   const git = (...args: string[]) => execFileAsync("git", ["-C", workspace, ...args]);
   await git("init", "-q", "-b", "glimmer/remote-fixture");
-  await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x");
+  await git(
+    "-c",
+    "user.email=t@t",
+    "-c",
+    "user.name=t",
+    "commit",
+    "-q",
+    "--allow-empty",
+    "-m",
+    "x",
+  );
   await git("add", "-A");
   await git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture");
   return workspace;
@@ -286,9 +296,7 @@ describe("runRemoteSession", () => {
 
   it("refuses an archive whose entries escape the session layout", async () => {
     const { bundle, manifest } = await makeManifest();
-    const archive = ustarArchive([
-      { name: "session/../escape.txt", content: Buffer.from("evil") },
-    ]);
+    const archive = ustarArchive([{ name: "session/../escape.txt", content: Buffer.from("evil") }]);
     const fake = fakeWorker(archive, checkpointKey);
     await expect(
       runRemoteSession(
@@ -377,9 +385,7 @@ describe("runRemoteSession", () => {
       await fs.readFile(path.join(sessionDir, "architecture-plan.json"), "utf8"),
     );
     expect(mirrored).toEqual({ risk: "low" });
-    expect(answers).toEqual([
-      { clarificationId: "clarify-1", optionId: "option-1", text: null },
-    ]);
+    expect(answers).toEqual([{ clarificationId: "clarify-1", optionId: "option-1", text: null }]);
   });
 
   it("cancels the remote job when the session is cancelled", async () => {
@@ -423,10 +429,9 @@ describe("buildRemoteTaskContract parity fixture", () => {
     );
     expect(fixture.cases.length).toBeGreaterThanOrEqual(3);
     for (const testCase of fixture.cases) {
-      expect(
-        buildRemoteTaskContract(testCase.taskContract as TaskContract),
-        testCase.name,
-      ).toEqual(testCase.contract);
+      expect(buildRemoteTaskContract(testCase.taskContract as TaskContract), testCase.name).toEqual(
+        testCase.contract,
+      );
     }
   });
 

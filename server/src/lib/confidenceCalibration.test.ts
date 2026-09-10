@@ -17,10 +17,7 @@ afterEach(async () => {
   await fs.rm(scratch, { recursive: true, force: true });
 });
 
-async function writeSession(
-  name: string,
-  files: Record<string, unknown>,
-): Promise<void> {
+async function writeSession(name: string, files: Record<string, unknown>): Promise<void> {
   const directory = path.join(scratch, "sessions", name);
   await fs.mkdir(directory, { recursive: true });
   for (const [file, content] of Object.entries(files)) {

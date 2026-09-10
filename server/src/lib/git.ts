@@ -429,7 +429,6 @@ export function resolvesWithinRoot(root: string, candidate: string): boolean {
   return path.resolve(candidate).startsWith(resolvedRoot);
 }
 
-
 // A session ends with UNCOMMITTED changes awaiting Diff Review; a worktree
 // under a volatile root (macOS wipes /private/tmp on boot) silently loses
 // that work on the next reboot, so a misconfigured GLIMMER_WORKTREE_ROOT

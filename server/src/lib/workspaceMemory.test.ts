@@ -61,9 +61,8 @@ describe("workspace memory surface", () => {
 
   it("deletes one entry as curation and reports a missing one honestly", async () => {
     const workspace = await makeRepoWithMemory();
-    const { readWorkspaceMemory, deleteWorkspaceMemoryEntry } = await import(
-      "./workspaceMemory.js"
-    );
+    const { readWorkspaceMemory, deleteWorkspaceMemoryEntry } =
+      await import("./workspaceMemory.js");
     expect(await deleteWorkspaceMemoryEntry(workspace, "cochange", "stale")).toBe(true);
     expect(await deleteWorkspaceMemoryEntry(workspace, "cochange", "stale")).toBe(false);
     const remaining = await readWorkspaceMemory(workspace);

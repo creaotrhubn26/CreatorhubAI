@@ -45,10 +45,7 @@
         "scope": {
           "package": "frontend",
           "area": "src/components",
-          "paths": [
-            "src/components/App.tsx",
-            " src/lib/util.ts "
-          ]
+          "paths": ["src/components/App.tsx", " src/lib/util.ts "]
         },
         "mode": "implement",
         "intent": {
@@ -62,12 +59,7 @@
           "noDeploy": true,
           "noDependencyInstall": true
         },
-        "verification": [
-          "frontend-typecheck",
-          "targeted-test",
-          "visual",
-          "unknown-check"
-        ],
+        "verification": ["frontend-typecheck", "targeted-test", "visual", "unknown-check"],
         "repairBudget": 2,
         "maxTurns": 24,
         "budgets": {
@@ -84,18 +76,12 @@
       },
       "contract": {
         "mode": "implement",
-        "verification": [
-          "frontend-typecheck",
-          "targeted-test"
-        ],
+        "verification": ["frontend-typecheck", "targeted-test"],
         "maxTurns": 24,
         "maxChangedFiles": 12,
         "scopePackage": "frontend",
         "scopeArea": "src/components",
-        "scopePaths": [
-          "src/components/App.tsx",
-          "src/lib/util.ts"
-        ],
+        "scopePaths": ["src/components/App.tsx", "src/lib/util.ts"],
         "intent": "direct",
         "intentSource": "explicit",
         "toolchainMode": "path",
@@ -143,10 +129,7 @@
         "scope": {
           "package": "backend",
           "area": "-bad",
-          "paths": [
-            "-x",
-            ""
-          ]
+          "paths": ["-x", ""]
         },
         "mode": "review",
         "intent": {

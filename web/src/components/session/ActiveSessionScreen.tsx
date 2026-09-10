@@ -268,7 +268,6 @@ function ClarificationCard({ sessionId }: { sessionId: string }) {
   );
 }
 
-
 // Context indicator: which files the agent has actually read this session —
 // the map-is-not-the-territory point made transparent. Sourced from the
 // evidence index (read-kind entries carry the path), fetched lazily when
@@ -509,8 +508,8 @@ export function ActiveSessionScreen() {
       {/* Budget meter, not a spinner: a number that stands still while the
           clock runs is an honest hang signal a spinner would hide. */}
       <p className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>
-        {events.filter((event) => event.type === "tool_completed").length} tool calls ·
-        repairs {session.repairsUsed}/{session.repairBudget}
+        {events.filter((event) => event.type === "tool_completed").length} tool calls · repairs{" "}
+        {session.repairsUsed}/{session.repairBudget}
         {events.some((event) => event.type === "loop_detected") && (
           <span style={{ color: "var(--amber)" }}> · loop nudge issued</span>
         )}
@@ -554,7 +553,9 @@ export function ActiveSessionScreen() {
       <GatesRow gates={session.gates} />
       <StatusesRow statuses={session.statuses} />
       {analysis && <RiskAndScopeSummary analysis={analysis} />}
-      {id && readOnlyMode && <TaskReportPanel sessionId={id} ready={!isRunning} workspace={session.workspace} />}
+      {id && readOnlyMode && (
+        <TaskReportPanel sessionId={id} ready={!isRunning} workspace={session.workspace} />
+      )}
       {id && !readOnlyMode && <ArchitecturePlanPanel sessionId={id} />}
       {id && !readOnlyMode && <ArchitectReviewPanel sessionId={id} gates={session.gates} />}
       {id && !readOnlyMode && <DeliveryReviewPanel sessionId={id} workspace={session.workspace} />}

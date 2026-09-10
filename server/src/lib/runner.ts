@@ -329,9 +329,7 @@ export function runGlimmer(
       // Harmless when the extension is not connected — the bridge reports
       // "not connected" and headless capture stands alone.
       GLIMMER_BROWSER_BRIDGE_URL: `http://127.0.0.1:${CONFIG.port}`,
-      ...(CONFIG.capabilityToken
-        ? { GLIMMER_BROWSER_BRIDGE_TOKEN: CONFIG.capabilityToken }
-        : {}),
+      ...(CONFIG.capabilityToken ? { GLIMMER_BROWSER_BRIDGE_TOKEN: CONFIG.capabilityToken } : {}),
     },
   });
 

@@ -244,7 +244,10 @@ describe("CodeViewer", () => {
     // Preview mode has no numbered source lines.
     expect(document.querySelector(".code-view__lineno")).toBeNull();
     // Links open safely in a new tab.
-    expect(screen.getByRole("link", { name: "link" })).toHaveAttribute("rel", "noreferrer noopener");
+    expect(screen.getByRole("link", { name: "link" })).toHaveAttribute(
+      "rel",
+      "noreferrer noopener",
+    );
   });
 
   it("toggles to raw source and back", async () => {
@@ -254,8 +257,9 @@ describe("CodeViewer", () => {
     const toggle = await screen.findByRole("button", { name: "Source" });
     fireEvent.click(toggle);
     // Source view shows the literal markdown with line numbers.
-    expect(screen.getByText("# Title", { selector: ".code-view__text, .code-view__text *" }))
-      .toBeTruthy();
+    expect(
+      screen.getByText("# Title", { selector: ".code-view__text, .code-view__text *" }),
+    ).toBeTruthy();
     expect(document.querySelector(".code-view__lineno")).not.toBeNull();
     expect(screen.getByRole("button", { name: "Preview" })).toBeTruthy();
   });

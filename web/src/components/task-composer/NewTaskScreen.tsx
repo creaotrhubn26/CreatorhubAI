@@ -442,10 +442,7 @@ export function NewTaskScreen() {
                   {memoryQuery.data!.entries.map((entry) => {
                     const faded = (entry.ageDays ?? 0) > 45 || entry.belowFloor;
                     return (
-                      <li
-                        key={`${entry.kind}:${entry.key}`}
-                        style={{ opacity: faded ? 0.55 : 1 }}
-                      >
+                      <li key={`${entry.kind}:${entry.key}`} style={{ opacity: faded ? 0.55 : 1 }}>
                         <span className="mono">
                           [{entry.kind}] {entry.key}
                         </span>{" "}
@@ -799,8 +796,8 @@ export function NewTaskScreen() {
                 Review plan before execution
               </label>
               <p>
-                Pauses after the architecture plan for your explicit proceed/stop decision
-                (implies architect first).
+                Pauses after the architecture plan for your explicit proceed/stop decision (implies
+                architect first).
               </p>
             </details>
           </div>

@@ -20,9 +20,9 @@ GPU execution chain. The live proofs live in `scripts/remote-e2e/`.
 - **Gateway** (`server/`, bundled into the app): routes sessions to the
   GPU worker when cloud compute is ready. After ANY gateway change:
   `./src-tauri/scripts/prepare-gateway.sh && rsync -a --delete
-  src-tauri/resources/gateway/ "/Applications/Glimmer Control
-  Center.app/Contents/Resources/resources/gateway/" && codesign -f -s -
-  "/Applications/Glimmer Control Center.app"` — then grep the bundle for
+src-tauri/resources/gateway/ "/Applications/Glimmer Control
+Center.app/Contents/Resources/resources/gateway/" && codesign -f -s -
+"/Applications/Glimmer Control Center.app"` — then grep the bundle for
   a new symbol to prove it landed.
 
 ## Monthly

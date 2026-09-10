@@ -120,10 +120,9 @@ export function buildRemoteTaskContract(contract: TaskContract): RemoteTaskContr
       qualityGates.minimumCustomerReadiness !== undefined &&
       CUSTOMER_READINESS_VALUES.has(qualityGates.minimumCustomerReadiness)
     ) {
-      gates.minimumCustomerReadiness =
-        qualityGates.minimumCustomerReadiness as NonNullable<
-          RemoteTaskContractV1["qualityGates"]
-        >["minimumCustomerReadiness"];
+      gates.minimumCustomerReadiness = qualityGates.minimumCustomerReadiness as NonNullable<
+        RemoteTaskContractV1["qualityGates"]
+      >["minimumCustomerReadiness"];
     }
     if (Object.keys(gates).length > 0) remote.qualityGates = gates;
   }

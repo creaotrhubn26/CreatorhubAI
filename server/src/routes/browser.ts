@@ -80,7 +80,9 @@ browserRouter.get("/browser/status", (_req, res) => {
 browserRouter.post("/browser/execute", async (req, res) => {
   const { kind, url, selector } = req.body ?? {};
   if (!COMMAND_KINDS.has(kind) || !isLoopbackHttpUrl(url)) {
-    return res.status(400).json({ error: "kind must be a bridge command and url loopback http(s)" });
+    return res
+      .status(400)
+      .json({ error: "kind must be a bridge command and url loopback http(s)" });
   }
   if (selector !== undefined && (typeof selector !== "string" || selector.length > 512)) {
     return res.status(400).json({ error: "selector is invalid" });

@@ -14,7 +14,6 @@ process.on("unhandledRejection", (reason) => {
   console.error("[gateway] unhandled rejection:", reason);
 });
 
-
 const app = createApp();
 
 let shutdownStarted = false;
@@ -32,9 +31,7 @@ async function shutdownWithComputeCleanup(reason: string, exitCode = 0) {
     // remote sessions that startup recovery can otherwise reattach to.
     const lease = await getComputeController().readLeaseForShutdown();
     if (lease?.orchestrationMode === "cloud_coordinator") {
-      console.log(
-        "[gateway] leaving coordinator-supervised compute running for restart recovery",
-      );
+      console.log("[gateway] leaving coordinator-supervised compute running for restart recovery");
     } else {
       const result = await getComputeController().stop(reason);
       if (result.terminated)

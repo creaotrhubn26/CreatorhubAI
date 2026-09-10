@@ -212,106 +212,106 @@ export function CodeViewer({
             <MarkdownView content={data.content} />
           ) : (
             <>
-          {/* A requested line the excerpt doesn't reach is said out loud —
+              {/* A requested line the excerpt doesn't reach is said out loud —
               silently landing at the top would read as "line N is line 1". */}
-          {line !== undefined && line > lines.length && (
-            <p className="code-view__notice" role="status">
-              Line {line} is past the {lines.length.toLocaleString()} line
-              {lines.length === 1 ? "" : "s"}
-              {data.truncated ? " read from this file" : " in this file"} — not shown.
-            </p>
-          )}
-          {lang === "plain" && lines.length > HIGHLIGHT_LINE_CEILING && (
-            <p className="code-view__notice">
-              Syntax highlighting is off for files over {HIGHLIGHT_LINE_CEILING.toLocaleString()}{" "}
-              lines.
-            </p>
-          )}
-          <div
-            className="code-view__body"
-            onMouseUp={captureSelection}
-            style={{ position: "relative" }}
-          >
-            {popover && (
+              {line !== undefined && line > lines.length && (
+                <p className="code-view__notice" role="status">
+                  Line {line} is past the {lines.length.toLocaleString()} line
+                  {lines.length === 1 ? "" : "s"}
+                  {data.truncated ? " read from this file" : " in this file"} — not shown.
+                </p>
+              )}
+              {lang === "plain" && lines.length > HIGHLIGHT_LINE_CEILING && (
+                <p className="code-view__notice">
+                  Syntax highlighting is off for files over{" "}
+                  {HIGHLIGHT_LINE_CEILING.toLocaleString()} lines.
+                </p>
+              )}
               <div
-                role="menu"
-                aria-label="Selection actions"
-                style={{
-                  position: "absolute",
-                  left: Math.max(8, popover.x - 40),
-                  top: popover.y,
-                  zIndex: 10,
-                  display: "flex",
-                  gap: 4,
-                  padding: 4,
-                  borderRadius: 8,
-                  border: "1px solid var(--border, #444)",
-                  background: "var(--bg-elevated, #222)",
-                  boxShadow: "0 4px 16px rgba(0,0,0,0.35)",
-                }}
+                className="code-view__body"
+                onMouseUp={captureSelection}
+                style={{ position: "relative" }}
               >
-                <button
-                  type="button"
-                  onClick={() => {
-                    void navigator.clipboard?.writeText(popover.text);
-                    setCopied(true);
-                  }}
-                >
-                  {copied ? "Copied ✓" : "Copy"}
-                </button>
-                {workspace && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      navigate("/tasks/new", {
-                        state: {
-                          selectionDraft: {
-                            objective: "",
-                            workspace,
-                            path,
-                            startLine: popover.startLine,
-                            endLine: popover.endLine,
-                          },
-                        },
-                      })
-                    }
+                {popover && (
+                  <div
+                    role="menu"
+                    aria-label="Selection actions"
+                    style={{
+                      position: "absolute",
+                      left: Math.max(8, popover.x - 40),
+                      top: popover.y,
+                      zIndex: 10,
+                      display: "flex",
+                      gap: 4,
+                      padding: 4,
+                      borderRadius: 8,
+                      border: "1px solid var(--border, #444)",
+                      background: "var(--bg-elevated, #222)",
+                      boxShadow: "0 4px 16px rgba(0,0,0,0.35)",
+                    }}
                   >
-                    Start as task
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(popover.text);
+                        setCopied(true);
+                      }}
+                    >
+                      {copied ? "Copied ✓" : "Copy"}
+                    </button>
+                    {workspace && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          navigate("/tasks/new", {
+                            state: {
+                              selectionDraft: {
+                                objective: "",
+                                workspace,
+                                path,
+                                startLine: popover.startLine,
+                                endLine: popover.endLine,
+                              },
+                            },
+                          })
+                        }
+                      >
+                        Start as task
+                      </button>
+                    )}
+                    <button type="button" onClick={() => setPopover(null)} aria-label="Dismiss">
+                      ✕
+                    </button>
+                  </div>
                 )}
-                <button type="button" onClick={() => setPopover(null)} aria-label="Dismiss">
-                  ✕
-                </button>
+                {lines.map((text, i) => {
+                  const no = i + 1;
+                  const isCurrent = line === no;
+                  const isSelected =
+                    selectionStart !== undefined &&
+                    selectionEnd !== undefined &&
+                    no >= selectionStart &&
+                    no <= selectionEnd;
+                  return (
+                    <div
+                      key={i}
+                      ref={isCurrent ? lineRef : undefined}
+                      className={`code-view__line${isCurrent ? " is-current" : ""}${isSelected ? " is-selected" : ""}`}
+                      data-line={no}
+                    >
+                      <span className="code-view__lineno">{no}</span>
+                      <span className="code-view__text">
+                        <HighlightedText text={text} lang={lang} />
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
-            )}
-            {lines.map((text, i) => {
-              const no = i + 1;
-              const isCurrent = line === no;
-              const isSelected =
-                selectionStart !== undefined &&
-                selectionEnd !== undefined &&
-                no >= selectionStart &&
-                no <= selectionEnd;
-              return (
-                <div
-                  key={i}
-                  ref={isCurrent ? lineRef : undefined}
-                  className={`code-view__line${isCurrent ? " is-current" : ""}${isSelected ? " is-selected" : ""}`}
-                  data-line={no}
-                >
-                  <span className="code-view__lineno">{no}</span>
-                  <span className="code-view__text">
-                    <HighlightedText text={text} lang={lang} />
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-          {data.truncated && (
-            <p className="code-view__notice" role="status">
-              — end of the truncated excerpt, not the end of the file —
-            </p>
-          )}
+              {data.truncated && (
+                <p className="code-view__notice" role="status">
+                  — end of the truncated excerpt, not the end of the file —
+                </p>
+              )}
             </>
           )}
         </>

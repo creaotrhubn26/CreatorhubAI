@@ -150,7 +150,9 @@ export function DeliveryReviewPanel({
                           type="button"
                           style={{ fontSize: 12 }}
                           title="Convert this next step into a new task (opens the composer, prefilled — nothing runs automatically)"
-                          onClick={() => navigate("/tasks/new", { state: { objective: s.action, workspace } })}
+                          onClick={() =>
+                            navigate("/tasks/new", { state: { objective: s.action, workspace } })
+                          }
                         >
                           Convert to task
                         </button>

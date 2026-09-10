@@ -462,18 +462,16 @@ describe("watchdog V2 leases", () => {
       },
     });
     await env.LEASES.put("lease-v2:job-1", JSON.stringify(fallbackLease));
-    const fetchMock = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(
-        Response.json(
-          cpuPodV2({
-            cpuFlavorId: undefined,
-            vcpuCount: undefined,
-            gpu: { id: "NVIDIA L4", count: 1 },
-            costPerHr: 0.49,
-          }),
-        ),
-      );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json(
+        cpuPodV2({
+          cpuFlavorId: undefined,
+          vcpuCount: undefined,
+          gpu: { id: "NVIDIA L4", count: 1 },
+          costPerHr: 0.49,
+        }),
+      ),
+    );
 
     await expect(sweep(env, NOW)).resolves.toMatchObject({
       ok: true,

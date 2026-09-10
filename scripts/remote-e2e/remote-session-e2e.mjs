@@ -19,12 +19,15 @@ const ORIGIN = "tauri://localhost";
 // GPU run (~$0.05-0.15) starts through the app's own APIs and is always
 // stopped and cleaned in the finally block.
 const options = Object.fromEntries(
-  process.argv.slice(2).map((argument, index, all) => {
-    if (!argument.startsWith("--")) return [];
-    const key = argument.replace(/^--/, "");
-    const next = all[index + 1];
-    return [key, next && !next.startsWith("--") ? next : "true"];
-  }).filter((entry) => entry.length),
+  process.argv
+    .slice(2)
+    .map((argument, index, all) => {
+      if (!argument.startsWith("--")) return [];
+      const key = argument.replace(/^--/, "");
+      const next = all[index + 1];
+      return [key, next && !next.startsWith("--") ? next : "true"];
+    })
+    .filter((entry) => entry.length),
 );
 const WORKTREE = options.worktree;
 if (!WORKTREE) {
@@ -107,14 +110,16 @@ try {
     }
   }
   if (attached && KILL_MID_RUN) {
-    throw new Error(
-      "--kill-mid-run needs to own the app process; quit the running app first",
-    );
+    throw new Error("--kill-mid-run needs to own the app process; quit the running app first");
   }
   if (!attached) {
     app = spawn(APP, [], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GLIMMER_INSTANCE_ID: instanceId, GLIMMER_CAPABILITY_TOKEN: capability },
+      env: {
+        ...process.env,
+        GLIMMER_INSTANCE_ID: instanceId,
+        GLIMMER_CAPABILITY_TOKEN: capability,
+      },
     });
     app.stdout.on("data", (d) => (appOut += d));
     app.stderr.on("data", (d) => (appOut += d));
@@ -128,9 +133,8 @@ try {
     }
   }
   log("gateway_ready", { attached });
-  originalEnabled = JSON.parse(
-    readFileSync(path.join(stateRoot, "compute.json"), "utf8"),
-  ).enabled === true;
+  originalEnabled =
+    JSON.parse(readFileSync(path.join(stateRoot, "compute.json"), "utf8")).enabled === true;
   await api("/api/compute/config", { method: "PUT", body: JSON.stringify(computeUpdate(true)) });
   await api("/api/compute/start", { method: "POST", body: JSON.stringify({}) });
   log("compute_start_accepted");
@@ -194,7 +198,11 @@ try {
     await delay(3_000);
     app = spawn(APP, [], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GLIMMER_INSTANCE_ID: instanceId, GLIMMER_CAPABILITY_TOKEN: capability },
+      env: {
+        ...process.env,
+        GLIMMER_INSTANCE_ID: instanceId,
+        GLIMMER_CAPABILITY_TOKEN: capability,
+      },
     });
     app.stdout.on("data", (d) => (appOut += d));
     app.stderr.on("data", (d) => (appOut += d));
@@ -247,7 +255,9 @@ try {
     exitCode = 0;
     throw { earlyExit: true };
   }
-  const gitStatus = execFileSync("git", ["-C", WORKTREE, "status", "--short"], { encoding: "utf8" });
+  const gitStatus = execFileSync("git", ["-C", WORKTREE, "status", "--short"], {
+    encoding: "utf8",
+  });
   const noteExists = (() => {
     try {
       return readFileSync(path.join(WORKTREE, "REMOTE_NOTE.md"), "utf8");
@@ -256,7 +266,10 @@ try {
     }
   })();
   log("worktree_after", { gitStatus: gitStatus.trim(), remoteNote: noteExists });
-  const podLog = readFileSync(path.join(stateRoot, "sessions", created.id, "orchestrator.log"), "utf8");
+  const podLog = readFileSync(
+    path.join(stateRoot, "sessions", created.id, "orchestrator.log"),
+    "utf8",
+  );
   log("verification_evidence", {
     npmCi: podLog.includes("npm ci"),
     fixtureTypecheck: podLog.includes("fixture typecheck OK"),
@@ -282,7 +295,10 @@ try {
     if (status && ["offline", "failed"].includes(status.state)) break;
     await delay(5000);
   }
-  await api("/api/compute/config", { method: "PUT", body: JSON.stringify(computeUpdate(originalEnabled)) })
+  await api("/api/compute/config", {
+    method: "PUT",
+    body: JSON.stringify(computeUpdate(originalEnabled)),
+  })
     .then(() => log("config_restored"))
     .catch((error) => log("config_restore_error", { message: String(error) }));
   const runpodKey = readFileSync(path.join(stateRoot, "compute-keys", "runpod.key"), "utf8").trim();

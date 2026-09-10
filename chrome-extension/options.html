@@ -4,12 +4,35 @@
     <meta charset="utf-8" />
     <title>Glimmer Browser Bridge</title>
     <style>
-      body { font: 14px system-ui; max-width: 30rem; margin: 2rem auto; padding: 0 1rem; }
-      label { display: block; margin-top: 1rem; font-weight: 600; }
-      input { width: 100%; padding: 0.4rem; margin-top: 0.25rem; box-sizing: border-box; }
-      button { margin-top: 1.25rem; padding: 0.5rem 1.25rem; }
-      #saved { color: green; margin-left: 0.75rem; }
-      p.hint { color: #555; font-size: 12px; }
+      body {
+        font: 14px system-ui;
+        max-width: 30rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      label {
+        display: block;
+        margin-top: 1rem;
+        font-weight: 600;
+      }
+      input {
+        width: 100%;
+        padding: 0.4rem;
+        margin-top: 0.25rem;
+        box-sizing: border-box;
+      }
+      button {
+        margin-top: 1.25rem;
+        padding: 0.5rem 1.25rem;
+      }
+      #saved {
+        color: green;
+        margin-left: 0.75rem;
+      }
+      p.hint {
+        color: #555;
+        font-size: 12px;
+      }
     </style>
   </head>
   <body>
@@ -19,8 +42,8 @@
     <label for="capabilityToken">Capability token</label>
     <input id="capabilityToken" type="password" autocomplete="off" />
     <p class="hint">
-      Finnes i <code>~/.muse-glimmer/gateway-capability.token</code> på maskinen som kjører
-      Glimmer Control Center.
+      Finnes i <code>~/.muse-glimmer/gateway-capability.token</code> på maskinen som kjører Glimmer
+      Control Center.
     </p>
     <button id="save">Lagre</button><span id="saved" hidden>Lagret</span>
     <script src="options.js"></script>
