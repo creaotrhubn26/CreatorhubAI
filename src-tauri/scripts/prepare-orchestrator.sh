@@ -103,6 +103,29 @@ for index in "${!FILES[@]}"; do
   fi
 done
 
+# Pin-drift guard, part 2: the release/CI runtime verifier
+# (scripts/verify-bundled-runtime.mjs) hardcodes the expected orchestrator
+# commit and snapshot. A fourth pin site that once shipped stale and failed
+# the release build after the snapshot was rolled — fail the prepare step
+# loudly instead of the release.
+VERIFY_MJS="$(cd .. && pwd)/scripts/verify-bundled-runtime.mjs"
+if ! grep -q "\"${ORCHESTRATOR_REF}\"" "$VERIFY_MJS"; then
+  echo "pin drift: verify-bundled-runtime.mjs EXPECTED_ORCHESTRATOR_COMMIT is not ${ORCHESTRATOR_REF}" >&2
+  exit 1
+fi
+if ! grep -q "\"${SNAPSHOT_ID}\"" "$VERIFY_MJS"; then
+  echo "pin drift: verify-bundled-runtime.mjs EXPECTED_ORCHESTRATOR_SNAPSHOT is not ${SNAPSHOT_ID}" >&2
+  exit 1
+fi
+# ...and its per-file EXPECTED_ORCHESTRATOR_FILES table (every file, including
+# eval-baselines and run-github-mcp.sh, unlike the gateway's table above).
+for index in "${!FILES[@]}"; do
+  if ! grep -q "\"${SHAS[$index]}\"" "$VERIFY_MJS"; then
+    echo "pin drift: verify-bundled-runtime.mjs EXPECTED_ORCHESTRATOR_FILES disagrees for ${FILES[$index]}" >&2
+    exit 1
+  fi
+done
+
 test "$OUT" = "binaries/runtime/orchestrator"
 rm -rf "$OUT"
 mkdir -p "$OUT"

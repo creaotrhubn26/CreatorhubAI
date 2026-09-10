@@ -7,8 +7,8 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 
-const EXPECTED_ORCHESTRATOR_COMMIT = "902e7ab8f98646e2b54d9498c33b3fb0bf288e95";
-const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-runpod-r2";
+const EXPECTED_ORCHESTRATOR_COMMIT = "1a84a9a1171cf2a37437e84a6a1a3dd019b13e1f";
+const EXPECTED_ORCHESTRATOR_SNAPSHOT = "glimmer-runpod-r5";
 const EXPECTED_RUNPOD_WORKFLOW_SHA =
   "c2f1b367b894a7dfea31c84ca844c52fd254b84e8b6aaaa0cfb2ff0d2b79c952";
 const EXPECTED_PYTHON_FILES = {
@@ -22,27 +22,23 @@ const EXPECTED_PYTHON_FILES = {
     "8bfe061a1ca73426e415f9a3ad2ffbe587e8bc49bb81423af8892cc1ffaa9326",
 };
 const EXPECTED_ORCHESTRATOR_FILES = {
-  "glimmer-v2.py": "ecd0952e83bc9fd658230e4aa2707d92e90151e994529e78aacbd011b067ee4a",
-  "glimmer-engineer.py": "16be8ca1c4ec368e3247a1f034a0db5b8418235129cf964962d12ee9bda3f7db",
-  "glimmer_events.py": "2fd4aa0afbe32b58150be442c0e2b4cbb70f1c5ab65f2a9d2e857b239cd34454",
+  "glimmer-v2.py": "23f4195a04db230d378bcdfcaa407af59c8b6269ec2fe813dc527283e23e2b0a",
+  "glimmer-engineer.py": "1d94fbfc892918d378d57ac4c5b2f258641251499a14ff485664ebde6565096f",
+  "glimmer_events.py": "7bbf8ace8c591704a152297c2978520a8ec59dd1e3c19b75ddd54a2453fc42e4",
   "glimmer_journal.py": "67a28a2c480ca65ff49133968bda89a0c4f9e670aa02e28cd5fcb3e269464cf5",
   "glimmer_models.py": "584302c1b0689f70d825fe5a155ed88d410cba8c835de054429c6b233138409c",
   "glimmer_memory.py": "84db728096ee22c016e6abdb6efdad4b88620a3a19aa6b95eda698f9fa523920",
   "glimmer_quality.py": "cadc645a90f18cd5b069f6cd90191a55b02d9c2ad0bb16a72186baa79cce3188",
-  "glimmer_semantic.py": "e1d3ce00c33f6db5d4183b1e8c237bbea50532ee051018b64b577163f864f167",
+  "glimmer_semantic.py": "998bcc8b0cf49a5e729c842a0be08344ec397ff8d216f92a61c3fb22bf7d02cb",
   "glimmer_verification.py": "fbd486ad5811ab3d4872f6638dd28e996c57119324bc2f04ab20fb393c9c4711",
-  "glimmer-visual.py": "c9bf09838ca8742e0225a71b52ee77ac99bf4ee30f03a1b258b94828671a0ee3",
-  "glimmer_remote.py": "5771ff5870bfc74b35cdad90c7011da5f23ca88bf2d54eb2f9a8a59188926bfd",
-  "runpod_worker.py": "b06de735ab48659456f59e188ea173cc839513d918235be4000f9651f6b5e979",
+  "glimmer-visual.py": "e67d2448adbdb34f00a523acee93de8fc25bbde8c26fbe4120f88f60ad19f1d6",
+  "glimmer_remote.py": "b2f7e2dab8478d95dd09787dc0cd3cbacd3a6f7e482a865f9f179f4c2089083d",
+  "runpod_worker.py": "1e004bb6dfcaf26a4d92468015b4770f00754ee1ae62e6b079d7834ff97390a8",
   "run-github-mcp.sh": "409041d9bd09a9febc199f755190caab073319ba68f1f3eae5417c14c4af5c33",
-  "eval-baselines/baseline-stub.json":
-    "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
-  "eval-baselines/latest-stub.json":
-    "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
-  "eval-baselines/baseline-live.json":
-    "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
-  "eval-baselines/latest-live.json":
-    "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
+  "eval-baselines/baseline-stub.json": "65fcc635efca36848fa1e1b4069a99ee8c8f556760ef50ada005f52564976c18",
+  "eval-baselines/latest-stub.json": "ab485efbfca4f7eb10d6105ad3b82c9b2cb82afba9231c9d4da915475c734a45",
+  "eval-baselines/baseline-live.json": "342ea08539e3dafb23bd0a529a63fd5b398f721412261fc8e4a6c5cecfb3aa41",
+  "eval-baselines/latest-live.json": "67b2c16d33f3cb59131d3a14147fa3912b3467bc28cb06736cda327ba7116d91",
 };
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
 
