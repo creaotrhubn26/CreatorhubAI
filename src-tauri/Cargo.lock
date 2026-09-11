@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "glimmer-control-center"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
